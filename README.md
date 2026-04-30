@@ -1,6 +1,10 @@
 # Agentic-Control-Architecture-for-USV
 Master Thesis Agentic Control Architecture for Aquality Autonomous USVs.
 
+The purpose is to introduce a agentic control architecture where the dataflow between layers are abstracted and put into a agent (currently FSM) for decision making). This makes the USV aware of different variables like communication state to enhance its autonomous performance.
+
+The main layers are low level control (Pixhawk 6C ONBBOARD), agent and main apps (Raspberry Pi 5 ONBOARD), global server / operator (Computer/laptop OFFBBOARD). Information is gathered by the agent from other layers to reason and then send back appropriate information.
+
 ## 📁 Project Structure
 
 ```text
