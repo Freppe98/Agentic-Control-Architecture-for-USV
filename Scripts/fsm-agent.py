@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agentic_layer_fsm.py
+FSM-agent.py
 
 A lightweight finite state machine (FSM) agentic layer template for a USV/UAV/robot.
 Designed for Raspberry Pi 5 using only Python standard library.

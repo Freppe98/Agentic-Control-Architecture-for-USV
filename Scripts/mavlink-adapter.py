@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-#mavlink_fsm_runner.py
+#mavlink-adapter.py
 
 from __future__ import annotations
 
