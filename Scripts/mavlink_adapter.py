@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-#mavlink-adapter.py
+#mavlink_adapter.py
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import csv
 
 from pymavlink import mavutil
 
-from FSM import (
+from fsm_agent import (
     AgenticFSM,
     Config,
     InputData,
