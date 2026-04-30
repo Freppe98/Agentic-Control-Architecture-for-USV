@@ -1,0 +1,31 @@
+RUN SITL
+cd ~/ardupilot
+./Tools/autotest/sim_vehicle.py -v Rover --console --map
+
+RUN AGENT
+cd ~/Thesis/Agentic-Control-Architecture-for-USV/Scripts
+python3 agent_runner.py \
+  --mavlink udp:0.0.0.0:14550 \
+  --global-ip 0.0.0.0 \
+  --global-port 15000 \
+  --home-lat 56.699859 \
+  --home-lon 13.002052
+
+  RUN DASHBOARD
+  cd ~/Thesis/Agentic-Control-Architecture-for-USV/Scripts
+python3 dashboard_simulator.py \
+  --ip 127.0.0.1 \
+  --port 15000 \
+  --period 1.0
+
+  TEST OVERRIDE
+  python3 dashboard_simulator.py \
+  --ip 127.0.0.1 \
+  --port 15000 \
+  --override HOLD_POSITION
+
+  TEST RETURN HOME
+  python3 dashboard_simulator.py \
+  --ip 127.0.0.1 \
+  --port 15000 \
+  --override RETURN_HOME
