@@ -64,7 +64,7 @@ gps:
   hdop (float)
 ```
 
-## 2. Agent → Pixhawk
+## Parameters 2. Agent → Pixhawk
 
 ```text
 SET_MODE:
@@ -85,7 +85,7 @@ SAFETY:
   arm / disarm
 ```
 
-## 3. Global → Agent (Unreliable Link)
+## Parameters 3. Global → Agent (Unreliable Link)
 
 ```text
 {
@@ -123,7 +123,7 @@ comm_state:
 last_intent_timestamp_s (float)
 ```
 
-## 4. Agent → Global (Telemetry / Feedback)
+## Parameters 4. Agent → Global (Telemetry / Feedback)
 
 ```text
 {
