@@ -1,6 +1,9 @@
 # Agentic-Control-Architecture-for-USV
 Master Thesis Agentic Control Architecture for Aquality Autonomous USVs.
 
+## 📁 Project Structure
+
+```text
 USV / Raspberry Pi 5
 │
 ├── adapters/
