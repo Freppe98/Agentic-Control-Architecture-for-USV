@@ -27,3 +27,44 @@ USV / Raspberry Pi 5
     ├── swarm_simulator.py        # fake other USVs
     ├── sensor_simulator.py       # fake sonar/sensor inputs
     └── network_emulation/        # Mininet/tc configs
+
+                    ┌──────────────────────────────┐
+                │   Server / Operator / Swarm  │
+                └──────────────┬───────────────┘
+                               │ 4G / Wi-Fi (UNRELIABLE)
+                               ▼
+                    ┌──────────────────────┐
+                    │   global_adapter.py  │
+                    └──────────────────────┘
+
+        ┌──────────────────────────────────────────────┐
+        │              Raspberry Pi 5                  │
+        │                                              │
+        │  ┌─────────────── ADAPTER LAYER ───────────┐ │
+        │  │ mavlink_adapter.py   (Pixhawk USB)      │ │
+        │  │ sonar_adapter.py     (Ethernet)         │ │
+        │  │ sensor_adapter.py    (I2C/GPIO/UART)    │ │
+        │  │ swarm_adapter.py     (USV coordination) │ │
+        │  └─────────────────────────────────────────┘ │
+        │                      │                        │
+        │                      ▼                        │
+        │      ┌──────────────────────────────┐        │
+        │      │   state_abstraction.py       │        │
+        │      │  - timestamping              │        │
+        │      │  - freshness / staleness     │        │
+        │      │  - confidence estimation     │        │
+        │      │  - data fusion               │        │
+        │      └──────────────────────────────┘        │
+        │                      │                        │
+        │                      ▼                        │
+        │      ┌──────────────────────────────┐        │
+        │      │        fsm_agent.py          │        │
+        │      │  Communication-aware logic   │        │
+        │      └──────────────────────────────┘        │
+        │                      │                        │
+        │                      ▼                        │
+        │      ┌──────────────────────────────┐        │
+        │      │     command_adapter.py       │        │
+        │      └──────────────────────────────┘        │
+        │                                              │
+        └──────────────────────────────────────────────┘
