@@ -6,13 +6,7 @@ from __future__ import annotations
 
 import time
 from typing import Optional
-import csv
-
-from pymavlink import mavutil
-
 from fsm_agent import (
-    AgenticFSM,
-    Config,
     InputData,
     Position,
     VehicleHealth,
@@ -20,7 +14,6 @@ from fsm_agent import (
     AgentState,
     CommState,
     GoalType,
-    output_to_json,
 )
 
 
@@ -105,86 +98,3 @@ class MavlinkAdapter:
             emergency_stop_requested=False,
             last_intent_timestamp_s=self.last_intent_timestamp_s,
         )
-
-
-def main() -> None:
-    print("Connecting to MAVLink on udp:0.0.0.0:14550")
-    #master = mavutil.mavlink_connection("udp:127.0.0.1:14550")
-    master = mavutil.mavlink_connection("udp:0.0.0.0:14550")
-
-    print("Waiting for heartbeat...")
-    master.wait_heartbeat()
-    print(f"Heartbeat received from system {master.target_system}")
-
-    config = Config(home_position=(56.699859, 13.002052))
-    fsm = AgenticFSM(config)
-    adapter = MavlinkAdapter()
-
-    last_state = None
-
-    with open("fsm_log.csv", "w", newline="") as log_file:
-        writer = csv.writer(log_file)
-        writer.writerow([
-            "time",
-            "fsm_state",
-            "goal_type",
-            "comm_state",
-            "heartbeat_age_s",
-            "lat",
-            "lon",
-            "battery",
-            "heading"
-        ])
-
-        try:
-            while True:
-                msg = master.recv_match(blocking=False)
-
-                if msg is not None:
-                    adapter.update_from_msg(msg)
-
-                input_data = adapter.build_input()
-                output_data = fsm.decide(input_data)
-
-                adapter.current_fsm_state = output_data.next_state
-                adapter.last_intent_timestamp_s = output_data.output_timestamp_s
-
-                hb_age = (
-                    9999.0
-                    if adapter.last_heartbeat_time is None
-                    else time.time() - adapter.last_heartbeat_time
-                )
-
-                if output_data.next_state != last_state:
-                    print("\n=== FSM TRANSITION ===")
-                    print(output_to_json(output_data))
-                    print(
-                        f"comm={input_data.comm_state.name} "
-                        f"hb_age={hb_age:.2f}s "
-                        f"pos=({input_data.position.x:.6f}, {input_data.position.y:.6f}) "
-                        f"battery={input_data.health.battery_percent:.1f}% "
-                        f"heading={input_data.position.heading_deg:.1f}"
-                    )
-                    last_state = output_data.next_state
-
-                writer.writerow([
-                    time.time(),
-                    output_data.next_state.name,
-                    output_data.intent.goal_type.name,
-                    input_data.comm_state.name,
-                    hb_age,
-                    input_data.position.x,
-                    input_data.position.y,
-                    input_data.health.battery_percent,
-                    input_data.position.heading_deg
-                ])
-                log_file.flush()
-
-                time.sleep(0.1)
-
-        except KeyboardInterrupt:
-            print("\nStopping logger cleanly.")
-
-
-if __name__ == "__main__":
-    main()

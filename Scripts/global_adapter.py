@@ -17,8 +17,8 @@ from __future__ import annotations
 import json
 import socket
 import time
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
 
 from fsm_agent import CommState, GoalType, SwarmStatus
 
@@ -62,6 +62,8 @@ class GlobalState:
 
     target_confidence: float = 0.0
 
+    waypoints: List[Dict[str, Any]] = field(default_factory=list)
+
     raw_last_message: Optional[dict] = None
 
 
@@ -83,7 +85,11 @@ class GlobalAdapter:
         "emergency_stop": false,
         "expected_neighbors": 3,
         "connected_neighbors": 2,
-        "target_confidence": 0.2
+        "target_confidence": 0.2,
+        "waypoints": [
+            {"id": "wp1", "lat": 56.7, "lon": 13.0, "alt_m": 0.0, "loiter_radius_m": 0.0},
+            {"id": "wp2", "lat": 56.7005, "lon": 13.0005, "alt_m": 0.0, "loiter_radius_m": 0.0}
+        ]
     }
     """
 
@@ -166,6 +172,9 @@ class GlobalAdapter:
         if "target_confidence" in payload:
             self.state.target_confidence = float(payload.get("target_confidence", 0.0))
 
+        if "waypoints" in payload and isinstance(payload.get("waypoints"), list):
+            self.state.waypoints = payload.get("waypoints", [])
+
     # -------------------------------------------------------------------------
     # FSM-FACING OUTPUTS
     # -------------------------------------------------------------------------
@@ -208,6 +217,9 @@ class GlobalAdapter:
     def get_last_intent_timestamp(self) -> float:
         return self.state.last_intent_timestamp_s
 
+    def get_waypoints(self) -> List[Dict[str, Any]]:
+        return self.state.waypoints
+
     def get_swarm_status(self) -> SwarmStatus:
         comm_state = self.derive_comm_state()
 
@@ -242,35 +254,3 @@ class GlobalAdapter:
 
     def close(self) -> None:
         self.sock.close()
-
-
-# =============================================================================
-# STANDALONE TEST
-# =============================================================================
-
-def main() -> None:
-    adapter = GlobalAdapter()
-
-    try:
-        while True:
-            adapter.update()
-
-            print(
-                f"comm={adapter.derive_comm_state().name} | "
-                f"goal={adapter.get_current_goal().name} | "
-                f"override={adapter.get_operator_override()} | "
-                f"estop={adapter.get_emergency_stop()} | "
-                f"neighbors={adapter.state.connected_neighbors}/"
-                f"{adapter.state.expected_neighbors} | "
-                f"target_conf={adapter.get_target_confidence():.2f}"
-            )
-
-            time.sleep(0.5)
-
-    except KeyboardInterrupt:
-        print("\n[GlobalAdapter] Stopping.")
-        adapter.close()
-
-
-if __name__ == "__main__":
-    main()
