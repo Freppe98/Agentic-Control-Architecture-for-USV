@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Aquality Fleet</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css">
+
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial;
+      background: #1e1e1e;
+      color: white;
+    }
+
+    #layout {
+      display: flex;
+      height: 100vh;
+      padding: 16px;
+      box-sizing: border-box;
+      gap: 20px;
+    }
+
+    #sidebars {
+      display: flex;
+      gap: 12px;
+    }
+
+    .panel {
+      width: 260px;
+      background: white;
+      color: black;
+      padding: 14px;
+      border-radius: 8px;
+      overflow-y: auto;
+    }
+
+    #map-window {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    #map {
+      width: 55%;
+      height: 55%;
+      border-radius: 10px;
+      border: 2px solid #555;
+    }
+
+    .usv-card {
+      border-bottom: 1px solid #444;
+      padding: 9px 0;
+      font-size: 14px;
+    }
+
+    .usv-card:last-child {
+      border-bottom: none;
+    }
+
+    button {
+      margin-top: 6px;
+      padding: 5px 8px;
+      cursor: pointer;
+    }
+    
+  </style>
+</head>
+
+<body>
+  <div id="layout">
+    <div id="sidebars">
+      <div class="panel">
+        <h3>Fleet library</h3>
+        <div id="fleet-list">Loading...</div>
+      </div>
+
+      <div class="panel">
+        <h3>Mission Fleet</h3>
+        <div id="mission-list">No active USVs</div>
+      </div>
+    </div>
+
+    <div id="map-window">
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
