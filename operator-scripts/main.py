@@ -10,6 +10,10 @@ import time
 app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent
 
+STALE_AFTER_SECONDS = 8
+PARTITIONED_AFTER_SECONDS = 20
+DISCONNECTED_AFTER_SECONDS = 40
+
 latest_agent_status = {}
 latest_agent_received_at = None
 
@@ -86,6 +90,12 @@ def normalize_agent_message(message: dict) -> dict:
         envelope = {}
 
     telemetry = payload.get("telemetry", {}) or {}
+    mission = payload.get("mission", {}) or {}
+    communication = payload.get("communication", {}) or {}
+    health = payload.get("health", {}) or {}
+    measurements = payload.get("measurements", {}) or {}
+    fleet_info = payload.get("fleet", {}) or {}
+    events = payload.get("events", []) or []
 
     usv_id_raw = payload.get("usv_id", payload.get("id", 2))
     try:
@@ -104,20 +114,47 @@ def normalize_agent_message(message: dict) -> dict:
         lat = 56.699893
         lng = 13.002148
 
+    def age_seconds(iso_time):
+        if not iso_time:
+            return None
+        t = datetime.fromisoformat(iso_time)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+
+    age = age_seconds(latest_agent_received_at)
+    if age is None:
+        online = False
+        comm_state = "UNKNOWN"
+    elif age > DISCONNECTED_AFTER_SECONDS:
+        online = False
+        comm_state = "DISCONNECTED"
+    elif age > PARTITIONED_AFTER_SECONDS:
+        online = True
+        comm_state = "PARTITIONED"
+    else:
+        online = True
+        comm_state = payload.get("comm_state", "CONNECTED")
+
     return {
         "id": usv_id,
         "name": payload.get("name", "Scout"),
-        "online": True,
-        "status": payload.get("mission_state", telemetry.get("mode", "ACTIVE")),
+        "online": online,
+        "status": mission.get("mission_state", payload.get("mission_state", "ACTIVE")),
         "battery": battery if battery != -1 else None,
         "comms": comm_state,
         "comm_state": comm_state,
+        "last_seen_age_s": round(age, 1) if age is not None else None,
         "heading": telemetry.get("heading", 0),
         "speed": telemetry.get("groundspeed", telemetry.get("speed")),
-        "mission": payload.get("mission", payload.get("mission_state", "Unknown")),
+        "mission": mission.get("mission_state", payload.get("mission", "Unknown")),
         "coverage": payload.get("coverage"),
         "lat": lat,
         "lng": lng,
+        "mission_data": payload.get("mission", {}) or {},
+        "communication": payload.get("communication", {}) or {},
+        "health": payload.get("health", {}) or {},
+        "measurements": payload.get("measurements", {}) or {},
+        "events": payload.get("events", []) or [],
+        "fleet_info": fleet_info,
         "agent": {
             "groups": payload.get("groups", []),
             "source": envelope.get("source", payload.get("source")),

@@ -137,6 +137,14 @@ function valueOrUnknown(value, suffix = "") {
   return `${value}${suffix}`;
 }
 
+function detailValue(value, suffix = "") {
+  if (value === null || value === undefined || value === "") return "?";
+  if (Array.isArray(value) || typeof value === "object") {
+    return `${JSON.stringify(value)}${suffix}`;
+  }
+  return `${value}${suffix}`;
+}
+
 function commClass(commState) {
   const s = String(commState || "unknown").toLowerCase();
   if (s === "connected") return "status-connected";
@@ -161,6 +169,7 @@ function usvCard(usv, inMissionFleet) {
       <div><b>USV ${usv.id}</b> ${dot} ${valueOrUnknown(usv.status)}</div>
       <div>Battery: ${battery}</div>
       <div>Comms: <span class="${commClass(commState)}">${commState}</span></div>
+      <div>Age: ${valueOrUnknown(usv.last_seen_age_s, " s")}</div>
       <div>Speed: ${speed}</div>
       <div>Mission: ${valueOrUnknown(usv.mission)}</div>
       <div>Coverage: ${coverage}</div>
@@ -179,7 +188,13 @@ function renderDetails() {
   }
 
   const telemetry = usv.telemetry || {};
-  const agent = usv.agent || {};
+  const agentState = usv.agent_state || usv.agent || {};
+  const mission = usv.mission_data || {};
+  const communication = usv.communication || {};
+  const health = usv.health || {};
+  const fleetInfo = usv.fleet_info || {};
+  const measurements = usv.measurements || {};
+  const events = usv.events || [];
   const commState = usv.comm_state ?? usv.comms ?? "UNKNOWN";
 
   details.innerHTML = `
@@ -188,6 +203,7 @@ function renderDetails() {
     <div class="kv"><span class="label">Online:</span> ${usv.online ? "Yes" : "No"}</div>
     <div class="kv"><span class="label">Communication:</span> <span class="${commClass(commState)}">${commState}</span></div>
     <div class="kv"><span class="label">Last seen:</span> ${valueOrUnknown(usv.last_seen)}</div>
+    <div class="kv"><span class="label">Last seen age:</span> ${valueOrUnknown(usv.last_seen_age_s, " s")}</div>
 
     <h4>Telemetry</h4>
     <div class="kv"><span class="label">Latitude:</span> ${valueOrUnknown(usv.lat)}</div>
@@ -199,15 +215,36 @@ function renderDetails() {
     <div class="kv"><span class="label">Armed:</span> ${valueOrUnknown(telemetry.armed)}</div>
     <div class="kv"><span class="label">Mode:</span> ${valueOrUnknown(telemetry.mode)}</div>
 
+    <h4>Mission</h4><div class="kv"><span class="label">State:</span> ${valueOrUnknown(mission.mission_state)}</div><div class="kv"><span class="label">Active:</span> ${valueOrUnknown(mission.mission_active)}</div><div class="kv"><span class="label">Waypoint:</span> ${valueOrUnknown(mission.current_waypoint_display)}</div><div class="kv"><span class="label">Mission count:</span> ${valueOrUnknown(mission.mission_count)}</div>
+
+    <h4>Communication Details</h4><div class="kv"><span class="label">Connectivity:</span> ${valueOrUnknown(communication.connectivity)}</div><div class="kv"><span class="label">Operator reachable:</span> ${valueOrUnknown(communication.operator_reachable)}</div><div class="kv"><span class="label">Buffered packets:</span> ${valueOrUnknown(communication.buffered_packets)}</div>
+
+    <h4>Health</h4><div class="kv"><span class="label">CPU load:</span> ${valueOrUnknown(health.cpu_load)}</div><div class="kv"><span class="label">Disk:</span> ${valueOrUnknown(health.disk_usage, "%")}</div><div class="kv"><span class="label">Flask:</span> ${valueOrUnknown(health.flask_status)}</div><div class="kv"><span class="label">Leak:</span> ${valueOrUnknown(health.leak_detected)}</div>
+
+    <h4>Measurements</h4>
+    <div class="kv"><span class="label">Water quality:</span> ${detailValue(measurements.water_quality)}</div>
+    <div class="kv"><span class="label">Bathymetry:</span> ${detailValue(measurements.bathymetry)}</div>
+
+    <h4>Fleet</h4>
+    <div class="kv"><span class="label">Role:</span> ${detailValue(fleetInfo.fleet_role)}</div>
+    <div class="kv"><span class="label">Sector:</span> ${detailValue(fleetInfo.assigned_sector)}</div>
+    <div class="kv"><span class="label">Formation:</span> ${detailValue(fleetInfo.formation)}</div>
+
+    <h4>Events</h4>
+    <div class="kv"><span class="label">Count:</span> ${Array.isArray(events) ? events.length : "?"}</div>
+
     <h4>Agent</h4>
-    <div class="kv"><span class="label">Message type:</span> ${valueOrUnknown(agent.message_type)}</div>
-    <div class="kv"><span class="label">Schema:</span> ${valueOrUnknown(agent.schema_version)}</div>
-    <div class="kv"><span class="label">Source:</span> ${valueOrUnknown(agent.source)}</div>
-    <div class="kv"><span class="label">Target:</span> ${valueOrUnknown(agent.target)}</div>
-    <div class="kv"><span class="label">Groups:</span> ${Array.isArray(agent.groups) ? agent.groups.join(", ") : "?"}</div>
+    <div class="kv"><span class="label">Message type:</span> ${valueOrUnknown(agentState.message_type)}</div>
+    <div class="kv"><span class="label">Schema:</span> ${valueOrUnknown(agentState.schema_version)}</div>
+    <div class="kv"><span class="label">Source:</span> ${valueOrUnknown(agentState.source)}</div>
+    <div class="kv"><span class="label">Target:</span> ${valueOrUnknown(agentState.target)}</div>
+    <div class="kv"><span class="label">Groups:</span> ${Array.isArray(agentState.groups) ? agentState.groups.join(", ") : "?"}</div>
 
     <h4>Raw message</h4>
-    <pre>${JSON.stringify(usv.raw || {}, null, 2)}</pre>
+    <details>
+      <summary>Raw message</summary>
+      <pre>${JSON.stringify(usv.raw || {}, null, 2)}</pre>
+    </details>
   `;
 }
 
