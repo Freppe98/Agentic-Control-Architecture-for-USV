@@ -1,66 +1,179 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import time
 
 app = FastAPI()
-
 BASE_DIR = Path(__file__).resolve().parent
 
-# Hardcoded fleet data for prototype.
-# Later these values can come from each USV Pi over Wi-Fi/VPN/4G.
-FLEET = [
+latest_agent_status = {}
+latest_agent_received_at = None
+
+
+FLEET_TEMPLATE = [
     {
         "id": 1,
         "name": "USV-1",
-        "online": True,
-        "status": "AUTO",
-        "battery": 82,
-        "comms": "Excellent",
-        "heading": 35,
-        "speed": 1.2,
-        "mission": "Survey",
-        "coverage": 42,
+        "online": False,
+        "status": "UNKNOWN",
+        "battery": None,
+        "comms": "No data",
+        "comm_state": "UNKNOWN",
+        "heading": 0,
+        "speed": None,
+        "mission": "Unknown",
+        "coverage": None,
         "lat": 56.699893,
         "lng": 13.002148,
+        "agent": {},
+        "telemetry": {},
     },
     {
         "id": 2,
-        "name": "USV-2",
-        "online": True,
-        "status": "STANDBY",
-        "battery": 67,
-        "comms": "Good",
-        "heading": 140,
-        "speed": 0.0,
-        "mission": "Waiting",
-        "coverage": 0,
-        "lat": 56.700293,
-        "lng": 13.002748,
+        "name": "Scout",
+        "online": False,
+        "status": "LOST",
+        "battery": None,
+        "comms": "Lost",
+        "comm_state": "UNKNOWN",
+        "heading": 0,
+        "speed": None,
+        "mission": "Unknown",
+        "coverage": None,
+        "lat": 56.699893,
+        "lng": 13.002148,
+        "agent": {},
+        "telemetry": {},
     },
     {
         "id": 3,
         "name": "USV-3",
         "online": False,
-        "status": "LOST",
+        "status": "UNKNOWN",
         "battery": None,
-        "comms": "Lost",
-        "heading": 270,
+        "comms": "No data",
+        "comm_state": "UNKNOWN",
+        "heading": 0,
         "speed": None,
         "mission": "Unknown",
         "coverage": None,
         "lat": 56.699493,
         "lng": 13.001548,
+        "agent": {},
+        "telemetry": {},
     },
 ]
 
 
+def normalize_agent_message(message: dict) -> dict:
+    """
+    Accepts both:
+    1. Envelope format:
+       {"message_type": "...", "source": "...", "payload": {...}}
+
+    2. Direct payload format:
+       {"usv_id": ..., "comm_state": ..., "telemetry": {...}}
+    """
+    if "payload" in message and isinstance(message["payload"], dict):
+        payload = message["payload"]
+        envelope = message
+    else:
+        payload = message
+        envelope = {}
+
+    telemetry = payload.get("telemetry", {}) or {}
+
+    usv_id_raw = payload.get("usv_id", payload.get("id", 2))
+    try:
+        usv_id = int(str(usv_id_raw).replace("usv-", ""))
+    except Exception:
+        usv_id = 2
+
+    comm_state = payload.get("comm_state", "UNKNOWN")
+    battery = telemetry.get("battery", payload.get("battery"))
+
+    lat = telemetry.get("lat", payload.get("lat", 56.699893))
+    lng = telemetry.get("lng", payload.get("lng", 13.002148))
+
+    # Avoid map jumping to 0,0 if GPS is not valid yet.
+    if not lat or not lng:
+        lat = 56.699893
+        lng = 13.002148
+
+    return {
+        "id": usv_id,
+        "name": payload.get("name", "Scout"),
+        "online": True,
+        "status": payload.get("mission_state", telemetry.get("mode", "ACTIVE")),
+        "battery": battery if battery != -1 else None,
+        "comms": comm_state,
+        "comm_state": comm_state,
+        "heading": telemetry.get("heading", 0),
+        "speed": telemetry.get("groundspeed", telemetry.get("speed")),
+        "mission": payload.get("mission", payload.get("mission_state", "Unknown")),
+        "coverage": payload.get("coverage"),
+        "lat": lat,
+        "lng": lng,
+        "agent": {
+            "groups": payload.get("groups", []),
+            "source": envelope.get("source", payload.get("source")),
+            "target": envelope.get("target", payload.get("target")),
+            "message_type": envelope.get("message_type", "status"),
+            "schema_version": envelope.get("schema_version", "unknown"),
+            "timestamp": envelope.get("timestamp", time.time()),
+        },
+        "telemetry": telemetry,
+        "raw": message,
+        "last_seen": latest_agent_received_at,
+    }
+
+
+@app.post("/agent/status")
+async def receive_agent_status(request: Request):
+    global latest_agent_status, latest_agent_received_at
+
+    latest_agent_status = await request.json()
+    latest_agent_received_at = datetime.now(timezone.utc).isoformat()
+
+    print("[OPERATOR] Received agent status:")
+    print(latest_agent_status)
+
+    return {
+        "ok": True,
+        "message": "status received",
+        "received_at": latest_agent_received_at,
+    }
+
+
+@app.get("/agent/status")
+def get_agent_status():
+    return {
+        "latest_status": latest_agent_status,
+        "received_at": latest_agent_received_at,
+    }
+
+
 @app.get("/api/fleet/status")
 def fleet_status():
-    return FLEET
+    fleet = [dict(usv) for usv in FLEET_TEMPLATE]
+
+    if latest_agent_status:
+        live_usv = normalize_agent_message(latest_agent_status)
+
+        replaced = False
+        for i, usv in enumerate(fleet):
+            if usv["id"] == live_usv["id"]:
+                fleet[i] = live_usv
+                replaced = True
+
+        if not replaced:
+            fleet.append(live_usv)
+
+    return fleet
 
 
 @app.get("/api/environment")
@@ -100,5 +213,4 @@ def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
 
 
-# Serve the frontend from the operator-scripts/static directory without shadowing /api routes.
 app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")

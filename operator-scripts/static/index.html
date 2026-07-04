@@ -23,6 +23,13 @@
     #sidebars {
       display: flex;
       gap: 12px;
+      max-width: 880px;
+    }
+
+    .column {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
 
     .panel {
@@ -32,6 +39,15 @@
       padding: 14px;
       border-radius: 8px;
       overflow-y: auto;
+      box-sizing: border-box;
+    }
+
+    .panel.tall {
+      height: calc(100vh - 32px);
+    }
+
+    .panel.small {
+      max-height: calc(50vh - 22px);
     }
 
     #map-window {
@@ -42,8 +58,8 @@
     }
 
     #map {
-      width: 55%;
-      height: 55%;
+      width: 70%;
+      height: 65%;
       border-radius: 10px;
       border: 2px solid #555;
     }
@@ -63,21 +79,67 @@
       padding: 5px 8px;
       cursor: pointer;
     }
-    
+
+    .kv {
+      font-size: 13px;
+      margin: 3px 0;
+    }
+
+    .label {
+      font-weight: bold;
+    }
+
+    .status-connected {
+      color: #008c3a;
+      font-weight: bold;
+    }
+
+    .status-partitioned {
+      color: #c98200;
+      font-weight: bold;
+    }
+
+    .status-disconnected,
+    .status-unknown {
+      color: #c90000;
+      font-weight: bold;
+    }
+
+    pre {
+      background: #111;
+      color: #0f0;
+      padding: 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
   </style>
 </head>
 
 <body>
   <div id="layout">
     <div id="sidebars">
-      <div class="panel">
-        <h3>Fleet library</h3>
-        <div id="fleet-list">Loading...</div>
+      <div class="column">
+        <div class="panel small">
+          <h3>Fleet library</h3>
+          <div id="fleet-list">Loading...</div>
+        </div>
+
+        <div class="panel small">
+          <h3>Mission Fleet</h3>
+          <div id="mission-list">No active USVs</div>
+        </div>
       </div>
 
-      <div class="panel">
-        <h3>Mission Fleet</h3>
-        <div id="mission-list">No active USVs</div>
+      <div class="column">
+        <div class="panel tall">
+          <h3>Live USV Details</h3>
+          <div id="details">No USV selected</div>
+
+          <h3>Environment</h3>
+          <div id="environment">Loading...</div>
+        </div>
       </div>
     </div>
 
