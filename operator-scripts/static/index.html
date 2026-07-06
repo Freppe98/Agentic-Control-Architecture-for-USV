@@ -50,6 +50,53 @@
       max-height: calc(50vh - 22px);
     }
 
+    .action-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .action-grid button {
+      width: 100%;
+      margin-top: 0;
+      padding: 8px 10px;
+      border: 1px solid #aaa;
+      border-radius: 6px;
+      background: #f1f1f1;
+      color: #777;
+      cursor: not-allowed;
+    }
+
+    .timeline-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .timeline-item {
+      padding: 8px 10px;
+      border-left: 3px solid #555;
+      background: #f5f5f5;
+      border-radius: 4px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .timeline-item .meta {
+      display: block;
+      margin-top: 4px;
+      color: #666;
+      font-size: 11px;
+    }
+
+    .empty-state {
+      color: #666;
+      font-style: italic;
+      margin-top: 8px;
+    }
+
     #map-window {
       flex: 1;
       display: flex;
@@ -133,6 +180,24 @@
       </div>
 
       <div class="column">
+        <div class="panel small">
+          <h3>Mission Actions</h3>
+          <div class="action-grid">
+            <button disabled title="Coming soon">Start search</button>
+            <button disabled title="Coming soon">Pause</button>
+            <button disabled title="Coming soon">Hold</button>
+            <button disabled title="Coming soon">Return home</button>
+            <button disabled title="Coming soon">Abort</button>
+          </div>
+        </div>
+
+        <div class="panel small">
+          <h3>Event Timeline</h3>
+          <div id="event-timeline" class="timeline-list">
+            <div class="empty-state">No USV selected</div>
+          </div>
+        </div>
+
         <div class="panel tall">
           <h3>Live USV Details</h3>
           <div id="details">No USV selected</div>

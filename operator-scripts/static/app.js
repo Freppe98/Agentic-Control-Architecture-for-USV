@@ -153,6 +153,82 @@ function commClass(commState) {
   return "status-unknown";
 }
 
+function formatEventTimestamp(value) {
+  if (value === null || value === undefined || value === "") return "";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  return date.toLocaleString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function normalizeEventItem(event) {
+  if (typeof event === "string") {
+    return { title: event, meta: "" };
+  }
+
+  if (Array.isArray(event)) {
+    return { title: event.join(" • "), meta: "" };
+  }
+
+  if (event && typeof event === "object") {
+    const title = event.title ?? event.message ?? event.text ?? event.event ?? event.name ?? event.action ?? JSON.stringify(event);
+    const metaParts = [];
+
+    const timestamp = event.timestamp ?? event.time ?? event.created_at ?? event.createdAt;
+    const formattedTimestamp = formatEventTimestamp(timestamp);
+    if (formattedTimestamp) metaParts.push(formattedTimestamp);
+
+    if (event.level) metaParts.push(String(event.level).toUpperCase());
+    if (event.type) metaParts.push(`type: ${event.type}`);
+    if (event.source) metaParts.push(`source: ${event.source}`);
+
+    return {
+      title: String(title),
+      meta: metaParts.join(" • "),
+    };
+  }
+
+  return { title: String(event), meta: "" };
+}
+
+function renderEventTimeline(usv) {
+  const timeline = document.getElementById("event-timeline");
+
+  if (!timeline) return;
+
+  if (!usv) {
+    timeline.innerHTML = '<div class="empty-state">No USV selected</div>';
+    return;
+  }
+
+  const events = Array.isArray(usv.events) ? usv.events : [];
+  const recentEvents = events.slice(-10).reverse();
+
+  if (recentEvents.length === 0) {
+    timeline.innerHTML = '<div class="empty-state">No recent events</div>';
+    return;
+  }
+
+  timeline.innerHTML = recentEvents
+    .map((event) => {
+      const item = normalizeEventItem(event);
+      const meta = item.meta ? `<span class="meta">${item.meta}</span>` : "";
+
+      return `
+        <div class="timeline-item">
+          <div>${item.title}</div>
+          ${meta}
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function usvCard(usv, inMissionFleet) {
   const dot = usv.online ? "🟢" : "🔴";
   const battery = valueOrUnknown(usv.battery, "%");
@@ -184,6 +260,7 @@ function renderDetails() {
 
   if (!usv) {
     details.innerHTML = "No live data";
+    renderEventTimeline(null);
     return;
   }
 
@@ -246,6 +323,8 @@ function renderDetails() {
       <pre>${JSON.stringify(usv.raw || {}, null, 2)}</pre>
     </details>
   `;
+
+  renderEventTimeline(usv);
 }
 
 async function updateFleet() {

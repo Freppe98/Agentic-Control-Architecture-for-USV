@@ -11,8 +11,8 @@ app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent
 
 STALE_AFTER_SECONDS = 8
-PARTITIONED_AFTER_SECONDS = 20
-DISCONNECTED_AFTER_SECONDS = 40
+PARTITIONED_AFTER_SECONDS = 15
+DISCONNECTED_AFTER_SECONDS = 30
 
 latest_agent_status = {}
 latest_agent_received_at = None
@@ -249,5 +249,9 @@ def environment():
 def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
 
+
+# New operator station (design-system frontend). Served alongside the classic
+# dashboard at "/" during incremental migration — existing routes are unchanged.
+app.mount("/app", StaticFiles(directory=BASE_DIR / "operator", html=True), name="operator")
 
 app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")
