@@ -39,7 +39,10 @@ Status: `built` = implemented & in use · `planned` = spec'd here, build when th
 | `BrowserFrame(url,reach)` | `components/BrowserFrame.js` | planned | onboard URL, reachability | Address bar + reach pill + Open; embeds onboard dashboard when reachable. | Pilot |
 | `EventList(events,{filters})` | `components/EventList.js` | planned | events | Severity-tinted rows, ack workflow, filters. | Events |
 | `WindWidget(env)` | `components/WindWidget.js` | built (in Map) | environment | Map overlay; rotates arrow; "No data" when absent. | Map |
-| `Toggle` / `NumberInput` / `Select` / `ThresholdTimeline` | `components/form/*.js` | planned | — | Config form controls; ThresholdTimeline visualizes stale/partitioned/disconnected. | Configuration |
+| `Select(opts)` | `components/form/Select.js` | built | `{id,label,value,options,hint?,disabled?}` | Labeled dropdown; page wires `change` on `[data-pref]`. | Configuration |
+| `Toggle(opts)` | `components/form/Toggle.js` | built | `{id,label,value,hint?,disabled?}` | Labeled on/off switch; `role=switch`, flips via `[data-pref]`. | Configuration |
+| `ThresholdTimeline(t)` | `components/ThresholdTimeline.js` | built | `{stale,partitioned,disconnected}` s | Read-only comms-timing bands; proportional so it stays correct if constants change. **Comms axis.** | Configuration |
+| `NumberInput` | `components/form/NumberInput.js` | planned | — | Editable numeric config control — build when a writable config endpoint exists (thresholds are read-only today). | Configuration |
 | `NotifPanel(events)` | `components/NotifPanel.js` | planned | unack events | Bell dropdown; ack removes from bell, stays in Events. | ribbon (all) |
 | `SearchPalette()` | `components/SearchPalette.js` | planned | — | Ctrl-K palette → entities/pages/concepts. | ribbon (all) |
 

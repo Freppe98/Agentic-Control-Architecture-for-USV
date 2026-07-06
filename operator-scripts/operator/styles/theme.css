@@ -314,3 +314,69 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .ev-ack.done { color:var(--muted); border-style:dashed; cursor:default; }
 .ev-note { display:flex; align-items:center; gap:8px; padding:11px 20px; color:var(--muted); font-size:11.5px; border-top:1px solid var(--line); line-height:1.45; }
 .ev-note svg { width:14px; height:14px; flex:none; color:var(--dim); }
+
+/* ---------- configuration ---------- */
+.cfg { flex:1; overflow-y:auto; overflow-x:hidden; padding:18px 20px 40px; display:flex; flex-direction:column; gap:16px; max-width:940px; }
+.cfg-card { background:var(--panel); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.cfg-h { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--panel-2); }
+.cfg-h h2 { margin:0; font-size:var(--fs-md); font-weight:600; }
+.cfg-sub { margin:3px 0 0; font-size:var(--fs-sm); color:var(--muted); line-height:1.4; }
+.cfg-tag { flex:none; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.06em; text-transform:uppercase; font-weight:600; padding:4px 9px; border-radius:var(--r-sm); white-space:nowrap; }
+.cfg-tag.ro { color:var(--muted); background:rgba(132,152,172,.12); border:1px solid var(--line-strong); }
+.cfg-tag.local { color:var(--accent-bright); background:var(--accent-dim); border:1px solid rgba(76,141,255,.3); }
+.cfg-tag.warn { color:var(--warn); background:rgba(229,72,77,.12); border:1px solid rgba(229,72,77,.3); }
+.cfg-body { padding:16px; display:flex; flex-direction:column; gap:16px; }
+
+/* honest note block (backend gaps / persistence scope) */
+.cfg-note { display:flex; align-items:flex-start; gap:9px; padding:10px 12px; border:1px dashed var(--line-strong); border-radius:var(--r); background:var(--panel-2); color:var(--muted); font-size:11.5px; line-height:1.5; }
+.cfg-note svg { width:15px; height:15px; flex:none; color:var(--dim); margin-top:1px; }
+
+/* threshold timeline (comms axis) */
+.tl { display:flex; flex-direction:column; gap:14px; }
+.tl-track { position:relative; height:16px; border-radius:var(--r-sm); background:var(--panel-2); border:1px solid var(--line); overflow:hidden; margin-top:6px; }
+.tl-seg { position:absolute; top:0; bottom:0; background:var(--c); opacity:.85; }
+.tl-seg.hatch { opacity:1; background:repeating-linear-gradient(-45deg, var(--c) 0 5px, rgba(0,0,0,.28) 5px 10px); }
+.tl-tick { position:absolute; top:-6px; bottom:-6px; width:0; border-left:1px solid var(--text); }
+.tl-tick .tl-tn { position:absolute; top:-16px; left:50%; transform:translateX(-50%); font-size:10px; color:var(--text); white-space:nowrap; }
+.tl-legend { display:flex; flex-wrap:wrap; gap:6px 16px; font-size:11px; color:var(--muted); }
+.tl-legend span { display:inline-flex; align-items:center; gap:7px; }
+.tl-legend i { width:11px; height:8px; border-radius:2px; flex:none; }
+.tl-legend i.hz { background:repeating-linear-gradient(-45deg, currentColor 0 3px, transparent 3px 6px); border:1px solid currentColor; }
+
+/* read-only value rows */
+.cfg-ro-grid { display:flex; flex-direction:column; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.cfg-ro { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel); }
+.cfg-ro:last-child { border-bottom:none; }
+.cfg-ro-l { display:flex; flex-direction:column; gap:3px; }
+.cfg-ro-v { font-family:var(--font-mono); font-size:var(--fs-md); font-variant-numeric:tabular-nums; color:var(--text); }
+.cfg-ro-v small { font-size:var(--fs-sm); color:var(--muted); margin-left:1px; }
+
+/* form controls (Select / Toggle) */
+.cfg-form { display:flex; flex-direction:column; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.fld { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel); }
+.fld:last-child { border-bottom:none; }
+.fld-l { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.fld-lbl { font-size:12.5px; font-weight:600; color:var(--text); }
+.fld-hint { font-size:var(--fs-sm); color:var(--muted); }
+.fld-c { flex:none; }
+.sel { font-family:var(--font-ui); font-size:12.5px; color:var(--text); background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:7px 10px; cursor:pointer; min-width:190px; transition:border-color var(--t-base); }
+.sel:hover { border-color:var(--accent); }
+.sel:disabled { opacity:.5; cursor:not-allowed; }
+.tgl { position:relative; width:40px; height:22px; border-radius:var(--r-pill); background:var(--panel-2); border:1px solid var(--line-strong); cursor:pointer; padding:0; transition:background var(--t-base), border-color var(--t-base); }
+.tgl .knob { position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:var(--muted); transition:transform var(--t-base), background var(--t-base); }
+.tgl.on { background:var(--accent-dim); border-color:var(--accent); }
+.tgl.on .knob { transform:translateX(18px); background:var(--accent); }
+.tgl:disabled { opacity:.5; cursor:not-allowed; }
+
+/* preference actions + save feedback */
+.cfg-actions { display:flex; align-items:center; gap:14px; }
+.cfg-btn { font-family:var(--font-ui); font-size:12px; color:var(--text); background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:7px 13px; cursor:pointer; transition:border-color var(--t-base), background var(--t-base); }
+.cfg-btn:hover { border-color:var(--accent); background:var(--accent-dim); }
+.cfg-save { font-family:var(--font-mono); font-size:11px; color:var(--connected); opacity:0; transition:opacity var(--t-base); }
+.cfg-save.show { opacity:1; }
+.cfg-save.err { color:var(--warn); }
+
+/* registry table */
+.cfg-tablewrap { border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.cfg-tablewrap table.dt tbody tr { cursor:default; }
+.cfg-tablewrap table.dt tbody tr:hover td { background:transparent; }
