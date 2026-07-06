@@ -35,6 +35,44 @@ export const bar = (pct, color = "var(--accent)") =>
 export const noTelem = (label = "not reported") =>
   `<span class="no-telem-val">—<span class="no-telem-tag">${label}</span></span>`;
 
+/** Event severity model — the four levels in DATA_DICTIONARY (INFO|CAUTION|WARNING|EMERGENCY).
+ *  token maps to a CSS var in variables.css; rank drives triage ordering + the bell threshold. */
+export const SEV = {
+  emergency: { rank: 4, label: "EMERGENCY", token: "emergency" },
+  warning:   { rank: 3, label: "WARNING",   token: "warning" },
+  caution:   { rank: 2, label: "CAUTION",   token: "caution" },
+  info:      { rank: 1, label: "INFO",      token: "info" },
+};
+
+/** Normalize an event's severity from whatever field the agent used, or null when the
+ *  event carries no level at all — we tag that UNSPEC rather than inventing a severity. */
+export function evSeverity(e) {
+  const raw = String((e && (e.severity ?? e.level ?? e.priority ?? e.sev)) ?? "").toLowerCase();
+  if (!raw) return null;
+  if (raw.startsWith("emerg") || raw === "critical" || raw === "fatal") return "emergency";
+  if (raw.startsWith("warn")) return "warning";
+  if (raw.startsWith("caut") || raw === "alert" || raw === "major") return "caution";
+  if (raw.startsWith("info") || raw === "notice" || raw === "debug" || raw === "minor") return "info";
+  return null;
+}
+
+/** Human title for an event (mirrors the classic dashboard's field precedence). */
+export function evText(e) {
+  if (e == null) return "";
+  if (typeof e === "string") return e;
+  if (Array.isArray(e)) return e.join(" • ");
+  return String(e.title ?? e.message ?? e.text ?? e.event ?? e.name ?? e.action ?? JSON.stringify(e));
+}
+
+/** Parse an event timestamp → { ms, label } or null when absent/unparseable. */
+export function evTime(e) {
+  const raw = e && (e.timestamp ?? e.time ?? e.ts ?? e.created_at ?? e.createdAt ?? e.date);
+  if (raw == null || raw === "") return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return { ms: null, label: String(raw) };
+  return { ms: d.getTime(), label: d.toLocaleTimeString([], { hour12: false }) };
+}
+
 /** Frozen navigation model (order + labels + icons). Keys are router routes. */
 export const NAV = [
   ["map", "Map"], ["fleet", "Fleet"], ["mission", "Mission"], ["autonomy", "Autonomy"],

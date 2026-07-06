@@ -3,9 +3,10 @@
 import { Map } from "./pages/Map.js";
 import { Fleet } from "./pages/Fleet.js";
 import { Vehicle } from "./pages/Vehicle.js";
+import { Events } from "./pages/Events.js";
 import { Stub } from "./pages/Stub.js";
 
-const routes = { map: Map, fleet: Fleet, vehicle: Vehicle };
+const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, events: Events };
 const root = document.getElementById("app");
 let cleanup = null;
 

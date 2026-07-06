@@ -288,3 +288,29 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .faults .frow { display:flex; align-items:center; gap:9px; font-size:12.5px; }
 .faults .frow .fd { width:8px; height:8px; border-radius:50%; flex:none; }
 .faults .frow.none { color:var(--muted); }
+
+/* ---------- events log ---------- */
+.evbar { display:flex; gap:8px; padding:11px 20px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+.chip { display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border:1px solid var(--line-strong); border-radius:999px; background:var(--panel-2); color:var(--muted); font-size:12px; cursor:pointer; transition:color var(--t-hover), border-color var(--t-hover), background var(--t-hover); }
+.chip:hover { color:var(--text); }
+.chip.on { color:var(--text); border-color:var(--accent); background:var(--accent-dim); }
+.chip .cc { font-family:var(--font-mono); font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
+.chip.on .cc { color:var(--accent); }
+
+.sevchip { display:inline-flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:11px; letter-spacing:.05em; color:var(--sc,var(--muted)); white-space:nowrap; }
+.sevchip .sd { width:8px; height:8px; border-radius:2px; background:var(--sc,var(--dim)); flex:none; box-shadow:var(--ring-dot); }
+
+table.dt tbody tr.sev-emergency td:first-child { box-shadow:inset 3px 0 0 var(--emergency); }
+table.dt tbody tr.sev-warning td:first-child { box-shadow:inset 3px 0 0 var(--warning); }
+table.dt tbody tr.sev-caution td:first-child { box-shadow:inset 3px 0 0 var(--caution); }
+table.dt tbody tr.sev-info td:first-child { box-shadow:inset 3px 0 0 var(--info); }
+table.dt tbody tr.sev-none td:first-child { box-shadow:inset 3px 0 0 var(--line-strong); }
+table.dt tbody tr.acked td { opacity:.5; }
+table.dt tbody tr.acked td:first-child { opacity:1; }
+
+.evmeta { display:block; margin-top:2px; font-family:var(--font-mono); font-size:10px; color:var(--dim); }
+.ev-ack { padding:4px 12px; border:1px solid var(--line-strong); border-radius:6px; background:var(--panel-2); color:var(--text); font-family:var(--font-mono); font-size:11px; cursor:pointer; transition:border-color var(--t-hover), color var(--t-hover); }
+.ev-ack:hover { border-color:var(--accent); color:var(--accent); }
+.ev-ack.done { color:var(--muted); border-style:dashed; cursor:default; }
+.ev-note { display:flex; align-items:center; gap:8px; padding:11px 20px; color:var(--muted); font-size:11.5px; border-top:1px solid var(--line); line-height:1.45; }
+.ev-note svg { width:14px; height:14px; flex:none; color:var(--dim); }
