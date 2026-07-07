@@ -415,3 +415,24 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .astate .node .val { font-family:var(--font-mono); font-size:16px; display:flex; align-items:center; }
 .astate .arrow { color:var(--dim); font-size:18px; }
 .astate .sp { flex:1; min-width:20px; }
+
+/* ---------- pilot (embedded vehicle-local dashboard) ---------- */
+.pilot-bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; padding:11px 20px; border-bottom:1px solid var(--line); background:var(--panel-2); }
+.pilot-target { display:flex; align-items:center; gap:10px; min-width:0; }
+.pilot-target > .lbl { font-family:var(--font-mono); font-size:var(--fs-micro); letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.pilot-veh { display:flex; align-items:center; gap:6px; }
+.pilot-vname { font-size:var(--fs-base); font-weight:600; color:var(--text); }
+.pilot-chip { background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r-sm); color:var(--muted); font-size:12px; font-weight:600; padding:4px 9px; cursor:pointer; transition:color var(--t-hover), border-color var(--t-hover); }
+.pilot-chip:hover { color:var(--text); border-color:var(--accent); }
+.pilot-chip.on { color:var(--accent); border-color:var(--accent); background:var(--accent-dim); }
+.pilot-url { font-size:12px; color:var(--accent-bright); text-decoration:none; opacity:.85; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pilot-url:hover { text-decoration:underline; }
+.pilot-status { flex:1; min-width:180px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+.pilot-actions { display:flex; align-items:center; gap:8px; margin-left:auto; }
+.pilot-btn { display:inline-flex; align-items:center; gap:7px; padding:7px 11px; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); color:var(--text); font-size:12.5px; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); }
+.pilot-btn:hover { border-color:var(--accent); background:var(--accent-dim); }
+.pilot-btn:active { transform:translateY(1px); }
+.pilot-btn svg { width:15px; height:15px; color:var(--muted); flex:none; }
+.pilot-stage { flex:1; min-height:0; background:var(--ground); position:relative; }
+.pilot-frame { width:100%; height:100%; border:0; display:block; background:#fff; }
+.pilot-empty { display:flex; align-items:center; justify-content:center; height:100%; color:var(--muted); font-size:var(--fs-base); padding:40px; text-align:center; }
