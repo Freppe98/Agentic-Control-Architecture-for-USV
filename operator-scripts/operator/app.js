@@ -4,11 +4,12 @@ import { Map } from "./pages/Map.js";
 import { Fleet } from "./pages/Fleet.js";
 import { Vehicle } from "./pages/Vehicle.js";
 import { Mission } from "./pages/Mission.js";
+import { Autonomy } from "./pages/Autonomy.js";
 import { Events } from "./pages/Events.js";
 import { Config } from "./pages/Config.js";
 import { Stub } from "./pages/Stub.js";
 
-const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, events: Events, config: Config };
+const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, autonomy: Autonomy, events: Events, config: Config };
 const root = document.getElementById("app");
 let cleanup = null;
 

@@ -109,7 +109,7 @@ a { color:inherit; }
 .vrow .body { min-width:0; display:flex; flex-direction:column; gap:2px; }
 .vrow .nm { font-family:var(--font-mono); font-size:14px; font-weight:600; }
 .vrow .act { font-size:12px; color:var(--text); }
-.vrow .sub { font-family:var(--font-mono); font-size:10.5px; color:var(--muted); }
+.vrow .sub { font-family:var(--font-mono); font-size:10.5px; color:var(--muted); border:none; background:transparent; border-radius:0; overflow:visible; }
 .vrow .mid { display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
 .vrow .bt { font-family:var(--font-mono); font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
 .mprog { border-top:1px solid var(--line); padding:13px 14px 15px; background:var(--panel-2); display:flex; flex-direction:column; gap:11px; }
@@ -391,3 +391,24 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .mtab.locked .lock { color:var(--dim); }
 .mission-body { flex:1; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; }
 .msect { padding:16px 20px 8px; display:flex; align-items:baseline; gap:10px; }
+
+/* ---------- data availability states (lib/availability.js) ---------- */
+.av-slot { display:inline-flex; align-items:center; gap:7px; }
+.av-val { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
+.av-val.av-stale, .av-val.av-dim { color:var(--dim); }
+.av-val.av-faultmark { color:var(--warn); font-weight:700; }
+.av { font-family:var(--font-mono); font-size:8px; letter-spacing:.06em; text-transform:uppercase; border-radius:3px; padding:1px 5px; border:1px solid var(--line); white-space:nowrap; line-height:1.5; }
+.av-live { color:var(--connected); border-color:rgba(62,207,142,.3); }
+.av-last-known { color:var(--partitioned); border-color:rgba(242,169,59,.32); background:rgba(242,169,59,.06); }
+.av-fault { color:var(--warn); border-color:rgba(229,72,77,.35); background:rgba(229,72,77,.06); }
+.av-na { color:var(--dim); }
+.av-gap { color:var(--dim); border-style:dashed; border-color:var(--line-strong); }
+
+/* ---------- autonomy ---------- */
+.astate { display:flex; align-items:center; gap:16px; flex-wrap:wrap; padding:14px 16px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); margin-bottom:14px; }
+.astate .node { display:flex; flex-direction:column; gap:5px; }
+.astate .node.end { align-items:flex-end; }
+.astate .node .k { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.astate .node .val { font-family:var(--font-mono); font-size:16px; display:flex; align-items:center; }
+.astate .arrow { color:var(--dim); font-size:18px; }
+.astate .sp { flex:1; min-width:20px; }
