@@ -108,20 +108,19 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 
 ---
 
-## Recommended first implementations (backend-owned, before resuming page migration)
+## Implementation order (agreed 2026-07-07 — backend-owned, before resuming page migration)
 
-Ordered by value ÷ effort, limited to what this repo can ship without hardware:
+Architectural owners per [`SYSTEM_INFORMATION_MODEL.md`](SYSTEM_INFORMATION_MODEL.md). All three are Operator-backend-owned and shippable without hardware:
 
-1. **Comms-state transition log — `GET /api/comms/history/{id}` (P0, Operator backend).**
-   The backend already derives `comm_state` every request; have it record per-vehicle transitions (state, `ts`) and expose the history. **Unblocks three reserved features at once** — the Map comms Timeline, the Autonomy decision-trace comms nodes, and the thesis evaluation metric *total disconnected time*. Highest value, fully in `main.py`, no agent or hardware dependency.
+1. **Comms-state transition log — `GET /api/comms/history/{id}` (P0, Operator backend).** ← implementing now
+   The backend already derives `comm_state`; have a 1 s monitor record per-vehicle transitions (state, `from`, `ts`) and expose the history + per-state durations. **Unblocks three reserved features at once** — the Map comms Timeline, the Autonomy decision-trace comms nodes, and the thesis metric *total disconnected time*. Fully in `main.py`.
 
-2. **`GET /api/config` (P1, Operator backend).**
-   Return the live thresholds (currently compiled constants). Turns the Configuration page from "mirrors main.py" into a genuinely live read (a one-endpoint change). Cheap honesty win; sets up `POST /api/config` later.
+2. **Persistent event log — `GET /api/events` + server-side store (P1, Operator backend).**
+   A real, permanent record replacing the flattened-from-payload feed and session-local acks (the Events page's two gaps). **Comms-state transitions from #1 are emitted into this log as events** — every PARTITIONED/DISCONNECTED/recovery becomes a first-class, acknowledgeable event. Add `POST /api/events/{id}/ack`.
 
-3. **Persistent event log — `GET /api/events` + server-side store (P1, Operator backend).**
-   Replaces the flattened-from-payload feed and session-local acks with a real record — the Events page's two known gaps. Moderate effort.
+3. **Live configuration API — `GET /api/config` (P1, Operator backend).**
+   Return the live thresholds (currently compiled constants) so Configuration is a genuine read, not a mirror of `main.py`. Cheap honesty win; sets up `POST /api/config` later.
 
-4. **Agent reasoning schema (P0 value, Local Agent — cross-component).**
-   Highest *thesis* value but not backend-only: `Scripts/fsm_agent.py` must emit `behavior_state`, `decision_confidence`, `decision_rationale`, `behavior_from`, `next_eval_s` in the payload; `normalize_agent_message` already forwards unknown payload fields, so the backend is mostly ready. Bigger change to the agent contract — worth a dedicated pass after #1–#3.
+**Then** (cross-component, after #1–#3): **surface the agent reasoning already emitted.** Per the information model, `payload.agent.*` (`current_behaviour`, `decision_reason`, `autonomy_level`, `current_policy`) is already sent by the Local Agent but **dropped** in `normalize_agent_message` — forwarding it closes much of the Autonomy page with no agent change. `decision_confidence` / `next_eval_s` / `active_constraints` remain a genuine agent-contract addition.
 
 Anything touching `main.py` or the `POST /agent/status` schema is an outward-facing contract change — propose, get a green light, then implement.
