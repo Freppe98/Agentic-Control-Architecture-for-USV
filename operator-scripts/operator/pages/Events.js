@@ -42,7 +42,12 @@ export function Events(root) {
     const sev = evSeverity(raw.event);
     const time = evTime(raw.event);
     const text = evText(raw.event);
-    const key = `${raw.vehicleId}|${time ? time.label : "?"}|${text}`;
+    // Prefer the backend's stable event id so acks survive re-fetch and never collide
+    // between two distinct events that share a second + message; fall back to a
+    // composite key for any event that predates server-side ids.
+    const key = raw.event && raw.event.id != null
+      ? `id:${raw.event.id}`
+      : `${raw.vehicleId}|${time ? time.label : "?"}|${text}`;
     return { ...raw, sev, time, text, key, acked: acked.has(key) };
   }
 

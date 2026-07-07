@@ -129,11 +129,14 @@ a { color:inherit; }
 .wind .arrow { font-size:26px; line-height:1; color:var(--accent); display:inline-block; }
 .wind .spd { font-family:var(--font-mono); font-size:var(--fs-base); margin-top:4px; }
 .wind .frm { font-size:9.5px; color:var(--muted); margin-top:1px; }
-.usv-marker { display:flex; flex-direction:column; align-items:center; position:relative; }
-.usv-marker .selring { position:absolute; left:50%; top:50%; width:36px; height:36px; transform:translate(-50%,-50%); border-radius:50%; box-shadow:0 0 0 2px var(--accent), 0 0 16px rgba(76,141,255,.55); }
-.usv-marker .arw { font-size:20px; line-height:16px; color:#fff; text-shadow:-1px -1px 0 #070C11,1px -1px 0 #070C11,-1px 1px 0 #070C11,1px 1px 0 #070C11; }
-.usv-marker .id { font-family:var(--font-mono); font-size:13px; font-weight:700; text-shadow:-1px -1px 0 #070C11,1px -1px 0 #070C11,-1px 1px 0 #070C11,1px 1px 0 #070C11; }
-.usv-marker .age { margin-top:2px; font-family:var(--font-mono); font-size:10px; font-weight:600; background:rgba(9,13,18,.9); padding:0 4px; border-radius:3px; border:1px solid currentColor; }
+.usv-marker { position:relative; width:40px; height:40px; display:flex; align-items:center; justify-content:center; }
+.usv-marker .dot { width:20px; height:20px; border-radius:50%; display:flex; align-items:center; justify-content:center; border:2px solid #070C11; box-shadow:0 1px 3px rgba(0,0,0,.55); }
+.usv-marker .dot span { font-family:var(--font-mono); font-size:11px; font-weight:700; line-height:1; color:#0A0E13; }
+/* Arrow sits at 12 o'clock of the marker box; rotating .heading orbits it around the dot. */
+.usv-marker .heading { position:absolute; inset:0; display:flex; align-items:flex-start; justify-content:center; pointer-events:none; }
+.usv-marker .heading .arw { font-size:11px; line-height:1; margin-top:-1px; text-shadow:0 0 2px #070C11, 0 0 2px #070C11; }
+.usv-marker .selring { position:absolute; left:50%; top:50%; width:48px; height:48px; transform:translate(-50%,-50%); border-radius:50%; box-shadow:0 0 0 2px var(--accent), 0 0 16px rgba(76,141,255,.55); }
+.usv-marker .age { position:absolute; top:38px; left:50%; transform:translateX(-50%); font-family:var(--font-mono); font-size:10px; font-weight:600; background:rgba(9,13,18,.9); padding:0 4px; border-radius:3px; border:1px solid currentColor; white-space:nowrap; }
 
 /* ---------- inspector ---------- */
 .inspector { grid-row:2; grid-column:4; background:var(--panel); border-left:1px solid var(--line); overflow-y:auto; overflow-x:hidden; }

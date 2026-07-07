@@ -15,6 +15,7 @@ const HOME = [56.699893, 13.002148];
 export function Map(root) {
   const L = window.L;
   let fleet = [], selId = null, env = null, map = null;
+  let commsHist = null;          // comms-state transition log for the selected vehicle
   const markers = {};
   const timers = [];
 
@@ -39,20 +40,30 @@ export function Map(root) {
 
   function makeIcon(v) {
     const st = commState(v), color = COL[st], stale = st !== "connected", sel = v.id === selId;
+    // Circular USV dot (comm-colored, id inside) + a heading arrow orbiting above it.
+    // Selection is the clean halo ring only. NOTE: the selected class is `is-sel`, not
+    // `sel` — a bare `.sel` collides with the form-select style (theme.css) and paints
+    // the marker as a large dark rectangle.
     return L.divIcon({
       className: "",
-      html: `<div class="usv-marker ${sel ? "sel" : ""}" style="opacity:${stale ? 0.82 : 1}">
+      html: `<div class="usv-marker${sel ? " is-sel" : ""}" style="opacity:${stale ? 0.82 : 1}">
         ${sel ? '<div class="selring"></div>' : ""}
+        <div class="heading" style="transform:rotate(${v.heading == null ? 0 : v.heading}deg)"><span class="arw" style="color:${color}">▲</span></div>
+        <div class="dot" style="background:${color}"><span>${v.id}</span></div>
         ${stale ? `<div class="age" style="color:${color}">${fmtAge(v.last_seen_age_s)}</div>` : ""}
-        <div class="arw" style="transform:rotate(${v.heading || 0}deg);color:${color}">➜</div>
-        <div class="id">${v.id}</div>
       </div>`,
-      iconSize: [40, 52], iconAnchor: [20, 26],
+      iconSize: [40, 40], iconAnchor: [20, 20],
     });
   }
 
   function updateMarkers() {
     fleet.forEach((v) => {
+      // Never plot a fabricated position: a vehicle that has not reported a valid
+      // position (never contacted / no GPS fix) has no marker rather than a fake one.
+      if (v.lat == null || v.lng == null) {
+        if (markers[v.id]) { map.removeLayer(markers[v.id]); delete markers[v.id]; }
+        return;
+      }
       const ll = [v.lat, v.lng];
       if (!markers[v.id]) {
         markers[v.id] = L.marker(ll, { icon: makeIcon(v) }).addTo(map).on("click", () => select(v.id));
@@ -88,6 +99,33 @@ export function Map(root) {
     if (e == null) return "";
     if (typeof e === "string") return e;
     return e.title || e.message || e.text || e.event || e.name || JSON.stringify(e);
+  }
+
+  // Comms-state transition log for the selected vehicle (GET /api/comms/history/{id}).
+  // Loaded on selection + refreshed on a timer; cached in commsHist and re-rendered.
+  function loadCommsHistory(id) {
+    if (id == null) { commsHist = null; return; }
+    api.getCommsHistory(id).then((h) => {
+      if (id === selId) { commsHist = h; renderInspector(); }
+    }).catch(() => {});
+  }
+
+  function commsTimeline() {
+    const h = commsHist;
+    const clk = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
+    if (!h || !Array.isArray(h.transitions) || !h.transitions.length)
+      return `<div class="no-telem-box">${clk}No communication transitions recorded yet</div>`;
+    const rows = h.transitions.slice(-6).reverse().map((t) => {
+      const color = COL[commState(t.state)] || COL.unknown;
+      const tm = t.ts ? new Date(t.ts).toLocaleTimeString([], { hour12: false }) : "—";
+      const from = t.from ? `${t.from} → ` : "";
+      return `<div class="ev"><span class="sv" style="background:${color}"></span><span class="tm">${tm}</span><span class="tx">${from}${t.state}</span></div>`;
+    }).join("");
+    const disc = h.durations_s && h.durations_s.DISCONNECTED;
+    const foot = disc
+      ? `<div class="mgrid" style="margin-top:8px"><div><span class="lbl">Total disconnected</span><span class="v txt-d">${Math.round(disc)}s</span></div></div>`
+      : "";
+    return `<div class="events">${rows}</div>${foot}`;
   }
 
   function renderInspector() {
@@ -131,8 +169,8 @@ export function Map(root) {
         ${stale ? `<div class="stale-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>Telemetry as of ${fmtAge(v.last_seen_age_s)} ago — not live</div>` : ""}
       </div>
       <div class="isec">
-        <div class="sec-title"><span class="lbl">Communication · last 60 min</span></div>
-        <div class="no-telem-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 18V6M4 12h16M20 6v12"/></svg>Comms history not logged yet — needs a comms-state transition log</div>
+        <div class="sec-title"><span class="lbl">Communication · transitions</span></div>
+        ${commsTimeline()}
       </div>
       <div class="isec" style="border-bottom:none">
         <div class="sec-title"><span class="lbl">Recent events</span></div>
@@ -146,11 +184,18 @@ export function Map(root) {
     return c;
   }
 
-  function select(id) { selId = id; renderDock(); renderInspector(); updateMarkers(); }
+  function select(id) {
+    if (id !== selId) { selId = id; commsHist = null; loadCommsHistory(id); }
+    // Snap the map to the selected vehicle (only if it has a known position — a
+    // never-contacted vehicle has none, so there is nothing to snap to).
+    const v = fleet.find((x) => x.id === id);
+    if (map && v && v.lat != null && v.lng != null) map.panTo([v.lat, v.lng]);
+    renderDock(); renderInspector(); updateMarkers();
+  }
 
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
-    if (selId == null && fleet.length) selId = fleet[0].id;
+    if (selId == null && fleet.length) { selId = fleet[0].id; loadCommsHistory(selId); }
     updateMarkers(); renderDock(); renderInspector();
     updateRibbon({ counts: counts() });
   }
@@ -164,6 +209,7 @@ export function Map(root) {
   // polling + clock
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
   const stopEnv = api.poll(api.getEnvironment, 10000, onEnv, () => {});
+  timers.push(setInterval(() => loadCommsHistory(selId), 3000));  // refresh selected vehicle's comms log
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
