@@ -42,11 +42,13 @@ export async function getEvents() {
 }
 
 /**
- * NOT YET AVAILABLE in the backend — kept here so pages import from one place.
- * These return null so callers render the NO-TELEM slot instead of inventing data.
- * See DATA_DICTIONARY.md (NO TELEM) and stop-and-explain notes.
+ * getAutonomy / getMissionScope are NOT YET in the backend — kept here so pages import
+ * from one place; they return null so callers render the availability slot instead of
+ * inventing data. getCommsHistory is now live (GET /api/comms/history/{id}).
+ * See DATA_DICTIONARY.md and BACKEND_ROADMAP.md.
  */
-export async function getCommsHistory(/* id */) { return null; } // needs comms-state transition log
+/** Operator-side comms-state transition log for a vehicle (timeline + durations). */
+export function getCommsHistory(id) { return getJSON(`/api/comms/history/${id}`); }
 export async function getAutonomy(/* id */)     { return null; } // needs agent reasoning fields
 export async function getMissionScope()         { return null; } // needs named-mission registry
 

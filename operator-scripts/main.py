@@ -2,12 +2,23 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import requests
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import asyncio
 import time
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app):
+    # Background monitor: log comms-state transitions once per second.
+    task = asyncio.create_task(_comms_monitor_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 BASE_DIR = Path(__file__).resolve().parent
 
 STALE_AFTER_SECONDS = 8
@@ -16,6 +27,14 @@ DISCONNECTED_AFTER_SECONDS = 30
 
 latest_agent_status = {}
 latest_agent_received_at = None
+
+# --- Operator-side comms-state transition log (see SYSTEM_INFORMATION_MODEL.md) ---
+# The operator backend owns the *arrival-age* view of reachability. A 1s monitor
+# records every per-vehicle transition so the UI can draw a comms timeline and the
+# thesis can measure total disconnected time — independent of frontend polling.
+last_seen_by_id = {}       # {vehicle_id: datetime}
+comms_state_by_id = {}     # {vehicle_id: last-logged state}
+comms_history_by_id = {}   # {vehicle_id: [ {state, from, ts, since_last_seen_s} ]}
 
 
 FLEET_TEMPLATE = [
@@ -169,12 +188,75 @@ def normalize_agent_message(message: dict) -> dict:
     }
 
 
+def extract_usv_id(message: dict) -> int:
+    """Vehicle id from either envelope or direct-payload form (mirrors normalize)."""
+    payload = message.get("payload", message) if isinstance(message, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    raw = payload.get("usv_id", payload.get("id", 2))
+    try:
+        return int(str(raw).replace("usv-", ""))
+    except Exception:
+        return 2
+
+
+def derive_comm_state(age_s):
+    """Operator-side comm-state from arrival age (same thresholds as normalize)."""
+    if age_s is None:
+        return "UNKNOWN"
+    if age_s > DISCONNECTED_AFTER_SECONDS:
+        return "DISCONNECTED"
+    if age_s > PARTITIONED_AFTER_SECONDS:
+        return "PARTITIONED"
+    return "CONNECTED"
+
+
+def record_comms_state(vid: int, state: str, ts: datetime, age_s):
+    """Append a transition only when the state actually changes."""
+    prev = comms_state_by_id.get(vid)
+    if state == prev:
+        return None
+    comms_state_by_id[vid] = state
+    entry = {
+        "state": state,
+        "from": prev,
+        "ts": ts.isoformat(),
+        "since_last_seen_s": round(age_s, 1) if age_s is not None else None,
+    }
+    comms_history_by_id.setdefault(vid, []).append(entry)
+    print(f"[COMMS] USV-{vid}: {prev} -> {state}")
+    return entry
+
+
+def evaluate_comms_transitions():
+    """Re-derive each tracked vehicle's comm-state and log any change."""
+    now = datetime.now(timezone.utc)
+    for vid, seen in list(last_seen_by_id.items()):
+        age = (now - seen).total_seconds()
+        record_comms_state(vid, derive_comm_state(age), now, age)
+
+
+async def _comms_monitor_loop():
+    while True:
+        try:
+            evaluate_comms_transitions()
+        except Exception as exc:  # keep the loop alive
+            print("[COMMS-MONITOR] error:", exc)
+        await asyncio.sleep(1)
+
+
 @app.post("/agent/status")
 async def receive_agent_status(request: Request):
     global latest_agent_status, latest_agent_received_at
 
     latest_agent_status = await request.json()
-    latest_agent_received_at = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    latest_agent_received_at = now.isoformat()
+
+    # A fresh packet = CONNECTED from the operator's perspective; log the transition.
+    vid = extract_usv_id(latest_agent_status)
+    last_seen_by_id[vid] = now
+    record_comms_state(vid, "CONNECTED", now, 0.0)
 
     print("[OPERATOR] Received agent status:")
     print(latest_agent_status)
@@ -211,6 +293,34 @@ def fleet_status():
             fleet.append(live_usv)
 
     return fleet
+
+
+def summarize_comms_durations(transitions, now):
+    """Total seconds spent in each comm-state (last segment runs to `now`)."""
+    durations = {}
+    for i, tr in enumerate(transitions):
+        start = datetime.fromisoformat(tr["ts"])
+        end = datetime.fromisoformat(transitions[i + 1]["ts"]) if i + 1 < len(transitions) else now
+        durations[tr["state"]] = round(durations.get(tr["state"], 0.0) + (end - start).total_seconds(), 1)
+    return durations
+
+
+@app.get("/api/comms/history/{vehicle_id}")
+def comms_history(vehicle_id: int):
+    """Operator-side comms-state transition log for one vehicle.
+
+    Powers the Map comms timeline, the Autonomy decision-trace comms nodes, and the
+    thesis 'total disconnected time' metric. Empty transitions => never contacted.
+    """
+    now = datetime.now(timezone.utc)
+    transitions = comms_history_by_id.get(vehicle_id, [])
+    return {
+        "vehicle_id": vehicle_id,
+        "current": comms_state_by_id.get(vehicle_id, "UNKNOWN"),
+        "transitions": transitions,
+        "durations_s": summarize_comms_durations(transitions, now),
+        "generated_at": now.isoformat(),
+    }
 
 
 @app.get("/api/environment")
