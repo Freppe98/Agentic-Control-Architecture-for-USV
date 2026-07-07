@@ -68,8 +68,8 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 ## Events
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|
-| persistent event log | Events, Map, Mission | Operator backend | B-field | append | C → `GET /api/events` | Feature unavailable | P1 |
-| persistent acknowledgement | Events, bell | Operator backend | B-field | on ack | C → `POST /api/events/{id}/ack` | Feature unavailable | P2 |
+| persistent event log | Events, Map, Mission | Operator backend | B-field | append | C → `GET /api/events` | — | **done** |
+| persistent acknowledgement | Events, bell | Operator backend | B-field | on ack | C → `POST /api/events/{id}/ack` | Feature unavailable | P2 (id-ready) |
 
 ## Configuration
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
@@ -112,13 +112,13 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 
 Architectural owners per [`SYSTEM_INFORMATION_MODEL.md`](SYSTEM_INFORMATION_MODEL.md). All three are Operator-backend-owned and shippable without hardware:
 
-1. **Comms-state transition log — `GET /api/comms/history/{id}` (P0, Operator backend).** ← implementing now
-   The backend already derives `comm_state`; have a 1 s monitor record per-vehicle transitions (state, `from`, `ts`) and expose the history + per-state durations. **Unblocks three reserved features at once** — the Map comms Timeline, the Autonomy decision-trace comms nodes, and the thesis metric *total disconnected time*. Fully in `main.py`.
+1. ~~**Comms-state transition log — `GET /api/comms/history/{id}` (P0, Operator backend).**~~ ✅ **done** (see `verification/comms-history.md`)
+   The backend already derives `comm_state`; a 1 s monitor records per-vehicle transitions (state, `from`, `ts`) and exposes the history + per-state durations. **Unblocks three reserved features at once** — the Map comms Timeline, the Autonomy decision-trace comms nodes, and the thesis metric *total disconnected time*. Fully in `main.py`.
 
-2. **Persistent event log — `GET /api/events` + server-side store (P1, Operator backend).**
-   A real, permanent record replacing the flattened-from-payload feed and session-local acks (the Events page's two gaps). **Comms-state transitions from #1 are emitted into this log as events** — every PARTITIONED/DISCONNECTED/recovery becomes a first-class, acknowledgeable event. Add `POST /api/events/{id}/ack`.
+2. ~~**Persistent event log — `GET /api/events` + server-side store (P1, Operator backend).**~~ ✅ **done** (see `verification/event-log.md`)
+   Real, permanent server-side store replacing the flattened-from-payload feed. **Comms-state transitions from #1 are emitted into this log as events** (PARTITIONED → caution, DISCONNECTED → warning, restored/first-contact → info), and vehicle-reported `payload.events` are ingested + deduped. Events carry stable ids and an `acknowledged` flag — ack is *design-ready* but `POST /api/events/{id}/ack` is deferred to its own P2 slot (would require wiring the Events page's session-local ack to the server).
 
-3. **Live configuration API — `GET /api/config` (P1, Operator backend).**
+3. **Live configuration API — `GET /api/config` (P1, Operator backend).** ← next
    Return the live thresholds (currently compiled constants) so Configuration is a genuine read, not a mirror of `main.py`. Cheap honesty win; sets up `POST /api/config` later.
 
 **Then** (cross-component, after #1–#3): **surface the agent reasoning already emitted.** Per the information model, `payload.agent.*` (`current_behaviour`, `decision_reason`, `autonomy_level`, `current_policy`) is already sent by the Local Agent but **dropped** in `normalize_agent_message` — forwarding it closes much of the Autonomy page with no agent change. `decision_confidence` / `next_eval_s` / `active_constraints` remain a genuine agent-contract addition.

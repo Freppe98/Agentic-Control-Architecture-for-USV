@@ -1,9 +1,10 @@
 // Events.js — fleet-wide event log for triage. Feed comes from api.getEvents()
-// (flattened per-vehicle payload events); ribbon comms counts from api.getFleet().
-// Severity is honest: events with no level tag render UNSPEC, never a fabricated
-// severity. Acknowledgement is a genuine operator action but SESSION-LOCAL (client
-// side) — the backend has no persistent event log or ack endpoint yet, so we do not
-// imply server persistence. Reuses Table (with row-tint) + shared ui helpers.
+// (the operator backend's persistent event log: comms transitions + vehicle-reported
+// events); ribbon comms counts from api.getFleet(). Severity is honest: events with no
+// level tag render UNSPEC, never a fabricated severity. Acknowledgement is a genuine
+// operator action but still SESSION-LOCAL (client side) — the backend log carries an
+// `acknowledged` flag but has no ack endpoint yet, so we do not imply server-side ack.
+// Reuses Table (with row-tint) + shared ui helpers.
 import * as api from "../services/api.js";
 import { NavRail } from "../components/NavRail.js";
 import { Ribbon, updateRibbon } from "../components/Ribbon.js";
@@ -32,7 +33,7 @@ export function Events(root) {
        <div class="tablewrap" id="etw"></div>
        <div class="ev-note">
          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>
-         Feed reflects events present in the latest fleet payloads. A dedicated, persistent event log is a known backend gap; acknowledgements are session-local.
+         Feed is the operator backend's persistent event log — communication transitions and vehicle-reported events from one server-side source. Acknowledgements are session-local; server-side acknowledgement is a known backend gap.
        </div>
      </div>`;
 

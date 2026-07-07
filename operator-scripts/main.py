@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import asyncio
+import json
 import time
 
 
@@ -35,6 +36,20 @@ latest_agent_received_at = None
 last_seen_by_id = {}       # {vehicle_id: datetime}
 comms_state_by_id = {}     # {vehicle_id: last-logged state}
 comms_history_by_id = {}   # {vehicle_id: [ {state, from, ts, since_last_seen_s} ]}
+
+# --- Persistent event log (BACKEND_ROADMAP #2; Operator-backend-owned) ---
+# One server-side, append-only record that replaces the frontend's flatten-from-
+# payload feed. Two sources feed it: (1) operator-side comms-state transitions from
+# the monitor above (first-class, deterministic), and (2) vehicle-reported events
+# forwarded in POST /agent/status.payload.events (deduped so re-sent packets don't
+# spam the log). Exposed at GET /api/events. Stable ids + an `acknowledged` field
+# model future acknowledgement without inventing the action yet. In-memory (resets
+# on restart), like the comms log; durable storage is out of scope here.
+MAX_EVENTS = 5000
+event_log = []             # [ {id, ts, severity, type, source, vehicle_id, vehicle, message, acknowledged} ]
+_event_seq = 0             # monotonic event id (supports later replay / since-id)
+_ingested_event_keys = set()  # fingerprints of forwarded vehicle events already stored
+# vehicle_names {vehicle_id: display name} is seeded from FLEET_TEMPLATE (defined below)
 
 
 FLEET_TEMPLATE = [
@@ -90,6 +105,8 @@ FLEET_TEMPLATE = [
         "telemetry": {},
     },
 ]
+
+vehicle_names = {usv["id"]: usv["name"] for usv in FLEET_TEMPLATE}
 
 
 def normalize_agent_message(message: dict) -> dict:
@@ -200,6 +217,18 @@ def extract_usv_id(message: dict) -> int:
         return 2
 
 
+def extract_name(message: dict):
+    """Display name from either envelope or direct-payload form (or None)."""
+    payload = message.get("payload", message) if isinstance(message, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return payload.get("name")
+
+
+def name_of(vid: int) -> str:
+    return vehicle_names.get(vid, f"USV-{vid}")
+
+
 def derive_comm_state(age_s):
     """Operator-side comm-state from arrival age (same thresholds as normalize)."""
     if age_s is None:
@@ -225,6 +254,7 @@ def record_comms_state(vid: int, state: str, ts: datetime, age_s):
     }
     comms_history_by_id.setdefault(vid, []).append(entry)
     print(f"[COMMS] USV-{vid}: {prev} -> {state}")
+    _emit_comms_event(vid, prev, state, ts)
     return entry
 
 
@@ -245,6 +275,142 @@ async def _comms_monitor_loop():
         await asyncio.sleep(1)
 
 
+# --- Event store (see the "Persistent event log" block above) ---
+
+def _append_event(*, severity, message, etype, source, vehicle_id=None,
+                  vehicle=None, ts=None):
+    """Append one event to the server-side log and return it."""
+    global _event_seq
+    _event_seq += 1
+    entry = {
+        "id": _event_seq,
+        "ts": ts or datetime.now(timezone.utc).isoformat(),
+        "severity": severity,          # info|caution|warning|emergency or None (UNSPEC)
+        "type": etype,                 # e.g. "comms", "vehicle"
+        "source": source,              # "operator-backend" or a vehicle/agent id
+        "vehicle_id": vehicle_id,
+        "vehicle": vehicle,
+        "message": message,
+        "acknowledged": False,         # modelled now; POST ack endpoint is a later item
+    }
+    event_log.append(entry)
+    if len(event_log) > MAX_EVENTS:
+        del event_log[0:len(event_log) - MAX_EVENTS]
+    print(f"[EVENT] #{entry['id']} {severity or 'unspec'} {source}: {message}")
+    return entry
+
+
+def _comms_event_for(prev, state):
+    """Deterministic (severity, message) for an operator-side comms transition."""
+    if state == "DISCONNECTED":
+        return ("warning", "Communication lost")
+    if state == "PARTITIONED":
+        return ("caution", "Communication partitioned")
+    if state == "CONNECTED":
+        if prev is None:
+            return ("info", "First contact established")
+        return ("info", "Communication restored")
+    return None  # UNKNOWN / other → not an operator event
+
+
+def _emit_comms_event(vid, prev, state, ts):
+    """Turn a comms-state transition into a first-class event."""
+    sev_msg = _comms_event_for(prev, state)
+    if sev_msg is None:
+        return
+    severity, message = sev_msg
+    _append_event(
+        severity=severity, message=message, etype="comms",
+        source="operator-backend", vehicle_id=vid, vehicle=name_of(vid),
+        ts=ts.isoformat(),
+    )
+
+
+def derive_event_severity(ev):
+    """Severity of a forwarded vehicle event, or None when it carries no level.
+    Mirrors the frontend `evSeverity` (lib/ui.js) so it is deterministic and the
+    UI never has to re-guess: the backend decides once and stores it."""
+    if isinstance(ev, dict):
+        raw = str(ev.get("severity") or ev.get("level")
+                  or ev.get("priority") or ev.get("sev") or "").lower()
+    else:
+        raw = ""
+    if not raw:
+        return None
+    if raw.startswith("emerg") or raw in ("critical", "fatal"):
+        return "emergency"
+    if raw.startswith("warn"):
+        return "warning"
+    if raw.startswith("caut") or raw in ("alert", "major"):
+        return "caution"
+    if raw.startswith("info") or raw in ("notice", "debug", "minor"):
+        return "info"
+    return None
+
+
+def extract_event_message(ev):
+    """Human title of a forwarded event (mirrors frontend `evText`)."""
+    if ev is None:
+        return ""
+    if isinstance(ev, str):
+        return ev
+    if isinstance(ev, list):
+        return " • ".join(str(x) for x in ev)
+    if isinstance(ev, dict):
+        for k in ("title", "message", "text", "event", "name", "action"):
+            if ev.get(k):
+                return str(ev[k])
+        return json.dumps(ev, sort_keys=True)
+    return str(ev)
+
+
+def event_timestamp(ev, now):
+    """The event's own timestamp if it carries one, else arrival time (iso)."""
+    if isinstance(ev, dict):
+        raw = (ev.get("timestamp") or ev.get("time") or ev.get("ts")
+               or ev.get("created_at") or ev.get("date"))
+        if raw:
+            return str(raw)
+    return now.isoformat()
+
+
+def event_fingerprint(vid, ev):
+    """Stable identity for a forwarded event so re-sent packets ingest once.
+    Prefers an explicit id, else (own timestamp + message); untimestamped repeats
+    of identical content collapse to one entry (a log, not per-packet spam)."""
+    if isinstance(ev, dict):
+        if ev.get("id") is not None:
+            return f"{vid}|id={ev['id']}"
+        stamp = (ev.get("timestamp") or ev.get("time") or ev.get("ts")
+                 or ev.get("created_at") or ev.get("date") or "")
+        return f"{vid}|{stamp}|{extract_event_message(ev)}"
+    return f"{vid}|{ev}"
+
+
+def ingest_payload_events(vid, message, now):
+    """Store any new vehicle-reported events from a POST /agent/status payload."""
+    payload = message.get("payload", message) if isinstance(message, dict) else {}
+    if not isinstance(payload, dict):
+        return
+    events = payload.get("events") or []
+    if not isinstance(events, list):
+        return
+    for ev in events:
+        key = event_fingerprint(vid, ev)
+        if key in _ingested_event_keys:
+            continue
+        _ingested_event_keys.add(key)
+        etype = (ev.get("type") if isinstance(ev, dict) else None) or "vehicle"
+        source = (ev.get("source") if isinstance(ev, dict) else None) or f"usv-{vid}"
+        _append_event(
+            severity=derive_event_severity(ev),
+            message=extract_event_message(ev),
+            etype=etype, source=source,
+            vehicle_id=vid, vehicle=name_of(vid),
+            ts=event_timestamp(ev, now),
+        )
+
+
 @app.post("/agent/status")
 async def receive_agent_status(request: Request):
     global latest_agent_status, latest_agent_received_at
@@ -255,8 +421,12 @@ async def receive_agent_status(request: Request):
 
     # A fresh packet = CONNECTED from the operator's perspective; log the transition.
     vid = extract_usv_id(latest_agent_status)
+    name = extract_name(latest_agent_status)
+    if name:
+        vehicle_names[vid] = name
     last_seen_by_id[vid] = now
     record_comms_state(vid, "CONNECTED", now, 0.0)
+    ingest_payload_events(vid, latest_agent_status, now)
 
     print("[OPERATOR] Received agent status:")
     print(latest_agent_status)
@@ -319,6 +489,23 @@ def comms_history(vehicle_id: int):
         "current": comms_state_by_id.get(vehicle_id, "UNKNOWN"),
         "transitions": transitions,
         "durations_s": summarize_comms_durations(transitions, now),
+        "generated_at": now.isoformat(),
+    }
+
+
+@app.get("/api/events")
+def get_events(limit: int = 500):
+    """Persistent operator event log (comms transitions + vehicle-reported events).
+
+    Single backend source for the Events page (and later Timeline / Replay / stats).
+    Returns events in chronological order (oldest→newest); the frontend sorts for
+    display. `limit` caps to the most recent N. Empty => nothing has happened yet.
+    """
+    now = datetime.now(timezone.utc)
+    items = event_log[-limit:] if limit and limit > 0 else list(event_log)
+    return {
+        "events": items,
+        "count": len(event_log),
         "generated_at": now.isoformat(),
     }
 

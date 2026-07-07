@@ -2,7 +2,8 @@
 // Pages/components call these methods; they never fetch() directly.
 // If the backend changes, this file changes — not ten pages.
 // Endpoints (see main.py): GET /api/fleet/status, GET /agent/status,
-// POST /agent/status, GET /api/environment.
+// POST /agent/status, GET /api/comms/history/{id}, GET /api/events,
+// GET /api/environment.
 
 const BASE = "";
 
@@ -33,12 +34,28 @@ export function getAgentStatus() {
   return getJSON("/agent/status");
 }
 
-/** Flattened event feed derived from per-vehicle payload events (until a dedicated endpoint exists). */
+/**
+ * Persistent event log from the operator backend (GET /api/events): comms-state
+ * transitions + vehicle-reported events, from one server-side store. Adapted here
+ * to the {vehicle, vehicleId, event} shape the Events page already consumes, so the
+ * page is unchanged — the backend swap lives in this module, not in the page.
+ */
 export async function getEvents() {
-  const fleet = await getFleet();
-  return fleet.flatMap((v) =>
-    (v.events || []).map((e) => ({ vehicle: v.name, vehicleId: v.id, event: e }))
-  );
+  const data = await getJSON("/api/events");
+  const list = Array.isArray(data) ? data : (data.events || []);
+  return list.map((e) => ({
+    vehicle: e.vehicle,
+    vehicleId: e.vehicle_id,
+    event: {
+      id: e.id,
+      severity: e.severity,
+      timestamp: e.ts,
+      message: e.message,
+      type: e.type,
+      source: e.source,
+      acknowledged: e.acknowledged,
+    },
+  }));
 }
 
 /**
