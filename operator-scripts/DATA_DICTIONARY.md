@@ -16,9 +16,18 @@ Every value/function slot must communicate **why** it is missing — never colla
 | `LAST_KNOWN` | value exists but stale because comms are partitioned/disconnected | dimmed value + amber "LAST KNOWN · Xs" tag (comms axis, **not** a fault) |
 | `FAULT` (UNAVAILABLE) | vehicle is *expected* to provide this but the sensor/subsystem is missing/broken/offline | fault ✕ + red tag — the **only** state that gets a ✕ |
 | `NOT_APPLICABLE` | this vehicle has no such hardware/feature installed | muted "N/A", never alarm |
-| `BACKEND_GAP` | frontend has a reserved slot the backend/schema doesn't expose yet | dim, dashed "NO BACKEND" tag — a *development* limitation that should disappear as backend grows |
+| `BACKEND_GAP` | frontend has a reserved slot the backend/schema doesn't expose yet | **development-only** — never shown to operators as-is; renders as an operator-facing reason (below). A dev tooltip may carry the real reason. |
 
-Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A) or "not wired yet" (that's BACKEND_GAP). **LAST_KNOWN must never turn OK into Warning** — health and communication stay independent. The operator must always be able to tell whether missing data is caused by comms, missing backend support, absent hardware, or a real fault. Applied to new pages first (Autonomy, Vehicle, Video, Pilot); existing `noTelem()` slots (which are mostly BACKEND_GAP) are migrated later in one system-wide pass.
+**BACKEND_GAP is developer-only and must never leak to an operator.** In the UI it maps to one of these operator-facing reasons (the operator should not need to know the backend is unfinished):
+
+| Operator-facing label | Use when |
+|---|---|
+| **Feature unavailable** / "Unavailable" | capability not built yet (default GAP tag) |
+| **No data received** / "No data" | expected field the vehicle/agent simply isn't sending |
+| **Not installed** | hardware/feature absent on this hull (usually `NOT_APPLICABLE`) |
+| **Unsupported by this vehicle** | vehicle model doesn't support it (usually `NOT_APPLICABLE`) |
+
+Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A) or "not wired yet" (that's BACKEND_GAP). **LAST_KNOWN must never turn OK into Warning** — health and communication stay independent. The operator must always be able to tell whether missing data is caused by comms, missing backend support, absent hardware, or a real fault — but "backend not implemented" is expressed as "unavailable", not as jargon. Every BACKEND_GAP is tracked with an owner and disposition in `BACKEND_ROADMAP.md`. Applied to new pages first (Autonomy, Vehicle, Video, Pilot); existing `noTelem()` slots migrate later in one system-wide pass.
 
 ## Identity & registry
 | Field | Type | Source | Pages | Freq | Opt | Notes |

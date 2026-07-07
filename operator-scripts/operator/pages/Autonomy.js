@@ -36,7 +36,7 @@ export function Autonomy(root) {
        <div class="veh-list" id="veh-list"></div>
        <div class="dock-foot">
          ${clockSvg}
-         <span>Availability — ${availTag(AVAIL.LIVE)} fresh · ${availTag(AVAIL.LAST_KNOWN)} stale (comms) · ${availTag(AVAIL.GAP)} not emitted by backend yet. Reasoning trust decays with contact age; comms and health stay independent.</span>
+         <span>Availability — ${availTag(AVAIL.LIVE)} fresh · ${availTag(AVAIL.LAST_KNOWN)} stale (last contact) · ${availTag(AVAIL.GAP)} not reported by this vehicle. Reasoning trust decays with contact age; comms and health stay independent.</span>
        </div>
      </div>
      <div class="content-main">
@@ -69,7 +69,7 @@ export function Autonomy(root) {
     const behavior = (hasContact && rawBehavior && !["unknown", "lost"].includes(String(rawBehavior).toLowerCase())) ? rawBehavior : null;
     const behaviorSlot = behavior
       ? availSlot(connected ? AVAIL.LIVE : AVAIL.LAST_KNOWN, { value: behavior, age: connected ? null : age })
-      : availSlot(AVAIL.GAP, { label: hasContact ? "not reported" : "no contact" });
+      : availSlot(AVAIL.GAP, { label: hasContact ? "No data" : "No contact", dev: "behavior approx. from mission_state" });
 
     // Current-state block (live position in the state machine)
     const astate = `
@@ -90,34 +90,34 @@ export function Autonomy(root) {
     // Behavior & decision — behavior live/last-known, the rest agent-emitted (gap)
     const behaviorCard = card("Behavior & decision", behavior ? (connected ? availTag(AVAIL.LIVE) : availTag(AVAIL.LAST_KNOWN)) : availTag(AVAIL.GAP),
       row("Current behavior", behaviorSlot) +
-      row("Decision confidence", availSlot(AVAIL.GAP, { label: "agent must emit" })) +
-      row("Previous behavior", availSlot(AVAIL.GAP, { label: "needs decision log" })) +
-      row("Rationale", availSlot(AVAIL.GAP, { label: "agent must emit" })) +
-      row("Next evaluation", availSlot(AVAIL.GAP, { label: "agent must emit" })));
+      row("Decision confidence", availSlot(AVAIL.GAP, { dev: "agent must emit decision_confidence" })) +
+      row("Previous behavior", availSlot(AVAIL.GAP, { dev: "needs onboard decision log" })) +
+      row("Rationale", availSlot(AVAIL.GAP, { dev: "agent must emit decision_rationale" })) +
+      row("Next evaluation", availSlot(AVAIL.GAP, { dev: "agent must emit next_eval_s" })));
 
     // Communication assumptions — live from payload
     const commCard = card("Communication assumptions", availTag(connected ? AVAIL.LIVE : AVAIL.LAST_KNOWN),
       row("Link state", `<span class="txt-${cls(v)}">${st.toUpperCase()}</span>`) +
       row("Operator reachable", comm.operator_reachable != null
         ? availSlot(connected ? AVAIL.LIVE : AVAIL.LAST_KNOWN, { value: comm.operator_reachable ? "Yes" : "No", age: connected ? null : age })
-        : availSlot(AVAIL.GAP, { label: "not reported" })) +
+        : availSlot(AVAIL.GAP, { label: "No data", dev: "communication.operator_reachable not sent" })) +
       row("Buffered packets", comm.buffered_packets != null
         ? availSlot(connected ? AVAIL.LIVE : AVAIL.LAST_KNOWN, { value: String(comm.buffered_packets), age: connected ? null : age })
-        : availSlot(AVAIL.GAP, { label: "not reported" })) +
+        : availSlot(AVAIL.GAP, { label: "No data", dev: "communication.buffered_packets not sent" })) +
       row("Reasoning trust", connected
         ? availSlot(AVAIL.LIVE, { value: "Current" })
-        : hasContact ? availSlot(AVAIL.LAST_KNOWN, { value: "Decaying", age }) : availSlot(AVAIL.GAP, { label: "no contact" })));
+        : hasContact ? availSlot(AVAIL.LAST_KNOWN, { value: "Decaying", age }) : availSlot(AVAIL.GAP, { label: "No contact" })));
 
     const constraints = gapCard("Active constraints",
-      "Decision inputs (met / unmet) are not emitted by the agent yet — the backend has no reasoning schema. Shown as a reserved slot, not fabricated.");
+      "Decision inputs (constraints met / unmet) are not available for this vehicle.");
     const transitions = gapCard("Next transitions & watch conditions",
-      "The agent does not publish candidate transitions or watch conditions yet — BACKEND_GAP until the reasoning schema exists.");
+      "Upcoming transitions and watch conditions are not available for this vehicle.");
 
     // Decision trace — current position is live; the history needs a transition log
     const trace = `
       <div class="sub full"><div class="sub-head idle"><span class="hd"></span><span class="nm">Decision trace</span><span class="cond">${availTag(AVAIL.GAP)}</span></div>
         <div class="metrics"><div class="mrow"><span class="k">Current node</span><span class="val keep"><span class="av-slot">${CommsPill(v, { full: true })}<span class="arrow" style="color:var(--dim)">·</span>${behaviorSlot}</span></span></div></div>
-        <div style="padding:0 13px 13px"><div class="no-telem-box">${gapSvg}State-machine history (Connected → Searching → Partitioned → Holding → Disconnected → Return Home) needs a comms-state transition log. Only the current node above is live.</div></div>
+        <div style="padding:0 13px 13px"><div class="no-telem-box">${gapSvg}Decision-trace history is not available for this vehicle yet — only the current node above is live.</div></div>
       </div>`;
 
     box.innerHTML =
