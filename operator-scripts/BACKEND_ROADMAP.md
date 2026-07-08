@@ -62,8 +62,8 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 ## Command / control (reverse path)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|
-| command lifecycle (Return Home / Pause / Resume / Loiter) | Map, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/command` | Feature unavailable | P1 |
-| command status (Pending/Executing/Finished/Failed, "queues until next contact") | Map, Mission | Operator backend | B-field | on change | E→B | Feature unavailable | P1 |
+| command lifecycle (Return Home / Pause / Resume / Loiter) | Map, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | Feature unavailable | P1 · **backend done** (see `verification/commands.md`) |
+| command status (Pending/Executing/Finished/Failed, "queues until next contact") | Map, Mission | Operator backend | B-field | on change | E→B | Feature unavailable | P1 · **backend done** (queue + comm-state gating + Agent result) |
 
 ## Events
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |

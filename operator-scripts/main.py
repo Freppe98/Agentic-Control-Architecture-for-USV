@@ -1,14 +1,15 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import requests
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import asyncio
 import json
 import time
+import uuid
 
 
 @asynccontextmanager
@@ -329,6 +330,7 @@ async def _comms_monitor_loop():
     while True:
         try:
             evaluate_comms_transitions()
+            expire_commands()
         except Exception as exc:  # keep the loop alive
             print("[COMMS-MONITOR] error:", exc)
         await asyncio.sleep(1)
@@ -528,6 +530,226 @@ def ingest_payload_events(vid, message, now):
             vehicle_id=vid, vehicle=name_of(vid),
             ts=event_timestamp(ev, now),
         )
+
+
+# --- Command queue (BACKEND_ROADMAP: reverse/control Path E; Operator-backend-owned) ---
+# The smallest safe Operator → Scout command path. The operator backend is the queue's
+# source of truth: it stores command records, gates them on the operator-side comm-state,
+# hands pending ones to the Local Agent on next contact, and records the Agent's result.
+# It NEVER fabricates execution — only a Local Agent result can mark a command EXECUTED
+# (SYSTEM_INFORMATION_MODEL: the backend stores operator-side records, it does not decide
+# what the vehicle did). In-memory like event_log / comms history (resets on restart).
+#
+# Lifecycle owners:
+#   QUEUED  — backend, on create
+#   SENT    — backend, when the Agent fetches it (a claim; at-least-once redelivery)
+#   ACCEPTED/EXECUTED/REJECTED/FAILED — Local Agent only, via the result endpoint
+#   EXPIRED — backend, when a non-terminal command passes its TTL (monitor loop)
+COMMAND_TYPES = {
+    "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_HOLD", "SET_MODE_GUIDED",
+    "RTL", "MISSION_PAUSE", "MISSION_RESUME",
+}
+COMMAND_TTL_S = 300              # queued commands survive ~5 min of disconnection, then EXPIRE
+TERMINAL_STATUSES = {"EXECUTED", "REJECTED", "FAILED", "EXPIRED"}
+RESULT_STATUSES = {"ACCEPTED", "EXECUTED", "REJECTED", "FAILED"}  # what an Agent may report
+
+commands = []              # append-only [ command record ] (see the spec object below)
+commands_by_id = {}        # {id: record} — uuid id is the dedup key (no duplicate execution)
+
+
+def known_vehicle_ids():
+    """Vehicle ids the backend recognises (template + any that have reported)."""
+    return set(vehicle_names) | {u["id"] for u in FLEET_TEMPLATE}
+
+
+def _command_event(cmd, *, severity, message, source):
+    """Record a command lifecycle change as a first-class event (Events page, no change)."""
+    _append_event(
+        severity=severity, message=message, etype="command", source=source,
+        vehicle_id=cmd["vehicle_id"], vehicle=cmd["vehicle"],
+    )
+
+
+def make_command(*, vid, ctype, params, created_by, comm_state, now):
+    """Build + store a QUEUED command record (the spec command object)."""
+    cmd = {
+        "id": str(uuid.uuid4()),
+        "vehicle_id": vid,
+        "vehicle": name_of(vid),
+        "type": ctype,
+        "params": params or {},
+        "status": "QUEUED",
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=COMMAND_TTL_S)).isoformat(),
+        "created_by": created_by or "operator",
+        "requested_comm_state": comm_state,   # operator-side link state at creation
+        "claimed_at": None,                   # set when the Agent first fetches it (SENT)
+        "completed_at": None,                 # set on any terminal status
+        "result": None,                       # Agent-reported result payload/string
+        "reason": None,                       # rejection/failure/expiry reason
+        "warning": None,                      # e.g. queued while PARTITIONED
+    }
+    commands.append(cmd)
+    commands_by_id[cmd["id"]] = cmd
+    return cmd
+
+
+def expire_commands(now=None):
+    """Flip any non-terminal command past its TTL to EXPIRED (backend-owned, once)."""
+    now = now or datetime.now(timezone.utc)
+    for cmd in commands:
+        if cmd["status"] in TERMINAL_STATUSES:
+            continue
+        try:
+            deadline = datetime.fromisoformat(cmd["expires_at"])
+        except (TypeError, ValueError):
+            continue
+        if now >= deadline:
+            cmd["status"] = "EXPIRED"
+            cmd["completed_at"] = now.isoformat()
+            cmd["reason"] = cmd["reason"] or "Expired before delivery/execution"
+            _command_event(cmd, severity="warning",
+                           message=f"Command {cmd['type']} expired",
+                           source="operator-backend")
+
+
+def apply_command_result(cmd, new_status, result, reason, now):
+    """Apply a Local-Agent-reported result. Idempotent: a result on an already-terminal
+    command is ignored (the uuid id prevents duplicate execution). Returns True if applied."""
+    if cmd["status"] in TERMINAL_STATUSES:
+        return False
+    cmd["status"] = new_status
+    cmd["result"] = result
+    cmd["reason"] = reason
+    if new_status in TERMINAL_STATUSES:
+        cmd["completed_at"] = now.isoformat()
+    return True
+
+
+@app.post("/api/commands")
+async def create_command(request: Request):
+    """Create a command for a vehicle (Operator UI / curl). Validates the type and
+    vehicle, then gates on the OPERATOR-side comm-state:
+      CONNECTED   → queued immediately
+      PARTITIONED → queued with a warning
+      DISCONNECTED→ 409 needs_confirmation, unless body has confirm:true (then queued;
+                    it survives until next contact or the TTL).
+    Never marks the command executed — that is the Local Agent's result only.
+    Body: { vehicle_id, type, params?, created_by?, confirm? }"""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+    body = await request.json()
+
+    ctype = str(body.get("type") or "").upper()
+    if ctype not in COMMAND_TYPES:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "unknown command type",
+            "type": body.get("type"), "allowed": sorted(COMMAND_TYPES)})
+
+    vid = parse_vehicle_id(body.get("vehicle_id"))
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": body.get("vehicle_id")})
+
+    comm_state = comms_state_by_id.get(vid, "UNKNOWN")
+    confirm = bool(body.get("confirm"))
+    if comm_state == "DISCONNECTED" and not confirm:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "needs_confirmation": True, "comm_state": comm_state,
+            "message": "Vehicle is DISCONNECTED — command will queue until next contact. "
+                       "Resend with confirm:true to queue it."})
+
+    cmd = make_command(vid=vid, ctype=ctype, params=body.get("params"),
+                       created_by=body.get("created_by"), comm_state=comm_state, now=now)
+
+    severity = "info"
+    if comm_state == "PARTITIONED":
+        cmd["warning"] = "Queued while communication is partitioned — delivery may be delayed."
+        severity = "caution"
+    elif comm_state == "DISCONNECTED":
+        cmd["warning"] = "Queued while disconnected — will deliver on next contact."
+        severity = "caution"
+    _command_event(cmd, severity=severity,
+                   message=f"Command {ctype} created ({comm_state})",
+                   source="operator-backend")
+    return {"ok": True, "command": cmd}
+
+
+@app.get("/api/commands/pending/{vehicle_id}")
+def pending_commands(vehicle_id: str):
+    """Commands awaiting the Local Agent for one vehicle. This fetch is the CLAIM: a
+    QUEUED command transitions to SENT (claimed_at stamped) and is redelivered while
+    SENT (at-least-once) until a result arrives — the Agent dedups by the command id."""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+    vid = parse_vehicle_id(vehicle_id)
+    pending = []
+    for cmd in commands:
+        if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
+            continue
+        if cmd["status"] == "QUEUED":
+            cmd["status"] = "SENT"
+            cmd["claimed_at"] = now.isoformat()
+            _command_event(cmd, severity="info",
+                           message=f"Command {cmd['type']} sent to {cmd['vehicle']}",
+                           source="operator-backend")
+        pending.append(cmd)
+    return {"vehicle_id": vid, "pending": pending, "generated_at": now.isoformat()}
+
+
+@app.post("/api/commands/{command_id}/result")
+async def command_result(command_id: str, request: Request):
+    """Local Agent reports the outcome of a command. Body: { status, result?, reason? }
+    where status ∈ ACCEPTED|EXECUTED|REJECTED|FAILED. Idempotent — a result on an
+    already-terminal command is a no-op (applied:false), so a re-sent ack never
+    double-executes. This is the ONLY way a command becomes EXECUTED."""
+    now = datetime.now(timezone.utc)
+    body = await request.json()
+    cmd = commands_by_id.get(command_id)
+    if cmd is None:
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown command id", "command_id": command_id})
+
+    new_status = str(body.get("status") or "").upper()
+    if new_status not in RESULT_STATUSES:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "invalid result status",
+            "status": body.get("status"), "allowed": sorted(RESULT_STATUSES)})
+
+    applied = apply_command_result(cmd, new_status, body.get("result"),
+                                   body.get("reason"), now)
+    if applied:
+        sev = "warning" if new_status in ("REJECTED", "FAILED") else "info"
+        msg = f"Command {cmd['type']} {new_status.lower()}"
+        if cmd.get("reason"):
+            msg = f"{msg} — {cmd['reason']}"
+        _command_event(cmd, severity=sev, message=msg, source=f"usv-{cmd['vehicle_id']}")
+    return {"ok": True, "applied": applied, "command": cmd}
+
+
+@app.get("/api/commands/history/{vehicle_id}")
+def command_history(vehicle_id: str):
+    """Terminal (completed) commands for one vehicle, newest first — the command log."""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+    vid = parse_vehicle_id(vehicle_id)
+    items = [c for c in commands
+             if c["vehicle_id"] == vid and c["status"] in TERMINAL_STATUSES]
+    items.reverse()
+    return {"vehicle_id": vid, "commands": items, "generated_at": now.isoformat()}
+
+
+@app.get("/api/commands/{vehicle_id}")
+def vehicle_commands(vehicle_id: str):
+    """Every command for one vehicle (active queue + history), newest first — the UI view."""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+    vid = parse_vehicle_id(vehicle_id)
+    items = [c for c in commands if c["vehicle_id"] == vid]
+    items.reverse()
+    active = [c for c in items if c["status"] not in TERMINAL_STATUSES]
+    return {"vehicle_id": vid, "commands": items, "active": active,
+            "generated_at": now.isoformat()}
 
 
 @app.post("/agent/status")
