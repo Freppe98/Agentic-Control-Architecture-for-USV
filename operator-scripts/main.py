@@ -548,6 +548,16 @@ def ingest_payload_events(vid, message, now):
 COMMAND_TYPES = {
     "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_HOLD", "SET_MODE_GUIDED",
     "RTL", "MISSION_PAUSE", "MISSION_RESUME",
+    "ARM", "DISARM",
+}
+# Arming touches the motors, so both ARM and DISARM ALWAYS require an explicit
+# confirm:true (independent of comm-state) — the backend rejects them otherwise.
+# ARM is the higher risk of the two (the vehicle can move under power once armed);
+# its record carries a caution warning. Still just the queue — no execution here.
+CONFIRM_REQUIRED_TYPES = {"ARM", "DISARM"}
+RISK_WARNING = {
+    "ARM": "High-risk: the vehicle can move under power once armed. Confirmed by operator.",
+    "DISARM": "Disarms the vehicle (motors off). Confirmed by operator.",
 }
 COMMAND_TTL_S = 300              # queued commands survive ~5 min of disconnection, then EXPIRE
 TERMINAL_STATUSES = {"EXECUTED", "REJECTED", "FAILED", "EXPIRED"}
@@ -634,6 +644,8 @@ async def create_command(request: Request):
       PARTITIONED → queued with a warning
       DISCONNECTED→ 409 needs_confirmation, unless body has confirm:true (then queued;
                     it survives until next contact or the TTL).
+    High-risk arming (ARM/DISARM) ALWAYS needs confirm:true regardless of comm-state
+    (409 otherwise); ARM additionally carries a caution warning in its record.
     Never marks the command executed — that is the Local Agent's result only.
     Body: { vehicle_id, type, params?, created_by?, confirm? }"""
     now = datetime.now(timezone.utc)
@@ -653,6 +665,15 @@ async def create_command(request: Request):
 
     comm_state = comms_state_by_id.get(vid, "UNKNOWN")
     confirm = bool(body.get("confirm"))
+
+    # High-risk arming: ARM/DISARM always require confirm:true, whatever the link state.
+    if ctype in CONFIRM_REQUIRED_TYPES and not confirm:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "needs_confirmation": True, "type": ctype,
+            "high_risk": ctype == "ARM",
+            "message": f"{ctype} affects the motors and requires explicit confirmation. "
+                       "Resend with confirm:true."})
+    # Disconnected: queue-until-contact still needs a confirmation for any command.
     if comm_state == "DISCONNECTED" and not confirm:
         return JSONResponse(status_code=409, content={
             "ok": False, "needs_confirmation": True, "comm_state": comm_state,
@@ -662,13 +683,17 @@ async def create_command(request: Request):
     cmd = make_command(vid=vid, ctype=ctype, params=body.get("params"),
                        created_by=body.get("created_by"), comm_state=comm_state, now=now)
 
-    severity = "info"
+    # Accumulate any warnings (risk + link state) into the record; a warning implies caution.
+    warnings = []
+    if ctype in RISK_WARNING:
+        warnings.append(RISK_WARNING[ctype])
     if comm_state == "PARTITIONED":
-        cmd["warning"] = "Queued while communication is partitioned — delivery may be delayed."
-        severity = "caution"
+        warnings.append("Queued while communication is partitioned — delivery may be delayed.")
     elif comm_state == "DISCONNECTED":
-        cmd["warning"] = "Queued while disconnected — will deliver on next contact."
-        severity = "caution"
+        warnings.append("Queued while disconnected — will deliver on next contact.")
+    if warnings:
+        cmd["warning"] = " ".join(warnings)
+    severity = "caution" if warnings else "info"
     _command_event(cmd, severity=severity,
                    message=f"Command {ctype} created ({comm_state})",
                    source="operator-backend")
