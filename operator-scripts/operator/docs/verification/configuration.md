@@ -15,7 +15,7 @@
 - ✓ reset to defaults restores values (speed_units → ms)
 - ✓ ribbon fleet counts + clock update
 - ✓ no console errors
-- ✓ classic dashboard intact (/ → 200, "Aquality Fleet")
+- ✓ classic dashboard intact (/ → 200, "Aquality Fleet")l
 
 **Honesty notes**
 - Thresholds are the backend's compiled-in constants (main.py), shown read-only — no runtime endpoint reads or writes them. If those constants change, update `BACKEND_THRESHOLDS` in Config.js to match.
