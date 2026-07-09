@@ -16,6 +16,24 @@ const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
 
 export function Vehicle(root) {
   let fleet = [], selId = null;
+  let authority = null;  // { authority: "OPERATOR"|"LOCAL_AGENT" } for the selected vehicle, or null (unknown)
+
+  // Control authority — a dedicated read (GET /api/control_authority/{id}, itself a
+  // live proxy to Scout's own Flask API), NOT part of the fleet payload and NOT the
+  // command queue. Loaded on selection + refreshed on a timer, same pattern as the
+  // fleet poll. null (not "OPERATOR") on any fetch failure — an unreachable Scout
+  // must read as unknown, not a guess.
+  function loadAuthority(id) {
+    if (id == null) { authority = null; return; }
+    api.getControlAuthority(id).then((a) => {
+      if (id === selId) { authority = a; renderDetail(); }
+    }).catch(() => {
+      if (id === selId) { authority = null; renderDetail(); }
+    });
+  }
+  function selectVehicle(id) {
+    if (id !== selId) { selId = id; authority = null; loadAuthority(id); }
+  }
 
   root.className = "app dock-main";
   root.innerHTML =
@@ -75,7 +93,7 @@ export function Vehicle(root) {
     }).join("");
     const mx = document.getElementById("mxwrap");
     mx.innerHTML = `<table class="mx"><thead>${head}</thead><tbody>${body}</tbody></table>`;
-    mx.querySelectorAll("tbody tr").forEach((tr) => (tr.onclick = () => { selId = +tr.dataset.id; renderMatrix(); renderDetail(); }));
+    mx.querySelectorAll("tbody tr").forEach((tr) => (tr.onclick = () => { selectVehicle(+tr.dataset.id); renderMatrix(); renderDetail(); }));
   }
 
   // ---- detail ----
@@ -102,9 +120,17 @@ export function Vehicle(root) {
       ? faults.map((f) => `<div class="frow"><span class="fd" style="background:var(--${f.sev})"></span><span class="txt-${f.sev === "warn" ? "d" : "p"}">${f.l} — ${f.val}</span></div>`).join("")
       : `<div class="frow none">No active faults — all reporting subsystems nominal</div>`;
 
+    // Control authority is fetched separately (loadAuthority), not derived from fleet
+    // data — it's a direct, dedicated proxy to Scout's own Flask API, not backend state.
+    const authVal = authority && authority.authority;
+    const authorityCell = authVal === "LOCAL_AGENT" ? '<span class="txt-c">LOCAL_AGENT</span>'
+      : authVal === "OPERATOR" ? '<span class="txt-p">OPERATOR</span>'
+      : noTelem("unknown");
+
     const healthCard = `<div class="sub full"><div class="sub-head ${ov == null ? "idle" : ov}"><span class="hd"></span><span class="nm">Health overview</span><span class="cond">${ov == null ? "No signal" : ov === "ok" ? "Nominal" : ov === "warn" ? "Warning" : "Caution"}</span></div>
       <div class="faults">${faultsHtml}</div>
       <div class="metrics" style="border-top:1px solid var(--line)">
+        ${row("Control authority", authorityCell, "keep")}
         ${row("Operator reachable", (v.communication && v.communication.operator_reachable != null) ? (v.communication.operator_reachable ? '<span class="txt-c">Yes</span>' : '<span class="txt-p">No</span>') : noTelem("no telem"), "keep")}
         ${row("Firmware", schema === "—" ? noTelem("no telem") : "v" + schema, "keep")}
         ${row("Services", h.flask_status ? "Flask " + h.flask_status : noTelem("no telem"), "keep")}
@@ -171,17 +197,18 @@ export function Vehicle(root) {
 
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
-    if (selId == null && fleet.length) selId = fleet[0].id;
+    if (selId == null && fleet.length) selectVehicle(fleet[0].id);
     document.getElementById("vcount").textContent = `${fleet.length} vehicles`;
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
-    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selId = +el.dataset.id; onFleet(fleet); }));
+    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selectVehicle(+el.dataset.id); onFleet(fleet); }));
     renderMatrix(); renderDetail();
     updateRibbon({ counts: counts() });
   }
 
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
+  const authorityId = setInterval(() => loadAuthority(selId), 2000);  // refresh selected vehicle's control authority
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); };
+  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); };
 }

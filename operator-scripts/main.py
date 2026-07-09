@@ -50,6 +50,23 @@ comms_history_by_id = {}   # {vehicle_id: [ {state, from, ts, since_last_seen_s}
 # state" = last-known composite; absent != reset. Only ever updated from real values.
 last_known_telemetry = {}  # {vehicle_id: {lat, lng, heading, groundspeed, battery, ...}}
 
+# --- Control authority (supervisory: who may command the Pixhawk) ---
+# Separate from flight mode, and deliberately NOT part of the command queue below —
+# it is vehicle state owned by the Scout Flask service (motherpi/services/flask),
+# not an operator-issued mission command. The operator backend holds no authority
+# state of its own; every read/write is a live, synchronous proxy to Scout's own
+# GET/POST /agent/control_authority (see set_control_authority / get_control_authority
+# further down). SCOUT_API_BASE is the same "no Configuration API yet" hardcoded
+# per-vehicle map already used by Pilot.js's DASHBOARDS / Terminal.js's SSH_TARGETS —
+# only vehicles with a real, reachable Scout Flask instance belong here.
+SCOUT_API_BASE = {
+    2: "http://10.0.2.10:8080",  # Scout — motherpi Flask API
+}
+
+
+def scout_api_base(vid: int):
+    return SCOUT_API_BASE.get(vid)
+
 # --- Persistent event log (BACKEND_ROADMAP #2; Operator-backend-owned) ---
 # One server-side, append-only record that replaces the frontend's flatten-from-
 # payload feed. Two sources feed it: (1) operator-side comms-state transitions from
@@ -750,6 +767,65 @@ async def command_result(command_id: str, request: Request):
             msg = f"{msg} — {cmd['reason']}"
         _command_event(cmd, severity=sev, message=msg, source=f"usv-{cmd['vehicle_id']}")
     return {"ok": True, "applied": applied, "command": cmd}
+
+
+# --- Control authority (direct proxy to Scout Flask, NOT the command queue above) ---
+# Take Control / Release Control in the Operator UI. Deliberately bypasses the
+# QUEUED→SENT→EXECUTED command lifecycle entirely: control authority is vehicle
+# state owned by Scout's own Flask service (motherpi/services/flask), reachable at
+# SCOUT_API_BASE. The operator backend holds no authority state of its own — every
+# call here is a live, synchronous round-trip to Scout; a network failure surfaces
+# as an honest 502/504, never a guessed or cached value.
+CONTROL_AUTHORITY_VALUES = ("LOCAL_AGENT", "OPERATOR")
+
+
+@app.post("/api/control_authority/{vehicle}")
+async def set_control_authority(vehicle: str, request: Request):
+    """Body: { "authority": "LOCAL_AGENT" | "OPERATOR" }. Forwards directly to Scout's
+    POST /agent/control_authority and returns Scout's response verbatim."""
+    body = await request.json()
+    authority = str(body.get("authority") or "").upper()
+    if authority not in CONTROL_AUTHORITY_VALUES:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "invalid authority",
+            "authority": body.get("authority"), "allowed": list(CONTROL_AUTHORITY_VALUES)})
+
+    vid = parse_vehicle_id(vehicle)
+    base = scout_api_base(vid)
+    if base is None:
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "no Scout API configured for this vehicle",
+            "vehicle_id": vehicle})
+
+    try:
+        r = requests.post(f"{base}/agent/control_authority",
+                          json={"authority": authority}, timeout=3)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "Scout control-authority API unreachable",
+            "detail": str(exc)})
+
+
+@app.get("/api/control_authority/{vehicle}")
+def get_control_authority(vehicle: str):
+    """Live read of Scout's GET /agent/control_authority — not cached, not backend state."""
+    vid = parse_vehicle_id(vehicle)
+    base = scout_api_base(vid)
+    if base is None:
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "no Scout API configured for this vehicle",
+            "vehicle_id": vehicle})
+
+    try:
+        r = requests.get(f"{base}/agent/control_authority", timeout=3)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "Scout control-authority API unreachable",
+            "detail": str(exc)})
 
 
 @app.get("/api/commands/history/{vehicle_id}")

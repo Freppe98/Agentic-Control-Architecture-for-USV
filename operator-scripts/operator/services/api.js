@@ -3,12 +3,22 @@
 // If the backend changes, this file changes — not ten pages.
 // Endpoints (see main.py): GET /api/fleet/status, GET /agent/status,
 // POST /agent/status, GET /api/comms/history/{id}, GET /api/events,
-// GET /api/environment.
+// GET /api/environment, GET/POST /api/control_authority/{id}.
 
 const BASE = "";
 
 async function getJSON(path) {
   const res = await fetch(BASE + path, { headers: { "Accept": "application/json" } });
+  if (!res.ok) throw new Error(`${path} → ${res.status}`);
+  return res.json();
+}
+
+async function postJSON(path, body) {
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify(body),
+  });
   if (!res.ok) throw new Error(`${path} → ${res.status}`);
   return res.json();
 }
@@ -68,6 +78,19 @@ export async function getEvents() {
 export function getCommsHistory(id) { return getJSON(`/api/comms/history/${id}`); }
 export async function getAutonomy(/* id */)     { return null; } // needs agent reasoning fields
 export async function getMissionScope()         { return null; } // needs named-mission registry
+
+/** Confirmed control authority for a vehicle ("OPERATOR" or "LOCAL_AGENT"). */
+export function getControlAuthority(id) { return getJSON(`/api/control_authority/${id}`); }
+
+/**
+ * Request a control-authority hand-off (Take Control / Release Control). NOT the
+ * command queue — a direct, synchronous proxy to Scout Flask's own
+ * POST /agent/control_authority (see main.py). Resolves with Scout's response
+ * verbatim, or rejects if Scout is unreachable; the operator backend caches nothing.
+ */
+export function setControlAuthority(id, authority) {
+  return postJSON(`/api/control_authority/${id}`, { authority });
+}
 
 /** Small polling helper so pages don't each reinvent setInterval + error handling. */
 export function poll(fn, ms, onData, onError) {

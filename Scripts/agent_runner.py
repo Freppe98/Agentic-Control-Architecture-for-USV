@@ -16,6 +16,7 @@ from pymavlink import mavutil
 
 from fsm_agent import AgenticFSM, CommState, Config, GoalType, InputData, output_to_json
 from command_adapter import CommandAdapter
+from control_authority import ControlAuthority
 from global_adapter import GlobalAdapter, GlobalAdapterConfig
 from mavlink_adapter import MavlinkAdapter
 
@@ -81,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         default="fsm_log.csv",
         help="CSV log output path.",
     )
+    parser.add_argument(
+        "--scout-api-url",
+        default="http://127.0.0.1:8080",
+        help="Scout's own Flask API base URL (motherpi/services/flask), for reading "
+             "control authority. Defaults to localhost since it runs on the same host.",
+    )
     return parser.parse_args()
 
 
@@ -105,9 +112,13 @@ def main() -> None:
         )
     )
     command_adapter = CommandAdapter(master)
+    authority = ControlAuthority(args.scout_api_url)
 
     last_state = None
     last_waypoints_signature = None
+    last_blocked_signature = None
+    last_authority_poll = 0.0
+    authority_poll_interval_s = 1.0
 
     with open(args.log_csv, "w", newline="") as log_file:
         writer = csv.writer(log_file)
@@ -127,6 +138,10 @@ def main() -> None:
 
         try:
             while True:
+                if time.time() - last_authority_poll >= authority_poll_interval_s:
+                    authority.poll()
+                    last_authority_poll = time.time()
+
                 msg = master.recv_match(blocking=False)
                 if msg is not None:
                     mavlink_adapter.update_from_msg(msg)
@@ -147,9 +162,14 @@ def main() -> None:
                     and input_data.comm_state != CommState.DISCONNECTED
                 )
 
-                if should_upload:
+                if should_upload and authority.has_control():
                     if command_adapter.upload_mission(waypoints):
                         last_waypoints_signature = waypoints_signature
+                        last_blocked_signature = None
+                elif should_upload and waypoints_signature != last_blocked_signature:
+                    print("[ControlAuthority] Mission ready but OPERATOR holds "
+                          "authority — not sending.")
+                    last_blocked_signature = waypoints_signature
 
                 mavlink_adapter.current_fsm_state = output_data.next_state
                 mavlink_adapter.last_intent_timestamp_s = output_data.output_timestamp_s

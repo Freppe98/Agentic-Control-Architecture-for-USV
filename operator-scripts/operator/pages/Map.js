@@ -16,6 +16,7 @@ export function Map(root) {
   const L = window.L;
   let fleet = [], selId = null, env = null, map = null;
   let commsHist = null;          // comms-state transition log for the selected vehicle
+  let authority = null;          // { authority: "OPERATOR"|"LOCAL_AGENT" } for the selected vehicle, or null (unknown/unreachable)
   const markers = {};
   const timers = [];
 
@@ -110,6 +111,20 @@ export function Map(root) {
     }).catch(() => {});
   }
 
+  // Control authority for the selected vehicle — a direct, dedicated read (GET
+  // /api/control_authority/{id}, itself a live proxy to Scout's own Flask API), NOT
+  // part of the fleet payload and NOT the command queue. Loaded on selection +
+  // refreshed on a timer, same pattern as comms history. null (not "OPERATOR") on
+  // any fetch failure — an unreachable Scout must read as unknown, not a guess.
+  function loadAuthority(id) {
+    if (id == null) { authority = null; return; }
+    api.getControlAuthority(id).then((a) => {
+      if (id === selId) { authority = a; renderInspector(); }
+    }).catch(() => {
+      if (id === selId) { authority = null; renderInspector(); }
+    });
+  }
+
   function commsTimeline() {
     const h = commsHist;
     const clk = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
@@ -134,6 +149,17 @@ export function Map(root) {
     if (!v) { box.innerHTML = `<div class="isec"><div class="empty-state">No vehicle selected</div></div>`; return; }
     const st = commState(v), stale = st !== "connected", t = v.telemetry || {};
     const events = Array.isArray(v.events) ? v.events.slice(-6).reverse() : [];
+
+    // Control authority — a dedicated fetch (loadAuthority), NOT fleet data and NOT
+    // the command queue. null = unknown (never contacted / Scout API unreachable).
+    // Mission commands (ARM/AUTO/RTL/HOLD/...) are meaningless while OPERATOR holds
+    // authority — Scout ignores its queue until authority is LOCAL_AGENT — so they
+    // stay disabled until Take Control succeeds.
+    const authVal = authority && authority.authority;
+    const hasControl = authVal === "LOCAL_AGENT";
+    const authLabel = authVal === "LOCAL_AGENT" ? "Local Agent" : authVal === "OPERATOR" ? "Operator" : "Unknown";
+    const missionTitle = hasControl ? "Command API not implemented yet" : "Local Agent does not have control — Take Control first";
+
     box.innerHTML = `
       <div class="isec">
         <div class="idcard">
@@ -151,10 +177,15 @@ export function Map(root) {
       <div class="isec">
         <div class="sec-title"><span class="lbl">Quick actions</span></div>
         <div class="qa">
-          <button disabled title="Command API not implemented yet">Return Home</button>
-          <button disabled title="Command API not implemented yet">Pause</button>
-          <button disabled title="Command API not implemented yet">Resume</button>
-          <button disabled title="Command API not implemented yet">Loiter</button>
+          <button data-authority="LOCAL_AGENT" ${hasControl ? "disabled" : ""}>Take Control</button>
+          <button data-authority="OPERATOR" ${!hasControl ? "disabled" : ""}>Release Control</button>
+        </div>
+        <div class="idbehav" style="margin-top:8px">Current authority: <b class="${hasControl ? "txt-c" : authVal === "OPERATOR" ? "txt-p" : ""}">${authLabel}</b></div>
+        <div class="qa" style="margin-top:8px">
+          <button disabled title="${missionTitle}">Return Home</button>
+          <button disabled title="${missionTitle}">Pause</button>
+          <button disabled title="${missionTitle}">Resume</button>
+          <button disabled title="${missionTitle}">Loiter</button>
         </div>
       </div>
       <div class="isec">
@@ -176,6 +207,10 @@ export function Map(root) {
         <div class="sec-title"><span class="lbl">Recent events</span></div>
         <div class="events">${events.length ? events.map((e) => `<div class="ev"><span class="sv" style="background:var(--muted)"></span><span class="tx">${normEvent(e)}</span></div>`).join("") : '<div class="empty-state">No recent events</div>'}</div>
       </div>`;
+
+    box.querySelectorAll(".qa button[data-authority]").forEach((btn) => {
+      btn.onclick = () => { api.setControlAuthority(v.id, btn.dataset.authority).catch(() => {}); };
+    });
   }
 
   function counts() {
@@ -185,7 +220,7 @@ export function Map(root) {
   }
 
   function select(id) {
-    if (id !== selId) { selId = id; commsHist = null; loadCommsHistory(id); }
+    if (id !== selId) { selId = id; commsHist = null; loadCommsHistory(id); authority = null; loadAuthority(id); }
     // Snap the map to the selected vehicle (only if it has a known position — a
     // never-contacted vehicle has none, so there is nothing to snap to).
     const v = fleet.find((x) => x.id === id);
@@ -195,7 +230,7 @@ export function Map(root) {
 
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
-    if (selId == null && fleet.length) { selId = fleet[0].id; loadCommsHistory(selId); }
+    if (selId == null && fleet.length) { selId = fleet[0].id; loadCommsHistory(selId); loadAuthority(selId); }
     updateMarkers(); renderDock(); renderInspector();
     updateRibbon({ counts: counts() });
   }
@@ -210,6 +245,7 @@ export function Map(root) {
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
   const stopEnv = api.poll(api.getEnvironment, 10000, onEnv, () => {});
   timers.push(setInterval(() => loadCommsHistory(selId), 3000));  // refresh selected vehicle's comms log
+  timers.push(setInterval(() => loadAuthority(selId), 2000));  // refresh selected vehicle's control authority
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
