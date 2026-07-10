@@ -7,6 +7,7 @@ import { NavRail } from "../components/NavRail.js";
 import { Ribbon, updateRibbon } from "../components/Ribbon.js";
 import { CommsPill } from "../components/CommsPill.js";
 import { BatteryBar } from "../components/BatteryBar.js";
+import { StatusBadges } from "../components/StatusBadges.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { COL, cls, commState, fmtAge, pad3, noTelem } from "../lib/ui.js";
 
@@ -157,7 +158,6 @@ export function Map(root) {
     // stay disabled until Take Control succeeds.
     const authVal = authority && authority.authority;
     const hasControl = authVal === "LOCAL_AGENT";
-    const authLabel = authVal === "LOCAL_AGENT" ? "Local Agent" : authVal === "OPERATOR" ? "Operator" : "Unknown";
     const missionTitle = hasControl ? "Command API not implemented yet" : "Local Agent does not have control — Take Control first";
 
     box.innerHTML = `
@@ -166,7 +166,6 @@ export function Map(root) {
           <div class="idtop">
             <div class="idrow"><span class="idname">${v.name || "USV-" + v.id}</span>${CommsPill(v, { full: true })}</div>
             <div class="idassign">${String(activity(v))}</div>
-            <div class="idbehav">Mode ${t.mode || "—"}</div>
           </div>
           <div class="idcontact ${stale ? "warn" : ""}">
             <span class="big txt-${cls(v)}">${v.last_seen_age_s == null ? "—" : Math.round(v.last_seen_age_s)}</span><span class="u">s ago</span>
@@ -175,12 +174,15 @@ export function Map(root) {
         </div>
       </div>
       <div class="isec">
+        <div class="sec-title"><span class="lbl">Status</span></div>
+        ${StatusBadges(v, authVal)}
+      </div>
+      <div class="isec">
         <div class="sec-title"><span class="lbl">Quick actions</span></div>
         <div class="qa">
           <button data-authority="LOCAL_AGENT" ${hasControl ? "disabled" : ""}>Take Control</button>
           <button data-authority="OPERATOR" ${!hasControl ? "disabled" : ""}>Release Control</button>
         </div>
-        <div class="idbehav" style="margin-top:8px">Current authority: <b class="${hasControl ? "txt-c" : authVal === "OPERATOR" ? "txt-p" : ""}">${authLabel}</b></div>
         <div class="qa" style="margin-top:8px">
           <button disabled title="${missionTitle}">Return Home</button>
           <button disabled title="${missionTitle}">Pause</button>

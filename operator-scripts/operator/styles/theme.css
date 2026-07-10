@@ -177,6 +177,23 @@ a { color:inherit; }
 .ev .tx { font-size:12px; line-height:1.4; }
 .empty-state { color:var(--muted); font-size:12px; font-style:italic; padding:6px 0; }
 
+/* ---------- status badges (Live Fleet inspector) ---------- */
+.vbadges { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.vbadge { display:inline-flex; align-items:center; gap:6px; font-family:var(--font-mono); font-size:10.5px; letter-spacing:.04em; text-transform:uppercase; font-weight:600; padding:4px 9px; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel-2); color:var(--muted); white-space:nowrap; }
+.vbadge .hd { width:7px; height:7px; border-radius:50%; flex:none; background:currentColor; }
+.vbadge.ok { color:var(--ok); border-color:rgba(62,207,142,.3); background:rgba(62,207,142,.08); }
+.vbadge.warn { color:var(--warn); border-color:rgba(229,72,77,.32); background:rgba(229,72,77,.08); }
+.vbadge.accent { color:var(--accent-bright); border-color:rgba(76,141,255,.32); background:var(--accent-dim); }
+.vbadge.idle { color:var(--dim); background:transparent; }
+
+/* ---------- authority segmented indicator (RC / Operator / Local Agent) ---------- */
+.authseg { display:inline-flex; align-items:stretch; border:1px solid var(--line-strong); border-radius:var(--r-sm); overflow:hidden; }
+.authseg .aseg { padding:4px 8px; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--dim); background:var(--panel-2); border-right:1px solid var(--line); white-space:nowrap; }
+.authseg .aseg:last-child { border-right:none; }
+.authseg .aseg.ready { color:var(--muted); }
+.authseg .aseg.on { color:var(--accent-bright); background:var(--accent-dim); font-weight:700; }
+.authseg.unk .aseg.ready { color:var(--dim); }
+
 /* ---------- generic page toolbar ---------- */
 .toolbar { display:flex; align-items:center; gap:16px; padding:13px 20px; border-bottom:1px solid var(--line); }
 .toolbar h1 { margin:0; font-size:var(--fs-lg); font-weight:600; }
@@ -269,6 +286,8 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .subgrid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
 @media (max-width:1320px){ .subgrid { grid-template-columns:repeat(2,1fr); } }
 @media (max-width:980px){ .subgrid { grid-template-columns:1fr; } }
+.twogrid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
+@media (max-width:900px){ .twogrid { grid-template-columns:1fr; } }
 .sub { background:var(--panel); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
 .sub.full { margin-bottom:12px; }
 .sub-head { display:flex; align-items:center; gap:10px; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel-2); }
@@ -291,6 +310,19 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .faults .frow { display:flex; align-items:center; gap:9px; font-size:12.5px; }
 .faults .frow .fd { width:8px; height:8px; border-radius:50%; flex:none; }
 .faults .frow.none { color:var(--muted); }
+
+/* ---------- diagnostics ---------- */
+.diag-btn { font-family:var(--font-ui); font-size:11.5px; color:var(--text); background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); padding:6px 12px; cursor:pointer; transition:border-color var(--t-base), background var(--t-base); }
+.diag-btn:hover:not(:disabled) { border-color:var(--accent); background:var(--accent-dim); }
+.diag-btn:disabled { opacity:.6; cursor:default; }
+.diag-note { padding:9px 13px; font-size:11px; color:var(--muted); line-height:1.5; border-bottom:1px solid var(--line); }
+.diag-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); }
+@media (max-width:640px){ .diag-grid { grid-template-columns:1fr; } }
+.diag-item { background:var(--panel); padding:9px 13px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.diag-item .dk { font-family:var(--font-mono); font-size:11px; color:var(--muted); }
+.dchip { display:inline-flex; align-items:center; gap:6px; font-family:var(--font-mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase; font-weight:600; white-space:nowrap; }
+.dchip .hd { width:7px; height:7px; border-radius:50%; flex:none; background:currentColor; }
+.dchip.ok { color:var(--ok); } .dchip.caution { color:var(--caution); } .dchip.warn { color:var(--warn); } .dchip.idle { color:var(--dim); }
 
 /* ---------- events log ---------- */
 .evbar { display:flex; gap:8px; padding:11px 20px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
