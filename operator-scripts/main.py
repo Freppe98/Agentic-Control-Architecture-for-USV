@@ -566,6 +566,34 @@ RESULT_STATUSES = {"ACCEPTED", "EXECUTED", "REJECTED", "FAILED"}  # what an Agen
 commands = []              # append-only [ command record ] (see the spec object below)
 commands_by_id = {}        # {id: record} — uuid id is the dedup key (no duplicate execution)
 
+# --- Control authority (INDEPENDENT of communication state) ---
+# Comm-state (can we reach the vehicle?) and control authority (may operator commands
+# execute?) are two orthogonal axes. A vehicle can be CONNECTED+OPERATOR, CONNECTED+
+# LOCAL_AGENT, PARTITIONED+LOCAL_AGENT, etc. Authority is operator-station-side state and
+# is NEVER derived from, or changed by, comm-state.
+#
+#   OPERATOR    — default, safe: the operator is observing only. Command buttons are
+#                 disabled and the backend refuses to create/deliver commands. All
+#                 telemetry / maps / events / Pilot / Terminal keep working.
+#   LOCAL_AGENT — the operator has pressed "Engage Control", granting permission for
+#                 commands to execute (delivered to the Local Agent). Engaging by itself
+#                 arms/changes nothing — it only opens the command channel.
+#
+# Safe defaults: unknown/undeterminable → OPERATOR. In-memory, so a backend restart or a
+# vehicle we have never seen both default to OPERATOR (observe-only), never LOCAL_AGENT.
+AUTHORITY_OPERATOR = "OPERATOR"
+AUTHORITY_LOCAL_AGENT = "LOCAL_AGENT"
+AUTHORITY_STATES = {AUTHORITY_OPERATOR, AUTHORITY_LOCAL_AGENT}
+authority_by_id = {}       # {vid: {"authority", "since", "by"}} — absent ⇒ OPERATOR
+
+
+def get_authority(vid):
+    """Current control authority for a vehicle. Safe default OPERATOR when unknown."""
+    rec = authority_by_id.get(vid)
+    if not rec or rec.get("authority") not in AUTHORITY_STATES:
+        return AUTHORITY_OPERATOR
+    return rec["authority"]
+
 
 def known_vehicle_ids():
     """Vehicle ids the backend recognises (template + any that have reported)."""
@@ -623,6 +651,25 @@ def expire_commands(now=None):
                            source="operator-backend")
 
 
+def expire_commands_for_vehicle(vid, reason, now=None):
+    """Cancel (EXPIRE) every non-terminal command for one vehicle. Called on any authority
+    transition so that granting/withdrawing authority can NEVER cause a stale queued
+    command to execute as a side-effect. Returns the ids that were expired."""
+    now = now or datetime.now(timezone.utc)
+    expired = []
+    for cmd in commands:
+        if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
+            continue
+        cmd["status"] = "EXPIRED"
+        cmd["completed_at"] = now.isoformat()
+        cmd["reason"] = reason
+        _command_event(cmd, severity="warning",
+                       message=f"Command {cmd['type']} cancelled — {reason}",
+                       source="operator-backend")
+        expired.append(cmd["id"])
+    return expired
+
+
 def apply_command_result(cmd, new_status, result, reason, now):
     """Apply a Local-Agent-reported result. Idempotent: a result on an already-terminal
     command is ignored (the uuid id prevents duplicate execution). Returns True if applied."""
@@ -662,6 +709,16 @@ async def create_command(request: Request):
     if vid not in known_vehicle_ids():
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "vehicle_id": body.get("vehicle_id")})
+
+    # Control-authority gate (independent of comm-state): commands may only be created
+    # while the operator has engaged control (authority == LOCAL_AGENT). Under the safe
+    # default OPERATOR the backend refuses — mirroring the disabled command buttons.
+    authority = get_authority(vid)
+    if authority != AUTHORITY_LOCAL_AGENT:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "control not engaged", "authority": authority,
+            "message": "Control is not engaged for this vehicle (authority OPERATOR). "
+                       "Engage Control before issuing commands."})
 
     comm_state = comms_state_by_id.get(vid, "UNKNOWN")
     confirm = bool(body.get("confirm"))
@@ -704,10 +761,19 @@ async def create_command(request: Request):
 def pending_commands(vehicle_id: str):
     """Commands awaiting the Local Agent for one vehicle. This fetch is the CLAIM: a
     QUEUED command transitions to SENT (claimed_at stamped) and is redelivered while
-    SENT (at-least-once) until a result arrives — the Agent dedups by the command id."""
+    SENT (at-least-once) until a result arrives — the Agent dedups by the command id.
+
+    Gated by control authority: while authority is OPERATOR (the safe default) NOTHING
+    is delivered — the operator has not engaged control, so no command may execute. Only
+    when the operator has engaged (authority LOCAL_AGENT) are commands handed over."""
     now = datetime.now(timezone.utc)
     expire_commands(now)
     vid = parse_vehicle_id(vehicle_id)
+    authority = get_authority(vid)
+    if authority != AUTHORITY_LOCAL_AGENT:
+        # Observe-only: deliver nothing and claim nothing (no side-effect on the queue).
+        return {"vehicle_id": vid, "authority": authority, "pending": [],
+                "generated_at": now.isoformat()}
     pending = []
     for cmd in commands:
         if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
@@ -719,7 +785,8 @@ def pending_commands(vehicle_id: str):
                            message=f"Command {cmd['type']} sent to {cmd['vehicle']}",
                            source="operator-backend")
         pending.append(cmd)
-    return {"vehicle_id": vid, "pending": pending, "generated_at": now.isoformat()}
+    return {"vehicle_id": vid, "authority": authority, "pending": pending,
+            "generated_at": now.isoformat()}
 
 
 @app.post("/api/commands/{command_id}/result")
@@ -773,8 +840,72 @@ def vehicle_commands(vehicle_id: str):
     items = [c for c in commands if c["vehicle_id"] == vid]
     items.reverse()
     active = [c for c in items if c["status"] not in TERMINAL_STATUSES]
-    return {"vehicle_id": vid, "commands": items, "active": active,
-            "generated_at": now.isoformat()}
+    return {"vehicle_id": vid, "authority": get_authority(vid),
+            "commands": items, "active": active, "generated_at": now.isoformat()}
+
+
+# --- Control authority endpoints (independent of comm-state) ---
+
+@app.get("/api/authority/{vehicle_id}")
+def get_authority_endpoint(vehicle_id: str):
+    """Current control authority for one vehicle. Safe default OPERATOR when never set."""
+    vid = parse_vehicle_id(vehicle_id)
+    rec = authority_by_id.get(vid) or {}
+    return {
+        "vehicle_id": vid,
+        "authority": get_authority(vid),
+        "since": rec.get("since"),
+        "by": rec.get("by"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/authority/{vehicle_id}")
+async def set_authority_endpoint(vehicle_id: str, request: Request):
+    """Set control authority for one vehicle. Body: { authority: OPERATOR|LOCAL_AGENT, by? }.
+    "Engage Control" → LOCAL_AGENT, "Release Control" → OPERATOR. This changes ONLY the
+    permission to command — it never arms/disarms or changes the vehicle mode.
+
+    Safety: on any actual transition, every non-terminal command for the vehicle is
+    cancelled (EXPIRED), so granting or releasing authority can never make a stale queued
+    command suddenly execute. Authority is independent of comm-state and is not touched by
+    reconnects; an unknown value always resolves to the safe default OPERATOR."""
+    now = datetime.now(timezone.utc)
+    vid = parse_vehicle_id(vehicle_id)
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle_id})
+
+    body = await request.json()
+    target = str(body.get("authority") or "").upper()
+    if target not in AUTHORITY_STATES:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "invalid authority",
+            "authority": body.get("authority"), "allowed": sorted(AUTHORITY_STATES)})
+
+    prev = get_authority(vid)
+    by = body.get("by") or "operator"
+    authority_by_id[vid] = {"authority": target, "since": now.isoformat(), "by": by}
+
+    expired = []
+    if target != prev:
+        # Cancel any in-flight commands so the transition can't trigger stale execution.
+        expired = expire_commands_for_vehicle(
+            vid, reason=f"Control authority changed to {target}", now=now)
+        if target == AUTHORITY_LOCAL_AGENT:
+            _append_event(severity="caution",
+                          message="Control engaged — operator authority granted (commands enabled)",
+                          etype="authority", source="operator-backend",
+                          vehicle_id=vid, vehicle=name_of(vid))
+        else:
+            _append_event(severity="info",
+                          message="Control released — returned to observe-only (commands disabled)",
+                          etype="authority", source="operator-backend",
+                          vehicle_id=vid, vehicle=name_of(vid))
+
+    return {"ok": True, "vehicle_id": vid, "authority": target,
+            "previous": prev, "changed": target != prev,
+            "expired_commands": expired, "since": now.isoformat()}
 
 
 @app.post("/agent/status")
@@ -850,6 +981,13 @@ def fleet_status():
 
         if not replaced:
             fleet.append(live_usv)
+
+    # Attach control authority (operator-side, independent of comm-state) so every page
+    # sees it live on the 2 s fleet poll. Absent ⇒ safe default OPERATOR.
+    for usv in fleet:
+        rec = authority_by_id.get(usv["id"]) or {}
+        usv["authority"] = get_authority(usv["id"])
+        usv["authority_since"] = rec.get("since")
 
     return fleet
 

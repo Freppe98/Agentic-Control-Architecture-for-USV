@@ -64,6 +64,7 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 |---|---|---|---|---|---|---|---|
 | command lifecycle (Return Home / Pause / Resume / Loiter) | Map, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | Feature unavailable | P1 · **backend done** (see `verification/commands.md`) |
 | command status (Pending/Executing/Finished/Failed, "queues until next contact") | Map, Mission | Operator backend | B-field | on change | E→B | Feature unavailable | P1 · **backend done** (queue + comm-state gating + Agent result) |
+| **control authority** (OPERATOR ⇄ LOCAL_AGENT, independent of comms; gates command create/deliver; Engage/Release) | Vehicle | Operator backend + Frontend | B-field | on action | C+E | Observe only / Control engaged | P1 · **done** (see `verification/authority.md`) |
 
 ## Events
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |

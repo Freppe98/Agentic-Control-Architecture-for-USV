@@ -14,8 +14,20 @@ import { commState, cls, fmtAge, pad3, noTelem } from "../lib/ui.js";
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
 
+// Command & Control: the safe command set for the reverse path. High-risk commands
+// (ARM/DISARM touch the motors; AUTO/RTL change what the vehicle does on its own) get an
+// extra operator confirmation and are sent with confirm:true. Labels are the operator's
+// shorthand; the value is the backend command type.
+const CMDS = [
+  ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"], ["SET_MODE_HOLD", "HOLD"],
+  ["SET_MODE_GUIDED", "GUIDED"], ["RTL", "RTL"], ["MISSION_PAUSE", "PAUSE"],
+  ["MISSION_RESUME", "RESUME"], ["ARM", "ARM"], ["DISARM", "DISARM"],
+];
+const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
+const CMD_STATUS_CLS = { QUEUED: "u", SENT: "p", ACCEPTED: "p", EXECUTED: "c", REJECTED: "d", FAILED: "d", EXPIRED: "u" };
+
 export function Vehicle(root) {
-  let fleet = [], selId = null;
+  let fleet = [], selId = null, cmds = [];
 
   root.className = "app dock-main";
   root.innerHTML =
@@ -32,6 +44,8 @@ export function Vehicle(root) {
      <div class="content-main">
        <div class="toolbar"><h1>Vehicle</h1><span class="count mono" id="vcount">—</span></div>
        <div class="vcontent">
+         <div class="sect"><span class="lbl">Command &amp; control</span><span class="tag" id="ctltag">selected vehicle</span></div>
+         <div id="control"></div>
          <div class="sect"><span class="lbl">Fleet systems matrix</span><span class="tag">vehicles × subsystems · click a row for detail</span></div>
          <div class="mxwrap" id="mxwrap"></div>
          <div class="sect"><span class="lbl">Vehicle detail</span><span class="tag" id="dettag"></span></div>
@@ -75,7 +89,7 @@ export function Vehicle(root) {
     }).join("");
     const mx = document.getElementById("mxwrap");
     mx.innerHTML = `<table class="mx"><thead>${head}</thead><tbody>${body}</tbody></table>`;
-    mx.querySelectorAll("tbody tr").forEach((tr) => (tr.onclick = () => { selId = +tr.dataset.id; renderMatrix(); renderDetail(); }));
+    mx.querySelectorAll("tbody tr").forEach((tr) => (tr.onclick = () => { selId = +tr.dataset.id; cmds = []; renderMatrix(); renderDetail(); renderControl(); refreshCommands(); }));
   }
 
   // ---- detail ----
@@ -163,6 +177,100 @@ export function Vehicle(root) {
       <div class="subgrid">${battery}${sensors}${gps}${compass}${storage}${cpu}${temps}${network}</div>`;
   }
 
+  // ---- Command & Control (authority + command queue for the selected vehicle) ----
+  const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
+  const fmtClock = (iso) => { if (!iso) return "—"; const d = new Date(iso); return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour12: false }); };
+
+  function renderControl() {
+    const box = document.getElementById("control");
+    if (!box) return;
+    const v = fleet.find((x) => x.id === selId);
+    const tag = document.getElementById("ctltag");
+    if (!v) { box.innerHTML = `<div class="empty-state" style="padding:8px 0">No vehicle selected</div>`; if (tag) tag.textContent = ""; return; }
+    const vname = v.name || "USV-" + v.id;
+    if (tag) tag.textContent = `${vname} · authority & command queue`;
+
+    // Authority is INDEPENDENT of comm-state. Default/unknown → OPERATOR (observe-only).
+    const authority = String(v.authority || "OPERATOR").toUpperCase();
+    const engaged = authority === "LOCAL_AGENT";
+
+    const authBadge = engaged
+      ? `<span class="auth-badge on"><i></i>CONTROL ENGAGED</span>`
+      : `<span class="auth-badge"><i></i>OBSERVE ONLY</span>`;
+    const authNote = engaged
+      ? `Operator commands are <b>enabled</b> for ${vname}. Authority is independent of link state — releasing returns to observe-only without changing the vehicle's mode.`
+      : `Safe default — command buttons are disabled. Press <b>Engage Control</b> to permit commands to execute. Engaging does not arm the vehicle or change its mode.`;
+    const authBtn = engaged
+      ? `<button class="ctl-auth release" data-auth="OPERATOR">Release Control</button>`
+      : `<button class="ctl-auth engage" data-auth="LOCAL_AGENT">Engage Control</button>`;
+
+    const btns = CMDS.map(([type, label]) => {
+      const hr = HIGH_RISK.has(type);
+      return `<button class="ctl-cmd${hr ? " hr" : ""}" data-cmd="${type}"${engaged ? "" : " disabled"} title="${type}${hr ? " · confirmation required" : ""}">${label}</button>`;
+    }).join("");
+
+    const queue = cmds.length
+      ? cmds.slice(0, 8).map((c) => {
+          const clsx = CMD_STATUS_CLS[c.status] || "u";
+          const when = c.completed_at || c.claimed_at || c.created_at;
+          const note = c.reason || c.warning || "";
+          return `<div class="ctl-row"><span class="ctl-type mono">${c.type}</span><span class="pill ${clsx}">${c.status}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
+        }).join("")
+      : `<div class="ctl-empty">No commands issued for ${vname} yet.</div>`;
+
+    box.innerHTML = `
+      <div class="ctl-panel">
+        <div class="ctl-auth-bar${engaged ? " engaged" : ""}">
+          <div class="ctl-auth-l"><span class="lbl">Control authority</span>${authBadge}</div>
+          <div class="ctl-auth-note">${authNote}</div>
+          ${authBtn}
+        </div>
+        <div class="ctl-cmds${engaged ? "" : " locked"}">${btns}</div>
+        ${engaged ? "" : `<div class="ctl-lock-note">${lockSvg}<span>Commands are locked. Engage control to enable them.</span></div>`}
+        <div class="ctl-queue">
+          <div class="ctl-queue-h"><span class="lbl">Command queue &amp; history</span><span class="tag">status is reported by the vehicle — never assumed</span></div>
+          ${queue}
+        </div>
+      </div>`;
+
+    const ab = box.querySelector(".ctl-auth");
+    if (ab) ab.onclick = () => toggleAuthority(ab.dataset.auth, vname);
+    box.querySelectorAll(".ctl-cmd").forEach((b) => (b.onclick = () => sendCommand(b.dataset.cmd, vname)));
+  }
+
+  async function toggleAuthority(target, vname) {
+    if (target === "LOCAL_AGENT" &&
+        !window.confirm(`Engage control of ${vname}?\n\nThis grants permission for operator commands to execute. It does NOT arm the vehicle or change its mode.`)) return;
+    const res = await api.setAuthority(selId, target);
+    if (!res.ok) window.alert((res.data && res.data.message) || "Authority change failed.");
+    await refreshAll();
+  }
+
+  async function sendCommand(type, vname) {
+    const label = (CMDS.find(([t]) => t === type) || [null, type])[1];
+    const highRisk = HIGH_RISK.has(type);
+    if (highRisk &&
+        !window.confirm(`Confirm ${label} for ${vname}?\n\nThe command is queued for the vehicle to execute. It is NOT applied until the local agent reports back.`)) return;
+    let res = await api.createCommand({ vehicle_id: selId, type, confirm: highRisk });
+    if (!res.ok && res.data && res.data.needs_confirmation) {
+      if (!window.confirm(`${res.data.message}\n\nQueue anyway?`)) return;
+      res = await api.createCommand({ vehicle_id: selId, type, confirm: true });
+    }
+    if (!res.ok) window.alert((res.data && res.data.message) || "Command was not accepted.");
+    await refreshCommands();
+  }
+
+  async function refreshCommands() {
+    if (selId == null) return;
+    try { const d = await api.getCommands(selId); cmds = (d && d.commands) || []; }
+    catch (e) { cmds = []; }
+    renderControl();
+  }
+
+  async function refreshAll() {
+    try { onFleet(await api.getFleet()); } catch (e) { /* keep last */ }
+  }
+
   function counts() {
     const c = { c: 0, p: 0, d: 0 };
     fleet.forEach((v) => { const st = commState(v); if (st === "connected") c.c++; else if (st === "partitioned") c.p++; else if (st === "disconnected") c.d++; });
@@ -174,9 +282,10 @@ export function Vehicle(root) {
     if (selId == null && fleet.length) selId = fleet[0].id;
     document.getElementById("vcount").textContent = `${fleet.length} vehicles`;
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
-    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selId = +el.dataset.id; onFleet(fleet); }));
-    renderMatrix(); renderDetail();
+    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selId = +el.dataset.id; cmds = []; onFleet(fleet); }));
+    renderMatrix(); renderDetail(); renderControl();
     updateRibbon({ counts: counts() });
+    refreshCommands();
   }
 
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});

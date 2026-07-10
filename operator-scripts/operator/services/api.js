@@ -13,6 +13,22 @@ async function getJSON(path) {
   return res.json();
 }
 
+/**
+ * POST helper that does NOT throw on 4xx — command/authority endpoints answer 409
+ * (needs_confirmation / control not engaged) with a meaningful body the caller must
+ * act on. Returns { ok, status, data } so pages can branch on it.
+ */
+async function postJSON(path, body) {
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* empty body */ }
+  return { ok: res.ok, status: res.status, data };
+}
+
 /** Full fleet, already normalized server-side (comm_state, last_seen_age_s, telemetry, …). */
 export function getFleet() {
   return getJSON("/api/fleet/status");
@@ -66,6 +82,25 @@ export async function getEvents() {
  */
 /** Operator-side comms-state transition log for a vehicle (timeline + durations). */
 export function getCommsHistory(id) { return getJSON(`/api/comms/history/${id}`); }
+
+// --- Control authority + command queue (reverse/control path) ---
+// Authority (OPERATOR default / LOCAL_AGENT engaged) is independent of comm-state and
+// gates whether commands may be created/delivered. It also rides on getFleet() as
+// v.authority, so pages usually read it from there; these are for reads/actions.
+
+/** Current control authority for one vehicle. */
+export function getAuthority(id) { return getJSON(`/api/authority/${id}`); }
+
+/** Engage ("LOCAL_AGENT") / release ("OPERATOR") control. Returns { ok, status, data }. */
+export function setAuthority(id, authority, by = "operator") {
+  return postJSON(`/api/authority/${id}`, { authority, by });
+}
+
+/** Create a command. body: { vehicle_id, type, params?, confirm? }. { ok, status, data }. */
+export function createCommand(body) { return postJSON("/api/commands", body); }
+
+/** All commands for a vehicle (active queue + history) — the panel view. */
+export function getCommands(id) { return getJSON(`/api/commands/${id}`); }
 export async function getAutonomy(/* id */)     { return null; } // needs agent reasoning fields
 export async function getMissionScope()         { return null; } // needs named-mission registry
 
