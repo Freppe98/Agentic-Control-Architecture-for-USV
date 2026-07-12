@@ -962,6 +962,161 @@ def get_control_authority(vehicle: str):
     return _scout_authority_read(vid, base)
 
 
+# --- Pixhawk mission (direct proxy to Scout Flask, NOT the command queue) ---
+# View-only readback of the mission currently STORED ON THE PIXHAWK for a vehicle
+# (MISSION_REQUEST_LIST/MISSION_ITEM_INT over MAVLink, performed on Scout). Same
+# proxy pattern as control_authority: the operator backend holds NO mission state of
+# its own — every fetch is a live, synchronous round-trip to Scout's own Flask API
+# (SCOUT_API_BASE). A network failure surfaces as an honest reachable:false with an
+# empty waypoint list, never a fabricated or cached mission. This is deliberately a
+# separate axis from the operator command queue and from `mission_state` progress:
+# it is what the flight controller actually holds, for testing/verification. The card
+# is designed to later carry Compare / Upload / Export against this same payload.
+#
+# Scout-side contract (to be exposed by motherpi/services/flask, mirroring
+# /agent/control_authority): GET /agent/pixhawk_mission returning any of the shapes
+# normalized below. Until Scout ships it, this endpoint returns reachable:false and
+# the operator UI reads "Scout unavailable" — never a guessed mission.
+
+# MAVLink MAV_CMD codes → readable names for the waypoint popup. Unmapped codes fall
+# back to "CMD <n>" so an unusual command is still shown honestly, never blanked.
+MAV_CMD_NAMES = {
+    16: "WAYPOINT", 17: "LOITER_UNLIM", 18: "LOITER_TURNS", 19: "LOITER_TIME",
+    20: "RETURN_TO_LAUNCH", 21: "LAND", 22: "TAKEOFF", 82: "SPLINE_WAYPOINT",
+    84: "VTOL_TAKEOFF", 85: "VTOL_LAND", 93: "DELAY", 177: "DO_JUMP",
+    178: "DO_CHANGE_SPEED", 183: "DO_SET_SERVO", 189: "DO_LAND_START",
+}
+# Commands whose param1 encodes a loiter/hold time in seconds.
+LOITER_TIME_CMDS = {19}
+
+
+def _mission_coord(*vals):
+    """First usable lat/lng from candidate fields. Accepts float degrees OR MAVLink
+    int1e7 (MISSION_ITEM_INT x/y): anything with |value| > 180 is treated as degrees*1e7.
+    Returns None when nothing usable is present (a waypoint with no position stays
+    positionless rather than plotting at 0,0)."""
+    for v in vals:
+        if v is None or v == "":
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if abs(f) > 180:
+            f = f / 1e7
+        if f == 0:
+            continue
+        return f
+    return None
+
+
+def normalize_mission_item(item):
+    """One Scout/MAVLink mission item → the stable waypoint schema the map overlay
+    consumes. Tolerant of field-name spellings (seq/sequence, command/cmd, lat/x, …)
+    so it works whether Scout forwards raw pymavlink items or a pre-shaped list."""
+    if not isinstance(item, dict):
+        return None
+    seq = _first_present(item.get("seq"), item.get("sequence"), item.get("index"))
+    cmd = _first_present(item.get("command"), item.get("cmd"), item.get("mav_cmd"))
+    lat = _mission_coord(item.get("lat"), item.get("latitude"), item.get("x"))
+    lng = _mission_coord(item.get("lng"), item.get("lon"), item.get("longitude"), item.get("y"))
+    alt = _first_present(item.get("alt"), item.get("altitude"), item.get("z"))
+    loiter = item.get("loiter_time")
+    if loiter is None and cmd in LOITER_TIME_CMDS:
+        loiter = item.get("param1")
+    try:
+        cmd_int = int(cmd) if cmd is not None else None
+    except (TypeError, ValueError):
+        cmd_int = None
+    return {
+        "seq": int(seq) if isinstance(seq, (int, float)) or (isinstance(seq, str) and seq.isdigit()) else seq,
+        "command": cmd_int if cmd_int is not None else cmd,
+        "command_name": item.get("command_name") or (MAV_CMD_NAMES.get(cmd_int, f"CMD {cmd_int}") if cmd_int is not None else None),
+        "lat": lat,
+        "lng": lng,
+        "alt": round(float(alt), 2) if isinstance(alt, (int, float)) else None,
+        "loiter_time": round(float(loiter), 1) if isinstance(loiter, (int, float)) else None,
+        "frame": item.get("frame"),
+    }
+
+
+def _scout_mission_read(vid: int, base: str, now):
+    """Live GET of the Pixhawk mission from Scout, normalized. Always returns a dict,
+    never raises: an unreachable Scout is reachable:false with an empty list so the
+    frontend's fetch never emits a console 4xx/5xx. `partial` marks an incomplete
+    download (Scout said so, or fewer items arrived than the reported count)."""
+    try:
+        r = requests.get(f"{base}/agent/pixhawk_mission", timeout=8)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException as exc:
+        return {
+            "ok": True, "vehicle_id": vid, "available": True, "reachable": False,
+            "fetched_at": now.isoformat(), "count": 0, "current_seq": None,
+            "waypoints": [], "partial": False, "source": "scout",
+            "reason": "Scout mission API unreachable", "detail": str(exc),
+        }
+    if not isinstance(data, dict):
+        data = {}
+    raw_items = (data.get("waypoints") or data.get("mission")
+                 or data.get("items") or data.get("mission_items") or [])
+    if not isinstance(raw_items, list):
+        raw_items = []
+    waypoints = [w for w in (normalize_mission_item(i) for i in raw_items) if w is not None]
+    current = _first_present(data.get("current_seq"), data.get("current"),
+                             data.get("current_wp"), data.get("current_waypoint"))
+    try:
+        current = int(current) if current is not None else None
+    except (TypeError, ValueError):
+        current = None
+    # partial: Scout flagged it, OR the mission list is shorter than the count it
+    # reported (a download that dropped items). Never claim complete when it isn't.
+    reported = data.get("count")
+    partial = bool(data.get("partial"))
+    if isinstance(reported, int) and reported > len(waypoints):
+        partial = True
+    out = {
+        "ok": True, "vehicle_id": vid, "available": True, "reachable": True,
+        "fetched_at": now.isoformat(), "count": len(waypoints),
+        "current_seq": current, "waypoints": waypoints, "partial": partial,
+        "source": "scout", "raw_count": reported,
+    }
+    # Optional Scout-provided integrity/identity fields for a future mission-compare
+    # (hash of the on-FC mission, whether a mission is loaded, whether it validated).
+    # Passed through ONLY when Scout actually sends them — never fabricated here. The
+    # operator backend stays a pure proxy: it does not compute a hash or a validity of
+    # its own (that would duplicate mission ownership Scout holds).
+    for k in ("hash", "loaded", "valid"):
+        if k in data:
+            out[k] = data[k]
+    return out
+
+
+@app.get("/api/vehicles/{vehicle_id}/pixhawk-mission")
+def pixhawk_mission(vehicle_id: str):
+    """Fetch the mission currently stored on the vehicle's Pixhawk (view-only). Live
+    proxy to Scout — same three-case honesty as control authority:
+      unknown vehicle id          → deliberate JSON 404 (no such vehicle)
+      known, no Scout API          → 200 available:false (nothing to read here)
+      known, Scout API configured  → live proxy; reachable:false + empty list if Scout
+                                      does not answer (never a console 5xx)."""
+    now = datetime.now(timezone.utc)
+    vid = parse_vehicle_id(vehicle_id)
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle_id})
+
+    base = scout_api_base(vid)
+    if base is None:
+        return {
+            "ok": True, "vehicle_id": vid, "available": False, "reachable": False,
+            "fetched_at": now.isoformat(), "count": 0, "current_seq": None,
+            "waypoints": [], "partial": False, "source": "scout",
+            "reason": "No Scout mission API configured for this vehicle",
+        }
+    return _scout_mission_read(vid, base, now)
+
+
 @app.get("/api/commands/history/{vehicle_id}")
 def command_history(vehicle_id: str):
     """Terminal (completed) commands for one vehicle, newest first — the command log."""

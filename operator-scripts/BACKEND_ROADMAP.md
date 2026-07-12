@@ -58,6 +58,7 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 | `assigned` (assigned vs depot pool) | Fleet, Mission, Vehicle | Operator backend | B-field (registry assignment) | on task change | C | Feature unavailable | P1 |
 | mission ETA / time remaining | Map, Mission | Local Agent | A-out (agent knows plan + progress) | on change | B | Feature unavailable | P2 |
 | mission-level coverage total | Map, Mission | Frontend | F-derive (avg of per-vehicle — already done) | slow | D | — | done |
+| **Pixhawk mission readback** (mission stored on the flight controller — numbered waypoints + overlay, view-only) | Map | Scout Flask (download over MAVLink) + Operator backend (thin proxy) | B-field | on demand | C → `GET /api/vehicles/{id}/pixhawk-mission` (proxies Scout `GET /agent/pixhawk_mission`) | Scout unavailable | P1 · **operator proxy done** (see `verification/pixhawk-mission.md`) · needs Scout route |
 
 ## Command / control (reverse path)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |

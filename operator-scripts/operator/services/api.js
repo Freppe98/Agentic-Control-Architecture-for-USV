@@ -121,6 +121,17 @@ export function createCommand(body) { return postJSON("/api/commands", body); }
 /** All commands for a vehicle (active queue + history) — the panel view. */
 export function getCommands(id) { return getJSON(`/api/commands/${id}`); }
 
+// --- Pixhawk mission (view-only readback — a live Scout proxy, NOT the command queue) ---
+// The mission currently STORED ON THE PIXHAWK for a vehicle (what the flight controller
+// actually holds), fetched on demand for testing/verification. Deliberately separate
+// from mission_state/coverage progress and from the operator command queue. The backend
+// (GET /api/vehicles/{id}/pixhawk-mission) proxies live to Scout and always answers with
+// a stable schema — { available, reachable, count, current_seq, waypoints[], partial } —
+// so an unreachable Scout is an honest reachable:false, never a thrown fetch. See main.py.
+
+/** Fetch the mission stored on a vehicle's Pixhawk (live Scout readback). */
+export function getPixhawkMission(id) { return getJSON(`/api/vehicles/${id}/pixhawk-mission`); }
+
 /** Small polling helper so pages don't each reinvent setInterval + error handling. */
 export function poll(fn, ms, onData, onError) {
   let stopped = false;

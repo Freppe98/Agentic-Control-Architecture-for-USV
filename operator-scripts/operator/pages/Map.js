@@ -54,6 +54,14 @@ export function Map(root) {
   const authCtl = createAuthorityController(() => renderInspector());
   const markers = {};
   const timers = [];
+  // Pixhawk mission readback — per-vehicle, view-only. Each entry:
+  //   { mission, fetchedAt, loading, note }  (see fetchPixhawkMission / renderPxm)
+  // `mission` is the last SUCCESSFUL (reachable) Scout readback and is never wiped by a
+  // later failed fetch — a subsequent unreachable attempt only sets `note`, so the card
+  // keeps showing the last-known mission with an honest "Scout unavailable" status.
+  // `shown` toggles the map overlay WITHOUT refetching (toggling never hits Scout).
+  const pxm = {};
+  let missionLayer = null;   // the single Leaflet layer group currently drawn (selected vehicle)
 
   root.className = "app has-dock";
   root.innerHTML =
@@ -62,6 +70,7 @@ export function Map(root) {
     `<div class="dock">
        <div class="dock-h"><span class="lbl">Vehicles</span><span class="lbl">Live</span></div>
        <div class="veh-list" id="veh-list"><div class="empty-state" style="padding:10px 12px">Connecting…</div></div>
+       <div class="pxm" id="pxm"></div>
        <div class="mprog" id="mprog"></div>
      </div>
      <div class="map-wrap">
@@ -129,6 +138,217 @@ export function Map(root) {
          <div><span class="lbl">Remaining</span><span class="v">${noTelem()}</span></div>
          <div><span class="lbl">ETA</span><span class="v">${noTelem()}</span></div>
        </div>`;
+  }
+
+  // ---- Pixhawk mission (view-only readback + map overlay) ------------------
+  function pxmState(id) {
+    return pxm[id] || (pxm[id] = { mission: null, fetchedAt: 0, loading: false, note: null, shown: false });
+  }
+
+  // Fetch the mission stored on the vehicle's Pixhawk (a live Scout proxy). A reachable
+  // reply replaces the displayed mission; an unreachable one (or a thrown 404) only sets
+  // a note so the last-known mission is preserved. Never called by Show/Hide.
+  async function fetchPixhawkMission(id) {
+    if (id == null) return;
+    const s = pxmState(id);
+    s.loading = true; renderPxm();
+    try {
+      const res = await api.getPixhawkMission(id);
+      if (res && res.reachable) {
+        s.mission = res; s.fetchedAt = Date.now();
+        s.note = res.available === false ? "no-api" : (res.partial ? "partial" : null);
+      } else {
+        s.note = (res && res.available === false) ? "no-api" : "unreachable";
+      }
+    } catch (e) {
+      s.note = "error";
+    } finally {
+      s.loading = false;
+      if (id === selId) { renderPxm(); if (s.shown) drawMissionOverlay(id); }
+    }
+  }
+
+  // A numbered waypoint marker — a rounded square so it never reads as a vehicle dot
+  // (round, comm-colored). The current waypoint is highlighted (green + ring).
+  function wpIcon(w, isCurrent) {
+    return L.divIcon({
+      className: "",
+      html: `<div class="wp-marker${isCurrent ? " cur" : ""}">${w.seq == null ? "•" : w.seq}</div>`,
+      iconSize: [22, 22], iconAnchor: [11, 11],
+    });
+  }
+
+  function wpPopup(w) {
+    const row = (k, v) => `<div class="wp-pop-row"><span>${k}</span><span>${v}</span></div>`;
+    const loiter = w.loiter_time != null ? row("Loiter", `${w.loiter_time} s`) : "";
+    return `<div class="wp-pop">
+      <div class="wp-pop-h">WP ${w.seq == null ? "—" : w.seq}${w.command_name ? ` · ${w.command_name}` : ""}</div>
+      ${row("Sequence", w.seq == null ? "—" : w.seq)}
+      ${row("Latitude", w.lat != null ? (+w.lat).toFixed(6) : "—")}
+      ${row("Longitude", w.lng != null ? (+w.lng).toFixed(6) : "—")}
+      ${row("Command", w.command_name || (w.command != null ? w.command : "—"))}
+      ${row("Altitude", w.alt != null ? `${w.alt} m` : "—")}
+      ${loiter}
+    </div>`;
+  }
+
+  // Full, idempotent teardown of the overlay: drop the layer group (which removes its
+  // markers + polyline) AND close any popup it opened, so repeated vehicle switching
+  // can never leave a stray marker or a dangling popup behind.
+  function clearMissionOverlay() {
+    if (missionLayer) { map.removeLayer(missionLayer); missionLayer = null; }
+    if (map) map.closePopup();
+  }
+
+  // Positioned waypoints for a vehicle's cached mission (those with a real lat/lng).
+  function positionedWaypoints(id) {
+    const s = pxm[id];
+    if (!s || !s.mission) return [];
+    return (s.mission.waypoints || []).filter((w) => w.lat != null && w.lng != null);
+  }
+
+  // Rebuild the overlay for one vehicle from its cached mission. Only waypoints with a
+  // real position are plotted (a positionless item — e.g. RTL — is never drawn at 0,0).
+  function drawMissionOverlay(id) {
+    clearMissionOverlay();
+    const s = pxm[id];
+    if (!map || !s || !s.mission) return;
+    const wps = positionedWaypoints(id);
+    if (!wps.length) return;
+    const cur = s.mission.current_seq;
+    const layer = L.layerGroup();
+    L.polyline(wps.map((w) => [w.lat, w.lng]),
+      { className: "mission-line", color: "#4C8DFF", weight: 2, opacity: 0.75, dashArray: "5 5" }).addTo(layer);
+    wps.forEach((w) => {
+      const isCur = cur != null && w.seq === cur;
+      L.marker([w.lat, w.lng], { icon: wpIcon(w, isCur), zIndexOffset: isCur ? 1000 : 0 })
+        .bindPopup(wpPopup(w)).addTo(layer);
+    });
+    layer.addTo(map);
+    missionLayer = layer;
+  }
+
+  function showMissionOverlay() {
+    if (selId == null) return;
+    const s = pxmState(selId);
+    s.shown = true; drawMissionOverlay(selId); renderPxm();
+  }
+  function hideMissionOverlay() {
+    if (selId == null) return;
+    pxmState(selId).shown = false; clearMissionOverlay(); renderPxm();
+  }
+
+  // Fit the map to the mission's bounds WITHOUT refetching — a pure client-side view
+  // change over the already-cached waypoints. Ensures the overlay is shown so the
+  // operator sees what was framed. Uses the last-known mission; safe while offline.
+  function centerMission() {
+    if (selId == null || !map) return;
+    const wps = positionedWaypoints(selId);
+    if (!wps.length) return;
+    const s = pxmState(selId);
+    if (!s.shown) { s.shown = true; drawMissionOverlay(selId); renderPxm(); }
+    const bounds = L.latLngBounds(wps.map((w) => [w.lat, w.lng]));
+    map.fitBounds(bounds, { padding: [48, 48], maxZoom: 18 });
+  }
+
+  // Switch the overlay to follow the selected vehicle: drop the old one, redraw the new
+  // vehicle's mission only if the operator had it shown. Called from select().
+  function syncMissionOverlay() {
+    clearMissionOverlay();
+    const s = selId != null ? pxm[selId] : null;
+    if (s && s.shown) drawMissionOverlay(selId);
+  }
+
+  // The chip carries the CURRENT communication / fetch status only — it is deliberately
+  // separate from whether a cached mission exists (the grid below shows that). So a
+  // "Scout unavailable" chip can sit above a fully-populated, last-downloaded mission.
+  const PXM_CHIP = {
+    loading:     ["Fetching…", "dim"],
+    "no-api":    ["No mission API", "dim"],
+    unreachable: ["Scout unavailable", "warn"],
+    error:       ["Fetch failed", "warn"],
+    partial:     ["Partial download", "warn"],
+    invalid:     ["Mission invalid", "warn"],
+    loaded:      ["Loaded", "ok"],
+    empty:       ["No mission loaded", "dim"],
+    none:        ["Not fetched", "dim"],
+  };
+
+  function fmtSince(ms) {
+    if (!ms) return "—";
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    return `${Math.floor(s / 3600)}h ago`;
+  }
+  function pxmAgeText(s) { return s && s.fetchedAt ? fmtSince(s.fetchedAt) : "—"; }
+
+  function renderPxm() {
+    const box = document.getElementById("pxm");
+    if (!box) return;
+    const id = selId;
+    const s = id != null ? pxmState(id) : null;
+    const m = s && s.mission;                 // last SUCCESSFULLY downloaded mission (cache)
+    const count = m ? m.count : null;
+    const cur = m ? m.current_seq : null;
+    // Scout-provided integrity fields — consumed ONLY if present (never invented).
+    const loadedFlag = m && typeof m.loaded === "boolean" ? m.loaded : null;
+    const validFlag = m && typeof m.valid === "boolean" ? m.valid : null;
+    const hash = m && m.hash ? String(m.hash) : null;
+
+    // Chip = current comm/fetch status. A live failure (note) wins; otherwise reflect
+    // the cached mission's own integrity/emptiness.
+    let key = "none";
+    if (s && s.loading) key = "loading";
+    else if (s && s.note) key = s.note;              // unreachable / no-api / error / partial
+    else if (validFlag === false) key = "invalid";
+    else if (loadedFlag === false) key = "empty";
+    else if (m && m.count > 0) key = "loaded";
+    else if (m) key = "empty";
+    const [chipText, chipCls] = PXM_CHIP[key] || PXM_CHIP.none;
+
+    const hasWps = positionedWaypoints(id).length > 0;
+    const shown = !!(s && s.shown);
+    const fetched = !!(s && s.fetchedAt);
+
+    // A cached mission is being shown while the live link is down / degraded — say so
+    // explicitly so the operator never mistakes last-known counts for a live readback.
+    const cachedNote = (m && s && s.note && ["unreachable", "error"].includes(s.note))
+      ? `<div class="pxm-note warn">Showing last downloaded mission — not re-confirmed with Scout.</div>`
+      : (validFlag === false
+          ? `<div class="pxm-note warn">Scout reports this mission did not validate.</div>`
+          : "");
+
+    box.innerHTML = `
+      <div class="pxm-h">
+        <span class="lbl">Pixhawk mission</span>
+        <span class="pxm-chip ${chipCls}">${chipText}</span>
+      </div>
+      <div class="pxm-grid">
+        <div class="pxm-row"><span class="k">Loaded</span><span class="v">${count == null ? "—" : `${count} waypoint${count === 1 ? "" : "s"}`}</span></div>
+        <div class="pxm-row"><span class="k">Current</span><span class="v">${cur != null && count != null ? `WP ${cur} / ${count}` : "—"}</span></div>
+        <div class="pxm-row"><span class="k">Last download</span><span class="v" id="pxm-age">${pxmAgeText(s)}</span></div>
+        ${hash ? `<div class="pxm-row"><span class="k">Mission id</span><span class="v" title="${hash}">${hash.slice(0, 8)}</span></div>` : ""}
+      </div>
+      ${cachedNote}
+      <div class="pxm-actions">
+        <button data-pxm="fetch" ${s && s.loading ? "disabled" : ""} title="Fetch the mission stored on the Pixhawk">${fetched ? "Refresh" : "Fetch"}</button>
+        <div class="pxm-btns">
+          <button data-pxm="show" ${hasWps && !shown ? "" : "disabled"} title="Show the mission overlay on the map">Show</button>
+          <button data-pxm="center" ${hasWps ? "" : "disabled"} title="Fit the map to the mission (no refetch)">Center</button>
+          <button data-pxm="hide" ${shown ? "" : "disabled"} title="Hide the mission overlay">Hide</button>
+        </div>
+      </div>`;
+
+    box.querySelector('[data-pxm="fetch"]').onclick = () => fetchPixhawkMission(selId);
+    box.querySelector('[data-pxm="show"]').onclick = () => showMissionOverlay();
+    box.querySelector('[data-pxm="center"]').onclick = () => centerMission();
+    box.querySelector('[data-pxm="hide"]').onclick = () => hideMissionOverlay();
+  }
+
+  function tickPxmAge() {
+    const el = document.getElementById("pxm-age");
+    if (el && selId != null) el.textContent = pxmAgeText(pxm[selId]);
   }
 
   function normEvent(e) {
@@ -380,7 +600,7 @@ export function Map(root) {
     // never-contacted vehicle has none, so there is nothing to snap to).
     const v = fleet.find((x) => x.id === id);
     if (map && v && v.lat != null && v.lng != null) map.panTo([v.lat, v.lng]);
-    renderDock(); renderInspector(); updateMarkers();
+    renderDock(); renderPxm(); syncMissionOverlay(); renderInspector(); updateMarkers();
   }
 
   // Default to a vehicle that is actually reporting (so the primary view opens on a
@@ -397,7 +617,7 @@ export function Map(root) {
       selId = defaultSelection();
       loadCommsHistory(selId); loadAuthority(selId); loadCommands(selId);
     }
-    updateMarkers(); renderDock(); renderInspector();
+    updateMarkers(); renderDock(); renderPxm(); renderInspector();
     updateRibbon({ counts: counts() });
   }
   function onEnv(e) {
@@ -413,12 +633,14 @@ export function Map(root) {
   timers.push(setInterval(() => loadCommsHistory(selId), 3000));  // refresh selected vehicle's comms log
   timers.push(setInterval(() => loadAuthority(selId), 2000));  // refresh selected vehicle's control authority
   timers.push(setInterval(() => loadCommands(selId), 3000));  // refresh selected vehicle's command lifecycle
+  timers.push(setInterval(tickPxmAge, 1000));  // keep the "last fetch … ago" line live
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
   return function cleanup() {
     stopFleet(); stopEnv(); clearInterval(clockId); timers.forEach(clearInterval);
     authCtl.dispose();
+    clearMissionOverlay();
     if (map) { map.remove(); map = null; }
   };
 }
