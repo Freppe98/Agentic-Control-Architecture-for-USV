@@ -140,6 +140,59 @@ FLEET_TEMPLATE = [
 vehicle_names = {usv["id"]: usv["name"] for usv in FLEET_TEMPLATE}
 
 
+def _first_present(*vals):
+    """First value that is not None (used to merge candidate field spellings)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _age_seconds_from(raw):
+    """Seconds since an epoch or ISO-8601 timestamp, or None. Used to convert a
+    Scout-provided 'last heartbeat / last message time' into a freshness age."""
+    if raw is None or raw == "":
+        return None
+    ts = extract_message_ts({"timestamp": raw})  # reuses the epoch/ISO parser
+    if ts is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc).timestamp() - ts))
+
+
+def mavlink_evidence(payload: dict) -> dict:
+    """Normalized MAVLink / Pixhawk-heartbeat evidence for the diagnostics page.
+
+    Read STRICTLY from real link fields Scout may forward — never inferred from GPS or
+    arrival age (a HEARTBEAT is its own MAVLink message; GPS position is not proof of
+    one). When Scout exposes none of these, every field is None and the operator
+    diagnostics render NOT AVAILABLE rather than a fabricated PASS. The candidate
+    spellings below are the Scout-side schema this consumer expects (see
+    BACKEND_ROADMAP.md → 'Pixhawk heartbeat / MAVLink evidence')."""
+    comm = payload.get("communication", {}) or {}
+    health = payload.get("health", {}) or {}
+    mav = payload.get("mavlink") or comm.get("mavlink") or health.get("mavlink") or {}
+    if not isinstance(mav, dict):
+        mav = {}
+
+    heartbeat_age = _first_present(
+        mav.get("heartbeat_age_s"), comm.get("heartbeat_age_s"),
+        health.get("pixhawk_heartbeat_age_s"), health.get("heartbeat_age_s"),
+        _age_seconds_from(_first_present(mav.get("last_heartbeat"), comm.get("last_heartbeat"),
+                                         health.get("last_heartbeat"))),
+    )
+    last_msg_age = _first_present(
+        mav.get("last_msg_age_s"), comm.get("mavlink_last_msg_age_s"),
+        _age_seconds_from(_first_present(mav.get("last_msg_time"), comm.get("mavlink_last_message"))),
+    )
+    return {
+        "connected": _first_present(mav.get("connected"), comm.get("mavlink_connected")),
+        "heartbeat_age_s": round(heartbeat_age, 2) if isinstance(heartbeat_age, (int, float)) else None,
+        "last_msg_age_s": round(last_msg_age, 2) if isinstance(last_msg_age, (int, float)) else None,
+        "msg_rate_hz": _first_present(mav.get("msg_rate_hz"), comm.get("mavlink_msg_rate_hz")),
+        "parser_errors": _first_present(mav.get("parser_errors"), comm.get("mavlink_parser_errors")),
+    }
+
+
 def normalize_agent_message(message: dict) -> dict:
     """
     Accepts both:
@@ -233,6 +286,7 @@ def normalize_agent_message(message: dict) -> dict:
         "mission_data": payload.get("mission", {}) or {},
         "communication": payload.get("communication", {}) or {},
         "health": payload.get("health", {}) or {},
+        "mavlink": mavlink_evidence(payload),
         "measurements": payload.get("measurements", {}) or {},
         "events": payload.get("events", []) or [],
         "fleet_info": fleet_info,
@@ -562,9 +616,12 @@ def ingest_payload_events(vid, message, now):
 #   SENT    — backend, when the Agent fetches it (a claim; at-least-once redelivery)
 #   ACCEPTED/EXECUTED/REJECTED/FAILED — Local Agent only, via the result endpoint
 #   EXPIRED — backend, when a non-terminal command passes its TTL (monitor loop)
+# Vehicle/Pixhawk modes are real ArduRover modes (MANUAL, AUTO, HOLD, LOITER, GUIDED,
+# RTL). MISSION_PAUSE/MISSION_RESUME are agent mission commands — NOT Pixhawk modes —
+# and are kept deliberately distinct. ARM/DISARM are the safety pair.
 COMMAND_TYPES = {
-    "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_HOLD", "SET_MODE_GUIDED",
-    "RTL", "MISSION_PAUSE", "MISSION_RESUME",
+    "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_HOLD", "SET_MODE_LOITER",
+    "SET_MODE_GUIDED", "RTL", "MISSION_PAUSE", "MISSION_RESUME",
     "ARM", "DISARM",
 }
 # Arming touches the motors, so both ARM and DISARM ALWAYS require an explicit
@@ -775,8 +832,41 @@ async def command_result(command_id: str, request: Request):
 # state owned by Scout's own Flask service (motherpi/services/flask), reachable at
 # SCOUT_API_BASE. The operator backend holds no authority state of its own — every
 # call here is a live, synchronous round-trip to Scout; a network failure surfaces
-# as an honest 502/504, never a guessed or cached value.
-CONTROL_AUTHORITY_VALUES = ("LOCAL_AGENT", "OPERATOR")
+# as an honest reachable:false, never a guessed or cached value.
+#
+# Effective-authority semantics (the axis the operator acts on):
+#   OPERATOR     — the operator holds the wheel; operator commands may execute.
+#                  Requested via "Take Control".
+#   LOCAL_AGENT  — the autonomous local agent holds the wheel; the mission runs.
+#                  Requested via "Release Control".
+#   RC           — an RC transmitter override has physically taken over. This is a
+#                  *reported* effective state only: the operator can never request it
+#                  (it is a hardware takeover), so it appears in reads, never in writes.
+REQUESTABLE_AUTHORITY = ("OPERATOR", "LOCAL_AGENT")   # operator-initiated (POST)
+REPORTABLE_AUTHORITY = ("OPERATOR", "LOCAL_AGENT", "RC")  # what a read may surface
+
+
+def _scout_authority_read(vid: int, base: str):
+    """Live GET of Scout's authority, normalized to a stable operator schema. Always
+    returns a dict, never raises: an unreachable Scout is an honest reachable:false /
+    authority:null so the frontend's 2 s poll never emits a console 4xx/5xx."""
+    try:
+        r = requests.get(f"{base}/agent/control_authority", timeout=3)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException as exc:
+        return {
+            "ok": True, "vehicle_id": vid, "available": True, "reachable": False,
+            "authority": None, "source": "scout",
+            "reason": "Scout control-authority API unreachable", "detail": str(exc),
+        }
+    raw = str(data.get("authority") or data.get("effective")
+              or data.get("control_authority") or "").upper()
+    value = raw if raw in REPORTABLE_AUTHORITY else None
+    return {
+        "ok": True, "vehicle_id": vid, "available": True, "reachable": True,
+        "authority": value, "source": "scout", "raw": data,
+    }
 
 
 def cancel_pending_commands(vid: int, now, reason: str):
@@ -797,61 +887,79 @@ def cancel_pending_commands(vid: int, now, reason: str):
 
 @app.post("/api/control_authority/{vehicle}")
 async def set_control_authority(vehicle: str, request: Request):
-    """Body: { "authority": "LOCAL_AGENT" | "OPERATOR" }. Forwards directly to Scout's
-    POST /agent/control_authority and returns Scout's response verbatim. On a
-    confirmed Release Control (authority=OPERATOR), also cancels any still-pending
-    command-queue entries for this vehicle (queue safety — see
-    cancel_pending_commands) so nothing stale can execute on a later Engage Control.
-    This is the only place the command queue and control authority intersect; Scout
-    remains the sole source of truth for the authority value itself."""
+    """Body: { "authority": "OPERATOR" | "LOCAL_AGENT" }. Take Control → OPERATOR,
+    Release Control → LOCAL_AGENT (RC is a hardware takeover and is NOT requestable).
+    Forwards to Scout's POST /agent/control_authority and returns a normalized ack
+    ({requested, authority} where authority is Scout's acknowledged effective value)
+    so the frontend confirms against the effective state, not the button press.
+
+    On a confirmed Release (authority=LOCAL_AGENT) also cancels any still-pending
+    command-queue entries for this vehicle (queue safety — see cancel_pending_commands)
+    so a stale operator command cannot fire once autonomy is back in control. Take
+    Control does NOT cancel — the operator is taking the wheel. Scout remains the sole
+    source of truth for the authority value itself."""
     body = await request.json()
     authority = str(body.get("authority") or "").upper()
-    if authority not in CONTROL_AUTHORITY_VALUES:
+    if authority not in REQUESTABLE_AUTHORITY:
         return JSONResponse(status_code=400, content={
             "ok": False, "error": "invalid authority",
-            "authority": body.get("authority"), "allowed": list(CONTROL_AUTHORITY_VALUES)})
+            "authority": body.get("authority"), "allowed": list(REQUESTABLE_AUTHORITY)})
 
     vid = parse_vehicle_id(vehicle)
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
+
     base = scout_api_base(vid)
     if base is None:
-        return JSONResponse(status_code=404, content={
-            "ok": False, "error": "no Scout API configured for this vehicle",
-            "vehicle_id": vehicle})
+        return JSONResponse(status_code=409, content={
+            "ok": False, "available": False, "vehicle_id": vid,
+            "error": "no Scout control-authority API configured for this vehicle",
+            "message": "This vehicle has no control-authority backend; authority cannot be changed."})
 
     try:
         r = requests.post(f"{base}/agent/control_authority",
                           json={"authority": authority}, timeout=3)
         r.raise_for_status()
-        result = r.json()
+        result = r.json() if r.content else {}
     except requests.RequestException as exc:
         return JSONResponse(status_code=502, content={
             "ok": False, "error": "Scout control-authority API unreachable",
             "detail": str(exc)})
 
-    if authority == "OPERATOR":
+    if authority == "LOCAL_AGENT":
         cancel_pending_commands(vid, datetime.now(timezone.utc),
-                                 "Cancelled — control authority released to OPERATOR")
-    return result
+                                 "Cancelled — control released to Local Agent")
+
+    eff = str(result.get("authority") or result.get("effective") or authority).upper()
+    return {
+        "ok": True, "vehicle_id": vid, "requested": authority,
+        "authority": eff if eff in REPORTABLE_AUTHORITY else None,
+        "available": True, "reachable": True, "source": "scout", "raw": result,
+    }
 
 
 @app.get("/api/control_authority/{vehicle}")
 def get_control_authority(vehicle: str):
-    """Live read of Scout's GET /agent/control_authority — not cached, not backend state."""
+    """Live read of Scout's authority, normalized. Distinguishes three cases so the
+    2 s poll is quiet and honest:
+      unknown vehicle id          → deliberate JSON 404 (no such vehicle)
+      known, no Scout API          → 200 available:false (nothing to read here)
+      known, Scout API configured  → live proxy; reachable:false + authority:null if
+                                      Scout does not answer (never a console 5xx)."""
     vid = parse_vehicle_id(vehicle)
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
+
     base = scout_api_base(vid)
     if base is None:
-        return JSONResponse(status_code=404, content={
-            "ok": False, "error": "no Scout API configured for this vehicle",
-            "vehicle_id": vehicle})
-
-    try:
-        r = requests.get(f"{base}/agent/control_authority", timeout=3)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as exc:
-        return JSONResponse(status_code=502, content={
-            "ok": False, "error": "Scout control-authority API unreachable",
-            "detail": str(exc)})
+        return {
+            "ok": True, "vehicle_id": vid, "available": False, "reachable": False,
+            "authority": None, "source": "scout",
+            "reason": "No Scout control-authority API configured for this vehicle",
+        }
+    return _scout_authority_read(vid, base)
 
 
 @app.get("/api/commands/history/{vehicle_id}")
@@ -1004,11 +1112,36 @@ def get_events(limit: int = 500):
     }
 
 
+# Last successful weather read (source freshness / graceful degradation). A transient
+# open-meteo failure then shows the last-known values dimmed with an age, rather than
+# blanking the widget or — worse — 500ing the whole endpoint.
+_env_cache = {"data": None, "fetched_at": None}
+_ENV_KEYS = ("temperature", "weather_code", "wind_speed", "wind_direction")
+
+
+def safe_local_time():
+    """Local wall-clock string that never raises. ZoneInfo needs the tz database, which
+    is absent on some hosts (no `tzdata`, no system zoneinfo) — there it raises
+    ZoneInfoNotFoundError. Falling back to a fixed Europe/Stockholm offset (CET/CEST is
+    a display nicety, not safety data) keeps the endpoint from 500ing on those hosts."""
+    try:
+        return datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%H:%M:%S")
+    except Exception:
+        # Approximate CET/CEST without tz data: UTC+1, +2 during summer DST months.
+        now = datetime.now(timezone.utc)
+        offset = 2 if 3 <= now.month <= 10 else 1
+        return (now + timedelta(hours=offset)).strftime("%H:%M:%S")
+
+
 @app.get("/api/environment")
 def environment():
-    lat = 56.699893
-    lng = 13.002148
-
+    """Weather/wind for the Map overlay. ALWAYS returns the same stable schema and
+    NEVER 500s — missing or unreachable sensors become null values with an
+    `available`/freshness indication, so the frontend can hide or dim the widget
+    instead of erroring. `available` = this response carries a real reading;
+    `stale` + `source_age_s` mark a served-from-cache reading after a fetch failure."""
+    now = datetime.now(timezone.utc)
+    lat, lng = 56.699893, 13.002148
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lng}"
@@ -1016,24 +1149,33 @@ def environment():
         "&timezone=Europe%2FStockholm"
     )
 
+    base = {"local_time": safe_local_time(), "generated_at": now.isoformat()}
+
     try:
         r = requests.get(url, timeout=5)
-        data = r.json()
-        current = data.get("current", {})
-
-        return {
-            "local_time": datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%H:%M:%S"),
+        r.raise_for_status()
+        current = (r.json() or {}).get("current", {}) or {}
+        data = {
             "temperature": current.get("temperature_2m"),
             "weather_code": current.get("weather_code"),
             "wind_speed": current.get("wind_speed_10m"),
             "wind_direction": current.get("wind_direction_10m"),
         }
-
+        _env_cache["data"] = data
+        _env_cache["fetched_at"] = now
+        return {**base, **data, "available": True, "stale": False,
+                "source": "open-meteo", "source_age_s": 0}
     except Exception as e:
-        return {
-            "error": str(e),
-            "local_time": datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%H:%M:%S"),
-        }
+        # Never 500: serve last-known (dimmed, with age) if we have it, else all-null.
+        cached = _env_cache["data"]
+        if cached:
+            age = (now - _env_cache["fetched_at"]).total_seconds() if _env_cache["fetched_at"] else None
+            return {**base, **cached, "available": False, "stale": True,
+                    "source": "open-meteo", "source_age_s": round(age, 1) if age is not None else None,
+                    "error": str(e)}
+        return {**base, **{k: None for k in _ENV_KEYS}, "available": False,
+                "stale": False, "source": "open-meteo", "source_age_s": None,
+                "error": str(e)}
 
 
 @app.get("/", include_in_schema=False)

@@ -19,6 +19,12 @@ export function battColor(b) {
 }
 
 export const fmtAge = (s) => (s == null ? "—" : `${Math.round(s)}s`);
+
+/** Operational state (armed / mode / effective authority) is only trustworthy while
+ *  the link is current. Anything not CONNECTED means the last reading may no longer
+ *  hold, so callers must render UNKNOWN rather than a stale ARMED/DISARMED/mode —
+ *  never assert an operational fact we can no longer confirm. */
+export const opsStale = (v) => commState(v) !== "connected";
 export const pad3 = (n) => String(n ?? 0).padStart(3, "0");
 
 /** build an element from an HTML string */

@@ -50,6 +50,8 @@ Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A)
 | `buffered_packets` | int | `communication.buffered_packets` | Vehicle, Autonomy | on packet | yes | store-and-forward depth |
 | `rssi` | dBm | **NO TELEM** (autopilot has it, not forwarded) | Vehicle, Video timeline, Autonomy | 1 s | yes | Show slot; add once logged |
 | `latency_rtt` | ms | **NO TELEM** | Vehicle | 1 s | yes | |
+| `mavlink.heartbeat_age_s` | s | **derived** in `mavlink_evidence()` from Scout MAVLink fields | Vehicle (Diagnostics: Pixhawk heartbeat, Pixhawk card) | 1 s | yes | REAL HEARTBEAT age only — never inferred from GPS/arrival. Absent → NOT AVAILABLE. See BACKEND_ROADMAP → "Pixhawk heartbeat / MAVLink evidence" |
+| `mavlink.connected` / `last_msg_age_s` / `msg_rate_hz` / `parser_errors` | bool/s/Hz/int | `communication.mavlink_*` / `payload.mavlink.*` | Vehicle (Diagnostics: MAVLink) | 1 s | yes | MAVLink link state + freshness. Absent → NOT AVAILABLE |
 
 ## Telemetry
 | Field | Type | Source | Pages | Freq | Opt | Notes |
@@ -115,9 +117,12 @@ Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A)
 ## Environment
 | Field | Type | Source | Pages | Freq | Opt | Notes |
 |---|---|---|---|---|---|---|
-| `wind_speed` / `wind_direction` | m/s / deg | `/api/environment` | Map (wind widget) | 10 min | yes | |
-| `temperature` / `weather_code` | °C / int | `/api/environment` | Map | 10 min | yes | |
-| `local_time` | string | `/api/environment` | Map/ribbon | 1 s | no | |
+| `wind_speed` / `wind_direction` | m/s / deg | `/api/environment` | Map (wind widget) | 10 min | yes | `null` when unavailable — widget hides/dims, never errors |
+| `temperature` / `weather_code` | °C / int | `/api/environment` | Map | 10 min | yes | `null` when unavailable |
+| `local_time` | string | `/api/environment` | Map/ribbon | 1 s | no | `safe_local_time()` never raises (ZoneInfo may be absent on some hosts) |
+| `available` / `stale` / `source_age_s` | bool/bool/s | `/api/environment` | Map | 10 min | no | Stable partial schema — endpoint NEVER 500s; `available:false`+`stale:true` = served from last-known cache after a fetch failure |
+
+Effective **control authority** (`GET /api/control_authority/{id}` → `authority`) is one of `OPERATOR` (operator holds the wheel), `LOCAL_AGENT` (autonomy), `RC` (RC transmitter override — reported only, not requestable), or `null` (unknown/unreachable/no source). The read also carries `available` (a source is configured) and `reachable` (we reached it). Take Control → OPERATOR, Release Control → LOCAL_AGENT. Stale link → the UI shows authority/arm/mode as UNKNOWN, never a last value.
 
 ## Config (drive the machine, not just UI prefs)
 | Field | Type | Source | Pages | Freq | Opt | Notes |

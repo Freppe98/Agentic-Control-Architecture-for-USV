@@ -62,9 +62,9 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 ## Command / control (reverse path)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|
-| command lifecycle (Return Home / Pause / Resume / Loiter) | Map, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | Feature unavailable | P1 · **backend done** (see `verification/commands.md`) |
-| command status (Pending/Executing/Finished/Failed, "queues until next contact") | Map, Mission | Operator backend | B-field | on change | E→B | Feature unavailable | P1 · **backend done** (queue + comm-state gating + Agent result) |
-| **command & control panel** (Take Control / Release Control + 9 command buttons + queue, gated on Scout-confirmed authority) | Vehicle | Scout Flask (authority) + Operator backend (queue) + Frontend | B-field | on action | E | Take Control / Release Control | P1 · **done** (see `verification/authority.md`, `verification/commands.md`) |
+| command lifecycle (modes AUTO/MANUAL/HOLD/LOITER/GUIDED/RTL, ARM/DISARM, MISSION_PAUSE/RESUME) | Map, Vehicle, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | state reported by vehicle | P1 · **backend done** (see `verification/commands.md`) |
+| command status (requested → sent → acknowledged → confirmed / rejected / timed-out) | Map, Vehicle, Mission | Operator backend | B-field | on change | E→B | never optimistic | P1 · **backend done** (queue + comm-state gating + Agent result) |
+| **command & control panel** (Take Control→OPERATOR / Release→LOCAL_AGENT + 10 command buttons + queue, gated on Scout-confirmed authority, PENDING until effective) | Map, Vehicle | Scout Flask (authority) + Operator backend (queue) + Frontend | B-field | on action | E | Take Control / Release Control | P1 · **done** (see `verification/authority.md`, `verification/commands.md`) |
 
 ## Events
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
@@ -102,6 +102,20 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 | MAVLink / Pixhawk heartbeat / RC receiver / camera / mission-service checks | Vehicle (Diagnostics) | USV → Agent / Scout Flask | A-out — no field carries these yet, even once the endpoint above exists | on demand | A/C | Not available | P2 |
 
 Checked against this repo 2026-07-12: `motherpi/services/flask` (Scout's Flask service, `Scripts/control_authority.py`'s counterpart) is not part of this codebase — only its client stub and the operator-backend's `control_authority` proxy are. No route named `diagnostics` or `system_check` exists anywhere in the repo. Until Scout ships one, `Vehicle.js`'s "Run System Check" computes its PASS/WARN/FAIL checks from fields the operator backend already has (comm state, local-agent reporting, GPS fix, battery, CPU/disk/RAM, operator-reachability, Scout-confirmed authority) and marks the rest **Not available** — never a guessed PASS.
+
+### Pixhawk heartbeat / MAVLink evidence — Scout-side schema (consumed now)
+
+Updated 2026-07-12: the operator backend now **consumes** real MAVLink/heartbeat evidence when Scout forwards it. `normalize_agent_message` (`mavlink_evidence()`) reads the candidate fields below off `payload.communication` / `payload.health` / `payload.mavlink` and exposes a stable `mavlink` block on every fleet vehicle. `Vehicle.js` diagnostics turn that into real **Pixhawk heartbeat** and **MAVLink** checks (PASS ≤3 s, WARN ≤10 s, FAIL beyond; NOT AVAILABLE when absent). **Heartbeat is never inferred from GPS/position or arrival age** — only a real MAVLink HEARTBEAT field counts. Scout should emit any of (first present wins):
+
+| Operator field (`vehicle.mavlink.*`) | Scout source fields it accepts | Meaning |
+|---|---|---|
+| `heartbeat_age_s` | `communication.heartbeat_age_s`, `health.pixhawk_heartbeat_age_s`, or `communication.last_heartbeat` / `mavlink.last_heartbeat` (epoch/ISO → age) | seconds since the last MAVLink HEARTBEAT Scout received from the Pixhawk |
+| `connected` | `communication.mavlink_connected` / `mavlink.connected` | MAVLink link up? |
+| `last_msg_age_s` | `communication.mavlink_last_msg_age_s`, or `mavlink.last_msg_time` (epoch/ISO → age) | age of the last MAVLink message of any type |
+| `msg_rate_hz` | `communication.mavlink_msg_rate_hz` / `mavlink.msg_rate_hz` | inbound MAVLink message rate |
+| `parser_errors` | `communication.mavlink_parser_errors` / `mavlink.parser_errors` | parser health (optional) |
+
+Until Scout forwards these, the two checks correctly read **Not available** (which never fails the overall System Check). The `battery` / `RC receiver` / `camera` / `mission service` checks likewise stay **Not available** while those subsystems are disabled. The **RC receiver detected/healthy** signal still has no telemetry field — Vehicle.js now separates the three RC concerns (override *policy* = always-available invariant; *receiver detected* = no telem; *override active* = derived from effective authority `== RC`).
 
 ## Video / Pilot (pages not yet migrated)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |

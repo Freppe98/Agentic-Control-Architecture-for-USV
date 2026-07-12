@@ -12,7 +12,8 @@ import { CommsPill } from "../components/CommsPill.js";
 import { BatteryBar } from "../components/BatteryBar.js";
 import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
-import { commState, cls, fmtAge, pad3, noTelem } from "../lib/ui.js";
+import { commState, cls, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
+import { createAuthorityController } from "../lib/authority.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
@@ -43,8 +44,9 @@ const DIAG_RUN_MS = 550;
 // Control card below; there is no separate/independent authority store.
 const CMDS = [
   ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"], ["SET_MODE_HOLD", "HOLD"],
-  ["SET_MODE_GUIDED", "GUIDED"], ["RTL", "RTL"], ["MISSION_PAUSE", "PAUSE"],
-  ["MISSION_RESUME", "RESUME"], ["ARM", "ARM"], ["DISARM", "DISARM"],
+  ["SET_MODE_LOITER", "LOITER"], ["SET_MODE_GUIDED", "GUIDED"], ["RTL", "RTL"],
+  ["MISSION_PAUSE", "PAUSE MISSION"], ["MISSION_RESUME", "RESUME MISSION"],
+  ["ARM", "ARM"], ["DISARM", "DISARM"],
 ];
 const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
 const CMD_STATUS_CLS = { QUEUED: "u", SENT: "p", ACCEPTED: "p", EXECUTED: "c", REJECTED: "d", FAILED: "d", EXPIRED: "u" };
@@ -53,21 +55,21 @@ const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stro
 
 export function Vehicle(root) {
   let fleet = [], selId = null, cmds = [];
-  let authority = null;  // { authority: "OPERATOR"|"LOCAL_AGENT" } for the selected vehicle, or null (unknown)
   let diag = { status: "idle", results: null, ranAt: null, durationMs: null };  // per-selected-vehicle; reset on selection change
 
-  // Control authority — a dedicated read (GET /api/control_authority/{id}, itself a
-  // live proxy to Scout's own Flask API), NOT part of the fleet payload and NOT the
-  // command queue. Loaded on selection + refreshed on a timer, same pattern as the
-  // fleet poll. null (not "OPERATOR") on any fetch failure — an unreachable Scout
-  // must read as unknown, not a guess. Scout is the ONLY source of truth for
-  // authority; the operator backend holds none of its own.
+  // Control authority — a dedicated read (GET /api/control_authority/{id}, a live
+  // proxy to Scout's Flask API), fed through the shared authority controller so a
+  // hand-off is PENDING until the effective value Scout reports confirms it (then
+  // confirmed / rejected / timeout). NOT fleet data, NOT the command queue. Scout is
+  // the sole source of truth; the operator backend holds no authority of its own.
+  //   Take Control  → request OPERATOR   Release Control → request LOCAL_AGENT
+  const authCtl = createAuthorityController(() => renderDetail());
   function loadAuthority(id) {
-    if (id == null) { authority = null; return; }
+    if (id == null) return;
     api.getControlAuthority(id).then((a) => {
-      if (id === selId) { authority = a; renderDetail(); }
+      if (id === selId) authCtl.setServer(a);
     }).catch(() => {
-      if (id === selId) { authority = null; renderDetail(); }
+      if (id === selId) authCtl.setServer({ ok: true, available: true, reachable: false, authority: null });
     });
   }
   function refreshCommands() {
@@ -85,7 +87,7 @@ export function Vehicle(root) {
   }
   function selectVehicle(id) {
     if (id !== selId) {
-      selId = id; authority = null; loadAuthority(id);
+      selId = id; authCtl.reset(); loadAuthority(id);
       diag = { status: "idle", results: null, ranAt: null, durationMs: null };
       cmds = []; refreshCommands();
     }
@@ -175,10 +177,11 @@ export function Vehicle(root) {
   // whether the safety fallback works".
   const rcAlwaysCell = '<span class="txt-c" title="RC transmitter always retains hardware-level override, independent of software control authority">Always</span>';
 
-  function computeDiagnostics(v, authVal) {
+  function computeDiagnostics(v, av) {
     const cs = commState(v);
     const h = v.health || {};
     const c = v.communication || {};
+    const mav = v.mavlink || {};
     const pass = (note) => ({ status: "pass", note });
     const warn = (note) => ({ status: "warn", note });
     const fail = (note) => ({ status: "fail", note });
@@ -186,10 +189,41 @@ export function Vehicle(root) {
     // Same warn/fail breakpoints as the matrix/subsystem cards (subsys() above) — CPU
     // runs hotter-tolerant (85/65) than storage/memory (90/75), kept in sync here.
     const pctCheck = (val, label, hi, mid) => val == null ? gap() : val > hi ? fail(val + "% " + label) : val > mid ? warn(val + "% " + label) : pass(val + "% " + label);
+
+    // Pixhawk HEARTBEAT freshness — from a REAL MAVLink HEARTBEAT age forwarded by
+    // Scout (v.mavlink.heartbeat_age_s), NEVER inferred from GPS/position or arrival
+    // age. Absent evidence → NOT AVAILABLE, never a fabricated PASS. PASS ≤3s (nominal
+    // 1 Hz heartbeat), WARN ≤10s, FAIL beyond.
+    const hb = mav.heartbeat_age_s;
+    const pixhawk = hb == null ? gap()
+      : hb <= 3 ? pass(`Heartbeat ${hb.toFixed(1)}s ago`)
+      : hb <= 10 ? warn(`Heartbeat ${hb.toFixed(1)}s ago`)
+      : fail(`No heartbeat for ${hb.toFixed(0)}s`);
+
+    // MAVLink link — connection state + age of last MAVLink message (+ rate/parser
+    // health when present). Absent evidence → NOT AVAILABLE.
+    const age = mav.last_msg_age_s, rate = mav.msg_rate_hz, connected = mav.connected;
+    const rateNote = rate != null ? `, ${rate} Hz` : "";
+    let mavlink;
+    if (connected == null && age == null && rate == null) mavlink = gap();
+    else if (connected === false) mavlink = fail("Disconnected");
+    else if (age == null) mavlink = pass(`Connected${rateNote}`);
+    else if (age <= 3) mavlink = pass(`Last msg ${age.toFixed(1)}s ago${rateNote}`);
+    else if (age <= 10) mavlink = warn(`Last msg ${age.toFixed(1)}s ago${rateNote}`);
+    else mavlink = fail(`No MAVLink message for ${age.toFixed(0)}s`);
+
+    // Authority service reachability. Has an effective value → PASS; configured but
+    // unreachable → WARN (a degraded service, not a hard subsystem FAIL); no source
+    // configured → NOT AVAILABLE (never fails the overall check).
+    const authority = av && av.value ? pass(av.value)
+      : av && av.available && !av.reachable ? warn("Authority service unreachable")
+      : !av || !av.available ? gap()
+      : warn("Authority unknown");
+
     return {
       comm: cs === "connected" ? pass("Link current") : cs === "partitioned" ? warn("Link partitioned") : fail("Link down"),
-      mavlink: gap(),
-      pixhawk: gap(),
+      mavlink,
+      pixhawk,
       local_agent: v.online ? pass("Reporting") : fail("Not reporting"),
       gps: v.lat != null && v.lng != null ? pass("3D fix") : warn("No fix"),
       battery: v.battery == null ? gap() : v.battery < 20 ? fail(v.battery + "% remaining") : v.battery < 40 ? warn(v.battery + "% remaining") : pass(v.battery + "% remaining"),
@@ -200,7 +234,7 @@ export function Vehicle(root) {
       cpu: pctCheck(h.cpu_load, "load", 85, 65),
       memory: pctCheck(h.ram_usage, "used", 90, 75),
       network: c.operator_reachable == null ? gap() : c.operator_reachable ? pass("Operator reachable") : fail("Operator unreachable"),
-      authority: authVal === "OPERATOR" || authVal === "LOCAL_AGENT" ? pass(authVal) : fail("Unreachable"),
+      authority,
     };
   }
 
@@ -237,7 +271,7 @@ export function Vehicle(root) {
       if (selId !== v.id) return; // selection moved on while "running"
       diag = {
         status: "done",
-        results: computeDiagnostics(v, authority && authority.authority),
+        results: computeDiagnostics(v, authCtl.view()),
         ranAt: new Date().toISOString(),
         durationMs: Date.now() - startedAt,
       };
@@ -246,12 +280,14 @@ export function Vehicle(root) {
   }
 
   // ---- Control actions (authority hand-off + command queue), Scout-confirmed only ----
+  // Take Control → OPERATOR, Release Control → LOCAL_AGENT. The request goes PENDING
+  // and is confirmed only when Scout's reported effective authority matches — the
+  // controller (not this click) decides confirmed/rejected/timeout.
   async function authorityAction(target, vname) {
-    if (target === "LOCAL_AGENT" &&
-        !window.confirm(`Take control of ${vname}?\n\nThis grants permission for operator commands to execute. It does NOT arm the vehicle or change its mode.`)) return;
-    const res = await api.setControlAuthority(selId, target);
-    if (!res.ok) window.alert((res.data && (res.data.message || res.data.error)) || "Authority change failed.");
-    loadAuthority(selId);
+    if (target === "OPERATOR" &&
+        !window.confirm(`Take control of ${vname}?\n\nThis requests OPERATOR authority so operator commands can execute. It does NOT arm the vehicle or change its mode.`)) return;
+    const res = await authCtl.request(target, (a) => api.setControlAuthority(selId, a));
+    if (res && !res.ok) window.alert((res.data && (res.data.message || res.data.error)) || "Authority change failed.");
     refreshCommands();
   }
 
@@ -284,17 +320,38 @@ export function Vehicle(root) {
       ? faults.map((f) => `<div class="frow"><span class="fd" style="background:var(--${f.sev})"></span><span class="txt-${f.sev === "warn" ? "d" : "p"}">${f.l} — ${f.val}</span></div>`).join("")
       : `<div class="frow none">No active faults — all reporting subsystems nominal</div>`;
 
-    // Control authority is fetched separately (loadAuthority), not derived from fleet
-    // data — it's a direct, dedicated proxy to Scout's own Flask API, the sole source
-    // of truth. hasControl gates both the mission-command buttons below and this
-    // page's command panel identically.
-    const authVal = authority && authority.authority;
-    const hasControl = authVal === "LOCAL_AGENT";
-    const authoritySeg = AuthoritySeg(authVal);
+    // Control authority via the controller (pending → confirmed/rejected/timeout).
+    //   Take Control  → OPERATOR (operator holds the wheel; commands enabled)
+    //   Release Control → LOCAL_AGENT (autonomy resumes)
+    // When the link is stale the effective authority is no longer trustworthy → UNKNOWN;
+    // commands are then locked. hasControl requires a CONFIRMED OPERATOR (never a click).
+    const av = authCtl.view();
+    const authVal = stale ? null : av.value;
+    const busy = av.phase === "pending";
+    const hasControl = !stale && av.hasControl;
+    const authoritySeg = AuthoritySeg(authVal, { phase: av.phase, pending: av.pending });
     const operatorReachable = v.communication && v.communication.operator_reachable;
     const operatorReachCell = operatorReachable != null ? (operatorReachable ? '<span class="txt-c">Yes</span>' : '<span class="txt-p">No</span>') : noTelem("no telem");
     const armed = t.armed;
-    const armedCell = armed == null ? noTelem("no telem") : armed ? '<span class="txt-d">ARMED</span>' : '<span class="txt-c">DISARMED</span>';
+    // Arm state is an operational fact — only assert it while the link is current.
+    const armedCell = stale ? '<span class="txt-u">UNKNOWN</span>'
+      : armed == null ? noTelem("no telem")
+      : armed ? '<span class="txt-d">ARMED</span>' : '<span class="txt-c">DISARMED</span>';
+    const modeCell = stale ? '<span class="txt-u">UNKNOWN</span>' : (t.mode || noTelem("no telem"));
+
+    // Pixhawk HEARTBEAT age — a REAL MAVLink heartbeat field (v.mavlink), kept separate
+    // from "Last contact" (operator-link arrival). Never inferred from GPS/arrival.
+    const mav = v.mavlink || {};
+    const heartbeatCell = mav.heartbeat_age_s != null
+      ? `<span class="txt-${mav.heartbeat_age_s <= 3 ? "c" : mav.heartbeat_age_s <= 10 ? "p" : "d"}">${mav.heartbeat_age_s.toFixed(1)}s ago</span>`
+      : noTelem("no telem");
+
+    // RC axis — three DISTINCT things, never conflated:
+    //   policy   : override is always available as a hardware fallback (config invariant)
+    //   receiver : is an RC receiver detected/healthy? (no telemetry field yet → no telem)
+    //   active   : is an RC override CURRENTLY seizing control? (authority === RC)
+    const rcActiveCell = stale || !av.reachable ? noTelem("no telem")
+      : av.value === "RC" ? '<span class="txt-d">ACTIVE</span>' : '<span class="txt-c">Inactive</span>';
 
     // ---- Overall Health ----
     const healthCard = `<div class="sub full"><div class="sub-head ${ov == null ? "idle" : ov}"><span class="hd"></span><span class="nm">Overall Health</span><span class="cond">${ov == null ? "No signal" : ov === "ok" ? "Nominal" : ov === "warn" ? "Warning" : "Caution"}</span></div>
@@ -305,31 +362,53 @@ export function Vehicle(root) {
       </div></div>`;
 
     // ---- Vehicle State ----
+    // Independent axes — arm state, Pixhawk mode, effective authority, and mission
+    // state are shown separately and never derived from one another.
     const vehicleStateCard = panelCard("Vehicle State", v.online ? "Reporting" : "Offline", v.online ? "ok" : "warn",
       `<div class="metrics">
         ${row("Armed", armedCell, "keep")}
-        ${row("Mode", t.mode || noTelem("no telem"), "keep")}
+        ${row("Mode", modeCell, "keep")}
         ${row("Authority", authoritySeg, "keep")}
-        ${row("RC present", rcAlwaysCell, "keep")}
+        ${row("RC override active", rcActiveCell, "keep")}
         ${row("Operator reachable", operatorReachCell, "keep")}
         ${row("Local Agent", v.online ? '<span class="txt-c">Online</span>' : '<span class="txt-d">Offline</span>', "keep")}
-        ${row("Last heartbeat", fmtAge(v.last_seen_age_s), "keep")}
+        ${row("Pixhawk heartbeat", heartbeatCell, "keep")}
+        ${row("Last contact (link)", fmtAge(v.last_seen_age_s), "keep")}
       </div>`);
 
     // ---- Control (authority hand-off + command queue, Scout-confirmed only) ----
-    const controlCond = hasControl ? "Local Agent engaged" : authVal === "OPERATOR" ? "RC / manual" : "Unknown";
-    const controlClass = hasControl ? "ok" : authVal === "OPERATOR" ? "idle" : "warn";
+    // OPERATOR = operator holds the wheel (commands enabled); LOCAL_AGENT = autonomy;
+    // RC = physical transmitter override. A hand-off in flight shows as PENDING.
+    const controlCond = busy ? "Requesting…"
+      : hasControl ? "Operator engaged"
+      : av.value === "LOCAL_AGENT" ? "Local Agent (autonomy)"
+      : av.value === "RC" ? "RC override active"
+      : "Unknown";
+    const controlClass = hasControl ? "ok" : av.value === "LOCAL_AGENT" ? "idle" : busy ? "caution" : "warn";
     const authBadge = hasControl
-      ? `<span class="auth-badge on"><i></i>LOCAL AGENT ENGAGED</span>`
-      : `<span class="auth-badge"><i></i>${authVal === "OPERATOR" ? "RC / OPERATOR" : "UNKNOWN"}</span>`;
-    const authNote = hasControl
-      ? `Operator commands are <b>enabled</b> for ${vname}. Releasing returns authority to RC/manual without changing the vehicle's mode.`
-      : authVal === "OPERATOR"
-        ? `RC holds exclusive authority — command buttons are disabled. Press <b>Take Control</b> to hand off to the Local Agent. This does not arm the vehicle or change its mode.`
-        : `Control authority is unknown — Scout's control-authority API did not respond. Commands stay disabled until authority is confirmed.`;
+      ? `<span class="auth-badge on"><i></i>OPERATOR ENGAGED</span>`
+      : `<span class="auth-badge"><i></i>${busy ? "REQUESTING…" : av.value === "LOCAL_AGENT" ? "LOCAL AGENT" : av.value === "RC" ? "RC OVERRIDE" : "UNKNOWN"}</span>`;
+    const p = av.pending;
+    const authNote = busy
+      ? `Requesting <b>${p && p.requested === "OPERATOR" ? "OPERATOR" : "LOCAL AGENT"}</b> authority for ${vname} — awaiting confirmation from the vehicle. Commands stay locked until confirmed.`
+      : p && p.phase === "rejected"
+        ? `Authority request rejected — ${p.reason || "not accepted"}.`
+      : p && p.phase === "timeout"
+        ? `Authority request timed out — ${p.reason || "no confirmation from the vehicle"}.`
+      : hasControl
+        ? `Operator commands are <b>enabled</b> for ${vname}. Releasing hands authority back to the Local Agent without changing the vehicle's mode.`
+      : av.value === "LOCAL_AGENT"
+        ? `The Local Agent holds control (autonomy). Press <b>Take Control</b> to request OPERATOR authority. This does not arm the vehicle or change its mode.`
+      : av.value === "RC"
+        ? `An RC transmitter override is active — it holds physical control. Take Control requests OPERATOR authority once RC releases.`
+      : stale
+        ? `Authority is <b>UNKNOWN</b> — telemetry is stale. Commands stay locked until the link is current.`
+        : `Control authority is unknown — Scout's control-authority service did not respond. Commands stay locked until authority is confirmed.`;
+    // Take Control → OPERATOR when the operator does not already hold it; Release →
+    // LOCAL_AGENT. Disabled while a request is in flight or the link is stale.
     const authBtn = hasControl
-      ? `<button class="ctl-auth release" data-auth="OPERATOR">Release Control</button>`
-      : `<button class="ctl-auth engage" data-auth="LOCAL_AGENT">Take Control</button>`;
+      ? `<button class="ctl-auth release" data-auth="LOCAL_AGENT"${busy ? " disabled" : ""}>Release Control</button>`
+      : `<button class="ctl-auth engage" data-auth="OPERATOR"${busy || stale || !av.available ? " disabled" : ""}>Take Control</button>`;
     const cmdBtns = CMDS.map(([type, label]) => {
       const hr = HIGH_RISK.has(type);
       return `<button class="ctl-cmd${hr ? " hr" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${type}${hr ? " · confirmation required" : ""}">${label}</button>`;
@@ -347,7 +426,9 @@ export function Vehicle(root) {
       `<div class="metrics">
         ${row("Authority", authoritySeg, "keep")}
         ${row("Operator connected", operatorReachCell, "keep")}
-        ${row("RC override available", rcAlwaysCell, "keep")}
+        ${row("RC override policy", rcAlwaysCell, "keep")}
+        ${row("RC receiver detected", noTelem("no telem"), "keep")}
+        ${row("RC override active", rcActiveCell, "keep")}
       </div>
       <div style="padding:13px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line)">
         <div class="ctl-auth-bar${hasControl ? " engaged" : ""}">
@@ -425,11 +506,15 @@ export function Vehicle(root) {
     const camera = subCard("Camera", null,
       naRow("Signal") + naRow("Resolution") + naRow("Recording"), false);
 
-    const pixhawkSev = t.mode == null && armed == null ? null : armed ? "caution" : "ok";
+    // Pixhawk fault axis stays "no signal" when the link is stale (arm/mode are then
+    // UNKNOWN, not a caution/ok we can assert). Heartbeat evidence is a real MAVLink age.
+    const pixhawkSev = stale ? null : t.mode == null && armed == null ? null : armed ? "caution" : "ok";
     const pixhawk = subCard("Pixhawk", pixhawkSev,
       row("Armed", armedCell, "keep") +
-      row("Mode", t.mode || noTelem("no telem"), "keep") +
-      naRow("Firmware version") + naRow("Motor temp"), stale);
+      row("Mode", modeCell, "keep") +
+      row("Heartbeat", heartbeatCell, "keep") +
+      (mav.msg_rate_hz != null ? row("MAVLink rate", mav.msg_rate_hz + " Hz", "keep") : naRow("MAVLink rate")) +
+      naRow("Firmware version"), stale);
 
     const missionSev = md.mission_active == null ? null : md.mission_active ? "ok" : "idle";
     const mission = subCard("Mission", missionSev,
@@ -473,7 +558,10 @@ export function Vehicle(root) {
 
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
-    if (selId == null && fleet.length) selectVehicle(fleet[0].id);
+    // Open on a vehicle that is actually reporting rather than a placeholder template row.
+    if (selId == null && fleet.length) {
+      selectVehicle((fleet.find((x) => x.online) || fleet.find((x) => x.lat != null) || fleet[0]).id);
+    }
     document.getElementById("vcount").textContent = `${fleet.length} vehicles`;
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
     document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selectVehicle(+el.dataset.id); onFleet(fleet); }));
@@ -487,5 +575,5 @@ export function Vehicle(root) {
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(commandsId); };
+  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(commandsId); authCtl.dispose(); };
 }

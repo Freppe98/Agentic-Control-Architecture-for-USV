@@ -1,54 +1,64 @@
-# Command & Control panel (Vehicle page)
+# Control authority & command panel (Map + Vehicle pages)
 
-Adds a command panel to the Vehicle page's **Control** card: Take Control / Release
-Control, the nine reverse-path command buttons (AUTO/MANUAL/HOLD/GUIDED/RTL/PAUSE/
-RESUME/ARM/DISARM), and a live command queue/history.
+Take Control / Release Control plus the reverse-path command buttons live on **both**
+the Map inspector (primary operational view) and the Vehicle Control card. Both drive
+the same shared authority state machine (`operator/lib/authority.js`) and the same
+command queue.
 
-**Revision (superseding an earlier version of this doc):** this panel was first built
-against a new, independent backend-owned authority store (`authority_by_id`,
-`GET/POST /api/authority/{id}`, default OPERATOR, gating command create/deliver). That
-duplicated the existing control-authority design and could show the operator two
-different, possibly contradictory "who's in control" answers on the same page. It has
-been removed. **Scout Flask remains the sole source of truth for control authority** —
-see `commands.md` ("Control authority"). This doc now only covers the panel UI and how
-it plugs into the existing Scout-proxy endpoints and command queue.
+**Revision 2026-07-12 — corrected authority semantics.** An earlier version mapped the
+buttons the wrong way round (Take Control → `LOCAL_AGENT`, `hasControl` keyed off
+`LOCAL_AGENT`). The effective-authority axis is now:
 
-## Model
-- Authority is read live from `GET /api/control_authority/{vehicle}` (Scout proxy, not
-  cached — see `commands.md`). There is no operator-backend authority store.
-- The panel's command buttons are enabled **only** when the latest Scout-confirmed
-  authority is `LOCAL_AGENT`. Same gate as the Map page's Take Control / Release
-  Control and the Vehicle page's own Authority row (`AuthoritySeg`) — one value, read
-  once per page, never duplicated into a second opinion.
-- Release must **first** succeed against Scout (`POST /api/control_authority/{vehicle}`
-  `{authority:"OPERATOR"}`); only after Scout confirms does the backend cancel
-  still-pending commands (`cancel_pending_commands` in `main.py`, called from
-  `set_control_authority` — see `commands.md`). Take Control does not touch the queue.
+| Effective authority | Meaning | Requested by |
+|---|---|---|
+| `OPERATOR` | operator holds the wheel; operator commands may execute | **Take Control** |
+| `LOCAL_AGENT` | the autonomous local agent holds the wheel (mission runs) | **Release Control** |
+| `RC` | RC transmitter override physically active | *reported only* — not requestable |
+| `null` | unknown / unreachable / no source configured | — |
+
+Scout Flask remains the **sole source of truth** for the authority value — the operator
+backend holds none of its own (see `commands.md`).
+
+## Pending → confirmed / rejected / timeout (never optimistic)
+A Take/Release click never asserts success. `createAuthorityController` puts the
+request into **PENDING** and only settles it when the *effective* authority Scout
+reports matches what was requested (**CONFIRMED**), Scout answers with a
+failure/different value (**REJECTED**), or no confirmation arrives within
+`AUTH_TIMEOUT_MS` (8 s → **TIMEOUT**). Command buttons enable **only** on a confirmed
+`OPERATOR`, and are withheld while any request is in flight.
 
 ## Backend (`main.py`)
-- No authority state, no `/api/authority/{id}`. The command queue
-  (`POST /api/commands`, `GET /api/commands/pending/{id}`) is gated only by comm-state
-  and high-risk confirmation, as before — **not** by a stored authority value; the UI
-  gate (buttons disabled unless Scout says LOCAL_AGENT) is what keeps commands from
-  being issued while RC/manual holds authority.
-- `cancel_pending_commands` (unchanged) still expires in-flight commands on a
-  Scout-confirmed Release, so a stale QUEUED/SENT command can never fire after a later
-  Take Control.
+- `POST /api/control_authority/{vehicle}` accepts only `OPERATOR` | `LOCAL_AGENT`
+  (`RC` is a hardware takeover, never requestable → 400). Forwards to Scout and returns
+  a normalized ack `{requested, authority(effective), available, reachable}` so the UI
+  confirms against the effective value, not the button.
+- `GET /api/control_authority/{vehicle}` distinguishes three cases so the 2 s poll is
+  quiet and honest: **unknown vehicle id → 404**; **known but no Scout API → 200
+  `available:false`** (not a 404 — that spammed the console and conflated "no such
+  vehicle" with "no authority backend"); **known + Scout configured → live proxy**, with
+  `reachable:false`+`authority:null` if Scout doesn't answer (never a console 5xx).
+- On a confirmed **Release** (`LOCAL_AGENT`) the backend cancels still-pending queue
+  commands (`cancel_pending_commands`) so a stale operator command cannot fire once
+  autonomy is back in control. **Take Control does not touch the queue.**
 
-## Frontend (Vehicle page)
-- `services/api.js`: `createCommand`, `getCommands` (command queue); `getControlAuthority`
-  / `setControlAuthority` (Scout proxy, unchanged); `postJSON` returns `{ ok, status,
-  data }` and does not throw on 4xx, so the panel can act on `needs_confirmation`
-  without a try/catch per call.
-- The panel lives inside the existing **Control** card (`Vehicle.js`), not a separate
-  section — one Control area on the page, not two.  High-risk (ARM/DISARM/RTL/AUTO) are
-  amber and prompt an extra confirmation (sent `confirm:true`); a DISCONNECTED create
-  prompts "queue anyway?". The queue shows only backend-reported status — the UI never
-  asserts a command executed.
+## Frontend
+- `operator/lib/authority.js` — shared controller (pending/confirm/reject/timeout),
+  used by both `pages/Map.js` and `pages/Vehicle.js`; no per-page duplication.
+- `components/AuthoritySeg.js` — RC · Operator · Local Agent segments; RC lights
+  **active** on an `RC` takeover (distinct from its baseline always-available "ready"),
+  and a hand-off in flight pulses the requested segment.
+- Stale link (`opsStale`, comm ≠ CONNECTED) → authority/arm/mode render **UNKNOWN**,
+  commands locked. Never shows a last-known authority as if current.
 
 ## Notes / honesty
-- Taking or releasing control performs **no** vehicle action by itself (no arm/disarm/
-  mode change) — it only changes who may issue commands; Scout's own
-  `/agent/control_authority` is the only place that value lives.
+- Taking or releasing control performs **no** vehicle action by itself — it only changes
+  who may issue commands; no arm/disarm/mode change.
 - Command execution is still only ever confirmed by a Local Agent result (see
   `commands.md`).
+
+## Verified 2026-07-12 (Playwright against live backend + reachable Scout)
+- Default-selected vehicle = Scout (first reporting vehicle), not the placeholder id 1.
+- Take Control from `LOCAL_AGENT`: pending → **confirmed OPERATOR**; the 10 command
+  buttons enable only after confirmation. Release → `LOCAL_AGENT` re-locks them.
+- Selecting id 1 (no Scout API) then back to id 2: endpoint vehicle id follows the
+  selection; **no 404/500**, no console errors; id 1 reads UNKNOWN (stale), not an error.
