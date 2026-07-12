@@ -12,20 +12,28 @@ import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
 import { createAuthorityController } from "../lib/authority.js";
+import { AVAIL, availSlot } from "../lib/availability.js";
 
 const HOME = [56.699893, 13.002148];
 
-// Compact operational controls for the primary map view. Vehicle/Pixhawk modes are
-// real ArduRover modes; PAUSE/RESUME are agent MISSION commands (NOT Pixhawk modes),
-// grouped separately. Every button goes through the command pipeline (api.createCommand)
-// and its state is reported by the vehicle — never assumed from the click.
+// The primary map view carries ONLY the essential operational controls, split into
+// two clearly separated cards so the operator never confuses commanding the vehicle
+// with supervising the agent:
+//   • Vehicle Commands — real ArduRover / Pixhawk modes + the ARM/DISARM safety pair.
+//     Completely independent of the local agent. (GUIDED/HOLD live on the Vehicle page;
+//     the map keeps the primary workflow short.)
+//   • Agent Commands — supervisory MISSION pause/resume (NOT Pixhawk modes).
+// Every button goes through the same command pipeline (api.createCommand) and its
+// state is reported by the vehicle — never assumed from the click.
 const MAP_MODES = [
-  ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"], ["SET_MODE_HOLD", "HOLD"],
-  ["SET_MODE_LOITER", "LOITER"], ["SET_MODE_GUIDED", "GUIDED"], ["RTL", "RTL"],
+  ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"],
+  ["SET_MODE_LOITER", "LOITER"], ["RTL", "RTL"],
 ];
 const MAP_SAFETY = [["ARM", "ARM"], ["DISARM", "DISARM"]];
+const MAP_VEHICLE = [...MAP_MODES, ...MAP_SAFETY];
 const MAP_MISSION = [["MISSION_PAUSE", "PAUSE MISSION"], ["MISSION_RESUME", "RESUME MISSION"]];
 const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
+const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
 // Command lifecycle → the operator-facing phase it represents (requested/pending,
 // acknowledged, confirmed effective, rejected, timeout).
 const CMD_PHASE = {
@@ -243,8 +251,12 @@ export function Map(root) {
         ${authNote(av, stale)}
       </div>
       <div class="isec">
-        <div class="sec-title"><span class="lbl">Vehicle &amp; agent commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">state reported by vehicle</span></div>
-        ${controlPanel(hasControl, av, stale)}
+        <div class="sec-title"><span class="lbl">Vehicle Commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">Pixhawk · state reported by vehicle</span></div>
+        ${vehicleCommands(hasControl, av, stale)}
+      </div>
+      <div class="isec">
+        <div class="sec-title"><span class="lbl">Agent Commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">supervisory · local agent</span></div>
+        ${agentCommands(hasControl, av, stale, v)}
       </div>
       <div class="isec">
         <div class="tele ${stale ? "stale" : ""}">
@@ -297,19 +309,48 @@ export function Map(root) {
     return "";
   }
 
-  // Compact command set for the primary view: real ArduRover modes, the ARM/DISARM
-  // safety pair, and the agent MISSION pause/resume (kept visually separate — mission
-  // commands are not Pixhawk modes). Enabled only on confirmed OPERATOR authority.
-  function controlPanel(hasControl, av, stale) {
-    const grp = (title, items) =>
-      `<div class="cmd-grp"><span class="cmd-grp-l">${title}</span><div class="ctl-cmds${hasControl ? "" : " locked"}">` +
+  // A row of command buttons; the ARM/DISARM etc. high-risk ones carry the caution
+  // style + a confirmation. Enabled only on confirmed OPERATOR authority.
+  function cmdBtns(items, hasControl) {
+    return `<div class="ctl-cmds${hasControl ? "" : " locked"}">` +
       items.map(([type, label]) => {
         const hr = HIGH_RISK.has(type);
         return `<button class="ctl-cmd${hr ? " hr" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${type}${hr ? " · confirmation required" : ""}">${label}</button>`;
-      }).join("") + `</div></div>`;
-    const lock = hasControl ? "" :
-      `<div class="ctl-lock-note">${'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>'}<span>${stale ? "Link not current" : av.value === "OPERATOR" ? "" : "Commands are locked"} — Take Control (OPERATOR, Scout-confirmed) to enable.</span></div>`;
-    return grp("Modes", MAP_MODES) + grp("Safety", MAP_SAFETY) + grp("Mission (agent)", MAP_MISSION) + lock + cmdStatus();
+      }).join("") + `</div>`;
+  }
+  function lockNote(hasControl, av, stale) {
+    if (hasControl) return "";
+    return `<div class="ctl-lock-note">${lockSvg}<span>${stale ? "Link not current" : av.value === "OPERATOR" ? "" : "Commands are locked"} — Take Control (OPERATOR, Scout-confirmed) to enable.</span></div>`;
+  }
+
+  // Vehicle/Pixhawk commands ONLY — real ArduRover modes + the ARM/DISARM safety pair.
+  // Independent of the local agent. The "Last command" line reports the queue lifecycle.
+  function vehicleCommands(hasControl, av, stale) {
+    return cmdBtns(MAP_VEHICLE, hasControl) + lockNote(hasControl, av, stale) + cmdStatus();
+  }
+
+  // Agent/supervisory commands ONLY — pause/resume the mission the local agent runs —
+  // plus the agent's current and immediately-previous status (no long history here;
+  // the Agent page owns the full reasoning view). Current status is approximated from
+  // mission_state (LIVE while connected, LAST KNOWN when stale); the previous status
+  // needs an onboard decision log the agent does not emit yet → honest gap.
+  function agentCommands(hasControl, av, stale, v) {
+    return cmdBtns(MAP_MISSION, hasControl) + lockNote(hasControl, av, stale) + agentStatusBlock(v);
+  }
+
+  function agentStatusBlock(v) {
+    const connected = commState(v) === "connected";
+    const age = v.last_seen_age_s, hasContact = age != null;
+    const raw = v.status || (v.mission_data && v.mission_data.mission_state) || null;
+    const behavior = (hasContact && raw && !["unknown", "lost"].includes(String(raw).toLowerCase())) ? raw : null;
+    const curSlot = behavior
+      ? availSlot(connected ? AVAIL.LIVE : AVAIL.LAST_KNOWN, { value: behavior, age: connected ? null : age })
+      : availSlot(AVAIL.GAP, { label: hasContact ? "No data" : "No contact", dev: "agent status approx. from mission_state" });
+    const prevSlot = availSlot(AVAIL.GAP, { label: "Unavailable", dev: "agent must emit a decision/status log for the previous state" });
+    return `<div class="agent-status">
+      <div class="asrow"><span class="k">Current agent status</span><span class="v">${curSlot}</span></div>
+      <div class="asrow"><span class="k">Previous agent status</span><span class="v">${prevSlot}</span></div>
+    </div>`;
   }
 
   // Most-relevant command's lifecycle phase (requested/pending/acknowledged/confirmed/

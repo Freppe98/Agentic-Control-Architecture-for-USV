@@ -210,6 +210,12 @@ a { color:inherit; }
 .cmd-status .ctl-type { font-size:12px; color:var(--text); }
 .cmd-reason { flex-basis:100%; font-size:10.5px; color:var(--muted); }
 
+/* Agent status readout under the map Agent Commands buttons (current + previous only) */
+.agent-status { margin-top:10px; padding-top:9px; border-top:1px solid var(--line); display:flex; flex-direction:column; gap:7px; }
+.asrow { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.asrow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
+.asrow .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); display:flex; align-items:center; gap:8px; }
+
 /* ---------- generic page toolbar ---------- */
 .toolbar { display:flex; align-items:center; gap:16px; padding:13px 20px; border-bottom:1px solid var(--line); }
 .toolbar h1 { margin:0; font-size:var(--fs-lg); font-weight:600; }
@@ -461,6 +467,29 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .astate .node .val { font-family:var(--font-mono); font-size:16px; display:flex; align-items:center; }
 .astate .arrow { color:var(--dim); font-size:18px; }
 .astate .sp { flex:1; min-width:20px; }
+
+/* ---------- Agent page (reasoning) ---------- */
+.subgrid.two { grid-template-columns:repeat(2,1fr); }
+@media (max-width:980px){ .subgrid.two { grid-template-columns:1fr; } }
+/* Current Situation summary strip */
+.sitgrid { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; padding:14px 16px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); margin-bottom:14px; }
+@media (max-width:1180px){ .sitgrid { grid-template-columns:repeat(3,1fr); } }
+@media (max-width:720px){ .sitgrid { grid-template-columns:repeat(2,1fr); } }
+.sitcell { display:flex; flex-direction:column; gap:6px; min-width:0; }
+.sitcell .k { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.sitcell .v { font-family:var(--font-mono); font-size:14px; display:flex; align-items:center; gap:7px; }
+.sitcell .sd { width:9px; height:9px; border-radius:50%; flex:none; box-shadow:var(--ring-dot); }
+/* Reason / observation bullet list (Current Decision, Watch Conditions) */
+.reason-head { padding:11px 13px 2px; border-top:1px solid var(--line); }
+.reason-note { display:flex; align-items:flex-start; gap:8px; padding:6px 13px 12px; font-size:11px; line-height:1.5; color:var(--dim); }
+.reason-note svg { width:13px; height:13px; flex:none; margin-top:2px; }
+.rlist { display:flex; flex-direction:column; }
+.ritem { display:flex; align-items:center; gap:10px; padding:8px 13px; border-bottom:1px solid var(--line); font-size:12.5px; }
+.ritem:last-child { border-bottom:none; }
+.ritem.dim .rtx { color:var(--muted); }
+.ritem .rdot { width:8px; height:8px; border-radius:50%; flex:none; }
+.ritem .rtx { color:var(--text); }
+.ritem .rav { margin-left:auto; }
 
 /* ---------- pilot (embedded vehicle-local dashboard) ---------- */
 .pilot-bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; padding:11px 20px; border-bottom:1px solid var(--line); background:var(--panel-2); }

@@ -81,7 +81,7 @@ export function evTime(e) {
 
 /** Frozen navigation model (order + labels + icons). Keys are router routes. */
 export const NAV = [
-  ["map", "Map"], ["fleet", "Fleet"], ["mission", "Mission"], ["autonomy", "Autonomy"],
+  ["map", "Map"], ["fleet", "Fleet"], ["mission", "Mission"], ["autonomy", "Agent"],
   ["video", "Video"], ["pilot", "Pilot"], ["vehicle", "Vehicle"], ["events", "Events"],
   ["config", "Configuration"], ["_sep", ""], ["terminal", "Terminal"], ["messages", "Messages"],
 ];
