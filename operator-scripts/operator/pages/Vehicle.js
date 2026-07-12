@@ -19,15 +19,19 @@ const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
 
 // Diagnostics: a client-side "Run System Check" that reports what the operator
 // backend can actually verify today and is honest ("Not available") about the
-// rest. No diagnostics backend exists yet (BACKEND_ROADMAP) — this is real for the
-// checks backed by a live field, and an explicit gap slot (never a fake PASS) for
-// the ones that need a MAVLink/Pixhawk/camera/mission-service backend that doesn't
-// exist in this repo yet.
+// rest. Scout does not expose GET /agent/diagnostics or POST /agent/system_check
+// yet (checked against this repo — see BACKEND_ROADMAP.md), so there is no
+// diagnostics backend to proxy: this is real for the checks backed by a live
+// field (comm state, local-agent reporting, GPS fix, battery, storage, CPU,
+// memory, operator-reachability, Scout-confirmed authority) and an explicit gap
+// slot (never a fake PASS) for the ones that need a MAVLink/Pixhawk/camera/RC/
+// mission-service backend that doesn't exist in this repo yet.
 const DIAG_CHECKS = [
-  ["comm", "Communication"], ["mavlink", "MAVLink"], ["pixhawk", "Pixhawk"],
+  ["comm", "Communication"], ["mavlink", "MAVLink"], ["pixhawk", "Pixhawk heartbeat"],
   ["local_agent", "Local Agent"], ["gps", "GPS"], ["battery", "Battery"],
-  ["camera", "Camera"], ["rc", "RC receiver"], ["authority", "Authority"],
-  ["mission", "Mission service"],
+  ["rc", "RC receiver"], ["camera", "Camera"], ["mission", "Mission service"],
+  ["storage", "Storage"], ["cpu", "CPU"], ["memory", "Memory"], ["network", "Network"],
+  ["authority", "Authority service"],
 ];
 const DIAG_RUN_MS = 550;
 
@@ -50,7 +54,7 @@ const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stro
 export function Vehicle(root) {
   let fleet = [], selId = null, cmds = [];
   let authority = null;  // { authority: "OPERATOR"|"LOCAL_AGENT" } for the selected vehicle, or null (unknown)
-  let diag = { status: "idle", results: null };  // per-selected-vehicle; reset on selection change
+  let diag = { status: "idle", results: null, ranAt: null, durationMs: null };  // per-selected-vehicle; reset on selection change
 
   // Control authority — a dedicated read (GET /api/control_authority/{id}, itself a
   // live proxy to Scout's own Flask API), NOT part of the fleet payload and NOT the
@@ -82,7 +86,7 @@ export function Vehicle(root) {
   function selectVehicle(id) {
     if (id !== selId) {
       selId = id; authority = null; loadAuthority(id);
-      diag = { status: "idle", results: null };
+      diag = { status: "idle", results: null, ranAt: null, durationMs: null };
       cmds = []; refreshCommands();
     }
   }
@@ -173,10 +177,15 @@ export function Vehicle(root) {
 
   function computeDiagnostics(v, authVal) {
     const cs = commState(v);
+    const h = v.health || {};
+    const c = v.communication || {};
     const pass = (note) => ({ status: "pass", note });
     const warn = (note) => ({ status: "warn", note });
     const fail = (note) => ({ status: "fail", note });
     const gap = () => ({ status: "gap", note: "No backend support yet" });
+    // Same warn/fail breakpoints as the matrix/subsystem cards (subsys() above) — CPU
+    // runs hotter-tolerant (85/65) than storage/memory (90/75), kept in sync here.
+    const pctCheck = (val, label, hi, mid) => val == null ? gap() : val > hi ? fail(val + "% " + label) : val > mid ? warn(val + "% " + label) : pass(val + "% " + label);
     return {
       comm: cs === "connected" ? pass("Link current") : cs === "partitioned" ? warn("Link partitioned") : fail("Link down"),
       mavlink: gap(),
@@ -184,11 +193,30 @@ export function Vehicle(root) {
       local_agent: v.online ? pass("Reporting") : fail("Not reporting"),
       gps: v.lat != null && v.lng != null ? pass("3D fix") : warn("No fix"),
       battery: v.battery == null ? gap() : v.battery < 20 ? fail(v.battery + "% remaining") : v.battery < 40 ? warn(v.battery + "% remaining") : pass(v.battery + "% remaining"),
-      camera: gap(),
       rc: gap(),
-      authority: authVal === "OPERATOR" || authVal === "LOCAL_AGENT" ? pass(authVal) : fail("Unreachable"),
+      camera: gap(),
       mission: gap(),
+      storage: pctCheck(h.disk_usage, "used", 90, 75),
+      cpu: pctCheck(h.cpu_load, "load", 85, 65),
+      memory: pctCheck(h.ram_usage, "used", 90, 75),
+      network: c.operator_reachable == null ? gap() : c.operator_reachable ? pass("Operator reachable") : fail("Operator unreachable"),
+      authority: authVal === "OPERATOR" || authVal === "LOCAL_AGENT" ? pass(authVal) : fail("Unreachable"),
     };
+  }
+
+  // Overall roll-up: worst of the checks that actually returned a signal (pass <
+  // warn < fail); "Not available" checks never count toward it, and a run where
+  // every check is a gap must never be reported as PASS — that would be inventing
+  // a result the backend never gave us.
+  function diagOverall(results) {
+    if (!results) return null;
+    const rank = { pass: 0, warn: 1, fail: 2 };
+    let worst = null;
+    Object.values(results).forEach((r) => {
+      if (!(r.status in rank)) return;
+      if (worst == null || rank[r.status] > rank[worst]) worst = r.status;
+    });
+    return worst;
   }
 
   function diagRow([id, label]) {
@@ -202,11 +230,17 @@ export function Vehicle(root) {
   function runDiagnostics() {
     const v = fleet.find((x) => x.id === selId);
     if (!v) return;
-    diag = { status: "running", results: null };
+    const startedAt = Date.now();
+    diag = { status: "running", results: null, ranAt: diag.ranAt, durationMs: diag.durationMs };
     renderDetail();
     setTimeout(() => {
       if (selId !== v.id) return; // selection moved on while "running"
-      diag = { status: "done", results: computeDiagnostics(v, authority && authority.authority) };
+      diag = {
+        status: "done",
+        results: computeDiagnostics(v, authority && authority.authority),
+        ranAt: new Date().toISOString(),
+        durationMs: Date.now() - startedAt,
+      };
       renderDetail();
     }, DIAG_RUN_MS);
   }
@@ -331,11 +365,24 @@ export function Vehicle(root) {
 
     // ---- Diagnostics ----
     const diagBtnLabel = diag.status === "running" ? "Checking…" : "Run System Check";
+    // Overall result reflects only checks that actually ran (diagOverall) — a run
+    // where every check comes back "Not available" reports NOT AVAILABLE, never PASS.
+    const diagResultKey = diag.status === "done" ? diagOverall(diag.results) : null;
+    const DIAG_RESULT_TEXT = { pass: "PASS", warn: "WARNING", fail: "FAIL" };
+    const diagHeadCls = diag.status === "running" ? "idle"
+      : diag.status !== "done" ? "idle"
+      : diagResultKey === "fail" ? "warn" : diagResultKey === "warn" ? "caution" : diagResultKey === "pass" ? "ok" : "idle";
+    const diagCondText = diag.status === "running" ? "Checking…"
+      : diag.status !== "done" ? "Not run"
+      : (DIAG_RESULT_TEXT[diagResultKey] || "NOT AVAILABLE");
+    const diagMeta = diag.status === "done"
+      ? ` · Last run ${fmtClock(diag.ranAt)} · ${(diag.durationMs / 1000).toFixed(1)}s`
+      : "";
     const diagnosticsCard = `<div class="sub full">
-        <div class="sub-head idle"><span class="hd"></span><span class="nm">Diagnostics</span>
-          <button class="diag-btn" id="diag-run" style="margin-left:auto" ${diag.status === "running" ? "disabled" : ""}>${diagBtnLabel}</button>
+        <div class="sub-head ${diagHeadCls}"><span class="hd"></span><span class="nm">Diagnostics</span><span class="cond">${diagCondText}</span>
+          <button class="diag-btn" id="diag-run" ${diag.status === "running" ? "disabled" : ""}>${diagBtnLabel}</button>
         </div>
-        <div class="diag-note">Run System Check reports what the operator backend can verify today; checks with no backend support yet are marked "Not available", never faked.</div>
+        <div class="diag-note">Run System Check reports what the operator backend can verify today; checks with no backend support yet are marked "Not available", never faked.${diagMeta}</div>
         <div class="diag-grid">${DIAG_CHECKS.map(diagRow).join("")}</div>
       </div>`;
 

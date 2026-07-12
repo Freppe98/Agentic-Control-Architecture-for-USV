@@ -91,6 +91,7 @@ Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A)
 | `health_state` | enum `OK\|CAUTION\|WARN` | **derived** per subsystem | Fleet, Vehicle | 1 s | no | named condition, not "Caution" alone |
 | `cpu_load` | % | `health.cpu_load` | Vehicle | 1–5 s | yes | |
 | `disk_usage` | % | `health.disk_usage` | Vehicle (Storage) | slow | yes | |
+| `ram_usage` | % | `health.ram_usage` | Vehicle (Diagnostics) | 1–5 s | yes | `get_ram_usage()` — posix only, `null` elsewhere |
 | `flask_status` | string | `health.flask_status` | Vehicle (Services) | slow | yes | |
 | `leak_detected` | bool | `health.leak_detected` | Vehicle (Safety), Events | 1 s | no | safety-critical |
 | `pack_voltage` / `current` / `endurance` | V/A/min | **NO TELEM** | Vehicle (Battery) | 1 s | yes | |

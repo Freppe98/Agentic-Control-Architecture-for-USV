@@ -86,7 +86,7 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 |---|---|---|---|---|---|---|---|
 | `onboard_ip` / `onboard_port` | Pilot | Operator backend | B-field (registry) | static | C | Feature unavailable | P1 (blocks Pilot) |
 | `pack_voltage` / `current` | Vehicle (Battery) | USV BMS → Agent | A-out | 1 s | A | No data received | P2 |
-| `cpu_load` / `disk_usage` / `flask_status` | Vehicle | Local Agent (Pi) | A-out (partial today) | 1–5 s | B | No data received | P2 |
+| `cpu_load` / `disk_usage` / `ram_usage` / `flask_status` | Vehicle | Local Agent (Pi) | A-out (partial today — `flask_status` still unset) | 1–5 s | B | No data received | P2 |
 | `gps_sats` / `hdop` | Vehicle (GPS) | USV → Agent | A-out | 1 s | A | No data received | P2 |
 | `cpu_temp` / `batt_temp` / `water_temp` / `motor_temp` | Vehicle (Temps) | USV/Pi sensors | A-out where sensor exists, else **NOT_APPLICABLE** | 1 s | A | No data received / Not installed | P2 |
 | `water_quality` / `bathymetry` | Vehicle (Sensors) | USV sensor → Agent | A-out (define schema) | 1 s | A | No data received | P2 |
@@ -94,6 +94,14 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 | `callsign` | all | Operator backend | B-field (registry) | static | C | Feature unavailable | P3 |
 | `firmware` / `schema_version` | Vehicle | Local Agent (envelope) | A-out — **done** | static | B | — | done |
 | `leak_detected` | Vehicle, Events | Agent — **done** | — | 1 s | A | — | done |
+
+## Diagnostics (Vehicle page — Run System Check)
+| Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
+|---|---|---|---|---|---|---|---|
+| `GET /agent/diagnostics` / `POST /agent/system_check` (read-only) | Vehicle (Diagnostics) | Scout Flask (motherpi/services/flask) | B-field, once Scout exposes it — operator backend would add a thin proxy (`GET/POST /api/{diagnostics,system_check}/{vehicle}`), same pattern as `control_authority` | on demand | C | Not available | P2 |
+| MAVLink / Pixhawk heartbeat / RC receiver / camera / mission-service checks | Vehicle (Diagnostics) | USV → Agent / Scout Flask | A-out — no field carries these yet, even once the endpoint above exists | on demand | A/C | Not available | P2 |
+
+Checked against this repo 2026-07-12: `motherpi/services/flask` (Scout's Flask service, `Scripts/control_authority.py`'s counterpart) is not part of this codebase — only its client stub and the operator-backend's `control_authority` proxy are. No route named `diagnostics` or `system_check` exists anywhere in the repo. Until Scout ships one, `Vehicle.js`'s "Run System Check" computes its PASS/WARN/FAIL checks from fields the operator backend already has (comm state, local-agent reporting, GPS fix, battery, CPU/disk/RAM, operator-reachability, Scout-confirmed authority) and marks the rest **Not available** — never a guessed PASS.
 
 ## Video / Pilot (pages not yet migrated)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
