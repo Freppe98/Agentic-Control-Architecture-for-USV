@@ -1,8 +1,9 @@
 // Vehicle.js — the Health page. Fleet systems matrix, then the selected vehicle's
-// Overall Health, Vehicle State, Control and Diagnostics, then subsystem cards.
-// Subsystem severity is derived from real inputs (battery, leak, disk, cpu, comms,
-// gps/heading); everything not in the telemetry schema (temps, voltages, compass
-// cal, rssi, latency, camera, MAVLink/Pixhawk-level checks) renders NO-TELEM.
+// Overall Health, Vehicle State, Control (authority + command queue) and
+// Diagnostics, then subsystem cards. Subsystem severity is derived from real
+// inputs (battery, leak, disk, cpu, comms, gps/heading); everything not in the
+// telemetry schema (temps, voltages, compass cal, rssi, latency, camera,
+// MAVLink/Pixhawk-level checks) renders NO-TELEM.
 // Reuses VehicleDock, CommsPill, BatteryBar, AuthoritySeg, ui helpers.
 import * as api from "../services/api.js";
 import { NavRail } from "../components/NavRail.js";
@@ -30,8 +31,24 @@ const DIAG_CHECKS = [
 ];
 const DIAG_RUN_MS = 550;
 
+// Command & Control: the safe command set for the reverse path. High-risk commands
+// (ARM/DISARM touch the motors; AUTO/RTL change what the vehicle does on its own) get
+// an extra operator confirmation and are sent with confirm:true. Labels are the
+// operator's shorthand; the value is the backend command type. Buttons are enabled
+// only when the latest Scout-confirmed control authority is LOCAL_AGENT — see the
+// Control card below; there is no separate/independent authority store.
+const CMDS = [
+  ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"], ["SET_MODE_HOLD", "HOLD"],
+  ["SET_MODE_GUIDED", "GUIDED"], ["RTL", "RTL"], ["MISSION_PAUSE", "PAUSE"],
+  ["MISSION_RESUME", "RESUME"], ["ARM", "ARM"], ["DISARM", "DISARM"],
+];
+const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
+const CMD_STATUS_CLS = { QUEUED: "u", SENT: "p", ACCEPTED: "p", EXECUTED: "c", REJECTED: "d", FAILED: "d", EXPIRED: "u" };
+const fmtClock = (iso) => { if (!iso) return "—"; const d = new Date(iso); return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour12: false }); };
+const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
+
 export function Vehicle(root) {
-  let fleet = [], selId = null;
+  let fleet = [], selId = null, cmds = [];
   let authority = null;  // { authority: "OPERATOR"|"LOCAL_AGENT" } for the selected vehicle, or null (unknown)
   let diag = { status: "idle", results: null };  // per-selected-vehicle; reset on selection change
 
@@ -39,7 +56,8 @@ export function Vehicle(root) {
   // live proxy to Scout's own Flask API), NOT part of the fleet payload and NOT the
   // command queue. Loaded on selection + refreshed on a timer, same pattern as the
   // fleet poll. null (not "OPERATOR") on any fetch failure — an unreachable Scout
-  // must read as unknown, not a guess.
+  // must read as unknown, not a guess. Scout is the ONLY source of truth for
+  // authority; the operator backend holds none of its own.
   function loadAuthority(id) {
     if (id == null) { authority = null; return; }
     api.getControlAuthority(id).then((a) => {
@@ -48,8 +66,25 @@ export function Vehicle(root) {
       if (id === selId) { authority = null; renderDetail(); }
     });
   }
+  function refreshCommands() {
+    const id = selId;
+    if (id == null) return;
+    api.getCommands(id).then((d) => {
+      if (id !== selId) return;
+      cmds = (d && d.commands) || [];
+      renderDetail();
+    }).catch(() => {
+      if (id !== selId) return;
+      cmds = [];
+      renderDetail();
+    });
+  }
   function selectVehicle(id) {
-    if (id !== selId) { selId = id; authority = null; loadAuthority(id); diag = { status: "idle", results: null }; }
+    if (id !== selId) {
+      selId = id; authority = null; loadAuthority(id);
+      diag = { status: "idle", results: null };
+      cmds = []; refreshCommands();
+    }
   }
 
   root.className = "app dock-main";
@@ -123,9 +158,10 @@ export function Vehicle(root) {
     return `<div class="sub"><div class="sub-head ${head}"><span class="hd"></span><span class="nm">${title}</span><span class="cond">${cond}</span></div><div class="metrics${stale ? " stale" : ""}">${rowsHtml}</div></div>`;
   }
   // Like subCard but with a free-text head condition instead of a severity-derived
-  // one — used for the status/control cards, which report state, not faults.
-  function panelCard(title, condLabel, condClass, rowsHtml, footHtml = "") {
-    return `<div class="sub"><div class="sub-head ${condClass}"><span class="hd"></span><span class="nm">${title}</span><span class="cond">${condLabel}</span></div><div class="metrics">${rowsHtml}</div>${footHtml}</div>`;
+  // one, and always full-width — used for the status/control cards, which report
+  // state (and, for Control, host the command panel), not faults.
+  function panelCard(title, condLabel, condClass, bodyHtml) {
+    return `<div class="sub full"><div class="sub-head ${condClass}"><span class="hd"></span><span class="nm">${title}</span><span class="cond">${condLabel}</span></div>${bodyHtml}</div>`;
   }
 
   // RC retains hardware-level override regardless of software control authority
@@ -175,11 +211,36 @@ export function Vehicle(root) {
     }, DIAG_RUN_MS);
   }
 
+  // ---- Control actions (authority hand-off + command queue), Scout-confirmed only ----
+  async function authorityAction(target, vname) {
+    if (target === "LOCAL_AGENT" &&
+        !window.confirm(`Take control of ${vname}?\n\nThis grants permission for operator commands to execute. It does NOT arm the vehicle or change its mode.`)) return;
+    const res = await api.setControlAuthority(selId, target);
+    if (!res.ok) window.alert((res.data && (res.data.message || res.data.error)) || "Authority change failed.");
+    loadAuthority(selId);
+    refreshCommands();
+  }
+
+  async function sendCommand(type, vname) {
+    const label = (CMDS.find(([t]) => t === type) || [null, type])[1];
+    const highRisk = HIGH_RISK.has(type);
+    if (highRisk &&
+        !window.confirm(`Confirm ${label} for ${vname}?\n\nThe command is queued for the vehicle to execute. It is NOT applied until the local agent reports back.`)) return;
+    let res = await api.createCommand({ vehicle_id: selId, type, confirm: highRisk });
+    if (!res.ok && res.data && res.data.needs_confirmation) {
+      if (!window.confirm(`${res.data.message}\n\nQueue anyway?`)) return;
+      res = await api.createCommand({ vehicle_id: selId, type, confirm: true });
+    }
+    if (!res.ok) window.alert((res.data && res.data.message) || "Command was not accepted.");
+    refreshCommands();
+  }
+
   function renderDetail() {
     const v = fleet.find((x) => x.id === selId);
     const box = document.getElementById("detail");
     if (!v) { box.innerHTML = `<div class="empty-state" style="padding:8px 0">No vehicle selected</div>`; return; }
-    document.getElementById("dettag").textContent = `${v.name || "USV-" + v.id} · health, control & diagnostics`;
+    const vname = v.name || "USV-" + v.id;
+    document.getElementById("dettag").textContent = `${vname} · health, control & diagnostics`;
     const s = subsys(v), ov = overallSev(s), stale = commState(v) !== "connected";
     const h = v.health || {}, meas = v.measurements || {}, t = v.telemetry || {}, md = v.mission_data || {}, schema = (v.agent && v.agent.schema_version) || "—";
 
@@ -190,7 +251,9 @@ export function Vehicle(root) {
       : `<div class="frow none">No active faults — all reporting subsystems nominal</div>`;
 
     // Control authority is fetched separately (loadAuthority), not derived from fleet
-    // data — it's a direct, dedicated proxy to Scout's own Flask API, not backend state.
+    // data — it's a direct, dedicated proxy to Scout's own Flask API, the sole source
+    // of truth. hasControl gates both the mission-command buttons below and this
+    // page's command panel identically.
     const authVal = authority && authority.authority;
     const hasControl = authVal === "LOCAL_AGENT";
     const authoritySeg = AuthoritySeg(authVal);
@@ -209,27 +272,62 @@ export function Vehicle(root) {
 
     // ---- Vehicle State ----
     const vehicleStateCard = panelCard("Vehicle State", v.online ? "Reporting" : "Offline", v.online ? "ok" : "warn",
-      row("Armed", armedCell, "keep") +
-      row("Mode", t.mode || noTelem("no telem"), "keep") +
-      row("Authority", authoritySeg, "keep") +
-      row("RC present", rcAlwaysCell, "keep") +
-      row("Operator reachable", operatorReachCell, "keep") +
-      row("Local Agent", v.online ? '<span class="txt-c">Online</span>' : '<span class="txt-d">Offline</span>', "keep") +
-      row("Last heartbeat", fmtAge(v.last_seen_age_s), "keep"));
+      `<div class="metrics">
+        ${row("Armed", armedCell, "keep")}
+        ${row("Mode", t.mode || noTelem("no telem"), "keep")}
+        ${row("Authority", authoritySeg, "keep")}
+        ${row("RC present", rcAlwaysCell, "keep")}
+        ${row("Operator reachable", operatorReachCell, "keep")}
+        ${row("Local Agent", v.online ? '<span class="txt-c">Online</span>' : '<span class="txt-d">Offline</span>', "keep")}
+        ${row("Last heartbeat", fmtAge(v.last_seen_age_s), "keep")}
+      </div>`);
 
-    // ---- Control ----
-    const controlCond = hasControl ? "Local Agent engaged" : authVal === "OPERATOR" ? "Manual / RC" : "Unknown";
+    // ---- Control (authority hand-off + command queue, Scout-confirmed only) ----
+    const controlCond = hasControl ? "Local Agent engaged" : authVal === "OPERATOR" ? "RC / manual" : "Unknown";
     const controlClass = hasControl ? "ok" : authVal === "OPERATOR" ? "idle" : "warn";
-    const controlActions = `<div class="qa" style="margin:0 13px 13px">
-        <button data-authority="LOCAL_AGENT" ${hasControl ? "disabled" : ""}>Take Control</button>
-        <button data-authority="OPERATOR" ${!hasControl ? "disabled" : ""}>Release Control</button>
-      </div>`;
+    const authBadge = hasControl
+      ? `<span class="auth-badge on"><i></i>LOCAL AGENT ENGAGED</span>`
+      : `<span class="auth-badge"><i></i>${authVal === "OPERATOR" ? "RC / OPERATOR" : "UNKNOWN"}</span>`;
+    const authNote = hasControl
+      ? `Operator commands are <b>enabled</b> for ${vname}. Releasing returns authority to RC/manual without changing the vehicle's mode.`
+      : authVal === "OPERATOR"
+        ? `RC holds exclusive authority — command buttons are disabled. Press <b>Take Control</b> to hand off to the Local Agent. This does not arm the vehicle or change its mode.`
+        : `Control authority is unknown — Scout's control-authority API did not respond. Commands stay disabled until authority is confirmed.`;
+    const authBtn = hasControl
+      ? `<button class="ctl-auth release" data-auth="OPERATOR">Release Control</button>`
+      : `<button class="ctl-auth engage" data-auth="LOCAL_AGENT">Take Control</button>`;
+    const cmdBtns = CMDS.map(([type, label]) => {
+      const hr = HIGH_RISK.has(type);
+      return `<button class="ctl-cmd${hr ? " hr" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${type}${hr ? " · confirmation required" : ""}">${label}</button>`;
+    }).join("");
+    const queueHtml = cmds.length
+      ? cmds.slice(0, 8).map((c) => {
+          const clsx = CMD_STATUS_CLS[c.status] || "u";
+          const when = c.completed_at || c.claimed_at || c.created_at;
+          const note = c.reason || c.warning || "";
+          return `<div class="ctl-row"><span class="ctl-type mono">${c.type}</span><span class="pill ${clsx}">${c.status}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
+        }).join("")
+      : `<div class="ctl-empty">No commands issued for ${vname} yet.</div>`;
+
     const controlCard = panelCard("Control", controlCond, controlClass,
-      row("Authority", authoritySeg, "keep") +
-      row("Engage / release", hasControl ? '<span class="txt-c">Engaged</span>' : '<span class="txt-p">Released</span>', "keep") +
-      row("Operator connected", operatorReachCell, "keep") +
-      row("RC override available", rcAlwaysCell, "keep"),
-      controlActions);
+      `<div class="metrics">
+        ${row("Authority", authoritySeg, "keep")}
+        ${row("Operator connected", operatorReachCell, "keep")}
+        ${row("RC override available", rcAlwaysCell, "keep")}
+      </div>
+      <div style="padding:13px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line)">
+        <div class="ctl-auth-bar${hasControl ? " engaged" : ""}">
+          <div class="ctl-auth-l"><span class="lbl">Engage</span>${authBadge}</div>
+          <div class="ctl-auth-note">${authNote}</div>
+          ${authBtn}
+        </div>
+        <div class="ctl-cmds${hasControl ? "" : " locked"}">${cmdBtns}</div>
+        ${hasControl ? "" : `<div class="ctl-lock-note">${lockSvg}<span>Commands are locked. Take Control (Scout-confirmed) to enable them.</span></div>`}
+        <div class="ctl-queue">
+          <div class="ctl-queue-h"><span class="lbl">Command queue &amp; history</span><span class="tag">status is reported by the vehicle — never assumed</span></div>
+          ${queueHtml}
+        </div>
+      </div>`);
 
     // ---- Diagnostics ----
     const diagBtnLabel = diag.status === "running" ? "Checking…" : "Run System Check";
@@ -299,7 +397,7 @@ export function Vehicle(root) {
 
     box.innerHTML = `
       <div class="dhead">
-        <span class="dname">${v.name || "USV-" + v.id}</span>
+        <span class="dname">${vname}</span>
         ${CommsPill(v, { full: true })}
         <span class="ovr ${ov == null ? "ok" : ov}"><span class="hd"></span>${ov == null ? "No signal" : ov === "ok" ? "OK" : ov === "warn" ? "Warning" : "Caution"}</span>
         <span class="sp"></span>
@@ -307,14 +405,15 @@ export function Vehicle(root) {
       </div>
       ${banner}
       ${healthCard}
-      <div class="twogrid">${vehicleStateCard}${controlCard}</div>
+      ${vehicleStateCard}
+      ${controlCard}
       ${diagnosticsCard}
       <div class="lbl" style="margin:18px 0 10px">Subsystem cards</div>
       <div class="subgrid">${battery}${gps}${compass}${cpu}${storage}${network}${sensors}${camera}${pixhawk}${mission}</div>`;
 
-    box.querySelectorAll(".qa button[data-authority]").forEach((btn) => {
-      btn.onclick = () => { api.setControlAuthority(v.id, btn.dataset.authority).catch(() => {}); };
-    });
+    const authBtnEl = box.querySelector(".ctl-auth");
+    if (authBtnEl) authBtnEl.onclick = () => authorityAction(authBtnEl.dataset.auth, vname);
+    box.querySelectorAll(".ctl-cmd").forEach((b) => (b.onclick = () => sendCommand(b.dataset.cmd, vname)));
     const runBtn = document.getElementById("diag-run");
     if (runBtn) runBtn.onclick = runDiagnostics;
   }
@@ -337,8 +436,9 @@ export function Vehicle(root) {
 
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
   const authorityId = setInterval(() => loadAuthority(selId), 2000);  // refresh selected vehicle's control authority
+  const commandsId = setInterval(() => refreshCommands(), 3000);  // refresh selected vehicle's command queue
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); };
+  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(commandsId); };
 }

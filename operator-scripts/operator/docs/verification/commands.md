@@ -65,8 +65,8 @@ The operator backend holds **no authority state of its own** — every `/api/con
 
 **Added** (Operator UI)
 - Map page "Quick actions" panel: **Take Control** / **Release Control** buttons + a **Current authority: Operator/Local Agent/Unknown** line, from a dedicated `GET /api/control_authority/{id}` fetch on selection + a 2 s refresh timer — separate from the fleet poll and separate from the command queue. The four mocked mission-command buttons (Return Home/Pause/Resume/Loiter) are disabled with "Local Agent does not have control — Take Control first" whenever authority isn't `LOCAL_AGENT` (still additionally mocked pending real command execution — see BACKEND_ROADMAP).
-- Vehicle page's Health overview card gains a read-only **Control authority** row, same dedicated fetch pattern; renders `unknown` (not a guessed `OPERATOR`) when the fetch fails.
-- `services/api.js`'s `getControlAuthority(id)` / `setControlAuthority(id, authority)` are unchanged from the previous revision — the frontend contract with the operator backend didn't change, only what happens behind it.
+- Vehicle page's **Control** card (part of the Health-page redesign) shows the same dedicated fetch, plus the full Take Control / Release Control + 9 command buttons + queue/history panel — see `verification/authority.md`. Renders `unknown` (not a guessed `OPERATOR`) when the fetch fails; command buttons stay disabled until authority reads `LOCAL_AGENT`.
+- `services/api.js`'s `getControlAuthority(id)` / `setControlAuthority(id, authority)` are unchanged from the previous revision — the frontend contract with the operator backend didn't change, only what happens behind it. `postJSON` now returns `{ ok, status, data }` instead of throwing on 4xx, so the command panel can act on `needs_confirmation` (see `authority.md`).
 
 **Verified** (fresh instance on :8211, live via curl, no fabricated results)
 - ✓ command queue regression: `POST /api/commands` with `type:"SET_MODE_AUTO"` still queues normally; `COMMAND_TYPES` no longer contains `SET_CONTROL_AUTHORITY`
@@ -81,4 +81,4 @@ The operator backend holds **no authority state of its own** — every `/api/con
 **Next**
 - Scout-side: add the real `GET`/`POST /agent/control_authority` to `motherpi/services/flask` (separate codebase/session).
 - Wire the Scout Local Agent to poll `GET /api/commands/pending/2` for mission commands, execute via Flask/mavlink2rest, and POST results — replacing the curl simulation (control authority does **not** use this path; see above).
-- Minimal UI command panel on an existing page (Vehicle or Pilot/Autonomy): AUTO/MANUAL/HOLD/GUIDED/RTL/PAUSE/RESUME buttons + queue/history, RTL confirm, existing styling. `services/api.js` gains the command methods (currently the backend is exercised directly).
+- ~~Minimal UI command panel~~ **done** — Vehicle page's Control card: AUTO/MANUAL/HOLD/GUIDED/RTL/PAUSE/RESUME/ARM/DISARM buttons + queue/history, high-risk confirm, existing styling; `services/api.js` gained `createCommand`/`getCommands`. See `verification/authority.md`.

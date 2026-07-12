@@ -3,7 +3,8 @@
 // If the backend changes, this file changes — not ten pages.
 // Endpoints (see main.py): GET /api/fleet/status, GET /agent/status,
 // POST /agent/status, GET /api/comms/history/{id}, GET /api/events,
-// GET /api/environment, GET/POST /api/control_authority/{id}.
+// GET /api/environment, GET/POST /api/control_authority/{id} (Scout proxy),
+// POST /api/commands, GET /api/commands/{id} (reverse command queue).
 
 const BASE = "";
 
@@ -13,14 +14,20 @@ async function getJSON(path) {
   return res.json();
 }
 
+/**
+ * POST helper that does NOT throw on 4xx — command endpoints answer 409
+ * (needs_confirmation) with a meaningful body the caller must act on. Returns
+ * { ok, status, data } so pages can branch on it.
+ */
 async function postJSON(path, body) {
   const res = await fetch(BASE + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error(`${path} → ${res.status}`);
-  return res.json();
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* empty body */ }
+  return { ok: res.ok, status: res.status, data };
 }
 
 /** Full fleet, already normalized server-side (comm_state, last_seen_age_s, telemetry, …). */
@@ -76,21 +83,43 @@ export async function getEvents() {
  */
 /** Operator-side comms-state transition log for a vehicle (timeline + durations). */
 export function getCommsHistory(id) { return getJSON(`/api/comms/history/${id}`); }
+
 export async function getAutonomy(/* id */)     { return null; } // needs agent reasoning fields
 export async function getMissionScope()         { return null; } // needs named-mission registry
 
-/** Confirmed control authority for a vehicle ("OPERATOR" or "LOCAL_AGENT"). */
+// --- Control authority (dedicated API — deliberately NOT the command queue) ---
+// Scout Flask (motherpi/services/flask) is the sole source of truth for control
+// authority ("OPERATOR" default — RC has exclusive authority — or "LOCAL_AGENT",
+// engaged by the operator). The operator backend holds no authority state of its
+// own; every call below is a live, synchronous proxy to Scout. See main.py and
+// docs/verification/commands.md ("Control authority").
+
+/** Confirmed control authority for a vehicle ("OPERATOR" or "LOCAL_AGENT"), read live from Scout. */
 export function getControlAuthority(id) { return getJSON(`/api/control_authority/${id}`); }
 
 /**
- * Request a control-authority hand-off (Take Control / Release Control). NOT the
- * command queue — a direct, synchronous proxy to Scout Flask's own
- * POST /agent/control_authority (see main.py). Resolves with Scout's response
- * verbatim, or rejects if Scout is unreachable; the operator backend caches nothing.
+ * Request a control-authority hand-off (Take Control / Release Control) — a direct
+ * proxy to Scout Flask's own POST /agent/control_authority. Returns { ok, status,
+ * data }: data is Scout's response verbatim on success, or the backend's error body
+ * (e.g. Scout unreachable) on failure — never thrown, so callers can branch on it.
+ * On a confirmed Release (OPERATOR), the operator backend also cancels any still-
+ * pending commands for this vehicle (see cancel_pending_commands in main.py) —
+ * queue safety, not an authority value the backend invents.
  */
 export function setControlAuthority(id, authority) {
   return postJSON(`/api/control_authority/${id}`, { authority });
 }
+
+// --- Command queue (reverse/control path) ---
+// Gated in the UI by control authority above (buttons disabled unless the latest
+// Scout-confirmed authority is LOCAL_AGENT) — the backend queue itself only gates
+// on comm-state + high-risk confirmation (see main.py POST /api/commands).
+
+/** Create a command. body: { vehicle_id, type, params?, confirm? }. Returns { ok, status, data }. */
+export function createCommand(body) { return postJSON("/api/commands", body); }
+
+/** All commands for a vehicle (active queue + history) — the panel view. */
+export function getCommands(id) { return getJSON(`/api/commands/${id}`); }
 
 /** Small polling helper so pages don't each reinvent setInterval + error handling. */
 export function poll(fn, ms, onData, onError) {

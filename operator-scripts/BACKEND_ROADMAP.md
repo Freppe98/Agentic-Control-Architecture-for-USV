@@ -64,6 +64,7 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 |---|---|---|---|---|---|---|---|
 | command lifecycle (Return Home / Pause / Resume / Loiter) | Map, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | Feature unavailable | P1 · **backend done** (see `verification/commands.md`) |
 | command status (Pending/Executing/Finished/Failed, "queues until next contact") | Map, Mission | Operator backend | B-field | on change | E→B | Feature unavailable | P1 · **backend done** (queue + comm-state gating + Agent result) |
+| **command & control panel** (Take Control / Release Control + 9 command buttons + queue, gated on Scout-confirmed authority) | Vehicle | Scout Flask (authority) + Operator backend (queue) + Frontend | B-field | on action | E | Take Control / Release Control | P1 · **done** (see `verification/authority.md`, `verification/commands.md`) |
 
 ## Events
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
