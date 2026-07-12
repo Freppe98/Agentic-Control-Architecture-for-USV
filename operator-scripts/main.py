@@ -779,10 +779,31 @@ async def command_result(command_id: str, request: Request):
 CONTROL_AUTHORITY_VALUES = ("LOCAL_AGENT", "OPERATOR")
 
 
+def cancel_pending_commands(vid: int, now, reason: str):
+    """Terminate every non-terminal command for one vehicle. Reuses the existing
+    EXPIRED terminal status — no new lifecycle/state machine — so a command left
+    QUEUED/SENT while OPERATOR held authority can never fire once LOCAL_AGENT is
+    re-engaged later. Queue-only; never touches Scout's own authority value."""
+    for cmd in commands:
+        if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
+            continue
+        cmd["status"] = "EXPIRED"
+        cmd["completed_at"] = now.isoformat()
+        cmd["reason"] = reason
+        _command_event(cmd, severity="warning",
+                       message=f"Command {cmd['type']} cancelled ({reason})",
+                       source="operator-backend")
+
+
 @app.post("/api/control_authority/{vehicle}")
 async def set_control_authority(vehicle: str, request: Request):
     """Body: { "authority": "LOCAL_AGENT" | "OPERATOR" }. Forwards directly to Scout's
-    POST /agent/control_authority and returns Scout's response verbatim."""
+    POST /agent/control_authority and returns Scout's response verbatim. On a
+    confirmed Release Control (authority=OPERATOR), also cancels any still-pending
+    command-queue entries for this vehicle (queue safety — see
+    cancel_pending_commands) so nothing stale can execute on a later Engage Control.
+    This is the only place the command queue and control authority intersect; Scout
+    remains the sole source of truth for the authority value itself."""
     body = await request.json()
     authority = str(body.get("authority") or "").upper()
     if authority not in CONTROL_AUTHORITY_VALUES:
@@ -801,11 +822,16 @@ async def set_control_authority(vehicle: str, request: Request):
         r = requests.post(f"{base}/agent/control_authority",
                           json={"authority": authority}, timeout=3)
         r.raise_for_status()
-        return r.json()
+        result = r.json()
     except requests.RequestException as exc:
         return JSONResponse(status_code=502, content={
             "ok": False, "error": "Scout control-authority API unreachable",
             "detail": str(exc)})
+
+    if authority == "OPERATOR":
+        cancel_pending_commands(vid, datetime.now(timezone.utc),
+                                 "Cancelled — control authority released to OPERATOR")
+    return result
 
 
 @app.get("/api/control_authority/{vehicle}")
