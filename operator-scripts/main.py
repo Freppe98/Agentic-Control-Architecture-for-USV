@@ -50,6 +50,19 @@ comms_history_by_id = {}   # {vehicle_id: [ {state, from, ts, since_last_seen_s}
 # state" = last-known composite; absent != reset. Only ever updated from real values.
 last_known_telemetry = {}  # {vehicle_id: {lat, lng, heading, groundspeed, battery, ...}}
 
+# Last-known agent reasoning per vehicle (payload.agent.*: current_behaviour,
+# decision_reason, current_policy, autonomy_level, …). Same store-and-forward rule as
+# telemetry: the Agent page shows the LAST KNOWN reasoning (marked stale) when a packet
+# omits the group, never a blank. Only ever updated from a real, non-stale packet.
+last_known_agent = {}      # {vehicle_id: {agent reasoning dict}}
+
+# Change-tracking for first-class agent/mission events (P3). We record a decision or a
+# mission-state event ONLY when the value actually changes — never once per status poll
+# (a status arrives ~1 Hz; logging every unchanged one would bury the real transitions).
+last_agent_decision_by_id = {}   # {vehicle_id: (behaviour, decision_reason, policy)}
+last_mission_state_by_id = {}    # {vehicle_id: mission_state}
+last_authority_by_id = {}        # {vehicle_id: last event-recorded effective authority}
+
 # --- Control authority (supervisory: who may command the Pixhawk) ---
 # Separate from flight mode, and deliberately NOT part of the command queue below —
 # it is vehicle state owned by the Scout Flask service (motherpi/services/flask),
@@ -216,6 +229,7 @@ def normalize_agent_message(message: dict) -> dict:
     measurements = payload.get("measurements", {}) or {}
     fleet_info = payload.get("fleet", {}) or {}
     events = payload.get("events", []) or []
+    agent_reasoning = payload.get("agent", {}) or {}
 
     usv_id_raw = payload.get("usv_id", payload.get("id", 2))
     try:
@@ -289,6 +303,12 @@ def normalize_agent_message(message: dict) -> dict:
         "mavlink": mavlink_evidence(payload),
         "measurements": payload.get("measurements", {}) or {},
         "events": payload.get("events", []) or [],
+        # Agent reasoning (payload.agent.*) forwarded verbatim for the Agent page:
+        # current_behaviour, decision_reason, current_policy, autonomy_level,
+        # current_communication_state, current_mission_state, buffer_usage,
+        # last_operator_command. Falls back to the last-known reasoning (marked stale by
+        # the frontend via comm-state) when a degraded packet omits the group.
+        "agent_status": agent_reasoning or last_known_agent.get(usv_id, {}),
         "fleet_info": fleet_info,
         "agent": {
             "groups": payload.get("groups", []),
@@ -603,6 +623,61 @@ def ingest_payload_events(vid, message, now):
         )
 
 
+def _clean(val):
+    """A displayable value, or None for absent/placeholder (None/""/'unknown'/'none')."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s == "" or s.lower() in ("unknown", "none", "n/a", "null"):
+        return None
+    return s
+
+
+def record_agent_changes(vid, payload, now):
+    """Record first-class events for agent-decision and mission-state CHANGES (P3).
+
+    Emitted only when the value actually changes vs. the last recorded one — never once
+    per status poll — so the event log shows real transitions with timestamps + reasons,
+    not a flood of unchanged rows. The agent-decision key is (current_behaviour,
+    decision_reason, current_policy) from payload.agent.*; the mission key is
+    mission.mission_state. Reasons are taken verbatim from the agent (never invented)."""
+    if not isinstance(payload, dict):
+        return
+    agent = payload.get("agent") or {}
+    mission = payload.get("mission") or {}
+    name = name_of(vid)
+
+    if isinstance(agent, dict) and agent:
+        behaviour = _clean(agent.get("current_behaviour") or agent.get("behaviour")
+                           or agent.get("behavior"))
+        reason = _clean(agent.get("decision_reason") or agent.get("decision_rationale"))
+        policy = _clean(agent.get("current_policy") or agent.get("communication_policy"))
+        key = (behaviour, reason, policy)
+        prev = last_agent_decision_by_id.get(vid)
+        # Only meaningful once the agent actually reports a behaviour/decision at least once.
+        if key != prev and (behaviour or reason):
+            last_agent_decision_by_id[vid] = key
+            if prev is not None:  # skip the very first observation (not a transition)
+                label = behaviour or "decision updated"
+                msg = f"Agent decision: {label}"
+                if reason:
+                    msg = f"{msg} — {reason}"
+                _append_event(severity="info", message=msg, etype="agent",
+                              source=f"usv-{vid}", vehicle_id=vid, vehicle=name,
+                              ts=now.isoformat())
+
+    if isinstance(mission, dict) and mission:
+        mstate = _clean(mission.get("mission_state"))
+        prev_m = last_mission_state_by_id.get(vid)
+        if mstate and mstate != prev_m:
+            last_mission_state_by_id[vid] = mstate
+            if prev_m is not None:
+                _append_event(severity="info",
+                              message=f"Mission state: {prev_m} → {mstate}",
+                              etype="mission", source=f"usv-{vid}",
+                              vehicle_id=vid, vehicle=name, ts=now.isoformat())
+
+
 # --- Command queue (BACKEND_ROADMAP: reverse/control Path E; Operator-backend-owned) ---
 # The smallest safe Operator → Scout command path. The operator backend is the queue's
 # source of truth: it stores command records, gates them on the operator-side comm-state,
@@ -710,6 +785,83 @@ def apply_command_result(cmd, new_status, result, reason, now):
     return True
 
 
+# Field spellings a Local Agent might use for the command id / lifecycle status /
+# detail / reason, so the result receiver accepts either endpoint's payload shape.
+_RESULT_ID_KEYS = ("command_id", "id", "cmd_id", "commandId", "uuid")
+_RESULT_STATUS_KEYS = ("status", "result_status", "outcome", "state")
+_RESULT_REASON_KEYS = ("reason", "error", "message", "detail")
+# A Local Agent may report TIMEOUT/ACK/DONE/OK — normalize to the lifecycle vocabulary
+# the queue owns (RESULT_STATUSES) so no valid outcome is dropped as "invalid".
+_RESULT_STATUS_ALIASES = {
+    "TIMEOUT": "FAILED", "TIMED_OUT": "FAILED", "TIMEDOUT": "FAILED",
+    "ERROR": "FAILED", "FAIL": "FAILED", "FAILURE": "FAILED",
+    "REJECT": "REJECTED", "DENIED": "REJECTED",
+    "ACK": "ACCEPTED", "ACKNOWLEDGED": "ACCEPTED",
+    "DONE": "EXECUTED", "COMPLETE": "EXECUTED", "COMPLETED": "EXECUTED",
+    "SUCCESS": "EXECUTED", "OK": "EXECUTED", "EXECUTE": "EXECUTED",
+}
+
+
+def _pick(d: dict, keys):
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def normalize_result_status(raw):
+    """Map a reported status onto the queue's RESULT_STATUSES vocabulary, or None."""
+    s = str(raw or "").upper().strip()
+    s = _RESULT_STATUS_ALIASES.get(s, s)
+    return s if s in RESULT_STATUSES else None
+
+
+def process_command_result(command_id, raw_status, result, reason, now):
+    """Look up a command and apply a Local-Agent-reported result. Single source of truth
+    shared by BOTH result endpoints (POST /agent/command_result and the id-in-path
+    /api/commands/{id}/result). Idempotent by the uuid command id: a duplicate/replayed
+    result on an already-terminal command is a no-op (applied:false) — no double history
+    row, no double execution. Returns a per-item dict; never raises."""
+    if not command_id:
+        return {"command_id": command_id, "found": False, "applied": False,
+                "error": "missing command id"}
+    cmd = commands_by_id.get(str(command_id))
+    if cmd is None:
+        # Unknown id: acknowledge without failing so a buffered backlog can still flush
+        # (the Agent drops it from its buffer) — the record simply no longer exists here.
+        return {"command_id": command_id, "found": False, "applied": False,
+                "error": "unknown command id"}
+    new_status = normalize_result_status(raw_status)
+    if new_status is None:
+        return {"command_id": command_id, "found": True, "applied": False,
+                "error": "invalid result status", "status": raw_status,
+                "allowed": sorted(RESULT_STATUSES)}
+    applied = apply_command_result(cmd, new_status, result, reason, now)
+    if applied:
+        sev = "warning" if new_status in ("REJECTED", "FAILED") else "info"
+        msg = f"Command {cmd['type']} {new_status.lower()}"
+        if cmd.get("reason"):
+            msg = f"{msg} — {cmd['reason']}"
+        _command_event(cmd, severity=sev, message=msg, source=f"usv-{cmd['vehicle_id']}")
+    return {"command_id": command_id, "found": True, "applied": applied,
+            "status": new_status, "command": cmd}
+
+
+def _result_items(body):
+    """Normalize a command-result request body into a list of result dicts. Accepts a
+    single object, a bare JSON list, or {results:[...]}/{command_results:[...]} — so a
+    single ack and a flushed backlog both work through one endpoint."""
+    if isinstance(body, list):
+        return [x for x in body if isinstance(x, dict)]
+    if isinstance(body, dict):
+        for key in ("results", "command_results", "items", "acks"):
+            if isinstance(body.get(key), list):
+                return [x for x in body[key] if isinstance(x, dict)]
+        return [body]
+    return []
+
+
 @app.post("/api/commands")
 async def create_command(request: Request):
     """Create a command for a vehicle (Operator UI / curl). Validates the type and
@@ -798,32 +950,71 @@ def pending_commands(vehicle_id: str):
 
 @app.post("/api/commands/{command_id}/result")
 async def command_result(command_id: str, request: Request):
-    """Local Agent reports the outcome of a command. Body: { status, result?, reason? }
-    where status ∈ ACCEPTED|EXECUTED|REJECTED|FAILED. Idempotent — a result on an
-    already-terminal command is a no-op (applied:false), so a re-sent ack never
-    double-executes. This is the ONLY way a command becomes EXECUTED."""
+    """Local Agent reports the outcome of a command (id in the PATH). Body:
+    { status, result?, reason? } where status ∈ ACCEPTED|EXECUTED|REJECTED|FAILED.
+    Idempotent — a result on an already-terminal command is a no-op (applied:false),
+    so a re-sent ack never double-executes. This is the ONLY way a command becomes
+    EXECUTED. Scout may instead POST /agent/command_result with the id in the body
+    (same lifecycle, backlog-friendly) — both share process_command_result."""
     now = datetime.now(timezone.utc)
     body = await request.json()
-    cmd = commands_by_id.get(command_id)
-    if cmd is None:
+    if not isinstance(body, dict):
+        body = {}
+    outcome = process_command_result(
+        command_id, _pick(body, _RESULT_STATUS_KEYS),
+        body.get("result"), _pick(body, _RESULT_REASON_KEYS), now)
+    if not outcome["found"]:
         return JSONResponse(status_code=404, content={
-            "ok": False, "error": "unknown command id", "command_id": command_id})
-
-    new_status = str(body.get("status") or "").upper()
-    if new_status not in RESULT_STATUSES:
+            "ok": False, "error": outcome.get("error", "unknown command id"),
+            "command_id": command_id})
+    if outcome.get("error"):
         return JSONResponse(status_code=400, content={
-            "ok": False, "error": "invalid result status",
-            "status": body.get("status"), "allowed": sorted(RESULT_STATUSES)})
+            "ok": False, "error": outcome["error"], "status": outcome.get("status"),
+            "allowed": outcome.get("allowed")})
+    return {"ok": True, "applied": outcome["applied"], "command": outcome["command"]}
 
-    applied = apply_command_result(cmd, new_status, body.get("result"),
-                                   body.get("reason"), now)
-    if applied:
-        sev = "warning" if new_status in ("REJECTED", "FAILED") else "info"
-        msg = f"Command {cmd['type']} {new_status.lower()}"
-        if cmd.get("reason"):
-            msg = f"{msg} — {cmd['reason']}"
-        _command_event(cmd, severity=sev, message=msg, source=f"usv-{cmd['vehicle_id']}")
-    return {"ok": True, "applied": applied, "command": cmd}
+
+@app.post("/agent/command_result")
+async def agent_command_result(request: Request):
+    """Command-result receiver expected by the Local Agent (Scout). The command id is in
+    the BODY, not the path — this is the endpoint Scout was POSTing to (previously 405
+    because only the id-in-path route existed). Accepts:
+      • a single result:  { command_id, status, result?, reason?, vehicle_id? }
+      • a flushed backlog: [ {...}, {...} ]  or  { results: [ {...}, ... ] }
+    Tolerant of field spellings (command_id/id/cmd_id, status/outcome, reason/error) and
+    status aliases (TIMEOUT/ACK/DONE → the queue vocabulary). Idempotent by the uuid
+    command id: replayed/duplicate results are no-ops (applied:false) — a flushed buffer
+    never creates duplicate history rows or re-executes. ALWAYS 2xx (per-item found/
+    applied flags carry the detail) so a buffered Agent can drain its backlog and stop
+    retrying even when some ids are unknown/already-terminal here."""
+    now = datetime.now(timezone.utc)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    items = _result_items(body)
+    if not items:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "no command results in body",
+            "expected": "{command_id, status} | [ ... ] | {results:[ ... ]}"})
+
+    results = [
+        process_command_result(
+            _pick(it, _RESULT_ID_KEYS), _pick(it, _RESULT_STATUS_KEYS),
+            it.get("result"), _pick(it, _RESULT_REASON_KEYS), now)
+        for it in items
+    ]
+    # Strip the full command echo from batch items to keep the ack compact; a single
+    # result keeps it for parity with the id-in-path endpoint.
+    applied_n = sum(1 for r in results if r["applied"])
+    if len(results) == 1:
+        r = results[0]
+        return {"ok": True, "applied": r["applied"], "found": r["found"],
+                "error": r.get("error"), "command": r.get("command"),
+                "received": 1, "applied_count": applied_n}
+    compact = [{k: v for k, v in r.items() if k != "command"} for r in results]
+    return {"ok": True, "received": len(results), "applied_count": applied_n,
+            "results": compact}
 
 
 # --- Control authority (direct proxy to Scout Flask, NOT the command queue above) ---
@@ -932,6 +1123,19 @@ async def set_control_authority(vehicle: str, request: Request):
                                  "Cancelled — control released to Local Agent")
 
     eff = str(result.get("authority") or result.get("effective") or authority).upper()
+
+    # First-class control-authority event (P3). Records the operator-initiated hand-off
+    # with the Scout-confirmed effective value — a real transition worth a timestamp,
+    # deduped so repeating the same request does not spam the log.
+    eff_val = eff if eff in REPORTABLE_AUTHORITY else authority
+    if last_authority_by_id.get(vid) != eff_val:
+        last_authority_by_id[vid] = eff_val
+        human = "Operator" if eff_val == "OPERATOR" else "Local Agent" if eff_val == "LOCAL_AGENT" else eff_val
+        verb = "Take Control" if authority == "OPERATOR" else "Release Control"
+        _append_event(severity="caution" if eff_val == "OPERATOR" else "info",
+                      message=f"Control authority → {human} ({verb})",
+                      etype="authority", source="operator-backend",
+                      vehicle_id=vid, vehicle=name_of(vid))
     return {
         "ok": True, "vehicle_id": vid, "requested": authority,
         "authority": eff if eff in REPORTABLE_AUTHORITY else None,
@@ -1171,6 +1375,12 @@ async def receive_agent_status(request: Request):
         if isinstance(tel, dict) and tel:
             lk = last_known_telemetry.setdefault(vid, {})
             lk.update({k: v for k, v in tel.items() if v is not None})
+        # Same carry-forward for the agent reasoning group (payload.agent.*), and record
+        # any agent-decision / mission-state CHANGE as a first-class event (deduped).
+        agent_block = payload.get("agent") if isinstance(payload, dict) else None
+        if isinstance(agent_block, dict) and agent_block:
+            last_known_agent[vid] = dict(agent_block)
+        record_agent_changes(vid, payload, now)
 
     # Arrival-age reachability is about *arrival*, not payload age: any packet that
     # reaches us (even a replayed one) proves the operator link is carrying data now,

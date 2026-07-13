@@ -76,15 +76,39 @@ export async function getEvents() {
 }
 
 /**
- * getAutonomy / getMissionScope are NOT YET in the backend — kept here so pages import
- * from one place; they return null so callers render the availability slot instead of
- * inventing data. getCommsHistory is now live (GET /api/comms/history/{id}).
- * See DATA_DICTIONARY.md and BACKEND_ROADMAP.md.
+ * getMissionScope is NOT YET in the backend — kept here so pages import from one place;
+ * it returns null so callers render the availability slot instead of inventing data.
+ * getCommsHistory / getEvents are live. See DATA_DICTIONARY.md and BACKEND_ROADMAP.md.
  */
 /** Operator-side comms-state transition log for a vehicle (timeline + durations). */
 export function getCommsHistory(id) { return getJSON(`/api/comms/history/${id}`); }
 
-export async function getAutonomy(/* id */)     { return null; } // needs agent reasoning fields
+/**
+ * Flat operator event log (GET /api/events) for the Agent page's Previous Decision +
+ * Recent Timeline: comms, agent-decision, mission, authority and command transitions,
+ * chronological (oldest→newest). Flat shape { id, ts, severity, message, type, source,
+ * vehicleId, vehicle } — distinct from getEvents(), which adapts to the Events page.
+ */
+export async function getEventLog() {
+  const data = await getJSON("/api/events");
+  const list = Array.isArray(data) ? data : (data.events || []);
+  return list.map((e) => ({
+    id: e.id, ts: e.ts, severity: e.severity, message: e.message,
+    type: e.type, source: e.source, vehicleId: e.vehicle_id, vehicle: e.vehicle,
+  }));
+}
+
+/**
+ * Agent reasoning for a vehicle. Now sourced directly from the fleet payload's
+ * `agent_status` block (payload.agent.* the backend forwards — behaviour, decision
+ * reason, policy, autonomy level, …). The Agent page reads it off the vehicle object;
+ * this helper stays so callers have a single import point. Returns the block or {}.
+ */
+export async function getAgentReasoning(id) {
+  const v = await getVehicle(id);
+  return (v && v.agent_status) || {};
+}
+
 export async function getMissionScope()         { return null; } // needs named-mission registry
 
 // --- Control authority (dedicated API — deliberately NOT the command queue) ---

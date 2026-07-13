@@ -1,17 +1,18 @@
 // app.js — hash router. Mounts the active page into #app; cleans up the previous.
-// Only Map is migrated so far; every other route renders the Stub (app stays runnable).
+// The `autonomy` route key is preserved for back-compat (the nav label + page title
+// read "Agent"); the Agent page module lives in pages/Agent.js.
 import { Map } from "./pages/Map.js";
 import { Fleet } from "./pages/Fleet.js";
 import { Vehicle } from "./pages/Vehicle.js";
 import { Mission } from "./pages/Mission.js";
-import { Autonomy } from "./pages/Autonomy.js";
+import { Agent } from "./pages/Agent.js";
 import { Events } from "./pages/Events.js";
 import { Config } from "./pages/Config.js";
 import { Pilot } from "./pages/Pilot.js";
 import { Terminal } from "./pages/Terminal.js";
 import { Stub } from "./pages/Stub.js";
 
-const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, autonomy: Autonomy, events: Events, config: Config, pilot: Pilot, terminal: Terminal };
+const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, autonomy: Agent, events: Events, config: Config, pilot: Pilot, terminal: Terminal };
 const root = document.getElementById("app");
 let cleanup = null;
 

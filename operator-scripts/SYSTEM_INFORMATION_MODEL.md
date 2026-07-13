@@ -46,7 +46,7 @@ The roadmap's comms-transition log is the **operator-side** view (reachability a
 |---|---|---|---|
 | Position / heading / speed / mode / armed | Vehicle | `payload.telemetry` | autopilot; relayed untouched |
 | Battery / GPS fix / leak / temps / voltages | Vehicle | `payload.telemetry` / `payload.health` | many not yet forwarded (roadmap) |
-| Behaviour / decision reason / autonomy level | **Local Agent** | `payload.agent.*` | **already emitted** (`get_agent_status`) but the backend currently **drops** it in `normalize_agent_message` — forwarding is a small, high-value fix |
+| Behaviour / decision reason / autonomy level | **Local Agent** | `payload.agent.*` | emitted by `get_agent_status`; **now forwarded** by `normalize_agent_message` as `agent_status` (with last-known carry-forward) and shown verbatim on the Agent page |
 | Reporting policy / buffered packets | Local Agent | `payload.agent` / `payload.communication` | store-and-forward depth |
 | Agent-side comm-state | Local Agent | `payload.comm_state` | link *the vehicle believes it has* |
 | Mission goal / waypoint plan / overrides / sector | **Mission Agent** | not yet surfaced to backend | needs a mission-object path (roadmap P1) |
