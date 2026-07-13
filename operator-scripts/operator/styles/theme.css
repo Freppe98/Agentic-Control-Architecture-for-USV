@@ -131,6 +131,10 @@ a { color:inherit; }
 .pxm-row { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
 .pxm-row .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
 .pxm-row .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); font-variant-numeric:tabular-nums; }
+.pxm-integ { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.05em; font-weight:700; padding:2px 7px; border-radius:var(--r-sm); border:1px solid var(--line-strong); color:var(--muted); }
+.pxm-integ.ok { color:var(--connected); border-color:rgba(62,207,142,.3); background:rgba(62,207,142,.08); }
+.pxm-integ.warn { color:var(--caution); border-color:rgba(242,169,59,.32); background:rgba(242,169,59,.08); }
+.pxm-integ.bad { color:var(--disconnected); border-color:rgba(229,72,77,.34); background:rgba(229,72,77,.08); }
 .pxm-note { font-size:11px; line-height:1.45; color:var(--muted); margin-top:-1px; }
 .pxm-note.warn { color:var(--caution); }
 .pxm-actions { display:flex; flex-direction:column; gap:6px; margin-top:2px; }
@@ -141,16 +145,32 @@ a { color:inherit; }
 .pxm-actions button:active:not(:disabled), .pxm-btns button:active:not(:disabled) { transform:translateY(1px); }
 .pxm-actions button:disabled, .pxm-btns button:disabled { opacity:.42; cursor:not-allowed; }
 
-/* mission overlay — numbered waypoints (rounded squares, distinct from round vehicle dots) */
-.wp-marker { width:22px; height:22px; border-radius:5px; background:var(--accent); color:#0A0E13; display:flex; align-items:center; justify-content:center; font-family:var(--font-mono); font-size:11px; font-weight:700; line-height:1; border:1.5px solid #070C11; box-shadow:0 1px 3px rgba(0,0,0,.55); }
-.wp-marker.cur { background:var(--connected); box-shadow:0 0 0 3px rgba(62,207,142,.35), 0 1px 3px rgba(0,0,0,.55); transform:scale(1.12); }
+/* mission overlay — small, discreet numbered waypoints that stay subordinate to the
+   round comm-colored vehicle dot. Rounded-square so they never read as a vehicle. */
+.wp-marker { width:20px; height:20px; border-radius:5px; background:rgba(76,141,255,.82); color:#08101C; display:flex; align-items:center; justify-content:center; font-family:var(--font-mono); font-size:10px; font-weight:700; line-height:1; border:1.5px solid rgba(7,12,17,.85); box-shadow:0 1px 2px rgba(0,0,0,.5); transition:transform var(--t-fast), background var(--t-hover), box-shadow var(--t-hover); }
+.wp-marker:hover { background:rgba(76,141,255,1); transform:scale(1.18); box-shadow:0 0 0 3px rgba(76,141,255,.25), 0 1px 3px rgba(0,0,0,.55); z-index:20; }
+.wp-marker .wp-num { pointer-events:none; }
+/* current waypoint — stronger ring, not a bigger box (keeps the flow calm) */
+.wp-marker.cur { background:var(--connected); color:#06120C; border-color:#06120C; box-shadow:0 0 0 2.5px rgba(62,207,142,.45), 0 1px 3px rgba(0,0,0,.55); }
+/* HOME / current-position item — distinct home glyph, never numbered into the route */
+.home-marker { width:22px; height:22px; border-radius:6px; background:rgba(18,24,31,.92); color:var(--muted); display:flex; align-items:center; justify-content:center; border:1.5px solid var(--muted); box-shadow:0 1px 3px rgba(0,0,0,.6); transition:transform var(--t-fast), color var(--t-hover), border-color var(--t-hover); }
+.home-marker svg { width:13px; height:13px; }
+.home-marker:hover { color:var(--text); border-color:var(--text); transform:scale(1.12); z-index:20; }
+.home-marker.cur { border-color:var(--connected); color:var(--connected); box-shadow:0 0 0 2.5px rgba(62,207,142,.4), 0 1px 3px rgba(0,0,0,.6); }
+/* wide zoom: drop the numbers and shrink the markers to just readable dots (no layer
+   rebuild — a single class on the map container). Current keeps its ring. */
+.mission-faded .wp-num { display:none; }
+.mission-faded .wp-marker { transform:scale(.5); }
+.mission-faded .wp-marker:hover { transform:scale(.85); }
+.mission-faded .home-marker { transform:scale(.62); }
 /* dark-theme the Leaflet popup shell so the waypoint readout is legible on the map */
 .leaflet-popup-content-wrapper { background:var(--panel); color:var(--text); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:var(--shadow-1); }
 .leaflet-popup-content { margin:9px 11px; }
 .leaflet-popup-tip { background:var(--panel); border:1px solid var(--line-strong); }
 .leaflet-popup-close-button { color:var(--muted); }
 .wp-pop { min-width:150px; }
-.wp-pop-h { font-family:var(--font-mono); font-size:12px; font-weight:700; margin-bottom:6px; padding-bottom:5px; border-bottom:1px solid var(--line); color:var(--text); }
+.wp-pop-h { display:flex; align-items:center; gap:8px; font-family:var(--font-mono); font-size:12px; font-weight:700; margin-bottom:6px; padding-bottom:5px; border-bottom:1px solid var(--line); color:var(--text); }
+.wp-cur-tag { margin-left:auto; font-size:8.5px; letter-spacing:.06em; font-weight:700; padding:2px 6px; border-radius:var(--r-sm); color:var(--connected); border:1px solid rgba(62,207,142,.4); background:rgba(62,207,142,.1); }
 .wp-pop-row { display:flex; align-items:baseline; justify-content:space-between; gap:14px; padding:1.5px 0; }
 .wp-pop-row span:first-child { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
 .wp-pop-row span:last-child { font-family:var(--font-mono); font-size:11.5px; color:var(--text); font-variant-numeric:tabular-nums; }

@@ -82,6 +82,9 @@ export function Map(root) {
   // Leaflet
   map = L.map("map", { zoomControl: true, attributionControl: false }).setView(HOME, 16);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20 }).addTo(map);
+  // Wide zoom hides mission waypoint numbers (leaving dots); close zoom restores them.
+  // A single container class toggle — the mission Leaflet layers are never recreated.
+  map.on("zoomend", applyMissionZoom);
 
   function makeIcon(v) {
     const st = commState(v), color = COL[st], stale = st !== "connected", sel = v.id === selId;
@@ -168,25 +171,101 @@ export function Map(root) {
     }
   }
 
-  // A numbered waypoint marker — a rounded square so it never reads as a vehicle dot
-  // (round, comm-colored). The current waypoint is highlighted (green + ring).
+  // ---- Mission geometry & HOME detection ----------------------------------
+  // Pixhawk stores sequence 0 as a home / current-location item that is NOT part of
+  // the stored survey: it typically uses MAV_FRAME_GLOBAL (absolute alt) while the
+  // survey legs use MAV_FRAME_GLOBAL_RELATIVE_ALT, and it sits at the vehicle's
+  // current position — often kilometres from the survey cluster. We render it as a
+  // separate HOME marker, keep it OUT of the route polyline, and EXCLUDE it from the
+  // mission-fit bounds so Center frames the survey, not the whole transit. Scout's
+  // data is never rewritten — the original seq / frame stay visible in the popup.
+  const METERS = (a, b) => {
+    const R = 6371000, toR = Math.PI / 180;
+    const dLat = (b[0] - a[0]) * toR, dLng = (b[1] - a[1]) * toR;
+    const la = a[0] * toR, lb = b[0] * toR;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(la) * Math.cos(lb) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  };
+  // true = absolute-global frame (home candidate), false = relative/terrain global
+  // frame (a survey leg), null = unknown / non-global. Accepts MAVLink ints
+  // (0 = GLOBAL, 3/6/10/11 = relative/terrain) or the string spellings Scout forwards.
+  function frameIsAbsGlobal(frame) {
+    if (frame == null || frame === "") return null;
+    if (typeof frame === "number") return frame === 0 ? true : [3, 6, 10, 11].includes(frame) ? false : null;
+    const s = String(frame).toUpperCase();
+    if (!s.includes("GLOBAL")) return null;
+    return !(s.includes("RELATIVE") || s.includes("TERRAIN"));
+  }
+
+  // Split a vehicle's positioned waypoints into { home, route } in sequence order. The
+  // lowest-seq item is a HOME candidate; it is treated as HOME only when it is clearly
+  // not a survey leg — a distinct absolute-global frame, OR a geographic outlier far
+  // from the rest of the cluster. Otherwise it stays an ordinary route waypoint, so a
+  // mission whose seq 0 genuinely is a normal leg is not mis-split.
+  function classifyMission(id) {
+    const wps = positionedWaypoints(id).slice()
+      .sort((a, b) => (a.seq == null ? 0 : a.seq) - (b.seq == null ? 0 : b.seq));
+    if (wps.length < 2) return { home: null, route: wps };
+    const cand = wps[0], rest = wps.slice(1);
+    const frameSaysHome = frameIsAbsGlobal(cand.frame) === true
+      && rest.some((w) => frameIsAbsGlobal(w.frame) === false);
+    // geographic outlier: candidate far from the cluster centroid relative to the
+    // cluster's own span, and past an absolute floor so a tight cluster still splits.
+    const cLat = rest.reduce((s, w) => s + w.lat, 0) / rest.length;
+    const cLng = rest.reduce((s, w) => s + w.lng, 0) / rest.length;
+    let span = 0;
+    for (const w of rest) span = Math.max(span, METERS([cLat, cLng], [w.lat, w.lng]));
+    const geoSaysHome = METERS([cand.lat, cand.lng], [cLat, cLng]) > Math.max(span * 3, 400);
+    return (frameSaysHome || geoSaysHome) ? { home: cand, route: rest } : { home: null, route: wps };
+  }
+
+  // A numbered survey waypoint — a small, discreet marker that never competes with the
+  // round comm-colored vehicle dot. The number lives in its own span so it can be
+  // hidden at wide zoom (leaving just the dot). The current waypoint gets a stronger
+  // ring, not a bigger box.
   function wpIcon(w, isCurrent) {
     return L.divIcon({
       className: "",
-      html: `<div class="wp-marker${isCurrent ? " cur" : ""}">${w.seq == null ? "•" : w.seq}</div>`,
+      html: `<div class="wp-marker${isCurrent ? " cur" : ""}"><span class="wp-num">${w.seq == null ? "•" : w.seq}</span></div>`,
+      iconSize: [20, 20], iconAnchor: [10, 10],
+    });
+  }
+  const homeSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20h14V9.5"/></svg>';
+  function homeIcon(isCurrent) {
+    return L.divIcon({
+      className: "",
+      html: `<div class="home-marker${isCurrent ? " cur" : ""}" title="Home / current position">${homeSvg}</div>`,
       iconSize: [22, 22], iconAnchor: [11, 11],
     });
   }
 
-  function wpPopup(w) {
+  // Readable command label: Scout's command_name when present, else the raw command
+  // string (e.g. MAV_CMD_NAV_WAYPOINT) with the boilerplate prefix trimmed, else the
+  // numeric code. Never renders "null" (the real proxy sends command as a string and
+  // leaves command_name null).
+  function cmdLabel(w) {
+    if (w.command_name) return w.command_name;
+    const c = w.command;
+    if (c == null || c === "") return "—";
+    if (typeof c === "string") return c.replace(/^MAV_CMD_(NAV_|DO_|CONDITION_)?/, "") || c;
+    return String(c);
+  }
+  function frameLabel(f) {
+    if (f == null || f === "") return "—";
+    return typeof f === "string" ? f.replace(/^MAV_FRAME_/, "") : String(f);
+  }
+
+  function wpPopup(w, isCur, isHome) {
     const row = (k, v) => `<div class="wp-pop-row"><span>${k}</span><span>${v}</span></div>`;
     const loiter = w.loiter_time != null ? row("Loiter", `${w.loiter_time} s`) : "";
     return `<div class="wp-pop">
-      <div class="wp-pop-h">WP ${w.seq == null ? "—" : w.seq}${w.command_name ? ` · ${w.command_name}` : ""}</div>
+      <div class="wp-pop-h">${isHome ? "HOME" : `WP ${w.seq == null ? "—" : w.seq}`}${isCur ? '<span class="wp-cur-tag">CURRENT</span>' : ""}</div>
+      ${row("Type", isHome ? "Home" : "Waypoint")}
       ${row("Sequence", w.seq == null ? "—" : w.seq)}
+      ${row("Command", cmdLabel(w))}
+      ${row("Frame", frameLabel(w.frame))}
       ${row("Latitude", w.lat != null ? (+w.lat).toFixed(6) : "—")}
       ${row("Longitude", w.lng != null ? (+w.lng).toFixed(6) : "—")}
-      ${row("Command", w.command_name || (w.command != null ? w.command : "—"))}
       ${row("Altitude", w.alt != null ? `${w.alt} m` : "—")}
       ${loiter}
     </div>`;
@@ -207,25 +286,45 @@ export function Map(root) {
     return (s.mission.waypoints || []).filter((w) => w.lat != null && w.lng != null);
   }
 
+  // Wide zoom hides the numbers (leaving dots) and shrinks the markers to cut noise;
+  // close zoom restores them. Toggled by a single class on the map container — the
+  // Leaflet layers are NEVER recreated on zoom (no flicker, no duplication).
+  const MISSION_LABEL_ZOOM = 15;
+  function applyMissionZoom() {
+    if (map) map.getContainer().classList.toggle("mission-faded", map.getZoom() < MISSION_LABEL_ZOOM);
+  }
+
   // Rebuild the overlay for one vehicle from its cached mission. Only waypoints with a
   // real position are plotted (a positionless item — e.g. RTL — is never drawn at 0,0).
+  // HOME (seq 0 home/current item, when separate) is drawn as its own marker and is
+  // never joined to WP 1 by the route polyline.
   function drawMissionOverlay(id) {
     clearMissionOverlay();
     const s = pxm[id];
     if (!map || !s || !s.mission) return;
-    const wps = positionedWaypoints(id);
-    if (!wps.length) return;
+    const { home, route } = classifyMission(id);
+    if (!route.length && !home) return;
     const cur = s.mission.current_seq;
+    const isCur = (w) => cur != null && w.seq === cur;
     const layer = L.layerGroup();
-    L.polyline(wps.map((w) => [w.lat, w.lng]),
-      { className: "mission-line", color: "#4C8DFF", weight: 2, opacity: 0.75, dashArray: "5 5" }).addTo(layer);
-    wps.forEach((w) => {
-      const isCur = cur != null && w.seq === cur;
-      L.marker([w.lat, w.lng], { icon: wpIcon(w, isCur), zIndexOffset: isCur ? 1000 : 0 })
-        .bindPopup(wpPopup(w)).addTo(layer);
+    if (route.length > 1) {
+      L.polyline(route.map((w) => [w.lat, w.lng]),
+        { className: "mission-line", color: "#4C8DFF", weight: 1.6, opacity: 0.6, dashArray: "6 7", lineCap: "round" }).addTo(layer);
+    }
+    route.forEach((w) => {
+      L.marker([w.lat, w.lng], { icon: wpIcon(w, isCur(w)), zIndexOffset: isCur(w) ? 1000 : 0 })
+        .bindPopup(wpPopup(w, isCur(w), false)).addTo(layer);
     });
+    if (home) {
+      // Home usually sits AT the vehicle's current position. Keep it beneath the
+      // vehicle marker (negative offset) so the round comm-colored dot stays dominant
+      // when the two coincide — the home glyph is fully visible whenever they differ.
+      L.marker([home.lat, home.lng], { icon: homeIcon(isCur(home)), zIndexOffset: -1000 })
+        .bindPopup(wpPopup(home, isCur(home), true)).addTo(layer);
+    }
     layer.addTo(map);
     missionLayer = layer;
+    applyMissionZoom();
   }
 
   function showMissionOverlay() {
@@ -239,16 +338,19 @@ export function Map(root) {
   }
 
   // Fit the map to the mission's bounds WITHOUT refetching — a pure client-side view
-  // change over the already-cached waypoints. Ensures the overlay is shown so the
-  // operator sees what was framed. Uses the last-known mission; safe while offline.
+  // change over the already-cached waypoints. Frames the SURVEY route only: a separate
+  // HOME item is excluded so Center does not zoom out to include the vehicle/home
+  // position kilometres away. Ensures the overlay is shown so the operator sees what
+  // was framed. Uses the last-known mission; safe while offline.
   function centerMission() {
     if (selId == null || !map) return;
-    const wps = positionedWaypoints(selId);
-    if (!wps.length) return;
+    const { route } = classifyMission(selId);
+    const pts = route.length ? route : positionedWaypoints(selId);
+    if (!pts.length) return;
     const s = pxmState(selId);
     if (!s.shown) { s.shown = true; drawMissionOverlay(selId); renderPxm(); }
-    const bounds = L.latLngBounds(wps.map((w) => [w.lat, w.lng]));
-    map.fitBounds(bounds, { padding: [48, 48], maxZoom: 18 });
+    const bounds = L.latLngBounds(pts.map((w) => [w.lat, w.lng]));
+    map.fitBounds(bounds, { padding: [56, 56], maxZoom: 17 });
   }
 
   // Switch the overlay to follow the selected vehicle: drop the old one, redraw the new
@@ -307,6 +409,21 @@ export function Map(root) {
     else if (m) key = "empty";
     const [chipText, chipCls] = PXM_CHIP[key] || PXM_CHIP.none;
 
+    // Mission integrity — shown ONLY from Scout-provided signals, never inferred
+    // locally: `valid` (VALID / INVALID) and `partial` (an incomplete download, which
+    // the proxy sets when Scout flags it or fewer items arrived than the reported count).
+    let integ = null;
+    if (validFlag === false) integ = ["INVALID", "bad"];
+    else if (m && m.partial) integ = ["PARTIAL", "warn"];
+    else if (validFlag === true) integ = ["VALID", "ok"];
+
+    // When the current sequence is a separated HOME item, name it as such rather than
+    // "WP 0" — the operator is not sitting on a survey waypoint 0.
+    const mc = m ? classifyMission(id) : { home: null };
+    const curText = cur == null ? "—"
+      : (mc.home && mc.home.seq === cur) ? `Home (seq ${cur})`
+      : (count != null ? `WP ${cur} / ${count}` : `WP ${cur}`);
+
     const hasWps = positionedWaypoints(id).length > 0;
     const shown = !!(s && s.shown);
     const fetched = !!(s && s.fetchedAt);
@@ -326,7 +443,8 @@ export function Map(root) {
       </div>
       <div class="pxm-grid">
         <div class="pxm-row"><span class="k">Loaded</span><span class="v">${count == null ? "—" : `${count} waypoint${count === 1 ? "" : "s"}`}</span></div>
-        <div class="pxm-row"><span class="k">Current</span><span class="v">${cur != null && count != null ? `WP ${cur} / ${count}` : "—"}</span></div>
+        <div class="pxm-row"><span class="k">Current</span><span class="v">${curText}</span></div>
+        ${integ ? `<div class="pxm-row"><span class="k">Integrity</span><span class="pxm-integ ${integ[1]}">${integ[0]}</span></div>` : ""}
         <div class="pxm-row"><span class="k">Last download</span><span class="v" id="pxm-age">${pxmAgeText(s)}</span></div>
         ${hash ? `<div class="pxm-row"><span class="k">Mission id</span><span class="v" title="${hash}">${hash.slice(0, 8)}</span></div>` : ""}
       </div>

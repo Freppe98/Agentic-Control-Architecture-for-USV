@@ -134,6 +134,66 @@ UI (Playwright, 1500×900, `#/map`):
   Nothing discarded.
 - **No console errors** across the whole flow.
 
+## Overlay polish + HOME handling (2026-07-13)
+
+Second pass: turn the overlay from a debug visualization into a **discreet operational
+overlay**, and handle the real Pixhawk **sequence-0 home / current-location item** so
+it never distorts the route or the Center fit.
+
+### Files changed
+| File | Change |
+|---|---|
+| `operator/pages/Map.js` | `classifyMission()` splits the mission into `{ home, route }` (`frameIsAbsGlobal` + `METERS` haversine); route polyline & `centerMission` bounds now use **route only** (HOME excluded); separate `homeIcon` marker drawn beneath the vehicle (`zIndexOffset:-1000`); markers shrunk + number moved to its own `.wp-num` span; `applyMissionZoom()` toggles `.mission-faded` on `zoomend` (no layer rebuild); richer `wpPopup` (HOME/Waypoint type, frame, `CURRENT` tag) with `cmdLabel()` command-string fallback; card gains a Scout-only `Integrity` badge and a `Home (seq N)` current line. |
+| `operator/styles/theme.css` | `.wp-marker` smaller/translucent + hover contrast; `.home-marker` (distinct home glyph); `.mission-faded` rules (hide `.wp-num`, shrink dots) for wide zoom; `.wp-cur-tag`, `.pxm-integ` badges. Polyline restyled inline (weight 1.6, opacity .6, dashed). |
+| `main.py` | **none** — the proxy already forwards `frame` and leaves `command` as Scout's string with `command_name:null`; all HOME/route logic is client-side and never rewrites Scout data. |
+
+### Root cause — Center zoomed out too far / route crossed the map
+The real mission's **seq 0 is a home/current-position item at the vehicle**, ~12 km from
+the survey cluster, and it was treated as an ordinary waypoint. Two consequences:
+1. **Bounds** — `centerMission` fit *all* positioned waypoints, so the fit box spanned
+   the whole Scout→survey transit and the survey shrank to a corner.
+2. **Route** — the polyline ran seq 0 → seq 1, drawing a long transit leg across the map.
+
+Fix: `classifyMission` detects the home item by **frame mismatch** (`MAV_FRAME_GLOBAL`
+vs the survey's `MAV_FRAME_GLOBAL_RELATIVE_ALT`) **or** as a **geographic outlier**
+(distance to the cluster centroid > max(3×cluster-span, 400 m)). The home item is then
+excluded from both the polyline and the Center bounds, and rendered as its own HOME
+marker. A seq 0 that genuinely is a normal leg (same frame, inside the cluster) is left
+as an ordinary route waypoint — nothing is mis-split.
+
+### Real-Scout verification
+Scout's `GET /agent/pixhawk_mission` lives on the vehicle network (`10.0.2.10:8080`),
+unreachable from the dev box, so the run used a mock reproducing the **exact real
+response shape** the task described: 14 items, seq 0 `MAV_FRAME_GLOBAL` at the current
+position, seq 1..13 `MAV_FRAME_GLOBAL_RELATIVE_ALT` near 56.679, 12.811, `current_seq:0`,
+**`command` as strings** (`"MAV_CMD_NAV_WAYPOINT"`) with **`command_name:null`**,
+`valid:true`, `hash`. Proxy output confirmed: `count:14`, seq 0 `frame:"MAV_FRAME_GLOBAL"`,
+strings passed through, `command_name:null`, `hash:"9f3ac71b2e6d480af12c"`.
+
+Playwright (1500×900, `#/map`, Scout selected). Results vs the required checks:
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Fetch shows 14 waypoints | ✅ card `Loaded 14 waypoints`, `Current Home (seq 0)`, `Integrity VALID`, `Mission id 9f3ac71b` |
+| 2 | Show renders the survey discreetly | ✅ 13 small numbered markers + thin dashed line ([04](img/04-center-survey.png)) |
+| 3 | HOME visually separate | ✅ distinct home glyph, **not** numbered, not joined to WP 1 ([02](img/02-show-home-centered.png)) |
+| 4 | Center zooms to the survey, not the transit | ✅ `fitBounds` over route-only frames the 13-point survey; home excluded |
+| 5 | Vehicle marker dominant | ✅ home drawn beneath vehicle; 40 px comm dot over the 22 px home glyph ([02](img/02-show-home-centered.png)) |
+| 6 | Repeated Show/Hide/Center → no duplicates | ✅ after 4× cycles: `13` wp-markers / `1` home-marker |
+| 7 | Vehicle switching removes/restores overlay | ✅ USV-1 → `0/0`; back to Scout + Show → `13/1` |
+| 8 | No console errors | ✅ 0 across the whole flow |
+| 9 | Popup shows command text when `command_name` null | ✅ `Command WAYPOINT` (string fallback) on both HOME and survey popups ([05](img/05-popup-survey.png), [03](img/03-popup-home.png)) |
+
+Extra confirmed: wide zoom drops the numbers to dots (`.mission-faded`, `wp-num`
+hidden) with the same 13 markers — **no layer rebuild** ([06](img/06-zoomed-out-both.png));
+survey popup (seq 7) shows `Frame GLOBAL_RELATIVE_ALT` + `Loiter 20 s`; HOME popup shows
+`HOME · CURRENT`, `Type Home`, `Frame GLOBAL`.
+
+Screenshots: [before/default](img/01-before-default.png) ·
+[Show — home + vehicle](img/02-show-home-centered.png) ·
+[HOME popup](img/03-popup-home.png) · [Center — survey](img/04-center-survey.png) ·
+[survey popup](img/05-popup-survey.png) · [wide zoom](img/06-zoomed-out-both.png).
+
 ## Still dependent on Scout
 Scout's Flask service (`motherpi/services/flask`) must expose
 `GET /agent/pixhawk_mission` (download the mission over MAVLink and return
