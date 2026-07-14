@@ -14,6 +14,7 @@ import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { commState, cls, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
 import { createAuthorityController } from "../lib/authority.js";
+import { isSafetyHold, SAFETY_HOLD_TITLE } from "../lib/home.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
@@ -42,12 +43,20 @@ const DIAG_RUN_MS = 550;
 // operator's shorthand; the value is the backend command type. Buttons are enabled
 // only when the latest Scout-confirmed control authority is LOCAL_AGENT — see the
 // Control card below; there is no separate/independent authority store.
-const CMDS = [
-  ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"], ["SET_MODE_HOLD", "HOLD"],
-  ["SET_MODE_LOITER", "LOITER"], ["SET_MODE_GUIDED", "GUIDED"], ["RTL", "RTL"],
+//
+// Mode presentation follows the shared taxonomy (lib/home.js): LOITER is the Scout's
+// PRIMARY safety hold (active anti-drift) and sits in the primary row beside AUTO /
+// MANUAL / RTL; the mission + arming controls follow. HOLD and GUIDED are demoted to a
+// collapsed "Advanced modes" group — HOLD is a PASSIVE hold (kept for backend
+// compatibility) and must never read as LOITER's equal.
+const PRIMARY_CMDS = [
+  ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"],
+  ["SET_MODE_LOITER", "LOITER"], ["RTL", "RTL"],
   ["MISSION_PAUSE", "PAUSE MISSION"], ["MISSION_RESUME", "RESUME MISSION"],
   ["ARM", "ARM"], ["DISARM", "DISARM"],
 ];
+const ADVANCED_CMDS = [["SET_MODE_HOLD", "HOLD"], ["SET_MODE_GUIDED", "GUIDED"]];
+const CMDS = [...PRIMARY_CMDS, ...ADVANCED_CMDS];  // combined lookup (labels, routing)
 const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
 const CMD_STATUS_CLS = { QUEUED: "u", SENT: "p", ACCEPTED: "p", EXECUTED: "c", REJECTED: "d", FAILED: "d", EXPIRED: "u" };
 const fmtClock = (iso) => { if (!iso) return "—"; const d = new Date(iso); return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour12: false }); };
@@ -409,10 +418,14 @@ export function Vehicle(root) {
     const authBtn = hasControl
       ? `<button class="ctl-auth release" data-auth="LOCAL_AGENT"${busy ? " disabled" : ""}>Release Control</button>`
       : `<button class="ctl-auth engage" data-auth="OPERATOR"${busy || stale || !av.available ? " disabled" : ""}>Take Control</button>`;
-    const cmdBtns = CMDS.map(([type, label]) => {
+    const renderCmd = ([type, label]) => {
       const hr = HIGH_RISK.has(type);
-      return `<button class="ctl-cmd${hr ? " hr" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${type}${hr ? " · confirmation required" : ""}">${label}</button>`;
-    }).join("");
+      const safety = isSafetyHold(type);   // LOITER — primary anti-drift safety hold
+      const title = safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`;
+      return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
+    };
+    const primaryBtns = PRIMARY_CMDS.map(renderCmd).join("");
+    const advancedBtns = ADVANCED_CMDS.map(renderCmd).join("");
     const queueHtml = cmds.length
       ? cmds.slice(0, 8).map((c) => {
           const clsx = CMD_STATUS_CLS[c.status] || "u";
@@ -436,8 +449,13 @@ export function Vehicle(root) {
           <div class="ctl-auth-note">${authNote}</div>
           ${authBtn}
         </div>
-        <div class="ctl-cmds${hasControl ? "" : " locked"}">${cmdBtns}</div>
+        <div class="ctl-cmds${hasControl ? "" : " locked"}">${primaryBtns}</div>
         ${hasControl ? "" : `<div class="ctl-lock-note">${lockSvg}<span>Commands are locked. Take Control (Scout-confirmed) to enable them.</span></div>`}
+        <details class="ctl-advanced">
+          <summary>Advanced modes</summary>
+          <div class="ctl-cmds${hasControl ? "" : " locked"}">${advancedBtns}</div>
+          <div class="ctl-advanced-note">HOLD is a <b>passive</b> hold — the USV may drift with wind or current. For an active anti-drift safety hold use <b>LOITER</b> above.</div>
+        </details>
         <div class="ctl-queue">
           <div class="ctl-queue-h"><span class="lbl">Command queue &amp; history</span><span class="tag">status is reported by the vehicle — never assumed</span></div>
           ${queueHtml}

@@ -619,8 +619,22 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .ctl-cmd.hr:hover:not(:disabled) { border-color:var(--caution); background:rgba(242,169,59,.13); }
 .ctl-cmd:disabled { opacity:.4; cursor:not-allowed; color:var(--dim); }
 .ctl-cmds.locked { opacity:.85; }
+/* LOITER — the primary anti-drift safety hold: a steady green accent so it reads as the
+   go-to safety action, distinct from the amber high-risk (hr) buttons. Never dimmed by
+   the Home interlock (it is not Home-gated). */
+.ctl-cmd.safety:not(:disabled) { border-color:rgba(62,207,142,.5); color:var(--connected); }
+.ctl-cmd.safety:hover:not(:disabled) { border-color:var(--connected); background:rgba(62,207,142,.13); }
 .ctl-lock-note { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--dim); margin-top:-4px; }
 .ctl-lock-note svg { width:14px; height:14px; flex:none; }
+/* Advanced modes (HOLD, GUIDED) — secondary, collapsed by default so they never sit
+   beside LOITER as an equal primary action. */
+.ctl-advanced { border:1px solid var(--line); border-radius:var(--r); background:var(--panel-2); padding:0 11px; }
+.ctl-advanced > summary { list-style:none; cursor:pointer; padding:9px 2px; font-family:var(--font-mono); font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); user-select:none; }
+.ctl-advanced > summary::-webkit-details-marker { display:none; }
+.ctl-advanced > summary::before { content:"▸"; display:inline-block; margin-right:7px; color:var(--dim); transition:transform var(--t-fast); }
+.ctl-advanced[open] > summary::before { transform:rotate(90deg); }
+.ctl-advanced .ctl-cmds { padding:2px 0 10px; }
+.ctl-advanced-note { font-size:11px; line-height:1.5; color:var(--dim); padding:0 0 11px; }
 /* queue / history */
 .ctl-queue { border:1px solid var(--line); border-radius:var(--r); background:var(--panel); overflow:hidden; }
 .ctl-queue-h { display:flex; align-items:baseline; gap:10px; padding:10px 13px; border-bottom:1px solid var(--line); background:var(--panel-2); }
@@ -631,3 +645,71 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .ctl-when { font-size:11px; color:var(--muted); margin-left:auto; }
 .ctl-note { flex-basis:100%; font-size:11px; color:var(--muted); padding-left:2px; }
 .ctl-empty { padding:14px 13px; font-size:12px; color:var(--muted); }
+
+/* --- Vehicle Home (deployment: set + read-back-verify the Pixhawk HOME_POSITION) --- */
+.home-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.home-badge { font-family:var(--font-mono); font-size:10px; font-weight:700; letter-spacing:.06em; padding:3px 9px; border-radius:var(--r-sm); border:1px solid var(--line-strong); color:var(--muted); white-space:nowrap; }
+.home-badge.ok { color:var(--connected); border-color:rgba(62,207,142,.34); background:rgba(62,207,142,.09); }
+.home-badge.warn { color:var(--caution); border-color:rgba(242,169,59,.34); background:rgba(242,169,59,.09); }
+.home-badge.pending { color:var(--accent-bright); border-color:rgba(76,141,255,.34); background:var(--accent-dim); }
+.home-dist { font-family:var(--font-mono); font-size:11px; color:var(--connected); margin-left:auto; }
+.home-msg { font-size:11.5px; line-height:1.5; color:var(--muted); margin-bottom:9px; }
+.home-msg.ok { color:var(--connected); }
+.home-msg.warn { color:var(--caution); }
+.home-msg.pending { color:var(--accent-bright); }
+.home-grid { display:flex; flex-direction:column; gap:6px; margin-bottom:10px; }
+.home-row { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.home-row .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+.home-row .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); font-variant-numeric:tabular-nums; }
+.home-set-btn { width:100%; padding:10px 12px; border-radius:var(--r); font-family:var(--font-mono); font-size:12.5px; font-weight:700; letter-spacing:.05em; cursor:pointer; color:var(--accent-bright); background:var(--accent-dim); border:1px solid rgba(76,141,255,.4); transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); }
+.home-set-btn:hover:not(:disabled) { border-color:var(--accent); background:rgba(76,141,255,.22); }
+.home-set-btn:active:not(:disabled) { transform:translateY(1px); }
+.home-set-btn:disabled { opacity:.42; cursor:not-allowed; color:var(--dim); background:var(--panel); border-color:var(--line-strong); }
+.home-btn-note { font-size:11px; color:var(--dim); margin-top:6px; text-align:center; }
+
+/* Home-interlock note under the disabled AUTO/RTL/RESUME buttons (never LOITER). */
+.home-gate-note { display:flex; align-items:center; gap:8px; font-size:11.5px; line-height:1.45; color:var(--caution); margin-top:-2px; }
+.home-gate-note svg { width:14px; height:14px; flex:none; }
+.ctl-cmd.home-locked:disabled { opacity:.5; color:var(--caution); border-color:rgba(242,169,59,.28); }
+
+/* Deployment-readiness checklist. */
+.rdy { display:flex; flex-direction:column; gap:5px; margin-bottom:9px; }
+.rdy-item { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+.rdy-item .rdy-mk { font-family:var(--font-mono); font-weight:700; width:14px; text-align:center; }
+.rdy-item.ok { color:var(--text); }
+.rdy-item.ok .rdy-mk { color:var(--connected); }
+.rdy-item.no .rdy-mk { color:var(--caution); }
+.rdy-banner { font-family:var(--font-mono); font-size:11px; font-weight:700; letter-spacing:.05em; text-align:center; padding:7px 10px; border-radius:var(--r-sm); border:1px solid var(--line-strong); }
+.rdy-banner.ok { color:var(--connected); border-color:rgba(62,207,142,.34); background:rgba(62,207,142,.09); }
+.rdy-banner.warn { color:var(--caution); border-color:rgba(242,169,59,.3); background:rgba(242,169,59,.07); font-weight:600; }
+.rdy-banner.dim { color:var(--dim); font-weight:600; }
+
+/* Mission card: "+ Home" sub-note next to the executable waypoint count. */
+.pxm-sub { font-family:var(--font-mono); font-size:10px; color:var(--dim); }
+
+/* Vehicle Home map marker (distinct from mission waypoints + the mission-readback house). */
+.veh-home-marker { width:26px; height:26px; display:flex; align-items:flex-start; justify-content:center; color:var(--muted); filter:drop-shadow(0 1px 2px rgba(0,0,0,.7)); transition:transform var(--t-fast), color var(--t-hover); }
+.veh-home-marker svg { width:26px; height:26px; }
+.veh-home-marker:hover { transform:scale(1.12); z-index:20; }
+.veh-home-marker.verified { color:var(--connected); }
+.veh-home-marker.unverified, .veh-home-marker.unknown { color:var(--caution); }
+.veh-home-marker.pending { color:var(--accent-bright); }
+.mission-faded .veh-home-marker { transform:scale(.7); }
+
+/* Confirmation modal (Set Home — never a one-click action). */
+.modal-ov { position:fixed; inset:0; z-index:2000; display:flex; align-items:center; justify-content:center; background:rgba(6,10,15,.66); backdrop-filter:blur(2px); }
+.modal { width:min(420px,92vw); background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:0 18px 48px rgba(0,0,0,.6); overflow:hidden; }
+.modal-h { padding:14px 16px; font-size:14px; font-weight:600; color:var(--text); border-bottom:1px solid var(--line); background:var(--panel-2); }
+.modal-b { padding:14px 16px; font-size:12.5px; line-height:1.55; color:var(--muted); }
+.modal-b p { margin:0 0 10px; }
+.modal-b .modal-warn { color:var(--caution); margin:12px 0 0; }
+.modal-kv { display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:5px 0; border-top:1px solid var(--line); }
+.modal-kv span { font-family:var(--font-mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase; color:var(--dim); }
+.modal-kv b { font-family:var(--font-mono); font-size:12.5px; font-weight:600; color:var(--text); font-variant-numeric:tabular-nums; }
+.modal-f { display:flex; gap:10px; padding:13px 16px; border-top:1px solid var(--line); background:var(--panel-2); }
+.modal-btn { flex:1; padding:10px 12px; border-radius:var(--r); font-family:var(--font-mono); font-size:12px; font-weight:700; letter-spacing:.05em; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); }
+.modal-btn:active { transform:translateY(1px); }
+.modal-cancel { color:var(--muted); background:var(--panel); border:1px solid var(--line-strong); }
+.modal-cancel:hover { border-color:var(--muted); color:var(--text); }
+.modal-confirm { color:var(--accent-bright); background:var(--accent-dim); border:1px solid rgba(76,141,255,.45); }
+.modal-confirm:hover { border-color:var(--accent); background:rgba(76,141,255,.24); }

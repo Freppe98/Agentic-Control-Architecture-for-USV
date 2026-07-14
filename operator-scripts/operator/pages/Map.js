@@ -13,6 +13,7 @@ import { vehicleRows } from "../components/VehicleDock.js";
 import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
 import { createAuthorityController } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
+import { homeStatus, commandGate, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE } from "../lib/home.js";
 
 const HOME = [56.699893, 13.002148];
 
@@ -42,6 +43,10 @@ const CMD_PHASE = {
   EXPIRED: ["timed out", "u"],
 };
 const CMD_LABEL = Object.fromEntries([...MAP_MODES, ...MAP_SAFETY, ...MAP_MISSION]);
+// Distinct recovery/home glyph for the Vehicle Home (Pixhawk HOME_POSITION) marker —
+// a home inside a location pin, deliberately unlike the numbered mission waypoints and
+// the mission-readback house icon. Colour comes from the verification state (CSS).
+const vehHomeSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-6.4 7-11a7 7 0 1 0-14 0c0 4.6 7 11 7 11Z"/><path d="M9.2 10.4 12 8l2.8 2.4V14H9.2z"/></svg>';
 
 export function Map(root) {
   const L = window.L;
@@ -53,6 +58,12 @@ export function Map(root) {
   // authority confirmed by Scout, never the button press.
   const authCtl = createAuthorityController(() => renderInspector());
   const markers = {};
+  let homeMarker = null;         // dedicated Vehicle Home (HOME_POSITION) marker, selected vehicle
+  // Set-Home lifecycle for the selected vehicle. `phase` drives the pending/verified/
+  // failed UI; the SETTLED verified state lives on v.home (server-persisted, survives the
+  // poll). The transient flash clears itself so the section falls back to v.home.
+  let setHome = { phase: "idle", code: null, message: null, at: 0 };
+  let setHomeTimer = null;
   const timers = [];
   // Pixhawk mission readback — per-vehicle, view-only. Each entry:
   //   { mission, fetchedAt, loading, note }  (see fetchPixhawkMission / renderPxm)
@@ -230,6 +241,49 @@ export function Map(root) {
       iconSize: [20, 20], iconAnchor: [10, 10],
     });
   }
+  // ---- Vehicle Home marker (Pixhawk HOME_POSITION / RTL recovery point) -----------
+  // A dedicated marker for the deployment home, driven by v.home — SEPARATE from the
+  // mission overlay's seq-0 house and from the numbered mission waypoints, and never
+  // joined to WP 1 by the route polyline. Colour tracks the verification state.
+  function vehHomeIcon(state) {
+    return L.divIcon({
+      className: "",
+      html: `<div class="veh-home-marker ${state}">${vehHomeSvg}</div>`,
+      iconSize: [26, 26], iconAnchor: [13, 24],
+    });
+  }
+  function vehHomeTooltip(v, hs) {
+    const row = (k, val) => `<div class="wp-pop-row"><span>${k}</span><span>${val}</span></div>`;
+    const verTxt = hs.state === "verified"
+      ? `Verified${hs.verifiedAgeS != null ? ` · ${fmtAgo(hs.verifiedAgeS)}` : ""}`
+      : hs.state === "pending" ? "Setting…" : hs.state === "unknown" ? "Unknown" : "Not verified";
+    return `<div class="wp-pop">
+      <div class="wp-pop-h">VEHICLE HOME</div>
+      ${row("Type", "RTL recovery point")}
+      ${row("Latitude", hs.homeLat != null ? hs.homeLat.toFixed(6) : "—")}
+      ${row("Longitude", hs.homeLng != null ? hs.homeLng.toFixed(6) : "—")}
+      ${row("Verification", verTxt)}
+      ${row("Distance from Scout", fmtDistance(hs.distanceM))}
+    </div>`;
+  }
+  function updateHomeMarker() {
+    if (!map) return;
+    const v = fleet.find((x) => x.id === selId);
+    const hs = v ? effectiveHomeStatus(v) : null;
+    if (!hs || !hs.available || hs.homeLat == null || hs.homeLng == null) {
+      if (homeMarker) { map.removeLayer(homeMarker); homeMarker = null; }
+      return;
+    }
+    const ll = [hs.homeLat, hs.homeLng];
+    const icon = vehHomeIcon(hs.state);
+    const tip = vehHomeTooltip(v, hs);
+    if (!homeMarker) {
+      homeMarker = L.marker(ll, { icon, zIndexOffset: -500 }).addTo(map).bindPopup(tip);
+    } else {
+      homeMarker.setLatLng(ll).setIcon(icon).setPopupContent(tip);
+    }
+  }
+
   const homeSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20h14V9.5"/></svg>';
   function homeIcon(isCurrent) {
     return L.divIcon({
@@ -418,11 +472,15 @@ export function Map(root) {
     else if (validFlag === true) integ = ["VALID", "ok"];
 
     // When the current sequence is a separated HOME item, name it as such rather than
-    // "WP 0" — the operator is not sitting on a survey waypoint 0.
+    // "WP 0" — the operator is not sitting on a survey waypoint 0. The EXECUTABLE count
+    // excludes a split-out Home (seq 0 is the RTL/home item, not a mission leg); the raw
+    // MAVLink `count`/`seq` are preserved internally and still shown per-waypoint.
     const mc = m ? classifyMission(id) : { home: null };
+    const homeSplit = !!(m && mc.home);
+    const execCount = count == null ? null : (homeSplit ? Math.max(0, count - 1) : count);
     const curText = cur == null ? "—"
       : (mc.home && mc.home.seq === cur) ? `Home (seq ${cur})`
-      : (count != null ? `WP ${cur} / ${count}` : `WP ${cur}`);
+      : (execCount != null ? `WP ${cur} / ${execCount}` : `WP ${cur}`);
 
     const hasWps = positionedWaypoints(id).length > 0;
     const shown = !!(s && s.shown);
@@ -442,7 +500,7 @@ export function Map(root) {
         <span class="pxm-chip ${chipCls}">${chipText}</span>
       </div>
       <div class="pxm-grid">
-        <div class="pxm-row"><span class="k">Loaded</span><span class="v">${count == null ? "—" : `${count} waypoint${count === 1 ? "" : "s"}`}</span></div>
+        <div class="pxm-row"><span class="k">Loaded</span><span class="v">${execCount == null ? "—" : `${execCount} waypoint${execCount === 1 ? "" : "s"}`}${homeSplit ? ` <span class="pxm-sub">+ Home (seq ${mc.home.seq == null ? 0 : mc.home.seq})</span>` : ""}</span></div>
         <div class="pxm-row"><span class="k">Current</span><span class="v">${curText}</span></div>
         ${integ ? `<div class="pxm-row"><span class="k">Integrity</span><span class="pxm-integ ${integ[1]}">${integ[0]}</span></div>` : ""}
         <div class="pxm-row"><span class="k">Last download</span><span class="v" id="pxm-age">${pxmAgeText(s)}</span></div>
@@ -525,6 +583,133 @@ export function Map(root) {
     loadCommands(selId);
   }
 
+  // ---- Vehicle Home (deployment: set + read-back-verify HOME_POSITION) ------------
+  const fmtCoords = (lat, lng) =>
+    (lat != null && lng != null) ? `${(+lat).toFixed(5)}, ${(+lng).toFixed(5)}` : "—";
+
+  // The displayed Home status: the settled state from v.home, overlaid with the
+  // transient set-home phase (pending → verified flash → failed) so the UI reacts
+  // immediately without waiting for the next fleet poll to flip v.home.verified.
+  function effectiveHomeStatus(v) {
+    const phase = setHome.phase === "pending" ? "pending"
+      : setHome.phase === "failed" ? "failed" : "idle";
+    let hs = homeStatus(v, { phase, failMessage: setHome.message });
+    if (setHome.phase === "verified" && hs.state !== "verified") {
+      hs = { ...hs, state: "verified", verified: true, reason: null };
+    }
+    return hs;
+  }
+
+  // A confirmation modal — Set Home moves the RTL recovery point, so it must never be a
+  // one-click action. Resolves true (SET AND VERIFY HOME) or false (CANCEL / Esc / scrim).
+  function confirmModal({ title, bodyHtml, cancelLabel = "CANCEL", confirmLabel = "CONFIRM" }) {
+    return new Promise((resolve) => {
+      const ov = document.createElement("div");
+      ov.className = "modal-ov";
+      ov.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-label="${title}">
+        <div class="modal-h">${title}</div>
+        <div class="modal-b">${bodyHtml}</div>
+        <div class="modal-f">
+          <button class="modal-btn modal-cancel">${cancelLabel}</button>
+          <button class="modal-btn modal-confirm">${confirmLabel}</button>
+        </div></div>`;
+      const done = (val) => { document.removeEventListener("keydown", onKey); ov.remove(); resolve(val); };
+      const onKey = (e) => { if (e.key === "Escape") done(false); };
+      ov.addEventListener("click", (e) => { if (e.target === ov) done(false); });
+      ov.querySelector(".modal-cancel").onclick = () => done(false);
+      ov.querySelector(".modal-confirm").onclick = () => done(true);
+      document.addEventListener("keydown", onKey);
+      document.body.appendChild(ov);
+      ov.querySelector(".modal-confirm").focus();
+    });
+  }
+
+  async function doSetHome() {
+    const v = fleet.find((x) => x.id === selId);
+    if (!v) return;
+    const hs = effectiveHomeStatus(v);
+    const body = `
+      <p>The Scout's current position will become the RTL recovery point.</p>
+      <div class="modal-kv"><span>Current Scout position</span><b>${fmtCoords(hs.vehLat, hs.vehLng)}</b></div>
+      <div class="modal-kv"><span>Existing Pixhawk Home</span><b>${hs.available ? fmtCoords(hs.homeLat, hs.homeLng) : "Not received"}</b></div>
+      <div class="modal-kv"><span>Distance from existing Home</span><b>${fmtDistance(hs.distanceM)}</b></div>
+      <p class="modal-warn">Only continue when the Scout is physically located at a safe and accessible recovery point.</p>`;
+    const ok = await confirmModal({ title: "Set Pixhawk Home here?", bodyHtml: body, confirmLabel: "SET AND VERIFY HOME" });
+    if (!ok) return;
+    if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
+    setHome = { phase: "pending", code: null, message: null, at: Date.now() };
+    renderInspector(); updateHomeMarker();
+    let res;
+    try { res = await api.setHome(v.id, { lat: v.lat, lng: v.lng }); }
+    catch (e) { res = { ok: false, data: { code: "scout_unavailable", message: "Set Home failed — network error." } }; }
+    const d = (res && res.data) || {};
+    if (res && res.ok && d.verified) {
+      setHome = { phase: "verified", code: null, message: null, at: Date.now() };
+    } else {
+      setHome = { phase: "failed", code: d.code || "failed",
+                  message: d.message || "Set Home was not accepted.", at: Date.now() };
+    }
+    const flashVerified = setHome.phase === "verified";
+    // Refresh Home status, selected vehicle state, marker and readiness controls.
+    loadCommands(selId);
+    renderInspector(); updateHomeMarker();
+    setHomeTimer = setTimeout(() => {
+      setHome = { phase: "idle", code: null, message: null, at: 0 };
+      renderInspector(); updateHomeMarker();
+    }, flashVerified ? 4000 : 9000);
+  }
+
+  const HOME_BADGE = {
+    verified: ["HOME VERIFIED", "ok"],
+    unverified: ["HOME NOT VERIFIED", "warn"],
+    unknown: ["HOME UNKNOWN", "warn"],
+    pending: ["SETTING HOME", "pending"],
+  };
+
+  function renderHomeSection(v, hs, gateCtx) {
+    const [badgeTxt, badgeCls] = HOME_BADGE[hs.state] || HOME_BADGE.unknown;
+    const verTxt = hs.state === "verified"
+      ? `Verified${hs.verifiedAgeS != null ? ` · ${fmtAgo(hs.verifiedAgeS)}` : ""}`
+      : hs.state === "pending" ? "Setting…" : hs.state === "unknown" ? "Not received" : "Not verified";
+    const message = hs.state === "pending"
+      ? "Waiting for Pixhawk acknowledgement and read-back verification…"
+      : hs.state === "verified"
+        ? `${hs.verifiedDistanceM != null ? fmtDistance(hs.verifiedDistanceM) + " from Scout. " : ""}Recovery point verified${hs.verifiedAgeS != null ? ` ${fmtAgo(hs.verifiedAgeS)}` : ""}.`
+        : (hs.reason || "");
+    const g = commandGate("SET_HOME", gateCtx);
+    const btnTitle = g.enabled
+      ? "Set the Pixhawk HOME / RTL recovery point to the Scout's current position"
+      : (g.reason || "Set Home unavailable");
+    const btnNote = (!g.enabled && g.reason)
+      ? `<div class="home-btn-note">${g.reason}</div>` : "";
+    return `
+      <div class="home-head">
+        <span class="home-badge ${badgeCls}">${badgeTxt}</span>
+        ${hs.state === "verified" && hs.distanceM != null ? `<span class="home-dist">${fmtDistance(hs.distanceM)} from Scout</span>` : ""}
+      </div>
+      ${message ? `<div class="home-msg ${badgeCls}">${message}</div>` : ""}
+      <div class="home-grid">
+        <div class="home-row"><span class="k">Pixhawk Home</span><span class="v">${fmtCoords(hs.homeLat, hs.homeLng)}</span></div>
+        <div class="home-row"><span class="k">Scout position</span><span class="v">${fmtCoords(hs.vehLat, hs.vehLng)}</span></div>
+        <div class="home-row"><span class="k">Distance</span><span class="v">${fmtDistance(hs.distanceM)}</span></div>
+        <div class="home-row"><span class="k">Source</span><span class="v">Pixhawk</span></div>
+        <div class="home-row"><span class="k">Home freshness</span><span class="v">${hs.available ? (hs.homeAgeS != null ? fmtAgo(hs.homeAgeS) : "reported") : "—"}</span></div>
+        <div class="home-row"><span class="k">Verification</span><span class="v">${verTxt}</span></div>
+      </div>
+      <button class="home-set-btn" id="set-home-btn"${g.enabled ? "" : " disabled"} title="${btnTitle.replace(/"/g, "&quot;")}">SET HOME HERE</button>
+      ${btnNote}`;
+  }
+
+  function renderReadiness(gateCtx) {
+    const r = deploymentReadiness(gateCtx);
+    const items = r.items.map((i) =>
+      `<div class="rdy-item ${i.ok ? "ok" : "no"}"><span class="rdy-mk">${i.ok ? "✓" : "✕"}</span>${i.label}</div>`).join("");
+    const banner = r.ready
+      ? `<div class="rdy-banner ok">READY FOR MISSION</div>`
+      : `<div class="rdy-banner ${r.loiterAvailable ? "warn" : "dim"}">Autonomous mission not ready.${r.loiterAvailable ? " LOITER remains available as an immediate anti-drift safety hold." : ""}</div>`;
+    return `<div class="rdy">${items}</div>${banner}`;
+  }
+
   function commsTimeline() {
     const h = commsHist;
     const clk = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
@@ -563,6 +748,19 @@ export function Map(root) {
     const canTake = av.available && !stale && !hasControl && !busy;
     const canRelease = av.available && !stale && av.value === "OPERATOR" && !busy;
 
+    // Vehicle Home + deployment interlock context. `connected`/`gpsFresh` are the
+    // arrival-age link freshness the backend also gates set-home on; `missionLoaded`
+    // reflects a fetched Pixhawk mission with waypoints. commandGate() (lib/home.js) is
+    // the single policy consumed by both the buttons and the readiness block.
+    const hs = effectiveHomeStatus(v);
+    const posValid = v.lat != null && v.lng != null;
+    const missionLoaded = !!(pxm[selId] && pxm[selId].mission && pxm[selId].mission.count > 0);
+    const gateCtx = {
+      hasControl, homeVerified: hs.state === "verified",
+      connected: !stale, posValid, gpsFresh: !stale,
+      missionLoaded, setHomePending: setHome.phase === "pending",
+    };
+
     box.innerHTML = `
       <div class="isec">
         <div class="idcard">
@@ -589,12 +787,20 @@ export function Map(root) {
         ${authNote(av, stale)}
       </div>
       <div class="isec">
+        <div class="sec-title"><span class="lbl">Vehicle Home</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">Pixhawk · RTL recovery point</span></div>
+        ${renderHomeSection(v, hs, gateCtx)}
+      </div>
+      <div class="isec">
+        <div class="sec-title"><span class="lbl">Deployment readiness</span></div>
+        ${renderReadiness(gateCtx)}
+      </div>
+      <div class="isec">
         <div class="sec-title"><span class="lbl">Vehicle Commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">Pixhawk · state reported by vehicle</span></div>
-        ${vehicleCommands(hasControl, av, stale)}
+        ${vehicleCommands(gateCtx, av, stale)}
       </div>
       <div class="isec">
         <div class="sec-title"><span class="lbl">Agent Commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">supervisory · local agent</span></div>
-        ${agentCommands(hasControl, av, stale, v)}
+        ${agentCommands(gateCtx, av, stale, v)}
       </div>
       <div class="isec">
         <div class="tele ${stale ? "stale" : ""}">
@@ -627,6 +833,8 @@ export function Map(root) {
     box.querySelectorAll("button[data-cmd]").forEach((btn) => {
       btn.onclick = () => sendCommand(btn.dataset.cmd);
     });
+    const setHomeBtn = box.querySelector("#set-home-btn");
+    if (setHomeBtn) setHomeBtn.onclick = () => doSetHome();
   }
 
   // Pending/rejected/timeout notice for the authority hand-off, plus the honest
@@ -647,24 +855,43 @@ export function Map(root) {
     return "";
   }
 
-  // A row of command buttons; the ARM/DISARM etc. high-risk ones carry the caution
-  // style + a confirmation. Enabled only on confirmed OPERATOR authority.
-  function cmdBtns(items, hasControl) {
-    return `<div class="ctl-cmds${hasControl ? "" : " locked"}">` +
+  // A row of command buttons. Each button is gated by the shared commandGate policy
+  // (lib/home.js): confirmed OPERATOR authority first, then the Home-verification
+  // interlock for AUTO / RTL / RESUME. LOITER is NEVER Home-gated — it stays enabled on
+  // control alone (a critical anti-drift safety action). ARM/DISARM keep their existing
+  // behaviour. High-risk ones carry the caution style + a confirmation.
+  function cmdBtns(items, gateCtx) {
+    return `<div class="ctl-cmds${gateCtx.hasControl ? "" : " locked"}">` +
       items.map(([type, label]) => {
         const hr = HIGH_RISK.has(type);
-        return `<button class="ctl-cmd${hr ? " hr" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${type}${hr ? " · confirmation required" : ""}">${label}</button>`;
+        const safety = isSafetyHold(type);       // LOITER — the primary anti-drift safety hold
+        const g = commandGate(type, gateCtx);
+        const dis = !g.enabled;
+        const homeLocked = dis && !!g.reason;   // disabled specifically by the Home interlock
+        const title = g.reason || (safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`);
+        return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}${homeLocked ? " home-locked" : ""}" data-cmd="${type}"${dis ? " disabled" : ""} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
       }).join("") + `</div>`;
   }
   function lockNote(hasControl, av, stale) {
     if (hasControl) return "";
     return `<div class="ctl-lock-note">${lockSvg}<span>${stale ? "Link not current" : av.value === "OPERATOR" ? "" : "Commands are locked"} — Take Control (OPERATOR, Scout-confirmed) to enable.</span></div>`;
   }
+  // Consolidated Home-interlock note for the disabled AUTO/RTL/RESUME buttons. Shown
+  // ONLY when the operator holds control but Home is not verified — so the disable reads
+  // as "verify Home", not "no control". Deliberately NOT shown for LOITER.
+  function homeGateNote(items, gateCtx) {
+    if (!gateCtx.hasControl || gateCtx.homeVerified) return "";
+    const gated = items.filter(([t]) => { const g = commandGate(t, gateCtx); return !g.enabled && g.reason; });
+    if (!gated.length) return "";
+    const labels = gated.map(([t]) => CMD_LABEL[t] || t).join(", ");
+    return `<div class="home-gate-note">${homeSvg}<span>${labels} disabled — set and verify Pixhawk Home before autonomous operation.</span></div>`;
+  }
 
   // Vehicle/Pixhawk commands ONLY — real ArduRover modes + the ARM/DISARM safety pair.
   // Independent of the local agent. The "Last command" line reports the queue lifecycle.
-  function vehicleCommands(hasControl, av, stale) {
-    return cmdBtns(MAP_VEHICLE, hasControl) + lockNote(hasControl, av, stale) + cmdStatus();
+  function vehicleCommands(gateCtx, av, stale) {
+    return cmdBtns(MAP_VEHICLE, gateCtx) + lockNote(gateCtx.hasControl, av, stale)
+      + homeGateNote(MAP_VEHICLE, gateCtx) + cmdStatus();
   }
 
   // Agent/supervisory commands ONLY — pause/resume the mission the local agent runs —
@@ -672,8 +899,9 @@ export function Map(root) {
   // the Agent page owns the full reasoning view). Current status is approximated from
   // mission_state (LIVE while connected, LAST KNOWN when stale); the previous status
   // needs an onboard decision log the agent does not emit yet → honest gap.
-  function agentCommands(hasControl, av, stale, v) {
-    return cmdBtns(MAP_MISSION, hasControl) + lockNote(hasControl, av, stale) + agentStatusBlock(v);
+  function agentCommands(gateCtx, av, stale, v) {
+    return cmdBtns(MAP_MISSION, gateCtx) + lockNote(gateCtx.hasControl, av, stale)
+      + homeGateNote(MAP_MISSION, gateCtx) + agentStatusBlock(v);
   }
 
   function agentStatusBlock(v) {
@@ -713,12 +941,15 @@ export function Map(root) {
       selId = id; commsHist = null; loadCommsHistory(id);
       authCtl.reset(); loadAuthority(id);
       cmds = []; loadCommands(id);
+      // Set-Home phase is per-vehicle — never carry a pending/failed flash across a switch.
+      if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
+      setHome = { phase: "idle", code: null, message: null, at: 0 };
     }
     // Snap the map to the selected vehicle (only if it has a known position — a
     // never-contacted vehicle has none, so there is nothing to snap to).
     const v = fleet.find((x) => x.id === id);
     if (map && v && v.lat != null && v.lng != null) map.panTo([v.lat, v.lng]);
-    renderDock(); renderPxm(); syncMissionOverlay(); renderInspector(); updateMarkers();
+    renderDock(); renderPxm(); syncMissionOverlay(); renderInspector(); updateMarkers(); updateHomeMarker();
   }
 
   // Default to a vehicle that is actually reporting (so the primary view opens on a
@@ -735,7 +966,7 @@ export function Map(root) {
       selId = defaultSelection();
       loadCommsHistory(selId); loadAuthority(selId); loadCommands(selId);
     }
-    updateMarkers(); renderDock(); renderPxm(); renderInspector();
+    updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
     updateRibbon({ counts: counts() });
   }
   function onEnv(e) {
@@ -757,6 +988,7 @@ export function Map(root) {
 
   return function cleanup() {
     stopFleet(); stopEnv(); clearInterval(clockId); timers.forEach(clearInterval);
+    if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
     authCtl.dispose();
     clearMissionOverlay();
     if (map) { map.remove(); map = null; }

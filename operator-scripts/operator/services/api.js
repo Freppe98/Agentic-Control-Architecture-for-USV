@@ -156,6 +156,19 @@ export function getCommands(id) { return getJSON(`/api/commands/${id}`); }
 /** Fetch the mission stored on a vehicle's Pixhawk (live Scout readback). */
 export function getPixhawkMission(id) { return getJSON(`/api/vehicles/${id}/pixhawk-mission`); }
 
+// --- Set Home (deployment: set + read-back-verify the Pixhawk HOME_POSITION) ---
+// A synchronous Scout proxy (POST /api/vehicles/{id}/commands/set-home) that threads
+// the normal command record. body: { lat, lng } — the Scout's CURRENT position — plus
+// confirm:true (required; this is a deliberate, non-one-click action). Returns
+// { ok, status, data }; data.verified is true ONLY when Scout read HOME back and it
+// landed within tolerance — success is never claimed before verification. On failure
+// data.code is the structured reason (gps_unavailable / position_stale /
+// scout_unavailable / command_rejected / ack_timeout / readback_timeout /
+// verification_out_of_tolerance). See main.py set_home.
+export function setHome(id, { lat, lng }) {
+  return postJSON(`/api/vehicles/${id}/commands/set-home`, { lat, lng, confirm: true });
+}
+
 /** Small polling helper so pages don't each reinvent setInterval + error handling. */
 export function poll(fn, ms, onData, onError) {
   let stopped = false;

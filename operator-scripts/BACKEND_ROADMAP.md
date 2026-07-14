@@ -59,6 +59,8 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 | mission ETA / time remaining | Map, Mission | Local Agent | A-out (agent knows plan + progress) | on change | B | Feature unavailable | P2 |
 | mission-level coverage total | Map, Mission | Frontend | F-derive (avg of per-vehicle — already done) | slow | D | — | done |
 | **Pixhawk mission readback** (mission stored on the flight controller — numbered waypoints + overlay, view-only) | Map | Scout Flask (download over MAVLink) + Operator backend (thin proxy) | B-field | on demand | C → `GET /api/vehicles/{id}/pixhawk-mission` (proxies Scout `GET /agent/pixhawk_mission`) | Scout unavailable | P1 · **operator proxy done** (see `verification/pixhawk-mission.md`) · needs Scout route |
+| **Vehicle Home read (`home_position`)** — live Pixhawk `HOME_POSITION` in the status payload, for the Map Home marker/section | Map | Local Agent (forward `HOME_POSITION` MAVLink) | A-out | on change | B → `GET /api/fleet/status.home` | HOME UNKNOWN | P1 · **operator/frontend done** · needs agent to forward `home_position` |
+| **Set Home + read-back verify** (deployment: set `HOME_POSITION` to Scout's current pos, verify by re-reading) | Map | Scout Flask (`MAV_CMD_DO_SET_HOME` + read-back over MAVLink) + Operator backend (thin proxy) | B-field | on deploy | E/C → `POST /api/vehicles/{id}/commands/set-home` (proxies Scout `POST /agent/set_home {lat,lng}` → `{accepted,verified,home,distance_m,error_code?}`) | Pixhawk/Scout unreachable | P1 · **operator proxy + UI done** (see `verification/set-home.md`) · needs Scout route |
 
 ## Command / control (reverse path)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |

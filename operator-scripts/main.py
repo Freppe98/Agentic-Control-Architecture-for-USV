@@ -206,6 +206,73 @@ def mavlink_evidence(payload: dict) -> dict:
     }
 
 
+def haversine_m(a_lat, a_lng, b_lat, b_lng):
+    """Great-circle distance in metres between two lat/lng points, or None if any
+    coordinate is missing. Used for the Home ↔ Scout distance the operator reads before
+    committing a deployment (and for the read-back verification tolerance check)."""
+    for v in (a_lat, a_lng, b_lat, b_lng):
+        if v is None:
+            return None
+    from math import radians, sin, cos, asin, sqrt
+    R = 6371000.0
+    d_lat = radians(float(b_lat) - float(a_lat))
+    d_lng = radians(float(b_lng) - float(a_lng))
+    la, lb = radians(float(a_lat)), radians(float(b_lat))
+    h = sin(d_lat / 2) ** 2 + cos(la) * cos(lb) * sin(d_lng / 2) ** 2
+    return round(2 * R * asin(min(1.0, sqrt(h))), 2)
+
+
+# --- Vehicle Home (Pixhawk HOME_POSITION / RTL recovery point) ---
+# Two independent facts, kept separate and never conflated:
+#   (1) the live HOME_POSITION Scout forwards in status (where the Pixhawk *thinks*
+#       home is) — surfaced in the fleet payload's `home` block, freshness and all; and
+#   (2) whether the operator has SET and read-back-VERIFIED that home at the current
+#       deployment site — operator-backend state recorded only on a confirmed set-home
+#       (see the set-home endpoint). Verification is what gates AUTO/RTL/RESUME in the UI.
+# The backend never fabricates a home: no HOME_POSITION reported => available:false =>
+# the UI reads "HOME UNKNOWN", never a garage/zero default.
+HOME_VERIFY_TOLERANCE_M = 5.0     # read-back must land within this of the commanded point
+home_verification_by_id = {}      # {vid: {verified, verified_at, lat, lng, distance_m}}
+
+
+def _extract_home(payload: dict, telemetry: dict):
+    """Pull a live HOME_POSITION (lat/lng + optional freshness) out of a status payload,
+    tolerant of the spellings Scout may forward. Returns {lat, lng, age_s} or None when
+    the vehicle has not reported a home — an absent home is honest, never zero-filled."""
+    src = None
+    for cand in (payload.get("home_position"), payload.get("home"),
+                 telemetry.get("home_position"), telemetry.get("home")):
+        if isinstance(cand, dict):
+            src = cand
+            break
+    if src is None:
+        return None
+    lat = _mission_coord(src.get("lat"), src.get("latitude"), src.get("x"))
+    lng = _mission_coord(src.get("lng"), src.get("lon"), src.get("longitude"), src.get("y"))
+    if lat is None or lng is None:
+        return None
+    age = _age_seconds_from(_first_present(src.get("timestamp"), src.get("received_at"),
+                                           src.get("time"), src.get("age_s")))
+    return {"lat": lat, "lng": lng, "age_s": round(age, 1) if isinstance(age, (int, float)) else None}
+
+
+def home_block(vid: int, payload: dict, telemetry: dict):
+    """The fleet-payload `home` block for one vehicle: the live Pixhawk HOME_POSITION
+    (or available:false) merged with the operator's read-back verification record."""
+    live = _extract_home(payload, telemetry)
+    ver = home_verification_by_id.get(vid) or {}
+    return {
+        "source": "pixhawk",
+        "available": live is not None,
+        "lat": live["lat"] if live else None,
+        "lng": live["lng"] if live else None,
+        "age_s": live["age_s"] if live else None,
+        "verified": bool(ver.get("verified")),
+        "verified_at": ver.get("verified_at"),
+        "verified_distance_m": ver.get("distance_m"),
+    }
+
+
 def normalize_agent_message(message: dict) -> dict:
     """
     Accepts both:
@@ -297,6 +364,10 @@ def normalize_agent_message(message: dict) -> dict:
         "coverage": payload.get("coverage"),
         "lat": lat,
         "lng": lng,
+        # Vehicle Home (Pixhawk HOME_POSITION / RTL recovery point) + the operator's
+        # read-back verification record. Distinct from `lat`/`lng` (the vehicle's own
+        # position) — the map plots them as two separate markers.
+        "home": home_block(usv_id, payload, telemetry),
         "mission_data": payload.get("mission", {}) or {},
         "communication": payload.get("communication", {}) or {},
         "health": payload.get("health", {}) or {},
@@ -697,16 +768,17 @@ def record_agent_changes(vid, payload, now):
 COMMAND_TYPES = {
     "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_HOLD", "SET_MODE_LOITER",
     "SET_MODE_GUIDED", "RTL", "MISSION_PAUSE", "MISSION_RESUME",
-    "ARM", "DISARM",
+    "ARM", "DISARM", "SET_HOME",
 }
 # Arming touches the motors, so both ARM and DISARM ALWAYS require an explicit
 # confirm:true (independent of comm-state) — the backend rejects them otherwise.
 # ARM is the higher risk of the two (the vehicle can move under power once armed);
 # its record carries a caution warning. Still just the queue — no execution here.
-CONFIRM_REQUIRED_TYPES = {"ARM", "DISARM"}
+CONFIRM_REQUIRED_TYPES = {"ARM", "DISARM", "SET_HOME"}
 RISK_WARNING = {
     "ARM": "High-risk: the vehicle can move under power once armed. Confirmed by operator.",
     "DISARM": "Disarms the vehicle (motors off). Confirmed by operator.",
+    "SET_HOME": "Sets the Pixhawk HOME / RTL recovery point to the Scout's current position. Confirmed by operator.",
 }
 COMMAND_TTL_S = 300              # queued commands survive ~5 min of disconnection, then EXPIRE
 TERMINAL_STATUSES = {"EXECUTED", "REJECTED", "FAILED", "EXPIRED"}
@@ -1319,6 +1391,174 @@ def pixhawk_mission(vehicle_id: str):
             "reason": "No Scout mission API configured for this vehicle",
         }
     return _scout_mission_read(vid, base, now)
+
+
+# --- Set Home (deployment: set + read-back-verify the Pixhawk HOME_POSITION) ---
+# The lake-deployment workflow: with the Scout floating at a safe recovery point and a
+# valid GPS fix, the operator commits its CURRENT position as the Pixhawk HOME / RTL
+# recovery point. This is a synchronous Scout proxy (like control authority / pixhawk
+# mission), NOT the async local-agent queue — but it still threads the normal command
+# record (uuid id, timestamps, lifecycle) so it appears in the command history and the
+# result is EXECUTED only on Scout's read-back verification, never on the click.
+#
+# Scout-side contract (to be exposed by motherpi/services/flask, mirroring
+# /agent/control_authority): POST /agent/set_home  body { lat, lng }  ->
+#   { accepted: bool, verified: bool, home: { lat, lng }, distance_m: float,
+#     error_code?: str, reason?: str }
+# where `verified` means Scout re-read HOME_POSITION back off the Pixhawk and it matched.
+# Until Scout ships it, this endpoint returns an honest scout_unavailable failure and the
+# operator UI never claims Home was set.
+
+# Structured failure vocabulary the UI branches on (E5). Scout's own error_code (if it
+# sends one) is normalized onto these; otherwise we derive from accepted/verified.
+_SET_HOME_CODE_ALIASES = {
+    "NO_GPS": "gps_unavailable", "GPS_UNAVAILABLE": "gps_unavailable", "NO_FIX": "gps_unavailable",
+    "STALE": "position_stale", "POSITION_STALE": "position_stale",
+    "UNREACHABLE": "scout_unavailable", "PIXHAWK_UNREACHABLE": "scout_unavailable",
+    "REJECTED": "command_rejected", "DENIED": "command_rejected", "COMMAND_REJECTED": "command_rejected",
+    "ACK_TIMEOUT": "ack_timeout", "NO_ACK": "ack_timeout",
+    "READBACK_TIMEOUT": "readback_timeout", "NO_READBACK": "readback_timeout",
+    "OUT_OF_TOLERANCE": "verification_out_of_tolerance",
+    "VERIFICATION_FAILED": "verification_out_of_tolerance",
+}
+_SET_HOME_MESSAGES = {
+    "gps_unavailable": "No valid GPS fix — Scout could not provide a home position.",
+    "position_stale": "Scout position is stale — wait for a current, valid GPS fix.",
+    "scout_unavailable": "Pixhawk/Scout unreachable — Home was not set.",
+    "command_rejected": "Pixhawk rejected the set-home command.",
+    "ack_timeout": "No acknowledgement from the Pixhawk — Home was not confirmed set.",
+    "readback_timeout": "Pixhawk did not read HOME back — set could not be verified.",
+    "verification_out_of_tolerance": "Home read back too far from the commanded point — not verified.",
+}
+
+
+def _fail_set_home(cmd, code, now, *, detail=None, distance_m=None, home=None):
+    """Mark the SET_HOME command REJECTED/FAILED with a structured code and return the
+    UI-facing failure body. command_rejected is a REJECTED; everything else is a FAILED."""
+    status = "REJECTED" if code == "command_rejected" else "FAILED"
+    message = _SET_HOME_MESSAGES.get(code, "Set Home failed.")
+    if cmd is not None:
+        apply_command_result(cmd, status, None, message, now)
+        _command_event(cmd, severity="warning",
+                       message=f"Set Home failed — {message}", source="operator-backend")
+    body = {"ok": False, "verified": False, "phase": "failed", "code": code,
+            "message": message, "distance_m": distance_m, "home": home}
+    if detail:
+        body["detail"] = detail
+    if cmd is not None:
+        body["command"] = cmd
+    return body
+
+
+@app.post("/api/vehicles/{vehicle_id}/commands/set-home")
+async def set_home(vehicle_id: str, request: Request):
+    """Set + read-back-verify the Pixhawk HOME_POSITION at the deployment site.
+    Body: { lat, lng, confirm }. `lat`/`lng` are the Scout's CURRENT position (the
+    recovery point); confirm:true is required (this is a deliberate, non-one-click
+    action). Never reports success before Scout's read-back verification succeeds."""
+    now = datetime.now(timezone.utc)
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if not isinstance(body, dict):
+        body = {}
+
+    vid = parse_vehicle_id(vehicle_id)
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle_id})
+
+    if not bool(body.get("confirm")):
+        return JSONResponse(status_code=409, content={
+            "ok": False, "needs_confirmation": True, "type": "SET_HOME",
+            "message": "Setting Home moves the RTL recovery point and requires explicit "
+                       "confirmation. Resend with confirm:true."})
+
+    lat = _mission_coord(body.get("lat"), body.get("latitude"))
+    lng = _mission_coord(body.get("lng"), body.get("lon"), body.get("longitude"))
+    comm_state = comms_state_by_id.get(vid, "UNKNOWN")
+
+    # Create the SET_HOME command record up front so even a validation failure is tracked.
+    cmd = make_command(vid=vid, ctype="SET_HOME",
+                       params={"lat": lat, "lng": lng}, created_by=body.get("created_by"),
+                       comm_state=comm_state, now=now)
+    cmd["warning"] = RISK_WARNING["SET_HOME"]
+    _command_event(cmd, severity="caution",
+                   message=f"Set Home requested ({comm_state})", source="operator-backend")
+
+    # GPS present + fresh (validated before we ever touch Scout).
+    if lat is None or lng is None:
+        return JSONResponse(status_code=422, content=_fail_set_home(cmd, "gps_unavailable", now))
+    if comm_state != "CONNECTED":
+        return JSONResponse(status_code=409, content=_fail_set_home(
+            cmd, "position_stale", now, detail=f"comm_state={comm_state}"))
+
+    base = scout_api_base(vid)
+    if base is None:
+        return JSONResponse(status_code=409, content=_fail_set_home(
+            cmd, "scout_unavailable", now, detail="no Scout API configured for this vehicle"))
+
+    try:
+        r = requests.post(f"{base}/agent/set_home", json={"lat": lat, "lng": lng}, timeout=8)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException as exc:
+        return JSONResponse(status_code=502, content=_fail_set_home(
+            cmd, "scout_unavailable", now, detail=str(exc)))
+    if not isinstance(data, dict):
+        data = {}
+
+    # Normalize Scout's response.
+    raw_code = str(data.get("error_code") or data.get("code") or "").upper()
+    code = _SET_HOME_CODE_ALIASES.get(raw_code)
+    accepted = data.get("accepted")
+    verified = bool(data.get("verified"))
+    rb = data.get("home") if isinstance(data.get("home"), dict) else {}
+    home_lat = _mission_coord(rb.get("lat"), rb.get("latitude")) if rb else None
+    home_lng = _mission_coord(rb.get("lng"), rb.get("lon"), rb.get("longitude")) if rb else None
+    home_out = {"lat": home_lat, "lng": home_lng} if home_lat is not None and home_lng is not None else None
+    distance_m = data.get("distance_m")
+    if distance_m is None and home_out:
+        distance_m = haversine_m(lat, lng, home_lat, home_lng)
+
+    # Scout signalled an explicit failure code, or did not accept the command.
+    if code:
+        return JSONResponse(status_code=502, content=_fail_set_home(
+            cmd, code, now, detail=data.get("reason"), distance_m=distance_m, home=home_out))
+    if accepted is False:
+        return JSONResponse(status_code=502, content=_fail_set_home(
+            cmd, "command_rejected", now, detail=data.get("reason"),
+            distance_m=distance_m, home=home_out))
+    if not verified:
+        return JSONResponse(status_code=502, content=_fail_set_home(
+            cmd, "readback_timeout", now, detail=data.get("reason"),
+            distance_m=distance_m, home=home_out))
+    # Verified by Scout, but the operator backend still enforces the tolerance itself —
+    # never trust a "verified" flag that read back kilometres away.
+    if distance_m is not None and distance_m > HOME_VERIFY_TOLERANCE_M:
+        return JSONResponse(status_code=502, content=_fail_set_home(
+            cmd, "verification_out_of_tolerance", now,
+            detail=f"{distance_m} m > {HOME_VERIFY_TOLERANCE_M} m tolerance",
+            distance_m=distance_m, home=home_out))
+
+    # Success: record verification (fleet payload picks it up) + mark the command EXECUTED.
+    verified_at = now.isoformat()
+    home_verification_by_id[vid] = {
+        "verified": True, "verified_at": verified_at,
+        "lat": home_lat if home_lat is not None else lat,
+        "lng": home_lng if home_lng is not None else lng,
+        "distance_m": distance_m,
+    }
+    apply_command_result(cmd, "EXECUTED", data, None, now)
+    _append_event(severity="info",
+                  message=f"Home verified ({distance_m} m from Scout)"
+                          if distance_m is not None else "Home verified",
+                  etype="command", source="operator-backend",
+                  vehicle_id=vid, vehicle=name_of(vid))
+    return {
+        "ok": True, "verified": True, "phase": "verified", "vehicle_id": vid,
+        "home": home_out or {"lat": lat, "lng": lng}, "distance_m": distance_m,
+        "verified_at": verified_at, "tolerance_m": HOME_VERIFY_TOLERANCE_M,
+        "command": cmd,
+    }
 
 
 @app.get("/api/commands/history/{vehicle_id}")
