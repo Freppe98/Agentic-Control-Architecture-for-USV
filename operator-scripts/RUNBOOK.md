@@ -13,7 +13,7 @@ This binds `0.0.0.0:8200` (all interfaces) so Scout can reach it over the networ
 and prints this PC's LAN addresses. Equivalent manual command:
 
 ```powershell
-python -m uvicorn main:app --host 0.0.0.0 --port 8200
+python -m uvicorn main:app --host 0.0.0.0 --port 8200 --no-access-log
 ```
 
 Open the station locally at http://127.0.0.1:8200/app/ to confirm it's up.

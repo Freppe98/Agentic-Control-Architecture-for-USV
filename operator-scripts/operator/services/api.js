@@ -156,26 +156,47 @@ export function getCommands(id) { return getJSON(`/api/commands/${id}`); }
 /** Fetch the mission stored on a vehicle's Pixhawk (live Scout readback). */
 export function getPixhawkMission(id) { return getJSON(`/api/vehicles/${id}/pixhawk-mission`); }
 
-// --- Set Home (deployment: set + read-back-verify the Pixhawk HOME_POSITION) ---
-// A synchronous Scout proxy (POST /api/vehicles/{id}/commands/set-home) that threads
-// the normal command record. body: { lat, lng } — the Scout's CURRENT position — plus
-// confirm:true (required; this is a deliberate, non-one-click action). Returns
-// { ok, status, data }; data.verified is true ONLY when Scout read HOME back and it
-// landed within tolerance — success is never claimed before verification. On failure
-// data.code is the structured reason (gps_unavailable / position_stale /
-// scout_unavailable / command_rejected / ack_timeout / readback_timeout /
-// verification_out_of_tolerance). See main.py set_home.
+// --- Set Home (deployment: set the Pixhawk HOME_POSITION) ---
+// SET_HOME is a normal queued command — exactly the createCommand() call above, just a
+// dedicated helper so callers don't repeat the type/params/confirm shape. body: { lat,
+// lng } is the Scout's CURRENT position (the recovery point). Returns { ok, status,
+// data } where data.command is the QUEUED command record; verification is NOT known at
+// this call — it lands later as the command's result (poll getCommands and watch this
+// command's id reach EXECUTED, same as every other command type). See main.py.
 export function setHome(id, { lat, lng }) {
-  return postJSON(`/api/vehicles/${id}/commands/set-home`, { lat, lng, confirm: true });
+  return createCommand({ vehicle_id: id, type: "SET_HOME", params: { lat, lng }, confirm: true });
 }
 
-/** Small polling helper so pages don't each reinvent setInterval + error handling. */
-export function poll(fn, ms, onData, onError) {
+// --- Feed health (data-freshness diagnostics) -------------------------------
+// poll() below is the ONLY polling primitive in the app, so tracking success/
+// failure here means every feed is diagnosable from one place instead of each
+// page reinventing it. Keyed per feed so an independent, secondary poll (e.g.
+// environment/wind) never smears into the signal for the primary one (fleet) —
+// a slow wind update must never read as "operator backend down".
+const feedHealth = new Map(); // key -> { lastOkAt, lastErrAt, consecutiveErrors }
+
+/** Current health for a poll() feed (by key), or null if that key never polled. */
+export function getFeedHealth(key) {
+  const h = feedHealth.get(key);
+  return h ? { ...h } : null;
+}
+
+/** Small polling helper so pages don't each reinvent setInterval + error handling.
+ *  `key` is optional — pass one (e.g. "fleet") to make this feed's health readable
+ *  via getFeedHealth() for an operator-facing freshness indicator. */
+export function poll(fn, ms, onData, onError, key) {
   let stopped = false;
+  if (key && !feedHealth.has(key)) feedHealth.set(key, { lastOkAt: null, lastErrAt: null, consecutiveErrors: 0 });
   async function tick() {
     if (stopped) return;
-    try { onData(await fn()); }
-    catch (err) { if (onError) onError(err); }
+    try {
+      const data = await fn();
+      if (key) { const h = feedHealth.get(key); h.lastOkAt = Date.now(); h.consecutiveErrors = 0; }
+      onData(data);
+    } catch (err) {
+      if (key) { const h = feedHealth.get(key); h.lastErrAt = Date.now(); h.consecutiveErrors++; }
+      if (onError) onError(err);
+    }
     if (!stopped) setTimeout(tick, ms);
   }
   tick();

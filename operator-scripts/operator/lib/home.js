@@ -25,8 +25,7 @@ export const PRIMARY_MODES = ["SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_LOIT
 export const ADVANCED_MODES = ["SET_MODE_HOLD", "SET_MODE_GUIDED"];
 export function isSafetyHold(type) { return type === SAFETY_HOLD_TYPE; }
 // One place to author the LOITER affordance so both pages say the same thing.
-export const SAFETY_HOLD_TITLE =
-  "LOITER — active position hold (anti-drift safety). Available even when Home is unverified.";
+export const SAFETY_HOLD_TITLE = "Active anti-drift safety hold. Always available.";
 
 export const HOME_VERIFY_TOLERANCE_M = 5;
 
@@ -59,17 +58,28 @@ export function fmtAgo(s) {
 /**
  * Settled + transient Home status for the inspector, marker and readiness block.
  *
+ * `verified` (and everything else read off `v.home`) is Scout's OWN continuously-
+ * reported status (payload.agent.home_status, normalized by the backend's
+ * home_block()) — never something this function or the backend reconstructs from a
+ * SET_HOME command's result. A command result only ever drives the transient
+ * `phase` ("pending"/"failed") for immediate click feedback; it can never force
+ * `state` to "verified" here. If Scout's status goes stale (link lost, Scout
+ * restarted), `v.home.stale`/`v.home.verified` flipping is what un-verifies the UI —
+ * this function just renders whatever the backend currently reports.
+ *
  * @param v     fleet vehicle object (uses v.home, v.lat, v.lng)
  * @param opts  { phase: 'idle'|'pending'|'failed', failMessage, now (ms) }
  * @returns {{ state, available, verified, homeLat, homeLng, vehLat, vehLng,
- *             distanceM, homeAgeS, verifiedAt, verifiedAgeS, verifiedDistanceM,
+ *             distanceM, verifiedAt, verifiedAgeS, verifiedDistanceM,
+ *             verificationMethod, readyForAuto, readyForRtl, reachable, stale,
  *             reason, failMessage }}
  *   state: 'unknown' | 'unverified' | 'pending' | 'verified'
  */
 export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.now() } = {}) {
   const home = (v && v.home) || {};
   const available = home.available === true && home.lat != null && home.lng != null;
-  const verified = home.verified === true;
+  const stale = home.stale === true;
+  const verified = home.verified === true; // backend already forces this false when stale
   const homeLat = available ? +home.lat : null;
   const homeLng = available ? +home.lng : null;
   const vehLat = v && v.lat != null ? +v.lat : null;
@@ -89,8 +99,11 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
   else state = "unverified";
 
   // Operator-facing reason when not verified (never shown for a verified Home).
+  // Scout's own `reason` (e.g. a staleness explanation) wins when it sent one —
+  // it is more accurate than anything we could infer locally.
   let reason = null;
   if (phase === "failed" && failMessage) reason = failMessage;
+  else if (state !== "verified" && home.reason) reason = home.reason;
   else if (state === "unknown") reason = "Pixhawk Home has not been received.";
   else if (state === "unverified") {
     reason = distanceM != null
@@ -99,24 +112,31 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
   }
 
   return {
-    state, available, verified,
+    state, available, verified, stale,
     homeLat, homeLng, vehLat, vehLng,
     distanceM,
-    homeAgeS: home.age_s != null ? +home.age_s : null,
     verifiedAt: home.verified_at || null,
     verifiedAgeS,
-    verifiedDistanceM: home.verified_distance_m != null ? +home.verified_distance_m : null,
+    verifiedDistanceM: home.verification_distance_m != null ? +home.verification_distance_m : null,
+    verificationMethod: home.verification_method || null,
+    readyForAuto: home.ready_for_auto === true,
+    readyForRtl: home.ready_for_rtl === true,
+    reachable: home.reachable == null ? null : !!home.reachable,
     reason,
     failMessage: phase === "failed" ? failMessage : null,
   };
 }
 
-// Commands the Home-verification interlock disables until Home is VERIFIED.
+// Commands the Home-verification interlock disables until Home is VERIFIED. Each
+// reason is the ONE place its hover copy is authored — the single contextual
+// explanation shown on the button itself (see the UI cleanup: the permanent
+// "Deployment readiness" card is the only always-visible Home indicator; everything
+// else, including these, is contextual/on-hover).
 export const HOME_GATED = new Set(["SET_MODE_AUTO", "RTL", "MISSION_RESUME"]);
 const HOME_REASONS = {
-  SET_MODE_AUTO: "Set and verify Pixhawk Home before starting AUTO.",
-  RTL: "Set and verify Pixhawk Home before RTL — an old Home may be unsafe.",
-  MISSION_RESUME: "Set and verify Pixhawk Home before resuming the mission.",
+  SET_MODE_AUTO: "Set and verify Home before AUTO.",
+  RTL: "RTL requires a verified Home.",
+  MISSION_RESUME: "Verify Home before resuming.",
 };
 
 export function isHomeGated(type) { return HOME_GATED.has(type); }

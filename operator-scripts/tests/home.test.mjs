@@ -50,12 +50,35 @@ test("Home NOT VERIFIED and far from Scout reports the distance", () => {
 
 test("Home VERIFIED reads from v.home.verified + verified_at age", () => {
   const now = Date.now();
-  const v = veh({ ...HOME_HERE, verified: true, verified_at: new Date(now - 8000).toISOString(), verified_distance_m: 1.4 });
+  const v = veh({ ...HOME_HERE, verified: true, verified_at: new Date(now - 8000).toISOString(), verification_distance_m: 1.4 });
   const hs = homeStatus(v, { now });
   assert.equal(hs.state, "verified");
   assert.equal(hs.verified, true);
   assert.ok(hs.verifiedAgeS >= 7 && hs.verifiedAgeS <= 9);
+  assert.equal(hs.verifiedDistanceM, 1.4);
   assert.equal(hs.reason, null); // never a "set home" nag once verified
+});
+
+test("a stale Scout home_status is NEVER surfaced as verified, even if it once was", () => {
+  // Scout's own `verified:true` from a moment ago must not be trusted once `stale`
+  // is set — the backend already forces verified:false when stale, but this pins
+  // that homeStatus() renders whatever it's given and never re-derives verified
+  // from anything else (no client-side latching either).
+  const v = veh({ ...HOME_HERE, verified: false, stale: true, reason: "Scout has not confirmed Home status recently — treating as unverified." });
+  const hs = homeStatus(v);
+  assert.equal(hs.state, "unverified");
+  assert.equal(hs.stale, true);
+  assert.match(hs.reason, /has not confirmed Home status recently/i);
+});
+
+test("a command's own 'confirmed' feedback phase is not a homeStatus phase — verified never gets forced", () => {
+  // homeStatus only recognizes 'idle'/'pending'/'failed' phases; passing anything else
+  // (as effectiveHomeStatus does for a successful SET_HOME command result) must fall
+  // through to the settled v.home state, never fabricate "verified".
+  const v = veh({ ...HOME_HERE, verified: false });
+  const hs = homeStatus(v, { phase: "confirmed" });
+  assert.equal(hs.state, "unverified");
+  assert.equal(hs.verified, false);
 });
 
 test("Pending phase overrides settled state", () => {
@@ -73,19 +96,19 @@ test("Failed phase surfaces the structured failure message as the reason", () =>
 test("AUTO disabled when Home unverified (with a Home reason)", () => {
   const g = commandGate("SET_MODE_AUTO", baseCtx);
   assert.equal(g.enabled, false);
-  assert.match(g.reason, /verify Pixhawk Home before starting AUTO/i);
+  assert.match(g.reason, /verify Home before AUTO/i);
 });
 
 test("RTL disabled when Home unverified", () => {
   const g = commandGate("RTL", baseCtx);
   assert.equal(g.enabled, false);
-  assert.match(g.reason, /old Home may be unsafe/i);
+  assert.match(g.reason, /requires a verified Home/i);
 });
 
 test("RESUME MISSION disabled when Home unverified", () => {
   const g = commandGate("MISSION_RESUME", baseCtx);
   assert.equal(g.enabled, false);
-  assert.match(g.reason, /verify Pixhawk Home/i);
+  assert.match(g.reason, /verify Home before resuming/i);
 });
 
 test("AUTO / RTL / RESUME ENABLED once Home is verified", () => {

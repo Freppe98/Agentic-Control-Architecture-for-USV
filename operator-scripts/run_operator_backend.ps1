@@ -33,4 +33,7 @@ try {
 }
 Write-Host ""
 
-python -m uvicorn main:app --host 0.0.0.0 --port $port
+# --no-access-log: the operator backend is polled every 2-3s by the UI (per open page)
+# and by Scout's status posts, so uvicorn's default per-request "GET/POST ... 200 OK"
+# line floods the terminal. Startup/shutdown/error logging stays on (unaffected).
+python -m uvicorn main:app --host 0.0.0.0 --port $port --no-access-log

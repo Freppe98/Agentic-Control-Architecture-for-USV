@@ -21,6 +21,11 @@ export function Ribbon({ missionLabel = "Live fleet", missionStatusKnown = false
       </button>
       ${status}
     </div>
+    <div class="rib-seg">
+      <div class="feedlink dim" id="rib-feed" title="Operator backend link — tracks whether this station is still receiving live data">
+        <span class="hd"></span><span id="rib-feed-txt">—</span>
+      </div>
+    </div>
     <div class="rib-seg grow">
       <div class="search" tabindex="0">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
@@ -46,7 +51,7 @@ export function Ribbon({ missionLabel = "Live fleet", missionStatusKnown = false
 }
 
 /** update the live bits without re-rendering the whole ribbon */
-export function updateRibbon({ counts, alertCount, clock } = {}) {
+export function updateRibbon({ counts, alertCount, clock, feed } = {}) {
   if (counts) {
     const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
     set("rib-c", counts.c); set("rib-p", counts.p); set("rib-d", counts.d);
@@ -55,5 +60,16 @@ export function updateRibbon({ counts, alertCount, clock } = {}) {
   if (alertCount != null) {
     const b = document.getElementById("rib-bell");
     if (b) { b.textContent = alertCount; b.style.display = alertCount ? "" : "none"; }
+  }
+  // feed = { cls: 'dim'|'ok'|'warn'|'bad', label, title } — the operator backend link
+  // health, driven by real poll success/failure (see api.js getFeedHealth), never a
+  // guess. A page that never calls this leaves the indicator at its neutral default.
+  if (feed) {
+    const el = document.getElementById("rib-feed"), txt = document.getElementById("rib-feed-txt");
+    if (el && txt) {
+      el.className = `feedlink ${feed.cls}`;
+      txt.textContent = feed.label;
+      if (feed.title) el.title = feed.title;
+    }
   }
 }

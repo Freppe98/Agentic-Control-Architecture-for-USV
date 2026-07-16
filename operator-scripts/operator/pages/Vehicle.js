@@ -1,10 +1,19 @@
-// Vehicle.js — the Health page. Fleet systems matrix, then the selected vehicle's
-// Overall Health, Vehicle State, Control (authority + command queue) and
-// Diagnostics, then subsystem cards. Subsystem severity is derived from real
-// inputs (battery, leak, disk, cpu, comms, gps/heading); everything not in the
-// telemetry schema (temps, voltages, compass cal, rssi, latency, camera,
-// MAVLink/Pixhawk-level checks) renders NO-TELEM.
-// Reuses VehicleDock, CommsPill, BatteryBar, AuthoritySeg, ui helpers.
+// Vehicle.js — the professional diagnostics page. Fleet systems matrix, then the
+// selected vehicle organized into named sections an operator can scan top-to-bottom:
+// Vehicle Health, Control, Power, Communication, Local Agent, Sensors, System.
+//
+// Every diagnostic here is ALWAYS LIVE — there is no "Run System Check" button or
+// simulated delay. The previous version's check ran a fake 550ms timer and then
+// re-displayed values already computed from the fleet payload (Scout exposes no real
+// diagnostics endpoint — see BACKEND_ROADMAP.md); that click-and-wait added workload
+// for zero new information, so every one of its checks now renders continuously in
+// the section it actually belongs to instead.
+//
+// Vehicle Health's Home verification / Current waypoint / Mission loaded reuse the
+// SAME Pixhawk mission readback + lib/mission.js math as Map.js and Mission.js — this
+// page can never disagree with those two about the same vehicle's mission state.
+//
+// Reuses VehicleDock, CommsPill, BatteryBar, AuthoritySeg, ui/home/mission helpers.
 import * as api from "../services/api.js";
 import { NavRail } from "../components/NavRail.js";
 import { Ribbon, updateRibbon } from "../components/Ribbon.js";
@@ -12,30 +21,21 @@ import { CommsPill } from "../components/CommsPill.js";
 import { BatteryBar } from "../components/BatteryBar.js";
 import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
-import { commState, cls, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
+import { commState, cls, fmtAge, pad3, noTelem } from "../lib/ui.js";
 import { createAuthorityController } from "../lib/authority.js";
-import { isSafetyHold, SAFETY_HOLD_TITLE } from "../lib/home.js";
+import { isSafetyHold, SAFETY_HOLD_TITLE, homeStatus } from "../lib/home.js";
+import { classifyMissionWaypoints, missionCounts } from "../lib/mission.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
-
-// Diagnostics: a client-side "Run System Check" that reports what the operator
-// backend can actually verify today and is honest ("Not available") about the
-// rest. Scout does not expose GET /agent/diagnostics or POST /agent/system_check
-// yet (checked against this repo — see BACKEND_ROADMAP.md), so there is no
-// diagnostics backend to proxy: this is real for the checks backed by a live
-// field (comm state, local-agent reporting, GPS fix, battery, storage, CPU,
-// memory, operator-reachability, Scout-confirmed authority) and an explicit gap
-// slot (never a fake PASS) for the ones that need a MAVLink/Pixhawk/camera/RC/
-// mission-service backend that doesn't exist in this repo yet.
-const DIAG_CHECKS = [
-  ["comm", "Communication"], ["mavlink", "MAVLink"], ["pixhawk", "Pixhawk heartbeat"],
-  ["local_agent", "Local Agent"], ["gps", "GPS"], ["battery", "Battery"],
-  ["rc", "RC receiver"], ["camera", "Camera"], ["mission", "Mission service"],
-  ["storage", "Storage"], ["cpu", "CPU"], ["memory", "Memory"], ["network", "Network"],
-  ["authority", "Authority service"],
-];
-const DIAG_RUN_MS = 550;
+const SEV_LABEL = { ok: "Nominal", warn: "Warning", caution: "Caution" };
+function sevLabel(sev) { return SEV_LABEL[sev] || "No signal"; }
+function sevClass(sev) { return sev || "idle"; }
+function worstSev(...sevs) {
+  let w = null;
+  sevs.forEach((sv) => { if (sv && sv in SEV_ORDER) { if (w == null || SEV_ORDER[sv] > SEV_ORDER[w]) w = sv; } });
+  return w;
+}
 
 // Command & Control: the safe command set for the reverse path. High-risk commands
 // (ARM/DISARM touch the motors; AUTO/RTL change what the vehicle does on its own) get
@@ -64,7 +64,7 @@ const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stro
 
 export function Vehicle(root) {
   let fleet = [], selId = null, cmds = [];
-  let diag = { status: "idle", results: null, ranAt: null, durationMs: null };  // per-selected-vehicle; reset on selection change
+  const pxm = {};  // per-vehicle Pixhawk mission cache — same contract as Map.js/Mission.js
 
   // Control authority — a dedicated read (GET /api/control_authority/{id}, a live
   // proxy to Scout's Flask API), fed through the shared authority controller so a
@@ -94,11 +94,26 @@ export function Vehicle(root) {
       renderDetail();
     });
   }
+  function pxmState(id) { return pxm[id] || (pxm[id] = { mission: null, fetchedAt: 0, loading: false, note: null }); }
+  async function fetchPixhawkMission(id) {
+    if (id == null) return;
+    const s = pxmState(id);
+    s.loading = true; if (id === selId) renderDetail();
+    try {
+      const res = await api.getPixhawkMission(id);
+      if (res && res.reachable) { s.mission = res; s.fetchedAt = Date.now(); s.note = res.available === false ? "no-api" : (res.partial ? "partial" : null); }
+      else s.note = (res && res.available === false) ? "no-api" : "unreachable";
+    } catch (e) { s.note = "error"; }
+    finally { s.loading = false; if (id === selId) renderDetail(); }
+  }
   function selectVehicle(id) {
     if (id !== selId) {
       selId = id; authCtl.reset(); loadAuthority(id);
-      diag = { status: "idle", results: null, ranAt: null, durationMs: null };
       cmds = []; refreshCommands();
+      // Auto-fetch once per vehicle per page visit (this page's whole purpose is
+      // showing vehicle state) — Refresh stays a deliberate action for re-fetches,
+      // the same caution Map.js's live Scout proxy already uses.
+      if (!pxm[id] || !pxm[id].fetchedAt) fetchPixhawkMission(id);
     }
   }
 
@@ -111,7 +126,7 @@ export function Vehicle(root) {
        <div class="veh-list" id="veh-list"></div>
        <div class="dock-foot">
          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>
-         <span>Health (faults) and Comms (link state) are independent axes. Values tagged <b>no telem</b> are not yet in the telemetry schema.</span>
+         <span>Every diagnostic below is live — no "run check" button or simulated delay. Values tagged <b>Not reported</b> have no telemetry field yet; never invented.</span>
        </div>
      </div>
      <div class="content-main">
@@ -119,12 +134,14 @@ export function Vehicle(root) {
        <div class="vcontent">
          <div class="sect"><span class="lbl">Fleet systems matrix</span><span class="tag">vehicles × subsystems · click a row for detail</span></div>
          <div class="mxwrap" id="mxwrap"></div>
-         <div class="sect"><span class="lbl">Vehicle health</span><span class="tag" id="dettag"></span></div>
+         <div class="sect"><span class="lbl">Vehicle diagnostics</span><span class="tag" id="dettag"></span></div>
          <div class="detail" id="detail"></div>
        </div>
      </div>`;
 
-  // ---- derive subsystem severity + display value from live data ----
+  // ---- derive subsystem severity + display value from live data (feeds the matrix
+  // AND the section severities below — one computation, never two slightly different
+  // judgements of the same battery/leak/gps reading) ----
   function subsys(v) {
     const h = v.health || {}, comm = commState(v);
     const num = (x) => (x == null ? null : x);
@@ -166,15 +183,10 @@ export function Vehicle(root) {
   // ---- detail ----
   const bar = (pct, color) => `<span class="bar" style="width:64px;flex:none"><i style="width:${pct}%;background:${color}"></i></span>`;
   const row = (k, val, extra = "") => `<div class="mrow"><span class="k">${k}</span><span class="val ${extra}">${val}</span></div>`;
-  const naRow = (k) => `<div class="mrow"><span class="k">${k}</span><span class="val na">${noTelem("no telem")}</span></div>`;
-  function subCard(title, sev, rowsHtml, stale) {
-    const head = sev == null ? "idle" : sev;
-    const cond = sev == null ? "No telemetry" : sev === "ok" ? "Nominal" : sev === "warn" ? "Warning" : sev === "caution" ? "Caution" : "Idle";
-    return `<div class="sub"><div class="sub-head ${head}"><span class="hd"></span><span class="nm">${title}</span><span class="cond">${cond}</span></div><div class="metrics${stale ? " stale" : ""}">${rowsHtml}</div></div>`;
-  }
-  // Like subCard but with a free-text head condition instead of a severity-derived
-  // one, and always full-width — used for the status/control cards, which report
-  // state (and, for Control, host the command panel), not faults.
+  const naRow = (k, reason = "no telem") => `<div class="mrow"><span class="k">${k}</span><span class="val na">${noTelem(reason)}</span></div>`;
+  // Full-width, always-live named section (Vehicle Health / Power / Communication /
+  // Local Agent / Sensors / System) — a free-text condition label, not a severity
+  // derived one, so a section with no bad signal at all can still say "Nominal".
   function panelCard(title, condLabel, condClass, bodyHtml) {
     return `<div class="sub full"><div class="sub-head ${condClass}"><span class="hd"></span><span class="nm">${title}</span><span class="cond">${condLabel}</span></div>${bodyHtml}</div>`;
   }
@@ -186,109 +198,7 @@ export function Vehicle(root) {
   // whether the safety fallback works".
   const rcAlwaysCell = '<span class="txt-c" title="RC transmitter always retains hardware-level override, independent of software control authority">Always</span>';
 
-  function computeDiagnostics(v, av) {
-    const cs = commState(v);
-    const h = v.health || {};
-    const c = v.communication || {};
-    const mav = v.mavlink || {};
-    const pass = (note) => ({ status: "pass", note });
-    const warn = (note) => ({ status: "warn", note });
-    const fail = (note) => ({ status: "fail", note });
-    const gap = () => ({ status: "gap", note: "No backend support yet" });
-    // Same warn/fail breakpoints as the matrix/subsystem cards (subsys() above) — CPU
-    // runs hotter-tolerant (85/65) than storage/memory (90/75), kept in sync here.
-    const pctCheck = (val, label, hi, mid) => val == null ? gap() : val > hi ? fail(val + "% " + label) : val > mid ? warn(val + "% " + label) : pass(val + "% " + label);
-
-    // Pixhawk HEARTBEAT freshness — from a REAL MAVLink HEARTBEAT age forwarded by
-    // Scout (v.mavlink.heartbeat_age_s), NEVER inferred from GPS/position or arrival
-    // age. Absent evidence → NOT AVAILABLE, never a fabricated PASS. PASS ≤3s (nominal
-    // 1 Hz heartbeat), WARN ≤10s, FAIL beyond.
-    const hb = mav.heartbeat_age_s;
-    const pixhawk = hb == null ? gap()
-      : hb <= 3 ? pass(`Heartbeat ${hb.toFixed(1)}s ago`)
-      : hb <= 10 ? warn(`Heartbeat ${hb.toFixed(1)}s ago`)
-      : fail(`No heartbeat for ${hb.toFixed(0)}s`);
-
-    // MAVLink link — connection state + age of last MAVLink message (+ rate/parser
-    // health when present). Absent evidence → NOT AVAILABLE.
-    const age = mav.last_msg_age_s, rate = mav.msg_rate_hz, connected = mav.connected;
-    const rateNote = rate != null ? `, ${rate} Hz` : "";
-    let mavlink;
-    if (connected == null && age == null && rate == null) mavlink = gap();
-    else if (connected === false) mavlink = fail("Disconnected");
-    else if (age == null) mavlink = pass(`Connected${rateNote}`);
-    else if (age <= 3) mavlink = pass(`Last msg ${age.toFixed(1)}s ago${rateNote}`);
-    else if (age <= 10) mavlink = warn(`Last msg ${age.toFixed(1)}s ago${rateNote}`);
-    else mavlink = fail(`No MAVLink message for ${age.toFixed(0)}s`);
-
-    // Authority service reachability. Has an effective value → PASS; configured but
-    // unreachable → WARN (a degraded service, not a hard subsystem FAIL); no source
-    // configured → NOT AVAILABLE (never fails the overall check).
-    const authority = av && av.value ? pass(av.value)
-      : av && av.available && !av.reachable ? warn("Authority service unreachable")
-      : !av || !av.available ? gap()
-      : warn("Authority unknown");
-
-    return {
-      comm: cs === "connected" ? pass("Link current") : cs === "partitioned" ? warn("Link partitioned") : fail("Link down"),
-      mavlink,
-      pixhawk,
-      local_agent: v.online ? pass("Reporting") : fail("Not reporting"),
-      gps: v.lat != null && v.lng != null ? pass("3D fix") : warn("No fix"),
-      battery: v.battery == null ? gap() : v.battery < 20 ? fail(v.battery + "% remaining") : v.battery < 40 ? warn(v.battery + "% remaining") : pass(v.battery + "% remaining"),
-      rc: gap(),
-      camera: gap(),
-      mission: gap(),
-      storage: pctCheck(h.disk_usage, "used", 90, 75),
-      cpu: pctCheck(h.cpu_load, "load", 85, 65),
-      memory: pctCheck(h.ram_usage, "used", 90, 75),
-      network: c.operator_reachable == null ? gap() : c.operator_reachable ? pass("Operator reachable") : fail("Operator unreachable"),
-      authority,
-    };
-  }
-
-  // Overall roll-up: worst of the checks that actually returned a signal (pass <
-  // warn < fail); "Not available" checks never count toward it, and a run where
-  // every check is a gap must never be reported as PASS — that would be inventing
-  // a result the backend never gave us.
-  function diagOverall(results) {
-    if (!results) return null;
-    const rank = { pass: 0, warn: 1, fail: 2 };
-    let worst = null;
-    Object.values(results).forEach((r) => {
-      if (!(r.status in rank)) return;
-      if (worst == null || rank[r.status] > rank[worst]) worst = r.status;
-    });
-    return worst;
-  }
-
-  function diagRow([id, label]) {
-    const r = diag.results && diag.results[id];
-    const state = r ? r.status : diag.status === "running" ? "running" : "idle";
-    const text = { pass: "PASS", warn: "WARNING", fail: "FAIL", gap: "Not available", running: "Checking…", idle: "Not run" }[state];
-    const cls_ = { pass: "ok", warn: "caution", fail: "warn", gap: "idle", running: "idle", idle: "idle" }[state];
-    return `<div class="diag-item"><span class="dk">${label}</span><span class="dchip ${cls_}"${r && r.note ? ` title="${r.note}"` : ""}><span class="hd"></span>${text}</span></div>`;
-  }
-
-  function runDiagnostics() {
-    const v = fleet.find((x) => x.id === selId);
-    if (!v) return;
-    const startedAt = Date.now();
-    diag = { status: "running", results: null, ranAt: diag.ranAt, durationMs: diag.durationMs };
-    renderDetail();
-    setTimeout(() => {
-      if (selId !== v.id) return; // selection moved on while "running"
-      diag = {
-        status: "done",
-        results: computeDiagnostics(v, authCtl.view()),
-        ranAt: new Date().toISOString(),
-        durationMs: Date.now() - startedAt,
-      };
-      renderDetail();
-    }, DIAG_RUN_MS);
-  }
-
-  // ---- Control actions (authority hand-off + command queue), Scout-confirmed only ----
+  // ---- Control actions (authority hand-off + command queue, Scout-confirmed only) ----
   // Take Control → OPERATOR, Release Control → LOCAL_AGENT. The request goes PENDING
   // and is confirmed only when Scout's reported effective authority matches — the
   // controller (not this click) decides confirmed/rejected/timeout.
@@ -314,80 +224,95 @@ export function Vehicle(root) {
     refreshCommands();
   }
 
+  // Pixhawk mission readback → { home, route, cur, counts }, or null when not fetched
+  // yet / unavailable. Same classification + progress math as Map.js/Mission.js
+  // (lib/mission.js) — this page never computes a second, different waypoint count.
+  function missionStatsFor(v) {
+    const s = pxm[v.id];
+    if (!s || !s.mission) return null;
+    const { home, route } = classifyMissionWaypoints(s.mission.waypoints || []);
+    const cur = s.mission.current_seq;
+    return { home, route, cur, counts: missionCounts(route, cur) };
+  }
+
   function renderDetail() {
     const v = fleet.find((x) => x.id === selId);
     const box = document.getElementById("detail");
     if (!v) { box.innerHTML = `<div class="empty-state" style="padding:8px 0">No vehicle selected</div>`; return; }
     const vname = v.name || "USV-" + v.id;
-    document.getElementById("dettag").textContent = `${vname} · health, control & diagnostics`;
+    document.getElementById("dettag").textContent = `${vname} · live diagnostics`;
     const s = subsys(v), ov = overallSev(s), stale = commState(v) !== "connected";
     const h = v.health || {}, meas = v.measurements || {}, t = v.telemetry || {}, md = v.mission_data || {}, schema = (v.agent && v.agent.schema_version) || "—";
+    const c = v.communication || {};
 
-    // faults for overview
+    // faults for the top-of-page glance
     const faults = MXCOLS.map(([k, l]) => ({ k, l, ...s[k] })).filter((x) => x.sev === "caution" || x.sev === "warn");
     const faultsHtml = faults.length
       ? faults.map((f) => `<div class="frow"><span class="fd" style="background:var(--${f.sev})"></span><span class="txt-${f.sev === "warn" ? "d" : "p"}">${f.l} — ${f.val}</span></div>`).join("")
       : `<div class="frow none">No active faults — all reporting subsystems nominal</div>`;
 
     // Control authority via the controller (pending → confirmed/rejected/timeout).
-    //   Take Control  → OPERATOR (operator holds the wheel; commands enabled)
-    //   Release Control → LOCAL_AGENT (autonomy resumes)
-    // When the link is stale the effective authority is no longer trustworthy → UNKNOWN;
-    // commands are then locked. hasControl requires a CONFIRMED OPERATOR (never a click).
     const av = authCtl.view();
     const authVal = stale ? null : av.value;
     const busy = av.phase === "pending";
     const hasControl = !stale && av.hasControl;
     const authoritySeg = AuthoritySeg(authVal, { phase: av.phase, pending: av.pending });
-    const operatorReachable = v.communication && v.communication.operator_reachable;
+    const operatorReachable = c.operator_reachable;
     const operatorReachCell = operatorReachable != null ? (operatorReachable ? '<span class="txt-c">Yes</span>' : '<span class="txt-p">No</span>') : noTelem("no telem");
     const armed = t.armed;
-    // Arm state is an operational fact — only assert it while the link is current.
     const armedCell = stale ? '<span class="txt-u">UNKNOWN</span>'
       : armed == null ? noTelem("no telem")
       : armed ? '<span class="txt-d">ARMED</span>' : '<span class="txt-c">DISARMED</span>';
     const modeCell = stale ? '<span class="txt-u">UNKNOWN</span>' : (t.mode || noTelem("no telem"));
-
-    // Pixhawk HEARTBEAT age — a REAL MAVLink heartbeat field (v.mavlink), kept separate
-    // from "Last contact" (operator-link arrival). Never inferred from GPS/arrival.
     const mav = v.mavlink || {};
     const heartbeatCell = mav.heartbeat_age_s != null
       ? `<span class="txt-${mav.heartbeat_age_s <= 3 ? "c" : mav.heartbeat_age_s <= 10 ? "p" : "d"}">${mav.heartbeat_age_s.toFixed(1)}s ago</span>`
       : noTelem("no telem");
-
-    // RC axis — three DISTINCT things, never conflated:
-    //   policy   : override is always available as a hardware fallback (config invariant)
-    //   receiver : is an RC receiver detected/healthy? (no telemetry field yet → no telem)
-    //   active   : is an RC override CURRENTLY seizing control? (authority === RC)
+    const mavlinkCell = mav.connected === true ? `<span class="txt-c">Connected${mav.msg_rate_hz != null ? `, ${mav.msg_rate_hz} Hz` : ""}</span>`
+      : mav.connected === false ? '<span class="txt-d">Disconnected</span>'
+      : mav.last_msg_age_s != null ? `<span class="txt-${mav.last_msg_age_s <= 3 ? "c" : mav.last_msg_age_s <= 10 ? "p" : "d"}">Last msg ${mav.last_msg_age_s.toFixed(1)}s ago</span>`
+      : noTelem("no telem");
     const rcActiveCell = stale || !av.reachable ? noTelem("no telem")
       : av.value === "RC" ? '<span class="txt-d">ACTIVE</span>' : '<span class="txt-c">Inactive</span>';
 
-    // ---- Overall Health ----
-    const healthCard = `<div class="sub full"><div class="sub-head ${ov == null ? "idle" : ov}"><span class="hd"></span><span class="nm">Overall Health</span><span class="cond">${ov == null ? "No signal" : ov === "ok" ? "Nominal" : ov === "warn" ? "Warning" : "Caution"}</span></div>
-      <div class="faults">${faultsHtml}</div>
-      <div class="metrics" style="border-top:1px solid var(--line)">
-        ${row("Firmware", schema === "—" ? noTelem("no telem") : "v" + schema, "keep")}
-        ${row("Services", h.flask_status ? "Flask " + h.flask_status : noTelem("no telem"), "keep")}
-      </div></div>`;
+    // Operator Backend link — the SAME feed-health api.js tracks for the Ribbon's
+    // Operator Link indicator (poll key "fleet", shared across pages), so this row and
+    // the Ribbon can never disagree about whether the backend itself is reachable.
+    const feedH = api.getFeedHealth("fleet");
+    const feedAgeS = feedH && feedH.lastOkAt != null ? (Date.now() - feedH.lastOkAt) / 1000 : null;
+    const operatorBackendCell = feedAgeS == null ? noTelem("connecting")
+      : feedAgeS <= 4 ? '<span class="txt-c">Live</span>'
+      : feedAgeS <= 12 ? `<span class="txt-p">Delayed ${Math.round(feedAgeS)}s</span>`
+      : `<span class="txt-d">Unreachable ${Math.round(feedAgeS)}s</span>`;
 
-    // ---- Vehicle State ----
-    // Independent axes — arm state, Pixhawk mode, effective authority, and mission
-    // state are shown separately and never derived from one another.
-    const vehicleStateCard = panelCard("Vehicle State", v.online ? "Reporting" : "Offline", v.online ? "ok" : "warn",
-      `<div class="metrics">
+    // Pixhawk mission readback (Vehicle Health's Home/Waypoint/Loaded rows) — never a
+    // second computation from what Map.js/Mission.js already trust (lib/mission.js).
+    const ms = missionStatsFor(v);
+    const hs = homeStatus(v, {});
+    const homeCls = hs.state === "verified" ? "ok" : hs.state === "pending" ? "pending" : hs.state === "unknown" ? "dim" : "warn";
+    const homeTxt = hs.state === "verified" ? "Verified" : hs.state === "pending" ? "Setting…" : hs.state === "unknown" ? "Unknown" : "Not verified";
+    const curWpText = !ms ? noTelem("not fetched") : ms.cur == null ? "—" : (ms.home && ms.home.seq === ms.cur ? `Mission start (seq ${ms.cur})` : `WP ${ms.cur} / ${ms.route.length}`);
+    const missionLoadedText = ms ? (ms.counts.total > 0 ? "Yes" : "No") : noTelem("not fetched");
+    const pixhawkCell = mav.heartbeat_age_s != null
+      ? (mav.heartbeat_age_s <= 3 ? '<span class="txt-c">Connected</span>' : mav.heartbeat_age_s <= 10 ? '<span class="txt-p">Degraded</span>' : '<span class="txt-d">No heartbeat</span>')
+      : mav.connected === true ? '<span class="txt-c">Connected</span>' : mav.connected === false ? '<span class="txt-d">Disconnected</span>' : noTelem("no telem");
+
+    // ---- section 1: Vehicle Health ----
+    const healthSev = stale ? null : worstSev(hs.state === "verified" ? "ok" : "caution", s.gps.sev);
+    const healthRows = `
+        ${row("Pixhawk", pixhawkCell, "keep")}
+        ${row("Heartbeat", heartbeatCell, "keep")}
+        ${row("GPS", v.lat != null && v.lng != null ? '<span class="txt-c">3D fix</span>' : '<span class="txt-p">No fix</span>', "keep")}
+        ${naRow("EKF")}
+        ${row("RC override active", rcActiveCell, "keep")}
         ${row("Armed", armedCell, "keep")}
         ${row("Mode", modeCell, "keep")}
-        ${row("Authority", authoritySeg, "keep")}
-        ${row("RC override active", rcActiveCell, "keep")}
-        ${row("Operator reachable", operatorReachCell, "keep")}
-        ${row("Local Agent", v.online ? '<span class="txt-c">Online</span>' : '<span class="txt-d">Offline</span>', "keep")}
-        ${row("Pixhawk heartbeat", heartbeatCell, "keep")}
-        ${row("Last contact (link)", fmtAge(v.last_seen_age_s), "keep")}
-      </div>`);
+        ${row("Mission", md.mission_state || v.status || noTelem("no telem"), "keep")}
+        ${row("Home verification", `<span class="pxm-chip ${homeCls}">${homeTxt}</span>`, "keep")}
+        ${row("Current waypoint", curWpText, "keep")}
+        ${row("Mission loaded", missionLoadedText, "keep")}`;
 
-    // ---- Control (authority hand-off + command queue, Scout-confirmed only) ----
-    // OPERATOR = operator holds the wheel (commands enabled); LOCAL_AGENT = autonomy;
-    // RC = physical transmitter override. A hand-off in flight shows as PENDING.
+    // ---- section 2: Control (authority hand-off + command queue) ----
     const controlCond = busy ? "Requesting…"
       : hasControl ? "Operator engaged"
       : av.value === "LOCAL_AGENT" ? "Local Agent (autonomy)"
@@ -413,35 +338,30 @@ export function Vehicle(root) {
       : stale
         ? `Authority is <b>UNKNOWN</b> — telemetry is stale. Commands stay locked until the link is current.`
         : `Control authority is unknown — Scout's control-authority service did not respond. Commands stay locked until authority is confirmed.`;
-    // Take Control → OPERATOR when the operator does not already hold it; Release →
-    // LOCAL_AGENT. Disabled while a request is in flight or the link is stale.
     const authBtn = hasControl
       ? `<button class="ctl-auth release" data-auth="LOCAL_AGENT"${busy ? " disabled" : ""}>Release Control</button>`
       : `<button class="ctl-auth engage" data-auth="OPERATOR"${busy || stale || !av.available ? " disabled" : ""}>Take Control</button>`;
     const renderCmd = ([type, label]) => {
       const hr = HIGH_RISK.has(type);
-      const safety = isSafetyHold(type);   // LOITER — primary anti-drift safety hold
+      const safety = isSafetyHold(type);
       const title = safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`;
       return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
     };
     const primaryBtns = PRIMARY_CMDS.map(renderCmd).join("");
     const advancedBtns = ADVANCED_CMDS.map(renderCmd).join("");
     const queueHtml = cmds.length
-      ? cmds.slice(0, 8).map((c) => {
-          const clsx = CMD_STATUS_CLS[c.status] || "u";
-          const when = c.completed_at || c.claimed_at || c.created_at;
-          const note = c.reason || c.warning || "";
-          return `<div class="ctl-row"><span class="ctl-type mono">${c.type}</span><span class="pill ${clsx}">${c.status}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
+      ? cmds.slice(0, 8).map((cm) => {
+          const clsx = CMD_STATUS_CLS[cm.status] || "u";
+          const when = cm.completed_at || cm.claimed_at || cm.created_at;
+          const note = cm.reason || cm.warning || "";
+          return `<div class="ctl-row"><span class="ctl-type mono">${cm.type}</span><span class="pill ${clsx}">${cm.status}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
         }).join("")
       : `<div class="ctl-empty">No commands issued for ${vname} yet.</div>`;
-
     const controlCard = panelCard("Control", controlCond, controlClass,
       `<div class="metrics">
         ${row("Authority", authoritySeg, "keep")}
         ${row("Operator connected", operatorReachCell, "keep")}
         ${row("RC override policy", rcAlwaysCell, "keep")}
-        ${row("RC receiver detected", noTelem("no telem"), "keep")}
-        ${row("RC override active", rcActiveCell, "keep")}
       </div>
       <div style="padding:13px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line)">
         <div class="ctl-auth-bar${hasControl ? " engaged" : ""}">
@@ -462,84 +382,65 @@ export function Vehicle(root) {
         </div>
       </div>`);
 
-    // ---- Diagnostics ----
-    const diagBtnLabel = diag.status === "running" ? "Checking…" : "Run System Check";
-    // Overall result reflects only checks that actually ran (diagOverall) — a run
-    // where every check comes back "Not available" reports NOT AVAILABLE, never PASS.
-    const diagResultKey = diag.status === "done" ? diagOverall(diag.results) : null;
-    const DIAG_RESULT_TEXT = { pass: "PASS", warn: "WARNING", fail: "FAIL" };
-    const diagHeadCls = diag.status === "running" ? "idle"
-      : diag.status !== "done" ? "idle"
-      : diagResultKey === "fail" ? "warn" : diagResultKey === "warn" ? "caution" : diagResultKey === "pass" ? "ok" : "idle";
-    const diagCondText = diag.status === "running" ? "Checking…"
-      : diag.status !== "done" ? "Not run"
-      : (DIAG_RESULT_TEXT[diagResultKey] || "NOT AVAILABLE");
-    const diagMeta = diag.status === "done"
-      ? ` · Last run ${fmtClock(diag.ranAt)} · ${(diag.durationMs / 1000).toFixed(1)}s`
-      : "";
-    const diagnosticsCard = `<div class="sub full">
-        <div class="sub-head ${diagHeadCls}"><span class="hd"></span><span class="nm">Diagnostics</span><span class="cond">${diagCondText}</span>
-          <button class="diag-btn" id="diag-run" ${diag.status === "running" ? "disabled" : ""}>${diagBtnLabel}</button>
-        </div>
-        <div class="diag-note">Run System Check reports what the operator backend can verify today; checks with no backend support yet are marked "Not available", never faked.${diagMeta}</div>
-        <div class="diag-grid">${DIAG_CHECKS.map(diagRow).join("")}</div>
-      </div>`;
+    // ---- section 3: Power ----
+    const powerRows = `
+        ${naRow("Battery voltage")}
+        ${naRow("Battery current")}
+        ${naRow("Power source")}
+        ${row("Remaining %", BatteryBar(v.battery), "keep")}
+        ${naRow("Failsafe status")}`;
 
-    // ---- Subsystem cards ----
-    const battery = subCard("Battery", s.battery.sev,
-      row("Charge", BatteryBar(v.battery), "keep") +
-      row("State", v.battery == null ? noTelem("no telem") : (v.battery < 40 ? "Discharging · low" : "Discharging"), "keep") +
-      naRow("Pack voltage") + naRow("Current draw") + naRow("Battery temp"), false);
+    // ---- section 4: Communication ----
+    const commRows = `
+        ${naRow("WireGuard", "no VPN telemetry field")}
+        ${row("Operator Backend", operatorBackendCell, "keep")}
+        ${row("Local Agent", v.online ? '<span class="txt-c">Online</span>' : '<span class="txt-d">Offline</span>', "keep")}
+        ${row("MAVLink", mavlinkCell, "keep")}
+        ${row("Telemetry freshness", `<span class="txt-${cls(v)}">${fmtAge(v.last_seen_age_s)}</span> · ${commState(v).toUpperCase()}`, "keep")}
+        ${naRow("Packet loss (future)")}
+        ${naRow("RTT (future)")}`;
 
-    const gps = subCard("GPS", s.gps.sev,
-      row("Fix", v.lat != null && v.lng != null ? "3D" : "No fix") +
-      row("Position", v.lat != null ? `${(+v.lat).toFixed(5)}, ${(+v.lng).toFixed(5)}` : noTelem("no telem")) +
-      naRow("Satellites") + naRow("HDOP"), stale);
+    // ---- section 5: Local Agent (payload.agent.* — forwarded verbatim, same field
+    // precedence the Agent page uses, so the two pages never disagree) ----
+    const a = v.agent_status || {};
+    const clean = (val) => (val == null || val === "" ? null : String(val));
+    const behaviour = clean(a.current_behaviour ?? a.behaviour ?? a.behavior);
+    const decision = clean(a.current_decision) || behaviour;
+    const policy = clean(a.current_policy ?? a.communication_policy);
+    const reasonRaw = Array.isArray(a.decision_reasons) ? a.decision_reasons[0] : (a.decision_reasons ?? a.decision_reason);
+    const reason = clean(reasonRaw);
+    const agentLive = behaviour != null || decision != null || reason != null || policy != null;
+    const agentRows = `
+        ${row("Current behaviour", behaviour || noTelem("not emitted"), "keep")}
+        ${row("Current decision", decision || noTelem("not emitted"), "keep")}
+        ${row("Current policy", policy || noTelem("not emitted"), "keep")}
+        ${row("Control authority", authoritySeg, "keep")}
+        ${row("Decision reason", reason || noTelem("not emitted"), "keep")}`;
 
-    const compass = subCard("Compass", s.compass.sev,
-      row("Heading", v.heading != null ? pad3(v.heading) + "°" : noTelem("no telem")) +
-      naRow("Declination") + naRow("Calibration"), stale);
+    // ---- section 6: Sensors ----
+    const sensorRows = `
+        ${row("GPS", v.lat != null ? `${(+v.lat).toFixed(5)}, ${(+v.lng).toFixed(5)}` : noTelem("no telem"), "keep")}
+        ${naRow("GPS satellites")}
+        ${row("Compass", v.heading != null ? pad3(v.heading) + "°" : noTelem("no telem"), "keep")}
+        ${naRow("IMU")}
+        ${naRow("Camera")}
+        ${row("Sonar / bathymetry", meas.bathymetry ? '<span class="txt-c">Logging</span>' : noTelem("no telem"), "keep")}
+        ${row("Leak sensor", h.leak_detected === true ? '<span class="txt-d">LEAK DETECTED</span>' : (h.leak_detected === false ? "No leak" : noTelem("no telem")), "keep")}`;
 
-    const cpu = subCard("CPU", s.cpu.sev,
-      (h.cpu_load != null ? row("Load", `${bar(h.cpu_load, h.cpu_load > 85 ? "var(--disconnected)" : h.cpu_load > 65 ? "var(--partitioned)" : "var(--connected)")}<span class="pcw">${h.cpu_load}%</span>`) : naRow("Load")) +
-      naRow("Memory") + naRow("Uptime") + naRow("CPU temp"), stale);
+    // ---- section 7: System ----
+    const sysRows = `
+        ${h.cpu_load != null ? row("CPU", `${bar(h.cpu_load, h.cpu_load > 85 ? "var(--disconnected)" : h.cpu_load > 65 ? "var(--partitioned)" : "var(--connected)")}<span class="pcw">${h.cpu_load}%</span>`, "keep") : naRow("CPU")}
+        ${h.ram_usage != null ? row("Memory", `${bar(h.ram_usage, h.ram_usage > 90 ? "var(--disconnected)" : h.ram_usage > 75 ? "var(--partitioned)" : "var(--connected)")}<span class="pcw">${h.ram_usage}%</span>`, "keep") : naRow("Memory")}
+        ${naRow("Temperature")}
+        ${h.disk_usage != null ? row("Disk usage", `${bar(h.disk_usage, "var(--connected)")}<span class="pcw">${h.disk_usage}%</span>`, "keep") : naRow("Disk usage")}
+        ${row("Service status", h.flask_status ? "Flask " + h.flask_status : noTelem("no telem"), "keep")}
+        ${row("Firmware", schema === "—" ? noTelem("no telem") : "v" + schema, "keep")}`;
 
-    const storage = subCard("Storage", s.storage.sev,
-      (h.disk_usage != null ? row("Disk usage", `${bar(h.disk_usage, "var(--connected)")}<span class="pcw">${h.disk_usage}%</span>`) : naRow("Disk usage")) +
-      (h.disk_usage != null ? row("Free", `${100 - h.disk_usage}%`) : "") + naRow("Log size"), stale);
-
-    const c = v.communication || {};
-    const network = subCard("Network", s.network.sev,
-      row("Connectivity", `<span class="txt-${cls(v)}">${commState(v).toUpperCase()}</span>`, "keep") +
-      row("Operator reachable", operatorReachCell, "keep") +
-      row("Buffered packets", c.buffered_packets != null ? String(c.buffered_packets) : noTelem("no telem"), "keep") +
-      naRow("RSSI") + naRow("Latency"), false);
-
-    const sensors = subCard("Sensors", s.sensors.sev,
-      row("Leak sensor", h.leak_detected === true ? '<span class="txt-d">LEAK DETECTED</span>' : (h.leak_detected === false ? "No leak" : noTelem("no telem")), "keep") +
-      row("Water quality", meas.water_quality ? "Streaming" : noTelem("no telem")) +
-      row("Bathymetry", meas.bathymetry ? "Logging" : noTelem("no telem")) +
-      naRow("Water temp"), stale);
-
-    const camera = subCard("Camera", null,
-      naRow("Signal") + naRow("Resolution") + naRow("Recording"), false);
-
-    // Pixhawk fault axis stays "no signal" when the link is stale (arm/mode are then
-    // UNKNOWN, not a caution/ok we can assert). Heartbeat evidence is a real MAVLink age.
-    const pixhawkSev = stale ? null : t.mode == null && armed == null ? null : armed ? "caution" : "ok";
-    const pixhawk = subCard("Pixhawk", pixhawkSev,
-      row("Armed", armedCell, "keep") +
-      row("Mode", modeCell, "keep") +
-      row("Heartbeat", heartbeatCell, "keep") +
-      (mav.msg_rate_hz != null ? row("MAVLink rate", mav.msg_rate_hz + " Hz", "keep") : naRow("MAVLink rate")) +
-      naRow("Firmware version"), stale);
-
-    const missionSev = md.mission_active == null ? null : md.mission_active ? "ok" : "idle";
-    const mission = subCard("Mission", missionSev,
-      row("Active", md.mission_active == null ? noTelem("no telem") : (md.mission_active ? '<span class="txt-c">Yes</span>' : "No")) +
-      row("State", md.mission_state || v.status || noTelem("no telem")) +
-      row("Waypoint", md.current_waypoint_display || noTelem("no telem")) +
-      (v.coverage != null ? row("Coverage", v.coverage + "%") : naRow("Coverage")), stale);
+    const powerSev = s.battery.sev;
+    const commSev = worstSev(s.network.sev, feedAgeS != null && feedAgeS > 12 ? "warn" : null);
+    const agentSev = !agentLive ? null : v.online ? "ok" : "warn";
+    const sensorsSev = s.sensors.sev;
+    const sysSev = worstSev(s.cpu.sev, s.storage.sev);
 
     const banner = stale
       ? `<div class="stale-note" style="margin:0 0 14px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>Telemetry as of ${fmtAge(v.last_seen_age_s)} ago — not live. Sensors, GPS, compass, storage &amp; CPU are last-known; battery and link state remain current.</div>`
@@ -554,24 +455,37 @@ export function Vehicle(root) {
         <span class="contact"><span class="lbl">Last contact</span><span class="big txt-${cls(v)}">${fmtAge(v.last_seen_age_s)}</span></span>
       </div>
       ${banner}
-      ${healthCard}
-      ${vehicleStateCard}
+      <div class="faults" style="margin-bottom:14px;border:1px solid var(--line);border-radius:var(--r);background:var(--panel)">${faultsHtml}</div>
+      ${panelCard("Vehicle Health", sevLabel(healthSev), sevClass(healthSev), `<div class="metrics${stale ? " stale" : ""}">${healthRows}</div>`)}
       ${controlCard}
-      ${diagnosticsCard}
-      <div class="lbl" style="margin:18px 0 10px">Subsystem cards</div>
-      <div class="subgrid">${battery}${gps}${compass}${cpu}${storage}${network}${sensors}${camera}${pixhawk}${mission}</div>`;
+      ${panelCard("Power", sevLabel(powerSev), sevClass(powerSev), `<div class="metrics">${powerRows}</div>`)}
+      ${panelCard("Communication", sevLabel(commSev), sevClass(commSev), `<div class="metrics">${commRows}</div>`)}
+      ${panelCard("Local Agent", sevLabel(agentSev), sevClass(agentSev), `<div class="metrics${stale ? " stale" : ""}">${agentRows}</div>`)}
+      ${panelCard("Sensors", sevLabel(sensorsSev), sevClass(sensorsSev), `<div class="metrics${stale ? " stale" : ""}">${sensorRows}</div>`)}
+      ${panelCard("System", sevLabel(sysSev), sevClass(sysSev), `<div class="metrics">${sysRows}</div>`)}`;
 
     const authBtnEl = box.querySelector(".ctl-auth");
     if (authBtnEl) authBtnEl.onclick = () => authorityAction(authBtnEl.dataset.auth, vname);
     box.querySelectorAll(".ctl-cmd").forEach((b) => (b.onclick = () => sendCommand(b.dataset.cmd, vname)));
-    const runBtn = document.getElementById("diag-run");
-    if (runBtn) runBtn.onclick = runDiagnostics;
   }
 
   function counts() {
     const c = { c: 0, p: 0, d: 0 };
     fleet.forEach((v) => { const st = commState(v); if (st === "connected") c.c++; else if (st === "partitioned") c.p++; else if (st === "disconnected") c.d++; });
     return c;
+  }
+
+  // Operator Link — shared with Map.js/Mission.js via the SAME api.js poll key
+  // ("fleet"), so the Ribbon's backend-reachability indicator (and this page's own
+  // "Operator Backend" row) read identically no matter which page is open.
+  function updateFeedIndicator() {
+    const h = api.getFeedHealth("fleet");
+    if (!h || (h.lastOkAt == null && h.lastErrAt == null)) { updateRibbon({ feed: { cls: "dim", label: "CONNECTING…" } }); return; }
+    if (h.lastOkAt == null) { updateRibbon({ feed: { cls: "bad", label: "BACKEND UNREACHABLE" } }); return; }
+    const ageS = (Date.now() - h.lastOkAt) / 1000;
+    if (ageS <= 4) updateRibbon({ feed: { cls: "ok", label: "LIVE" } });
+    else if (ageS <= 12) updateRibbon({ feed: { cls: "warn", label: `DELAYED ${Math.round(ageS)}s` } });
+    else updateRibbon({ feed: { cls: "bad", label: `UNREACHABLE ${Math.round(ageS)}s` } });
   }
 
   function onFleet(data) {
@@ -587,11 +501,12 @@ export function Vehicle(root) {
     updateRibbon({ counts: counts() });
   }
 
-  const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
+  const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeedIndicator, "fleet");
   const authorityId = setInterval(() => loadAuthority(selId), 2000);  // refresh selected vehicle's control authority
   const commandsId = setInterval(() => refreshCommands(), 3000);  // refresh selected vehicle's command queue
-  const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
+  const clockId = setInterval(() => { updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }); updateFeedIndicator(); }, 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
+  updateFeedIndicator();
 
   return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(commandsId); authCtl.dispose(); };
 }
