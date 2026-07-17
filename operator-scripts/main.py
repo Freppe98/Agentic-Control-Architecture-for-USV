@@ -940,6 +940,65 @@ def _annotate_set_home_result(cmd):
         cmd["home_result"] = "verified"
 
 
+def _mode_is_rtl(mode) -> bool:
+    """True when a reported flight-mode string names RTL (ArduRover reports 'RTL')."""
+    return mode is not None and "RTL" in str(mode).upper()
+
+
+def _annotate_rtl_result(cmd):
+    """Classify an RTL command's own nested Scout result for the operator UI — the RTL
+    twin of _annotate_set_home_result. This is NEVER the vehicle's live mode (that comes
+    from telemetry); it only says whether THIS RTL attempt actually put the Pixhawk into
+    RTL, so the command row never renders a green 'confirmed' on transport success alone.
+
+    Command-protocol status EXECUTED means only 'the Local Agent completed the attempt'.
+    An RTL is a verified success ONLY when ALL of:
+      - result.accepted is True   (MAVLink accepted the mode change)
+      - result.verified is True   (Scout read the mode back)
+      - result.observed_mode confirms RTL (the read-back mode IS RTL — the ack alone is
+        not trusted; a vehicle can ack then revert)
+    Anything else — including the legacy optimistic {"status": "Returning home"} shape,
+    which carries no accepted/verified flags — sets cmd['rtl_result'] = 'failed' and
+    replaces cmd['reason'] with Scout's real error / observed mode (never invented),
+    even though cmd['status'] stays EXECUTED (the transport succeeded; RTL did not)."""
+    if cmd["type"] != "RTL" or cmd["status"] != "EXECUTED":
+        return
+    result = cmd.get("result") if isinstance(cmd.get("result"), dict) else {}
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    accepted = result.get("accepted")
+    verified = result.get("verified")
+    observed = result.get("observed_mode")
+    previous = result.get("previous_mode")
+    err_msg = error.get("message") or error.get("code")
+
+    failure_reason = None
+    if accepted is not True:
+        # No explicit acceptance — covers a rejected mode change AND the legacy
+        # {"status":"Returning home"} HTTP-200 shape (no accepted flag at all). Never a
+        # verified RTL just because a route returned 200.
+        failure_reason = err_msg or "MAVLink rejected the RTL mode change."
+    elif verified is not True:
+        if err_msg:
+            failure_reason = err_msg
+        elif observed is not None and not _mode_is_rtl(observed):
+            failure_reason = (f"Mode reverted from RTL to {observed}"
+                              if _mode_is_rtl(previous) else f"Pixhawk remained in {observed}")
+        else:
+            failure_reason = "RTL verification timed out."
+    elif not _mode_is_rtl(observed):
+        # Accepted + verified, but the read-back mode is not RTL (or was not reported) —
+        # refuse to call it success on the ack alone.
+        failure_reason = (err_msg or
+                          (f"Pixhawk reported mode {observed}, not RTL." if observed is not None
+                           else "Scout confirmed RTL without reporting the observed flight mode."))
+
+    if failure_reason:
+        cmd["rtl_result"] = "failed"
+        cmd["reason"] = failure_reason
+    else:
+        cmd["rtl_result"] = "confirmed"
+
+
 def process_command_result(command_id, raw_status, result, reason, now):
     """Look up a command and apply a Local-Agent-reported result. Single source of truth
     shared by BOTH result endpoints (POST /agent/command_result and the id-in-path
@@ -962,12 +1021,18 @@ def process_command_result(command_id, raw_status, result, reason, now):
                 "allowed": sorted(RESULT_STATUSES)}
     applied = apply_command_result(cmd, new_status, result, reason, now)
     if applied:
-        _annotate_set_home_result(cmd)  # before the event message so it carries the real reason
-        home_failed = cmd.get("home_result") == "failed"
-        sev = "warning" if new_status in ("REJECTED", "FAILED") or home_failed else "info"
-        # An outer EXECUTED that Set Home itself did not verify is reported as a
-        # verification failure, not "executed" — the transport succeeded, Set Home did not.
-        msg = (f"Command {cmd['type']} verification failed" if home_failed
+        # Command-specific result classifiers run BEFORE the event message so it carries
+        # the real reason. Each inspects only its own command type's nested result and
+        # may replace cmd['reason']; a bare EXECUTED with no per-type verification (AUTO/
+        # MANUAL/LOITER/ARM/…) is left untouched and reads as a normal success.
+        _annotate_set_home_result(cmd)
+        _annotate_rtl_result(cmd)
+        verify_failed = cmd.get("home_result") == "failed" or cmd.get("rtl_result") == "failed"
+        sev = "warning" if new_status in ("REJECTED", "FAILED") or verify_failed else "info"
+        # An outer EXECUTED that the command's own verification did not confirm (Set Home
+        # not read back, RTL not actually entered) is reported as a verification failure,
+        # not "executed" — the transport succeeded, the vehicle action did not.
+        msg = (f"Command {cmd['type']} verification failed" if verify_failed
                else f"Command {cmd['type']} {new_status.lower()}")
         if cmd.get("reason"):
             msg = f"{msg} — {cmd['reason']}"

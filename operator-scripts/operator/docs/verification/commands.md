@@ -136,6 +136,45 @@ The operator backend holds **no authority state of its own** — every `/api/con
 - Not verified: the real Scout Flask `/agent/control_authority` endpoints don't exist yet (separate codebase, in progress) — this pass verifies the operator-backend proxy and Local Agent client against a stand-in mock with the agreed contract, not the real device.
 - Not verified in this pass: the Operator UI (Map/Vehicle pages) was reviewed by reading the rendered markup/handlers, but not click-tested in a real browser (no Node/Playwright available in this environment).
 
+## RTL & LOITER result classification (verification-aware, not optimistic)
+
+**The bug fixed here:** the command panels rendered any `EXECUTED` status as a green "confirmed", and the backend only ever classified `SET_HOME` (`home_result`). So an RTL that Scout completed as a transport but that never actually put the Pixhawk into RTL — `EXECUTED` with `result.verified:false`, or the legacy `{"status":"Returning home"}` HTTP-200 shape — read as a **success the vehicle never performed**. LOITER had no duplicate-press guard.
+
+**Command types (unchanged, canonical — do not rename without coordinating with Scout):** `SET_MODE_AUTO`, `SET_MODE_MANUAL`, `SET_MODE_LOITER`, `RTL`. The UI sends `SET_MODE_LOITER` (never `HOLD` in its place; `SET_MODE_HOLD` remains a demoted, backend-only compatibility type).
+
+**RTL classifier** (`main._annotate_rtl_result`, the twin of `_annotate_set_home_result`) — runs on `process_command_result`, sets `cmd["rtl_result"]`:
+- `"confirmed"` **only** when `result.accepted is True` AND `result.verified is True` AND `result.observed_mode` names RTL.
+- `"failed"` otherwise — `cmd["reason"]` is replaced with Scout's real error, or a synthesized one from the observed mode:
+  - not accepted / legacy `{"status":"Returning home"}` → `"MAVLink rejected the RTL mode change."` (or `error.message`)
+  - `verified:false`, observed ≠ RTL → `"Pixhawk remained in <MODE>"`, or `"Mode reverted from RTL to <MODE>"` when `previous_mode` was RTL
+  - `verified:false`, no observed mode → `"RTL verification timed out."` (or `error.message`)
+- The nested `result` is **preserved verbatim** (`cmd["result"]`), and `cmd["status"]` stays `EXECUTED` — only `rtl_result`/`reason` carry the verdict. Idempotent (a replayed result on a terminal command is a no-op).
+
+**LOITER** is a plain mode command: `EXECUTED` **is** the confirmation (Scout reporting the mode change), so it gets **no** `rtl_result`/`home_result` annotation and is never Home-gated. A `REJECTED` surfaces Scout's reason verbatim (e.g. `"unsupported command_type: SET_MODE_LOITER"`).
+
+**Frontend** — one shared, tested rule (`operator/lib/command.js` `commandVerification`, used by both Map `cmdStatus` and Vehicle's queue row): an `EXECUTED` `RTL`/`SET_HOME` renders green only when its `rtl_result`/`home_result` confirms; otherwise it renders **FAILED** (red) with the real reason on hover. Map additionally suppresses a duplicate press while a same-type command is nonterminal (`hasPendingOfType` + a synchronous `sending` guard) — the LOITER button stays visible (dashed "awaiting" state) but disabled until the outstanding command is terminal.
+
+**Success/failure vocabulary shown to the operator**
+- Successful RTL → pill `confirmed` (green); the structured `result` (previous_mode → RTL, observed_mode) is preserved in history.
+- Failed RTL → pill `failed` (red) + reason: `"Pixhawk remained in MANUAL"` / `"Mode reverted from RTL to MANUAL"` / `"MAVLink rejected the RTL mode change."` / `"RTL verification timed out."`
+- LOITER → `confirmed` only after Scout's `EXECUTED`; otherwise the real rejection/failure reason.
+
+**Live test procedure** (backend on `:8000` — adjust port; `usv-2` is Scout)
+1. **Queue + inspect:** `POST /api/commands {"vehicle_id":2,"type":"RTL"}` → note the returned `command.id`. Poll `GET /api/commands/2` (UI view) and `GET /api/commands/history/2` (terminal only) to watch the lifecycle.
+2. **Simulate each Scout result** against the claimed command (claim first with `GET /agent/commands?usv_id=usv-2`), via `POST /agent/command_result`:
+   - success: `{"command_id":"…","status":"executed","result":{"accepted":true,"verified":true,"observed_mode":"RTL","previous_mode":"MANUAL"}}` → `rtl_result:"confirmed"`.
+   - not entered: `…"result":{"accepted":true,"verified":false,"observed_mode":"MANUAL"}` → `rtl_result:"failed"`, `reason:"Pixhawk remained in MANUAL"`.
+   - legacy: `…"result":{"status":"Returning home"}` → `rtl_result:"failed"` (never confirmed).
+3. **Compare with Scout ground truth:** `GET {SCOUT_API_BASE[2]}/agent/state` (Scout's own reported flight mode) — the operator's `observed_mode`/verdict must agree with Scout's live mode.
+4. **Compare with Mission Planner:** the Pixhawk mode indicator (bottom-left flight-mode box) must read `RTL` for a `confirmed` RTL, and the pre-RTL mode for any `failed` one. A green `confirmed` with Mission Planner **not** in RTL is the exact regression this change forbids — report it.
+5. **LOITER duplicate guard:** press LOITER on the Map inspector; while it is `QUEUED`/`SENT` the button is disabled (dashed, "already sent — awaiting the vehicle's result"). On `REJECTED` it re-enables and shows the reason.
+
+**Verified** (automated, no live vehicle)
+- ✓ backend: `tests/test_mode_commands.py` — RTL confirmed/verified-false/observed-MANUAL/reverted/rejected/failed/error-surfaced/legacy-string, LOITER executed-is-plain-success / rejected-reason-verbatim / never-home-gated.
+- ✓ frontend: `tests/command.test.mjs` — `commandVerification` (RTL/SET_HOME/LOITER/AUTO/MANUAL, bare-EXECUTED-is-failure) + `hasPendingOfType` duplicate guard.
+- ✓ existing SET_HOME / AUTO / MANUAL / ARM / DISARM tests remain green (`test_agent_commands.py`, `test_set_home.py`, 69 backend + 81 frontend tests pass).
+- Not verified in this pass: click-test in a real browser and against a live Scout/Pixhawk (procedure above) — the Scout-side RTL endpoint returning the structured result is a separate codebase change.
+
 **Next**
 - Scout-side: add the real `GET`/`POST /agent/control_authority` to `motherpi/services/flask` (separate codebase/session).
 - Wire the Scout Local Agent to poll `GET /api/commands/pending/2` for mission commands, execute via Flask/mavlink2rest, and POST results — replacing the curl simulation (control authority does **not** use this path; see above).

@@ -25,6 +25,7 @@ import { commState, cls, fmtAge, pad3, noTelem } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { isSafetyHold, SAFETY_HOLD_TITLE, homeStatus, commandGate, commandGateCtx } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts } from "../lib/mission.js";
+import { commandVerification } from "../lib/command.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
@@ -372,10 +373,17 @@ export function Vehicle(root) {
     const advancedBtns = ADVANCED_CMDS.map(renderCmd).join("");
     const queueHtml = cmds.length
       ? cmds.slice(0, 8).map((cm) => {
-          const clsx = CMD_STATUS_CLS[cm.status] || "u";
+          // An EXECUTED whose per-type verification failed (SET_HOME not read back, RTL
+          // not actually entered) is shown as FAILED, never a green EXECUTED — the same
+          // shared rule the Map panel uses (commandVerification, lib/command.js). The
+          // real reason is already on cm.reason (set by the backend classifier) and
+          // renders in the note below.
+          const failedVerify = commandVerification(cm).verified === false;
+          const clsx = failedVerify ? "d" : (CMD_STATUS_CLS[cm.status] || "u");
+          const label = failedVerify ? "FAILED" : cm.status;
           const when = cm.completed_at || cm.claimed_at || cm.created_at;
           const note = cm.reason || cm.warning || "";
-          return `<div class="ctl-row"><span class="ctl-type mono">${cm.type}</span><span class="pill ${clsx}">${cm.status}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
+          return `<div class="ctl-row"><span class="ctl-type mono">${cm.type}</span><span class="pill ${clsx}">${label}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
         }).join("")
       : `<div class="ctl-empty">No commands issued for ${vname} yet.</div>`;
     const controlCard = panelCard("Control", controlCond, controlClass,
