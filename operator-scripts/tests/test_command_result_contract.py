@@ -208,6 +208,170 @@ class TestCommandResultBatchStillAlways2xx(ContractTestBase):
         return cid
 
 
+def _envelope(command_id, status, result=None, reason=None):
+    """The canonical Local Agent message the deployed Scout's agent_buffer.jsonl actually
+    writes — POST /agent/command_result must unwrap payload to reach command_id/status."""
+    return {
+        "message_type": "command_result", "schema_version": "1.0",
+        "source": "usv-2", "target": "operator", "timestamp": 1784286523.1308434,
+        "payload": {
+            "command_id": command_id, "usv_id": "usv-2", "command_type": "SET_HOME",
+            "source": "operator", "status": status, "reason": reason,
+            "timestamp": 1784286523.1306949, "lifecycle": [],
+            "result": result,
+        },
+    }
+
+
+# The exact production body from Scout's agent_buffer.jsonl (2026-07-17) — Pixhawk
+# rejected MAV_CMD_DO_SET_HOME. Previously rejected with a 400 (see
+# TestCanonicalMessageEnvelope's module docstring / the class docstring below for why).
+PRODUCTION_REJECTED_RESULT = {
+    "accepted": False, "ack_result": "MAV_RESULT_FAILED",
+    "error": {"code": "ACK_REJECTED",
+              "message": "Pixhawk rejected MAV_CMD_DO_SET_HOME: MAV_RESULT_FAILED"},
+    "home_position": None,
+    "requested_position": {"latitude": 56.6636479, "longitude": 12.8817432},
+    "verification_distance_m": None, "verified": False,
+}
+
+
+class TestCanonicalMessageEnvelope(ContractTestBase):
+    """POST /agent/command_result must accept the canonical Local Agent message envelope
+    — { message_type: "command_result", ..., payload: {command_id, status, result, ...} }
+    — not just the legacy flat { command_id, status, ... } shape.
+
+    PRE-FIX ROOT CAUSE: _result_items(body) found no "results"/"command_results"/"items"/
+    "acks" list key on the envelope, so it fell through to `return [body]` — treating the
+    WHOLE envelope (message_type/schema_version/source/target/timestamp/payload) as if it
+    were itself one flat result item. `_pick(item, _RESULT_ID_KEYS)` then found no
+    top-level command_id (it was nested one level down, under payload) and returned None,
+    so process_command_result got command_id=None → {"found": False, "error": "missing
+    command id"} → the single-item honest-status mapping (added for the prior incident)
+    turned that into HTTP 400. The command was left exactly as it was: SENT,
+    completed_at:null — a real Scout-reported terminal failure, silently never applied.
+
+    POST-FIX: _unwrap_envelope() detects message_type=="command_result" + a dict payload
+    and substitutes payload for the item before any field-picking happens, exactly once,
+    non-recursively. The legacy flat form (no message_type/payload keys) is untouched."""
+
+    def _claimed_set_home(self, lat=56.6636479, lng=12.8817432):
+        r = self.client.post("/api/commands", json={
+            "vehicle_id": SCOUT_VID, "type": "SET_HOME",
+            "params": {"lat": lat, "lng": lng}, "confirm": True})
+        cid = r.json()["command"]["id"]
+        self.client.get("/agent/commands?usv_id=usv-2")
+        return cid
+
+    def test_exact_production_rejected_set_home_body_is_accepted_and_classified_failed(self):
+        cid = self._claimed_set_home()
+        body = _envelope(cid, "executed", result=PRODUCTION_REJECTED_RESULT,
+                         reason="command executed successfully")
+        r = self.client.post("/agent/command_result", json=body)
+        self.assertEqual(r.status_code, 200, r.text)  # PRE-FIX: this was 400
+        self.assertTrue(r.json()["applied"])
+
+        cmd = main.commands_by_id[cid]
+        self.assertEqual(cmd["status"], "EXECUTED")            # transport/execution completed
+        self.assertIsNotNone(cmd["completed_at"])
+        self.assertEqual(cmd["home_result"], "failed")         # ...Set Home itself did not
+        self.assertEqual(cmd["reason"],
+                         "Pixhawk rejected MAV_CMD_DO_SET_HOME: MAV_RESULT_FAILED")
+        # The nested result survives completely unflattened.
+        self.assertEqual(cmd["result"], PRODUCTION_REJECTED_RESULT)
+        for key in ("accepted", "verified", "ack_result", "error", "home_position",
+                    "requested_position", "verification_distance_m"):
+            self.assertIn(key, cmd["result"])
+        # Removed from pending — a terminal command is never redelivered.
+        self.assertEqual(self.client.get("/agent/commands?usv_id=usv-2").json()["commands"], [])
+
+    def test_enveloped_failed_result_is_terminal(self):
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result",
+                             json=_envelope(cid, "failed", reason="mavlink timeout"))
+        self.assertEqual(r.status_code, 200, r.text)
+        cmd = main.commands_by_id[cid]
+        self.assertEqual(cmd["status"], "FAILED")
+        self.assertEqual(cmd["reason"], "mavlink timeout")
+        self.assertIsNotNone(cmd["completed_at"])
+
+    def test_enveloped_rejected_result_is_terminal(self):
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result",
+                             json=_envelope(cid, "rejected", reason="no GPS fix"))
+        self.assertEqual(r.status_code, 200, r.text)
+        cmd = main.commands_by_id[cid]
+        self.assertEqual(cmd["status"], "REJECTED")
+        self.assertEqual(cmd["reason"], "no GPS fix")
+
+    def test_enveloped_executed_accepted_and_verified_true_is_home_verified(self):
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result",
+                             json=_envelope(cid, "executed", result=SUCCESS_RESULT))
+        self.assertEqual(r.status_code, 200, r.text)
+        cmd = main.commands_by_id[cid]
+        self.assertEqual(cmd["status"], "EXECUTED")
+        self.assertEqual(cmd["home_result"], "verified")
+
+    def test_legacy_flat_form_still_works_unchanged(self):
+        """The envelope unwrap must never break the pre-existing flat contract."""
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result",
+                             json={"command_id": cid, "status": "executed",
+                                   "result": SUCCESS_RESULT})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(main.commands_by_id[cid]["home_result"], "verified")
+
+    def test_batch_of_full_envelopes_flushes_correctly(self):
+        """buffer.py may flush a backlog as a bare JSON list of FULL envelopes (not flat
+        payloads) — each item must be unwrapped independently."""
+        cid1 = self._claimed_set_home(lat=56.1, lng=12.1)
+        cid2 = self._claimed_set_home(lat=56.2, lng=12.2)
+        r = self.client.post("/agent/command_result", json=[
+            _envelope(cid1, "failed", reason="timeout"),
+            _envelope(cid2, "executed", result=SUCCESS_RESULT),
+        ])
+        self.assertEqual(r.status_code, 200, r.text)
+        results = r.json()["results"]
+        self.assertTrue(all(r["applied"] for r in results))
+        self.assertEqual(main.commands_by_id[cid1]["status"], "FAILED")
+        self.assertEqual(main.commands_by_id[cid2]["home_result"], "verified")
+
+    def test_batch_via_results_key_of_full_envelopes_also_unwraps(self):
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result", json={
+            "results": [_envelope(cid, "failed", reason="x"),
+                        _envelope("unknown-id", "failed")]})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = r.json()["results"]
+        self.assertTrue(results[0]["applied"])
+        self.assertFalse(results[1]["found"])
+
+    def test_envelope_with_unrecognized_message_type_is_treated_as_flat_and_rejected(self):
+        """A malformed/foreign envelope must not be silently unwrapped — it is honestly
+        rejected as the flat form it does not satisfy (no top-level command_id)."""
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result", json={
+            "message_type": "telemetry", "payload": {"command_id": cid, "status": "executed"}})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(main.commands_by_id[cid]["status"], "SENT")
+
+    def test_envelope_with_non_dict_payload_is_treated_as_flat_and_rejected(self):
+        r = self.client.post("/agent/command_result",
+                             json={"message_type": "command_result", "payload": "oops"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_envelope_missing_command_id_in_payload_is_a_clear_400(self):
+        r = self.client.post("/agent/command_result",
+                             json=_envelope(None, "executed", result=SUCCESS_RESULT))
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_envelope_unknown_command_id_is_a_clear_404(self):
+        r = self.client.post("/agent/command_result",
+                             json=_envelope("does-not-exist", "failed"))
+        self.assertEqual(r.status_code, 404, r.text)
+
+
 class TestRedeliveryIsExplicitlyBoundedByTTL(ContractTestBase):
     """Requirement: a claimed SENT command must not be handed out as fresh-forever work
     unless the bound is explicit. Here the bound IS explicit and documented: at-least-once

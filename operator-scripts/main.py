@@ -992,18 +992,41 @@ def process_command_result(command_id, raw_status, result, reason, now):
             "status": new_status, "command": cmd}
 
 
+def _unwrap_envelope(item):
+    """Unwrap ONE canonical Local Agent message envelope — { message_type:
+    "command_result", schema_version, source, target, timestamp, payload:{command_id,
+    status, result, ...} } — down to its `payload`, which is the actual result dict.
+    Detected ONLY when message_type is EXACTLY "command_result" and payload is an object;
+    anything else (including the legacy flat {command_id, status, ...} shape, which has
+    no message_type/payload at all) passes through completely unchanged — the two forms
+    are never conflated. Applied once per item, never recursively, so a payload that
+    itself happens to carry message_type/payload keys is not unwrapped again."""
+    if (isinstance(item, dict) and item.get("message_type") == "command_result"
+            and isinstance(item.get("payload"), dict)):
+        return item["payload"]
+    return item
+
+
 def _result_items(body):
     """Normalize a command-result request body into a list of result dicts. Accepts a
     single object, a bare JSON list, or {results:[...]}/{command_results:[...]} — so a
-    single ack and a flushed backlog both work through one endpoint."""
+    single ack and a flushed backlog both work through one endpoint. Each candidate item
+    is then run through _unwrap_envelope, so any of the three shapes may carry either the
+    legacy flat result or a full canonical message envelope — including a backlog flush
+    that is itself a list of envelopes rather than flat payloads."""
     if isinstance(body, list):
-        return [x for x in body if isinstance(x, dict)]
-    if isinstance(body, dict):
+        items = [x for x in body if isinstance(x, dict)]
+    elif isinstance(body, dict):
+        items = None
         for key in ("results", "command_results", "items", "acks"):
             if isinstance(body.get(key), list):
-                return [x for x in body[key] if isinstance(x, dict)]
-        return [body]
-    return []
+                items = [x for x in body[key] if isinstance(x, dict)]
+                break
+        if items is None:
+            items = [body]
+    else:
+        items = []
+    return [_unwrap_envelope(it) for it in items]
 
 
 @app.post("/api/commands")
@@ -1212,8 +1235,18 @@ async def agent_command_result(request: Request):
     """Command-result receiver expected by the Local Agent (Scout). The command id is in
     the BODY, not the path — this is the endpoint Scout was POSTing to (previously 405
     because only the id-in-path route existed). Accepts:
-      • a single result:  { command_id, status, result?, reason?, vehicle_id? }
-      • a flushed backlog: [ {...}, {...} ]  or  { results: [ {...}, ... ] }
+      • a legacy flat result:      { command_id, status, result?, reason?, vehicle_id? }
+      • a canonical message envelope (2026-07-17 — what the deployed Scout's
+        agent_buffer.jsonl actually contains): { message_type: "command_result",
+        schema_version, source, target, timestamp, payload: { command_id, status,
+        result?, reason?, ... } } — unwrapped to `payload` exactly once by
+        _unwrap_envelope, then handled identically to the legacy flat form. The nested
+        `result` (accepted/verified/ack_result/error/home_position/requested_position/
+        verification_distance_m) is never flattened or altered — it is stored verbatim on
+        the command record for _annotate_set_home_result to classify.
+      • a flushed backlog: [ {...}, {...} ]  or  { results: [ {...}, ... ] } — each item
+        may itself be EITHER a flat result or a full envelope; every item is unwrapped
+        independently.
     Tolerant of field spellings (command_id/id/cmd_id, status/outcome, reason/error) and
     status aliases (TIMEOUT/ACK/DONE → the queue vocabulary). Idempotent by the uuid
     command id: replayed/duplicate results are no-ops (applied:false) — a flushed buffer
