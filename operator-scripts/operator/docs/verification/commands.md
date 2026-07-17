@@ -97,6 +97,57 @@ the full queue → claim → redeliver → result → stop round trip).
 - Delivery is at-least-once: `pending` redelivers a SENT command until a result arrives, so the **Local Agent must dedup by `id`**. The backend guarantees no duplicate *record* transition (results on terminal commands are ignored).
 - Claim-on-fetch (QUEUED→SENT on `GET pending`) means a SENT command whose delivery response was lost is still redelivered — correct for reliability; the id dedup covers the double-send.
 
+## Command-result contract hardening + SET_HOME canonicalization (2026-07-17)
+
+**Fixes a live incident**: a queued `SET_HOME` sat `SENT` indefinitely — redelivered by
+`GET /agent/commands` on every Scout poll — even after the Local Agent caught its own
+internal error and attempted to report a terminal `failed` result. Traced to two bugs,
+both fixed here:
+
+1. **`POST /agent/command_result` always answered 2xx, even on a single request with an
+   unknown `command_id` or an unrecognized `status`.** A caller that checks the HTTP
+   status (not just the body) to decide whether to stop retrying would see "200 OK" and
+   believe its result was accepted, while the command record was left untouched (still
+   `SENT`, `completed_at: null`) — indistinguishable from Scout never having reported
+   anything. Fixed: a **single** result now gets an honest status — `404` unknown
+   `command_id`, `400` missing id / invalid status — exactly like
+   `/api/commands/{id}/result` already did. A **batch** (2+ items, a flushed backlog) is
+   unchanged: always 2xx with per-item `found`/`applied`/`error` detail, so one bad id in
+   a backlog never fails the whole flush.
+2. **Diagnostic logging** (`[COMMAND-RESULT] ...`) now prints the raw incoming body and
+   the per-item `found`/`applied`/`status`/`error` outcome for both result endpoints, so a
+   future field-name/status-value mismatch between what Scout sends and what this backend
+   recognizes is visible in the server log instead of only manifesting as "the command
+   never resolves."
+
+Redelivery itself was re-audited and is unchanged: `SENT` is redelivered on every poll,
+but that is an **explicit, documented, bounded** lease — bounded by `COMMAND_TTL_S` (300 s)
+— not silent or indefinite (see `agent_commands()`'s docstring and
+`TestRedeliveryIsExplicitlyBoundedByTTL` in `tests/test_command_result_contract.py`).
+
+**SET_HOME's canonical params changed**: the command now always carries
+`params.mode == "current_position"` — Scout picks and verifies its own current position;
+a browser-supplied lat/lng is never authoritative (it can be stale by the time the Local
+Agent executes). `main.create_command()` canonicalizes this server-side for every
+`SET_HOME`, regardless of caller (UI, curl, tests), via `_canonical_set_home_params()` —
+one enforcement point, not duplicated in the frontend. Any lat/lng supplied survives only
+as non-authoritative audit metadata under `params.requested_position`:
+```json
+{ "mode": "current_position", "requested_position": { "lat": 56.66, "lng": 12.88 } }
+```
+`operator/services/api.js`'s `setHome(id, {lat, lng})` is unchanged in signature — it still
+forwards whatever fix the UI has for the audit trail — but no longer needs to construct
+the canonical contract itself, since the backend now enforces it unconditionally.
+
+Covered by `tests/test_command_result_contract.py` (15 tests): SET_HOME canonicalization
+(mode present, audit-only lat/lng, no-lat/lng-supplied case, Scout sees the canonical
+params on delivery); single-result honest status (failed/rejected/executed all 200 +
+terminal, terminal removes from pending, duplicate is idempotent, unknown id → 404,
+invalid status → 400, missing id → 400, garbage body → 400); batch still always-2xx; TTL-
+bounded redelivery. `tests/test_agent_commands.py`'s delivered-params assertion updated to
+the new canonical shape; the rest of the existing suite (`test_agent_commands`,
+`test_set_home`, `test_mode_commands`) is unaffected and green.
+
 ## Control authority (dedicated API — deliberately NOT this queue)
 
 Fixes a live-testing finding: the Local Agent must never assume control of the Pixhawk on its own. `OPERATOR` (default — RC has exclusive authority) vs `LOCAL_AGENT` (operator has explicitly handed off control) is a supervisory flag, independent of `SET_MODE_*`/ARM/DISARM.

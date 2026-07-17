@@ -80,8 +80,13 @@ Body (backlog): [ {…}, {…} ]   or   { "results": [ {…}, … ] }
   reasons preserved on the record).
 - **Idempotent**: keyed by the uuid command id. A result on an already-terminal command
   is a no-op (`applied:false`) — no duplicate history row, no re-execution.
-- **Always 2xx**: per-item `found`/`applied` flags carry detail, so a buffered Agent can
-  drain its backlog (including unknown/already-terminal ids) and stop retrying.
+- **Batch always 2xx** (2+ items, a flushed backlog): per-item `found`/`applied` flags
+  carry detail, so a buffered Agent can drain its backlog (including unknown/already-
+  terminal ids) and stop retrying without one bad id failing the whole flush.
+- **Single result gets an honest status** (2026-07-17, fixing a live incident where a
+  silent 200 on an unrecognized id/status hid a result that never applied, leaving the
+  command `SENT` forever): `404` unknown `command_id`, `400` missing id or an invalid/
+  unrecognized `status`, `200` applied — same as `/api/commands/{id}/result`.
 - Response (single): `{ ok, applied, found, error, command, received, applied_count }`.
   Response (batch): `{ ok, received, applied_count, results:[{command_id,found,applied,…}] }`.
 
@@ -99,7 +104,10 @@ Backwards compatible: `POST /api/commands/{id}/result` still works (same apply p
 | Batch containing an unknown id | 200, item `found:false`, **flush not failed** |
 | Bare-list form `[ {…} ]` | 200 |
 | Old id-in-path route | 200 (still works) |
-| Empty/garbage body | 2xx with per-item error / 400 no-results |
+| Empty body (no results) | 400 `no command results in body` |
+| Single result, unknown `command_id` | **404** (was silently 200 — see `commands.md`) |
+| Single result, invalid/unrecognized `status` | **400** (was silently 200) |
+| Single result, missing `command_id` | **400** |
 
 ### Agent reasoning forwarding (P1)
 `agent_status` present on the fleet vehicle and equal to Scout's `payload.agent.*`

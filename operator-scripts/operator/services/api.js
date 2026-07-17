@@ -162,13 +162,20 @@ export function getPixhawkMission(id) { return getJSON(`/api/vehicles/${id}/pixh
 
 // --- Set Home (deployment: set the Pixhawk HOME_POSITION) ---
 // SET_HOME is a normal queued command — exactly the createCommand() call above, just a
-// dedicated helper so callers don't repeat the type/params/confirm shape. body: { lat,
-// lng } is the Scout's CURRENT position (the recovery point). Returns { ok, status,
-// data } where data.command is the QUEUED command record; verification is NOT known at
-// this call — it lands later as the command's result (poll getCommands and watch this
-// command's id reach EXECUTED, same as every other command type). See main.py.
-export function setHome(id, { lat, lng }) {
-  return createCommand({ vehicle_id: id, type: "SET_HOME", params: { lat, lng }, confirm: true });
+// dedicated helper so callers don't repeat the type/params/confirm shape. The canonical
+// command means "Scout's own current position" (mode: "current_position") — Scout
+// chooses and verifies its own fix; a browser-supplied lat/lng can be stale or wrong by
+// the time the Local Agent actually executes it, so it is never authoritative. The
+// backend (main.py create_command) canonicalizes params for every SET_HOME regardless of
+// what is sent here, so { lat, lng } — if the caller has a current fix to show — is kept
+// only as non-authoritative audit metadata (params.requested_position), never as a
+// target coordinate. Returns { ok, status, data } where data.command is the QUEUED
+// command record; verification is NOT known at this call — it lands later as the
+// command's result (poll getCommands and watch this command's id reach EXECUTED, same
+// as every other command type). See main.py.
+export function setHome(id, { lat, lng } = {}) {
+  const params = lat != null && lng != null ? { lat, lng } : {};
+  return createCommand({ vehicle_id: id, type: "SET_HOME", params, confirm: true });
 }
 
 // --- Feed health (data-freshness diagnostics) -------------------------------
