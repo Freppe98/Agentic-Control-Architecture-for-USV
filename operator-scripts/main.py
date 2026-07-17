@@ -1076,6 +1076,88 @@ def pending_commands(vehicle_id: str):
     return {"vehicle_id": vid, "pending": pending, "generated_at": now.isoformat()}
 
 
+def agent_command_view(cmd):
+    """The Scout-facing view of a command record. The Local Agent's own field names
+    (command_id / command_type) — deliberately NOT the internal record, which uses
+    id/type and carries operator-side bookkeeping the vehicle has no business seeing
+    (requested_comm_state, created_by, warning, …). `params` is always an object, never
+    null, so the Agent can index it without a None check."""
+    return {
+        "command_id": cmd["id"],
+        "command_type": cmd["type"],
+        "params": cmd["params"] or {},
+        "expires_at": cmd["expires_at"],
+    }
+
+
+@app.get("/agent/commands")
+async def agent_commands(usv_id: str = ""):
+    """Command delivery to the Scout Local Agent — the endpoint the DEPLOYED agent polls
+    (`local_mission_agent/api_client.py`, configured `USV_ID = usv-2`):
+
+        GET /agent/commands?usv_id=usv-2  →  {"commands": [ {command_id, command_type,
+                                              params, expires_at}, ... ]}
+
+    This is the Agent-facing twin of GET /api/commands/pending/{id} (the operator/debug
+    view, which was the originally *planned* agent path — see docs/verification/
+    commands.md). Both claim from the ONE queue with the SAME at-least-once semantics,
+    differing only in field names; neither is a second source of truth.
+
+    THE FIRST FETCH IS THE CLAIM: a QUEUED command moves QUEUED → SENT with claimed_at
+    stamped, in the same pass that builds the response. `async def` with no awaits inside
+    is what makes that atomic — the whole scan/mutate runs to completion on the event loop
+    without yielding, so two concurrent polls can never claim the same command a plain
+    `def` would run in the threadpool and could interleave).
+
+    DELIVERY IS AT-LEAST-ONCE: a non-terminal command (QUEUED/SENT/ACCEPTED) is
+    redelivered on every poll until a terminal result arrives or it expires. The Scout's
+    Local Agent dedups by command_id — it records processed ids and rejects redeliveries
+    without re-executing — so a repeat is harmless, while NOT redelivering would lose the
+    command outright whenever a delivery response is dropped by an intermittent link
+    (exactly the condition this system is built for). Same semantics as
+    /api/commands/pending/{id}; the two endpoints differ only in field names.
+
+    claimed_at records when the Agent FIRST took the command and is never rewritten by a
+    redelivery — it is the claim time, not the last-seen time. The "sent to Scout" event
+    likewise fires once, on the first claim, so a polling Agent cannot flood the log.
+
+    Terminal and expired commands are never delivered (expire_commands runs first, so a
+    command past its TTL is EXPIRED here rather than handed to the vehicle late).
+    Never marks a command executed — only a Local Agent result can (POST
+    /agent/command_result)."""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+
+    if not usv_id:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "missing usv_id",
+            "expected": "GET /agent/commands?usv_id=usv-2"})
+
+    vid = parse_vehicle_id(usv_id)
+    if vid not in known_vehicle_ids():
+        # Loud, not an empty list: a misconfigured USV_ID must never look like "no work
+        # to do" forever — that is exactly the failure mode this endpoint was added for.
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "usv_id": usv_id,
+            "known": sorted(known_vehicle_ids())})
+
+    delivered = []
+    for cmd in commands:
+        if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
+            continue
+        if cmd["status"] == "QUEUED":
+            # First delivery only: claim it. A redelivery re-sends the same record
+            # untouched — claimed_at and the event both stay as they were.
+            cmd["status"] = "SENT"
+            cmd["claimed_at"] = now.isoformat()
+            _command_event(cmd, severity="info",
+                           message=f"Command {cmd['type']} sent to {cmd['vehicle']}",
+                           source="operator-backend")
+        delivered.append(agent_command_view(cmd))
+    return {"commands": delivered, "usv_id": usv_id, "vehicle_id": vid,
+            "generated_at": now.isoformat()}
+
+
 @app.post("/api/commands/{command_id}/result")
 async def command_result(command_id: str, request: Request):
     """Local Agent reports the outcome of a command (id in the PATH). Body:

@@ -10,6 +10,64 @@ First slice of the Operator → Scout command path from `BACKEND_ROADMAP.md` ("C
 - Command record = the spec object: `id, vehicle_id, vehicle, type, params, status, created_at, expires_at, created_by, requested_comm_state, claimed_at, completed_at, result, reason` (+ `warning`).
 - Comm-state gate on create (operator-side, from `comms_state_by_id`): CONNECTED → queue immediately · PARTITIONED → queue + `warning` (caution event) · DISCONNECTED → `409 needs_confirmation` unless `confirm:true` (then queue until contact/TTL). `UNKNOWN` (never-contacted template vehicle) queues immediately.
 - Endpoints: `POST /api/commands` · `GET /api/commands/pending/{id}` (claims QUEUED→SENT, redelivers SENT at-least-once) · `POST /api/commands/{command_id}/result` (idempotent) · `GET /api/commands/{id}` (queue + history + active) · `GET /api/commands/history/{id}` (terminal only).
+
+## Local Agent delivery API (2026-07-17) — what the DEPLOYED Scout actually polls
+
+**Fixes a live integration bug**: the Scout's `local_mission_agent` is configured
+`USV_ID = usv-2` and polls **`GET /agent/commands?usv_id=usv-2`** — an endpoint that did
+not exist, so the backend answered `{"detail":"Not Found"}` and **no command was ever
+claimed**; every `SET_HOME` sat `QUEUED` until its TTL. `GET /api/commands/2` worked, but
+that is the operator/UI view, not the Agent delivery path. The originally *planned* agent
+path (`GET /api/commands/pending/2`, "Next" below) was never adopted by the Scout.
+
+| | Agent-facing | Operator/UI-facing |
+|---|---|---|
+| Delivery | `GET /agent/commands?usv_id=usv-2` | `GET /api/commands/pending/{id}` |
+| Result | `POST /agent/command_result` (id in body) | `POST /api/commands/{id}/result` (id in path) |
+| Fields | `command_id`, `command_type`, `params`, `expires_at` | the full internal record |
+| Semantics | **at-least-once** (identical to the operator path) | at-least-once |
+
+Both claim from the **one** queue (`commands`) with the **same** delivery semantics,
+differing only in field names — neither is a second source of truth.
+
+### Delivery: at-least-once, with Scout-side deduplication
+
+The **first** fetch is the claim: a `QUEUED` command moves to `SENT` with `claimed_at`
+stamped, atomically (the handler is `async def` with no awaits, so the scan/mutate cannot
+interleave with a concurrent poll). Thereafter:
+
+| Command state | Delivered? |
+|---|---|
+| `QUEUED` | yes — and claimed (`SENT`, `claimed_at` set) |
+| `SENT` / `ACCEPTED`, no terminal result | **yes, redelivered on every poll** |
+| `EXECUTED` / `REJECTED` / `FAILED` / `EXPIRED` | never |
+
+Redelivery continues until a terminal result arrives **or the command expires** — the TTL
+(`COMMAND_TTL_S = 300`) is what bounds it, so nothing is redelivered forever. This is what
+stops a command being permanently lost when the backend marks it `SENT` but the HTTP
+response is dropped by an intermittent link — the condition this system exists for. The
+**Scout Local Agent deduplicates by `command_id`**: it records processed ids and rejects a
+redelivery without re-executing, so a repeat is inert.
+
+A redelivery is also inert **backend-side**: `claimed_at` keeps the ORIGINAL claim time (it
+records when the Agent first took the command, not when it last saw it), and the "sent to
+Scout" event fires **once**, on the first claim — a polling Agent cannot flood the log.
+
+`agent_command_view()` exposes only the Agent's four fields — operator-side bookkeeping
+(`created_by`, `requested_comm_state`, `warning`, …) never leaves the backend. Terminal and
+expired commands are never delivered; `expire_commands()` runs first, so a command past its
+TTL expires rather than reaching the vehicle late.
+
+`usv-2` / `2` / `USV-2` all map to internal id 2 (`parse_vehicle_id`). An **unknown**
+`usv_id` is a loud `404 unknown vehicle` (listing known ids), never an empty list — a
+misconfigured `USV_ID` must not look like "no work to do" forever, which is the failure
+mode this endpoint was added for. A missing `usv_id` is a `400` naming the expected form.
+
+Covered by `tests/test_agent_commands.py` (26 tests: claim, shape, redelivery of `SENT`,
+`claimed_at` preserved across redeliveries, no duplicate claim event, `ACCEPTED` still
+redelivered, expiry of both `QUEUED` and `SENT`, `usv_id` mapping/unknown/missing,
+per-vehicle scoping, lowercase result statuses, Set Home annotation, idempotent replay, and
+the full queue → claim → redeliver → result → stop round trip).
 - Every create / claim / result / expiry emits a first-class `type:"command"` event into the existing log (Events page unchanged). Expiry is also swept once per second in `_comms_monitor_loop`.
 
 **Verified** (fresh instance on :8210, live lifecycle via curl + a timed Python helper)
