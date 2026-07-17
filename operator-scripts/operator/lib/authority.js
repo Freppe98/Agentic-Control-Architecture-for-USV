@@ -7,10 +7,23 @@
 // This keeps the displayed authority honest — it always reflects the vehicle/Scout's
 // confirmed effective state, not an optimistic assumption.
 //
-// Effective-authority values (see main.py):
-//   OPERATOR    — operator holds the wheel (Take Control); operator commands allowed.
-//   LOCAL_AGENT — autonomy holds the wheel (Release Control).
-//   RC          — RC transmitter override active (reported only, never requestable).
+// Effective-authority values (see main.py) — the FINALIZED strict-ownership contract.
+// Startup/default authority is OPERATOR.
+//   OPERATOR    — the human operator owns supervisory command authority. The station is
+//                 read/write: every supported action is enabled subject to its OWN
+//                 safety gates (Home interlock, GPS, connectivity). Scout disables the
+//                 Local Agent's autonomous writes. Release Control is available.
+//   LOCAL_AGENT — autonomy owns authority. The station is READ-ONLY for vehicle-control
+//                 and configuration writes: EVERY write action is disabled, with NO
+//                 exceptions — SET_HOME and LOITER are deliberately NOT exempt (strict
+//                 ownership). Take Control always remains available.
+//   RC          — an independent physical override with the HIGHEST priority. Reported
+//                 only, never requestable (REQUESTABLE_AUTHORITY excludes it). While RC
+//                 holds control, hasControl is false, so software writes stay disabled
+//                 and the UI never claims the operator or the agent has effective control.
+//
+// hasControl is the single write-enable predicate for the whole station, and handoffGate
+// below is the single Take/Release predicate — neither is ever re-derived per page.
 
 export const AUTH_TIMEOUT_MS = 8000;    // no effective confirmation within this → TIMEOUT
 export const AUTH_CONFIRM_HOLD_MS = 2500;  // how long a CONFIRMED flash lingers before settling
@@ -27,6 +40,40 @@ export function normAuthority(raw) {
     reachable: raw.reachable === true,
     value: v === "OPERATOR" || v === "LOCAL_AGENT" || v === "RC" ? v : null,
     reason: raw.reason || raw.message || raw.error || null,
+  };
+}
+
+/**
+ * The Take Control / Release Control policy — pure, and the ONE place it is authored
+ * (Map and Vehicle both render their hand-off buttons from this, so the two surfaces
+ * can never drift apart). Separate from `hasControl`, which gates vehicle WRITES:
+ * a hand-off is itself never a vehicle write, it is a request to Scout's dedicated
+ * authority endpoint and deliberately does not touch the command queue.
+ *
+ * Contract:
+ *   Take Control    — available whenever authority is not already a confirmed OPERATOR.
+ *                     This includes LOCAL_AGENT (where it MUST always remain available)
+ *                     and RC (the request is honest: it takes effect once RC releases).
+ *   Release Control — available only on a confirmed OPERATOR (there is nothing to
+ *                     release otherwise).
+ * Both are withheld while a request is in flight (`busy`), while the link is not
+ * current (`stale` — a hand-off cannot be confirmed over a dead link), and when the
+ * vehicle has no authority source at all (`available:false`).
+ *
+ * @param view   the controller's view() output
+ * @param opts   { stale } — operator-side link state, which view() cannot know
+ * @returns {{ canTake, canRelease, hasControl, busy }}
+ */
+export function handoffGate(view, { stale = false } = {}) {
+  const av = view || {};
+  const busy = av.phase === "pending";
+  const hasControl = !stale && av.hasControl === true;
+  const blocked = av.available === false || stale || busy;
+  return {
+    canTake: !blocked && !hasControl,
+    canRelease: !blocked && av.value === "OPERATOR",
+    hasControl,
+    busy,
   };
 }
 

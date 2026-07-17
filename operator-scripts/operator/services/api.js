@@ -135,9 +135,13 @@ export function setControlAuthority(id, authority) {
 }
 
 // --- Command queue (reverse/control path) ---
-// Gated in the UI by control authority above (buttons disabled unless the latest
-// Scout-confirmed authority is LOCAL_AGENT) — the backend queue itself only gates
-// on comm-state + high-risk confirmation (see main.py POST /api/commands).
+// Gated in the UI by control authority above: buttons are disabled unless the latest
+// Scout-confirmed authority is OPERATOR (Take Control) — matching main.py's
+// set_control_authority ("Take Control → OPERATOR, Release Control → LOCAL_AGENT")
+// and lib/authority.js (hasControl = value === "OPERATOR"). The backend queue itself
+// does NOT gate on authority at all; it only gates on comm-state + high-risk
+// confirmation (see main.py POST /api/commands), so a command can sit QUEUED
+// regardless of who holds the wheel — the UI is the only authority interlock.
 
 /** Create a command. body: { vehicle_id, type, params?, confirm? }. Returns { ok, status, data }. */
 export function createCommand(body) { return postJSON("/api/commands", body); }

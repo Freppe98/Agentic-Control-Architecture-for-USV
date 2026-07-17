@@ -85,6 +85,31 @@ page's "Last command" line reads `cmd.home_result` (not a bare `EXECUTED`) so a
 verification failure never displays as "confirmed", exactly like AUTO/RTL/ARM/DISARM's
 lifecycle display otherwise.
 
+### 1b. The pending flash always terminates (no permanent "Setting…")
+
+Because the Local Agent does not execute `SET_HOME` off the queue yet (the backend gap
+above), the realistic case today is a command that NEVER reaches `EXECUTED`. The button
+must not present that as an in-progress action forever, so `setHomeOutcome`
+(`lib/home.js`, pure + unit-tested) bounds every wait:
+
+| Situation | Resolves to | After |
+|---|---|---|
+| `EXECUTED` + `home_result: "verified"` | `confirmed` | immediately |
+| any terminal status (incl. backend `EXPIRED`) | `failed`, carrying Scout's real reason | immediately |
+| Scout never reports a result | `failed` / `timeout` | the command's own `expires_at` (backend `COMMAND_TTL_S`, 300 s) + 5 s |
+| the tracked record vanishes (operator backend restarted — the queue is in-memory) | `failed` / `lost` | 15 s |
+| the `POST` never confirms a queued command (`fetch` has no timeout) | `failed` / `not_queued` | 15 s |
+
+The deadline is **read off the command's `expires_at`**, never invented client-side, so
+the client and the backend cannot disagree about when a command is dead; the 5 s slack
+lets the backend's own `EXPIRED` (which carries the real reason) win the race. The
+client deadline is a backstop for when no status arrives at all — including when the
+command poll itself is down, which is why a 1 s watchdog in `Map.js` evaluates it
+independently of any feed.
+
+Timeout copy never claims Home was or was not set — on a timeout the operator genuinely
+does not know — so it says the Home state is unknown and to re-check before AUTO/RTL.
+
 ### 2. The permanent Home status (`payload.agent.home_status`)
 
 Reported continuously by the Local Agent/Scout Flask on every status packet:
@@ -170,7 +195,10 @@ compatibility) is demoted, never shown as LOITER's equal. Taxonomy lives in `lib
   clearing verified state, and a command's own result/failure never touching Scout's own
   truth. LOITER routes as `SET_MODE_LOITER` with no forced confirmation; HOLD still
   accepted for compatibility.
-- Frontend: `npm test` (27 tests — home status + gating policy; a stale `v.home` is never
+- Frontend: `npm test` (37 tests — home status + gating policy; the in-flight `SET_HOME`
+  resolution above, including a GUARANTEE test that no input can pend past the fallback
+  TTL, that a bare `EXECUTED` is a failure, and that the deadline follows the command's
+  own `expires_at` rather than a client-invented number; a stale `v.home` is never
   surfaced as verified and a command's "confirmed" click-feedback phase never forces
   `state` to verified; LOITER is the safety hold and in `PRIMARY_MODES`, HOLD is
   advanced-only, LOITER enabled when Home unverified/readiness false while AUTO/RTL/RESUME

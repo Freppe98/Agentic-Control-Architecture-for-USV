@@ -142,6 +142,40 @@ const HOME_REASONS = {
 export function isHomeGated(type) { return HOME_GATED.has(type); }
 
 /**
+ * Build the commandGate context for a vehicle — the ONE place the gate's inputs are
+ * derived, so no page re-implements "what counts as a valid position", "when is GPS
+ * fresh", or "when is Home verified". Map and Vehicle both call this, which is what
+ * makes their button enablement provably identical (tests/gating-parity.test.mjs).
+ *
+ * Everything derivable from the vehicle object is derived here. The rest are page-local
+ * facts the vehicle object cannot supply, and are passed in:
+ *   hasControl      — confirmed OPERATOR authority for THIS page's controller, already
+ *                     resolved against link staleness (see lib/authority.js handoffGate).
+ *   connected       — operator-side link state (commState(v) === "connected"); lives in
+ *                     lib/ui.js, which this module deliberately does not import.
+ *   missionLoaded   — from the page's own Pixhawk mission readback cache.
+ *   setHomePending  — a Set Home request in flight from THIS page (Map only; the Vehicle
+ *                     page has no Set Home control, so nothing can be pending from it).
+ *   homePhase       — 'idle'|'pending'|'failed' transient Set-Home click feedback, so a
+ *                     Home mid-change never reads as verified while it is being replaced.
+ */
+export function commandGateCtx(v, {
+  hasControl = false, connected = false, missionLoaded = false,
+  setHomePending = false, homePhase = "idle", now,
+} = {}) {
+  const hs = homeStatus(v, now == null ? { phase: homePhase } : { phase: homePhase, now });
+  return {
+    hasControl: !!hasControl,
+    homeVerified: hs.state === "verified",
+    connected: !!connected,
+    posValid: !!(v && v.lat != null && v.lng != null),
+    gpsFresh: !!connected,        // a current link is what makes the reported fix current
+    missionLoaded: !!missionLoaded,
+    setHomePending: !!setHomePending,
+  };
+}
+
+/**
  * Gate one command against the deployment interlock.
  * @param type  backend command type (SET_MODE_AUTO, RTL, MISSION_RESUME, SET_MODE_LOITER, …)
  * @param ctx   { hasControl, homeVerified, connected, posValid, gpsFresh, setHomePending }
@@ -168,6 +202,95 @@ export function commandGate(type, ctx = {}) {
     return { enabled: false, reason: HOME_REASONS[type] };
   }
   return { enabled: true, reason: null };
+}
+
+// --- In-flight SET_HOME resolution (the "Setting…" flash can never hang) ----------
+// The pending flash resolves on the command's queue lifecycle, but a lifecycle can
+// stop arriving entirely: the Local Agent never reports a result, the operator
+// backend restarts (the command queue is in-memory — main.py: "resets on restart"),
+// so the tracked record simply vanishes, or the POST itself never settles. None of
+// those produce a terminal status, so a UI that waits only for one waits forever.
+//
+// The deadline is READ OFF THE COMMAND (`expires_at`, stamped by the backend from
+// COMMAND_TTL_S) rather than invented here, so the client and the backend can never
+// disagree about when a command is dead. DEADLINE_SLACK lets the backend's own
+// EXPIRED — which carries Scout's real reason — win the race; this is a backstop for
+// when no status arrives at all, never the primary path.
+export const SET_HOME_QUEUE_GRACE_MS = 15000;    // POST must confirm the command was queued
+export const SET_HOME_LOST_GRACE_MS = 15000;     // queued record must appear in the poll
+export const SET_HOME_DEADLINE_SLACK_MS = 5000;  // let the backend's own EXPIRED land first
+export const SET_HOME_FALLBACK_TTL_MS = 315000;  // only if a record carries no expires_at
+
+const SET_HOME_TERMINAL = new Set(["EXECUTED", "REJECTED", "FAILED", "EXPIRED"]);
+
+/**
+ * Resolve an in-flight SET_HOME into its click-feedback phase. Pure — the caller
+ * supplies the tracked command record (or null) and the clock.
+ *
+ * Guarantees an exit: every branch either returns a terminal phase or is bounded by a
+ * deadline, so "pending" can never be returned indefinitely for a fixed startedAt.
+ *
+ * Messages never claim Home is or is not set — on a timeout the operator genuinely
+ * does not know, so they are told to re-check rather than given a fabricated verdict.
+ *
+ * @param cmd       the tracked command record from the queue poll, or null if absent
+ * @param cmdId     the id we are tracking, or null while the POST is still in flight
+ * @param startedAt ms timestamp of the click
+ * @param now       ms
+ * @returns {{ phase: 'pending'|'confirmed'|'failed', code, message }}
+ */
+export function setHomeOutcome({ cmd = null, cmdId = null, startedAt = 0, now = Date.now() } = {}) {
+  const pending = { phase: "pending", code: null, message: null };
+  const elapsed = now - startedAt;
+
+  if (cmd && SET_HOME_TERMINAL.has(cmd.status)) {
+    // A bare EXECUTED is NOT success: it means only that the Local Agent reached Scout
+    // Flask. Only the backend's own home_result classification confirms Set Home.
+    if (cmd.status === "EXECUTED" && cmd.home_result === "verified") {
+      return { phase: "confirmed", code: null, message: null };
+    }
+    return {
+      phase: "failed",
+      code: String(cmd.home_result || cmd.status || "failed").toLowerCase(),
+      message: cmd.reason || "Set Home was not accepted.",
+    };
+  }
+
+  if (!cmdId) {
+    // The POST has not returned a queued record yet. fetch() has no timeout of its own,
+    // so a hung request would otherwise pend forever.
+    if (elapsed <= SET_HOME_QUEUE_GRACE_MS) return pending;
+    return {
+      phase: "failed", code: "not_queued",
+      message: "The operator backend did not confirm the Set Home request was queued. Home was not changed.",
+    };
+  }
+
+  if (!cmd) {
+    // Tracked, but the record is not in the queue: a poll that has not caught up yet
+    // (fine, inside the grace) or a record that is gone for good — an operator-backend
+    // restart wipes the in-memory queue, and no status will ever arrive for it.
+    if (elapsed <= SET_HOME_LOST_GRACE_MS) return pending;
+    return {
+      phase: "failed", code: "lost",
+      message: "Lost track of the Set Home command (the operator backend may have restarted). Re-check Home status before AUTO or RTL.",
+    };
+  }
+
+  // Queued/SENT/ACCEPTED and still running: bounded by the backend's own TTL.
+  let deadline = null;
+  if (cmd.expires_at) {
+    const t = new Date(cmd.expires_at).getTime();
+    if (!Number.isNaN(t)) deadline = t + SET_HOME_DEADLINE_SLACK_MS;
+  }
+  if (deadline == null) deadline = startedAt + SET_HOME_FALLBACK_TTL_MS;
+  if (now >= deadline) {
+    return {
+      phase: "failed", code: "timeout",
+      message: "Scout never reported a result for Set Home. Home may or may not have been set — re-check Home status before AUTO or RTL.",
+    };
+  }
+  return pending;
 }
 
 /**

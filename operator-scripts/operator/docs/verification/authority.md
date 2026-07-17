@@ -19,6 +19,35 @@ buttons the wrong way round (Take Control → `LOCAL_AGENT`, `hasControl` keyed 
 Scout Flask remains the **sole source of truth** for the authority value — the operator
 backend holds none of its own (see `commands.md`).
 
+**Revision 2026-07-17 — finalized strict-ownership contract.** Startup/default authority
+is `OPERATOR`. The axis above is unchanged; what is now pinned is the *ownership model*:
+
+| Authority | Operator Station | Local Agent autonomous writes | Hand-off |
+|---|---|---|---|
+| `OPERATOR` | read/write — every supported action enabled subject to **its own** gates (Home interlock, GPS, connectivity) | disabled on Scout | Release Control available |
+| `LOCAL_AGENT` | **read-only** for vehicle-control/configuration writes — telemetry, health, mission state, events and Agent info stay visible | enabled on Scout | **Take Control always available** |
+| `RC` | read-only; highest priority, independent physical override | — | reported only, never requestable |
+
+`SET_HOME` and `LOITER` are **deliberately NOT exempt** under `LOCAL_AGENT` — a strict
+ownership model was chosen over per-command exceptions. `hasControl` (`value ===
+"OPERATOR"`) is the single write-enable predicate for the whole station; `handoffGate`
+(`lib/authority.js`) is the single Take/Release predicate. Map and Vehicle both render
+from those two — neither re-derives the policy. Pinned by `tests/authority.test.mjs`.
+
+A hand-off uses the **dedicated authority endpoint** (`POST /api/control_authority/{id}`,
+a live Scout proxy) and never the command queue.
+
+**Backend gap — RC detection.** RC is plumbed end-to-end as a *reportable* effective
+authority (`REPORTABLE_AUTHORITY` includes it; `normAuthority` accepts it; `AuthoritySeg`
+lights it; `hasControl` goes false so writes lock). But it only ever appears if Scout's
+`GET /agent/control_authority` actually returns `authority: "RC"`. That is unverified —
+Scout Flask (`motherpi/services/flask`) is not in this repo, and this repo's own agent-side
+client (`Scripts/control_authority.py`) treats anything other than `OPERATOR`/`LOCAL_AGENT`
+as unrecognized. Nothing is invented operator-side: with no `RC` from Scout, the UI simply
+never shows RC as active. The Vehicle page's "RC override policy → Always" row is the
+*architecture invariant* (RC hardware override always exists), **not** a live detection
+field — do not read it as "RC is currently active".
+
 ## Pending → confirmed / rejected / timeout (never optimistic)
 A Take/Release click never asserts success. `createAuthorityController` puts the
 request into **PENDING** and only settles it when the *effective* authority Scout

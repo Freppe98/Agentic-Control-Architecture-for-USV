@@ -9,6 +9,8 @@ import {
   homeStatus, commandGate, deploymentReadiness, metersBetween, fmtDistance,
   HOME_VERIFY_TOLERANCE_M,
   SAFETY_HOLD_TYPE, PRIMARY_MODES, ADVANCED_MODES, isSafetyHold,
+  setHomeOutcome, SET_HOME_QUEUE_GRACE_MS, SET_HOME_LOST_GRACE_MS,
+  SET_HOME_DEADLINE_SLACK_MS, SET_HOME_FALLBACK_TTL_MS,
 } from "../operator/lib/home.js";
 
 // ---- helpers ----
@@ -214,4 +216,149 @@ test("LOITER stays enabled with unverified Home AND false readiness (regression 
   for (const t of ["SET_MODE_AUTO", "RTL", "MISSION_RESUME"]) {
     assert.equal(commandGate(t, ctx).enabled, false, `${t} must stay Home-gated`);
   }
+});
+
+// ---- F. In-flight SET_HOME can never hang on "Setting…" ----
+// The bug these pin: the UI resolved the pending flash ONLY on a terminal command
+// status, so anything that stops a status from ever arriving (a Local Agent that
+// never executes SET_HOME, an operator-backend restart wiping the in-memory queue,
+// a POST that never settles) left the button on "Setting…" indefinitely.
+const T0 = 1_000_000_000_000;
+const cmdRec = (over = {}) => ({
+  id: "c1", status: "QUEUED",
+  expires_at: new Date(T0 + 300_000).toISOString(),   // backend COMMAND_TTL_S = 300 s
+  ...over,
+});
+
+test("SET_HOME confirmed ONLY on EXECUTED + home_result verified", () => {
+  const out = setHomeOutcome({
+    cmd: cmdRec({ status: "EXECUTED", home_result: "verified" }),
+    cmdId: "c1", startedAt: T0, now: T0 + 4000,
+  });
+  assert.equal(out.phase, "confirmed");
+});
+
+test("a bare EXECUTED with no home_result is a FAILURE, never an optimistic success", () => {
+  // EXECUTED means only "the Local Agent reached Scout Flask" — not that Home was set.
+  const out = setHomeOutcome({
+    cmd: cmdRec({ status: "EXECUTED", reason: "No ack from the Pixhawk." }),
+    cmdId: "c1", startedAt: T0, now: T0 + 4000,
+  });
+  assert.equal(out.phase, "failed");
+  assert.match(out.message, /No ack from the Pixhawk/);
+});
+
+test("the backend's own terminal status wins and carries Scout's real reason", () => {
+  for (const [status, code] of [["REJECTED", "rejected"], ["FAILED", "failed"], ["EXPIRED", "expired"]]) {
+    const out = setHomeOutcome({ cmd: cmdRec({ status }), cmdId: "c1", startedAt: T0, now: T0 + 4000 });
+    assert.equal(out.phase, "failed");
+    assert.equal(out.code, code);
+  }
+});
+
+test("a QUEUED command still inside its TTL stays pending (no premature failure)", () => {
+  const out = setHomeOutcome({ cmd: cmdRec(), cmdId: "c1", startedAt: T0, now: T0 + 299_000 });
+  assert.equal(out.phase, "pending");
+});
+
+test("a Scout that NEVER reports a result times out at the command's own TTL", () => {
+  // The exact reported bug: the command sits QUEUED/SENT forever.
+  const out = setHomeOutcome({
+    cmd: cmdRec({ status: "SENT" }), cmdId: "c1",
+    startedAt: T0, now: T0 + 300_000 + SET_HOME_DEADLINE_SLACK_MS,
+  });
+  assert.equal(out.phase, "failed");
+  assert.equal(out.code, "timeout");
+  // Honest: it must NOT claim Home was or was not set.
+  assert.match(out.message, /re-check Home status/i);
+});
+
+test("the deadline comes from the command's expires_at, not an invented client number", () => {
+  // A backend with a longer TTL must not be contradicted by the client.
+  const longTtl = cmdRec({ status: "SENT", expires_at: new Date(T0 + 900_000).toISOString() });
+  assert.equal(setHomeOutcome({ cmd: longTtl, cmdId: "c1", startedAt: T0, now: T0 + 600_000 }).phase, "pending");
+  assert.equal(setHomeOutcome({ cmd: longTtl, cmdId: "c1", startedAt: T0, now: T0 + 900_001 + SET_HOME_DEADLINE_SLACK_MS }).phase, "failed");
+});
+
+test("a record with no usable expires_at still times out via the fallback TTL", () => {
+  for (const bad of [{ expires_at: null }, { expires_at: "not-a-date" }]) {
+    const cmd = cmdRec({ status: "SENT", ...bad });
+    assert.equal(setHomeOutcome({ cmd, cmdId: "c1", startedAt: T0, now: T0 + 1000 }).phase, "pending");
+    const out = setHomeOutcome({ cmd, cmdId: "c1", startedAt: T0, now: T0 + SET_HOME_FALLBACK_TTL_MS });
+    assert.equal(out.phase, "failed", `expires_at ${bad.expires_at} must still time out`);
+  }
+});
+
+test("a vanished command record (operator backend restarted) fails after the grace, not forever", () => {
+  // The in-memory queue resets on restart, so the tracked id is gone for good.
+  assert.equal(setHomeOutcome({ cmd: null, cmdId: "c1", startedAt: T0, now: T0 + 1000 }).phase, "pending");
+  const out = setHomeOutcome({ cmd: null, cmdId: "c1", startedAt: T0, now: T0 + SET_HOME_LOST_GRACE_MS + 1 });
+  assert.equal(out.phase, "failed");
+  assert.equal(out.code, "lost");
+  assert.match(out.message, /re-check Home status/i);
+});
+
+test("a POST that never confirms a queued command fails after the queue grace", () => {
+  // fetch() has no timeout of its own — without this the flash pends forever.
+  assert.equal(setHomeOutcome({ cmd: null, cmdId: null, startedAt: T0, now: T0 + 1000 }).phase, "pending");
+  const out = setHomeOutcome({ cmd: null, cmdId: null, startedAt: T0, now: T0 + SET_HOME_QUEUE_GRACE_MS + 1 });
+  assert.equal(out.phase, "failed");
+  assert.equal(out.code, "not_queued");
+  assert.match(out.message, /was not changed|not confirm/i);
+});
+
+test("GUARANTEE: pending is always bounded — no input pends past the fallback TTL", () => {
+  const far = T0 + SET_HOME_FALLBACK_TTL_MS + 60_000;
+  const cases = [
+    { cmd: null, cmdId: null },
+    { cmd: null, cmdId: "c1" },
+    { cmd: cmdRec({ status: "QUEUED" }), cmdId: "c1" },
+    { cmd: cmdRec({ status: "SENT" }), cmdId: "c1" },
+    { cmd: cmdRec({ status: "ACCEPTED" }), cmdId: "c1" },
+    { cmd: cmdRec({ status: "SENT", expires_at: null }), cmdId: "c1" },
+  ];
+  for (const c of cases) {
+    const out = setHomeOutcome({ ...c, startedAt: T0, now: far });
+    assert.notEqual(out.phase, "pending", `${c.cmd ? c.cmd.status : "no record"} must not pend forever`);
+    assert.ok(out.message, "a terminal outcome must always carry an operator-facing message");
+  }
+});
+
+// ---- G. The timeout is a FALLBACK ONLY — a real Scout result always wins ----
+// Pins the contract with the updated Scout: the bounded-pending work must never
+// interfere with, delay, or override a genuine terminal result.
+test("a fast Scout success resolves immediately — the timeout never interferes", () => {
+  const out = setHomeOutcome({
+    cmd: cmdRec({ status: "EXECUTED", home_result: "verified" }),
+    cmdId: "c1", startedAt: T0, now: T0 + 1200,   // Scout answered in 1.2 s
+  });
+  assert.equal(out.phase, "confirmed");
+});
+
+test("a terminal result OVERRIDES the deadline, even if it lands late", () => {
+  // Terminal status is checked before any deadline, so a slow-but-real Scout answer
+  // is still reported as Scout reported it — never masked by a client timeout.
+  const late = T0 + 600_000; // long past expires_at
+  assert.equal(setHomeOutcome({
+    cmd: cmdRec({ status: "EXECUTED", home_result: "verified" }), cmdId: "c1",
+    startedAt: T0, now: late,
+  }).phase, "confirmed");
+  // ...and a late rejection keeps Scout's real reason rather than the timeout copy.
+  const rej = setHomeOutcome({
+    cmd: cmdRec({ status: "REJECTED", reason: "blocked: SET_HOME requires a GPS fix" }),
+    cmdId: "c1", startedAt: T0, now: late,
+  });
+  assert.equal(rej.code, "rejected");
+  assert.match(rej.message, /blocked: SET_HOME requires a GPS fix/);
+});
+
+test("an authority rejection is surfaced verbatim, not as a comms/timeout failure", () => {
+  const out = setHomeOutcome({
+    cmd: cmdRec({ status: "REJECTED", reason: "blocked: SET_HOME requires LOCAL_AGENT control authority" }),
+    cmdId: "c1", startedAt: T0, now: T0 + 2000,
+  });
+  assert.equal(out.phase, "failed");
+  assert.equal(out.code, "rejected");
+  assert.equal(out.message, "blocked: SET_HOME requires LOCAL_AGENT control authority");
+  assert.doesNotMatch(out.message, /timed out|never reported|lost track/i);
 });

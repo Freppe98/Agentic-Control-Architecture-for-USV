@@ -11,9 +11,9 @@ import { StatusBadges } from "../components/StatusBadges.js";
 import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
-import { createAuthorityController } from "../lib/authority.js";
+import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
-import { homeStatus, commandGate, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE } from "../lib/home.js";
+import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
 
 const HOME = [56.699893, 13.002148];
@@ -728,23 +728,25 @@ export function Map(root) {
   // success. The PERMANENT Verified/Not verified state always comes from v.home
   // (Scout's own continuously-reported home_status) on the next fleet poll — never
   // from this flash, which is cosmetic and self-clears.
+  //
+  // The decision itself is setHomeOutcome (lib/home.js) — pure and unit-tested — which
+  // also bounds the wait: a Local Agent that never reports, a vanished command record
+  // (the backend queue is in-memory and resets on restart) or a POST that never settles
+  // all resolve to a "failed" timeout instead of pending forever. Driven by the command
+  // poll AND by a 1 s watchdog, so the deadline still fires when polling itself is down.
   function syncSetHomeFromCommands() {
-    if (!setHome.cmdId) return;
-    const cmd = cmds.find((c) => c.id === setHome.cmdId);
-    const TERMINAL = ["EXECUTED", "REJECTED", "FAILED", "EXPIRED"];
-    if (!cmd || !TERMINAL.includes(cmd.status)) return;
+    if (setHome.phase !== "pending") return;   // only an in-flight request is resolvable
+    const cmd = setHome.cmdId ? cmds.find((c) => c.id === setHome.cmdId) || null : null;
+    const out = setHomeOutcome({ cmd, cmdId: setHome.cmdId, startedAt: setHome.at, now: Date.now() });
+    if (out.phase === "pending") return;
     if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
-    if (cmd.status === "EXECUTED" && cmd.home_result === "verified") {
-      setHome = { phase: "confirmed", code: null, message: null, at: Date.now(), cmdId: null };
-    } else {
-      setHome = { phase: "failed", code: (cmd.home_result || cmd.status || "failed").toLowerCase(),
-                  message: cmd.reason || "Set Home was not accepted.", at: Date.now(), cmdId: null };
-    }
+    setHome = { phase: out.phase, code: out.code, message: out.message, at: Date.now(), cmdId: null };
     const flashConfirmed = setHome.phase === "confirmed";
     setHomeTimer = setTimeout(() => {
       setHome = { phase: "idle", code: null, message: null, at: 0, cmdId: null };
       renderInspector(); renderPxm(); updateHomeMarker();
     }, flashConfirmed ? 4000 : 9000);
+    renderInspector(); renderPxm(); updateHomeMarker();
   }
 
   // Transient, non-blocking command-result notice (replaces window.alert, which froze
@@ -801,19 +803,20 @@ export function Map(root) {
 
   // Home-verification interlock context for the selected vehicle — computed once and
   // shared by the Pixhawk Mission card (Set Home + status) and the Vehicle Commands /
-  // readiness gating below, so the policy inputs (control, connectivity, GPS, pending)
-  // are gathered in exactly one place. The policy itself stays in commandGate (lib/home.js).
+  // readiness gating below. The derivation lives in commandGateCtx (lib/home.js), the
+  // SAME builder the Vehicle page uses, so the two pages cannot gate a button
+  // differently; this function only supplies Map's page-local inputs. The policy itself
+  // stays in commandGate (lib/home.js).
   function homeGateCtx(v) {
     const stale = commState(v) !== "connected";
-    const hasControl = !stale && authCtl.view().hasControl;
-    const hs = effectiveHomeStatus(v);
-    const posValid = v.lat != null && v.lng != null;
-    const missionLoaded = !!(pxm[v.id] && pxm[v.id].mission && pxm[v.id].mission.count > 0);
-    return {
-      hasControl, homeVerified: hs.state === "verified",
-      connected: !stale, posValid, gpsFresh: !stale,
-      missionLoaded, setHomePending: setHome.phase === "pending",
-    };
+    return commandGateCtx(v, {
+      hasControl: !stale && authCtl.view().hasControl,
+      connected: !stale,
+      missionLoaded: !!(pxm[v.id] && pxm[v.id].mission && pxm[v.id].mission.count > 0),
+      setHomePending: setHome.phase === "pending",
+      // Mirrors effectiveHomeStatus: a Home mid-change must not read as verified.
+      homePhase: setHome.phase === "pending" ? "pending" : setHome.phase === "failed" ? "failed" : "idle",
+    });
   }
 
   // A confirmation modal — Set Home moves the RTL recovery point, so it must never be a
@@ -918,10 +921,9 @@ export function Map(root) {
     // never enabled optimistically on a button press or while a request is in flight.
     const av = authCtl.view();
     const authVal = stale ? null : av.value;
-    const busy = av.phase === "pending";
-    const hasControl = !stale && av.hasControl;
-    const canTake = av.available && !stale && !hasControl && !busy;
-    const canRelease = av.available && !stale && av.value === "OPERATOR" && !busy;
+    // One authored policy for both the write-enable and the hand-off affordances
+    // (lib/authority.js) — never re-derived here. See the strict-ownership contract there.
+    const { canTake, canRelease, hasControl } = handoffGate(av, { stale });
 
     // Deployment interlock context — Vehicle Home is set + shown from the Pixhawk
     // Mission card (renderPxm); this gateCtx is only for the command gating below.
@@ -1172,6 +1174,11 @@ export function Map(root) {
   timers.push(setInterval(() => loadCommsHistory(selId), 3000));  // refresh selected vehicle's comms log
   timers.push(setInterval(() => loadAuthority(selId), 2000));  // refresh selected vehicle's control authority
   timers.push(setInterval(() => loadCommands(selId), 3000));  // refresh selected vehicle's command lifecycle
+  // Watchdog for an in-flight Set Home. loadCommands() already resolves it on every
+  // poll, but the poll is exactly what stops when the operator backend is unreachable —
+  // and that is a case the flash must still time out of, so the deadline is also
+  // evaluated here, independent of any feed. No-ops unless a request is pending.
+  timers.push(setInterval(syncSetHomeFromCommands, 1000));
   timers.push(setInterval(tickPxmAge, 1000));  // keep the "last fetch … ago" line live
   const clockId = setInterval(() => {
     updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });

@@ -22,8 +22,8 @@ import { BatteryBar } from "../components/BatteryBar.js";
 import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { commState, cls, fmtAge, pad3, noTelem } from "../lib/ui.js";
-import { createAuthorityController } from "../lib/authority.js";
-import { isSafetyHold, SAFETY_HOLD_TITLE, homeStatus } from "../lib/home.js";
+import { createAuthorityController, handoffGate } from "../lib/authority.js";
+import { isSafetyHold, SAFETY_HOLD_TITLE, homeStatus, commandGate, commandGateCtx } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts } from "../lib/mission.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
@@ -41,8 +41,11 @@ function worstSev(...sevs) {
 // (ARM/DISARM touch the motors; AUTO/RTL change what the vehicle does on its own) get
 // an extra operator confirmation and are sent with confirm:true. Labels are the
 // operator's shorthand; the value is the backend command type. Buttons are enabled
-// only when the latest Scout-confirmed control authority is LOCAL_AGENT — see the
-// Control card below; there is no separate/independent authority store.
+// only when the latest Scout-confirmed control authority is OPERATOR — see the
+// Control card below; there is no separate/independent authority store. Under
+// LOCAL_AGENT the station is read-only for vehicle writes (strict ownership: no
+// SET_HOME/LOITER exemption), and under RC the physical override wins — both leave
+// hasControl false, which is the single write-enable predicate (lib/authority.js).
 //
 // Mode presentation follows the shared taxonomy (lib/home.js): LOITER is the Scout's
 // PRIMARY safety hold (active anti-drift) and sits in the primary row beside AUTO /
@@ -252,10 +255,11 @@ export function Vehicle(root) {
       : `<div class="frow none">No active faults — all reporting subsystems nominal</div>`;
 
     // Control authority via the controller (pending → confirmed/rejected/timeout).
+    // Write-enable + hand-off affordances both come from the one authored policy
+    // (lib/authority.js handoffGate) — identical to Map's, never a second derivation.
     const av = authCtl.view();
     const authVal = stale ? null : av.value;
-    const busy = av.phase === "pending";
-    const hasControl = !stale && av.hasControl;
+    const { canTake, canRelease, hasControl, busy } = handoffGate(av, { stale });
     const authoritySeg = AuthoritySeg(authVal, { phase: av.phase, pending: av.pending });
     const operatorReachable = c.operator_reachable;
     const operatorReachCell = operatorReachable != null ? (operatorReachable ? '<span class="txt-c">Yes</span>' : '<span class="txt-p">No</span>') : noTelem("no telem");
@@ -289,6 +293,14 @@ export function Vehicle(root) {
     // second computation from what Map.js/Mission.js already trust (lib/mission.js).
     const ms = missionStatsFor(v);
     const hs = homeStatus(v, {});
+    // Command-gate context, built by the SAME shared builder Map uses (lib/home.js), so
+    // both pages gate every button identically. The Vehicle page has no Set Home control,
+    // so no Set Home request can be pending from here.
+    const gateCtx = commandGateCtx(v, {
+      hasControl,
+      connected: !stale,
+      missionLoaded: !!(ms && ms.counts.total > 0),
+    });
     const homeCls = hs.state === "verified" ? "ok" : hs.state === "pending" ? "pending" : hs.state === "unknown" ? "dim" : "warn";
     const homeTxt = hs.state === "verified" ? "Verified" : hs.state === "pending" ? "Setting…" : hs.state === "unknown" ? "Unknown" : "Not verified";
     const curWpText = !ms ? noTelem("not fetched") : ms.cur == null ? "—" : (ms.home && ms.home.seq === ms.cur ? `Mission start (seq ${ms.cur})` : `WP ${ms.cur} / ${ms.route.length}`);
@@ -338,14 +350,23 @@ export function Vehicle(root) {
       : stale
         ? `Authority is <b>UNKNOWN</b> — telemetry is stale. Commands stay locked until the link is current.`
         : `Control authority is unknown — Scout's control-authority service did not respond. Commands stay locked until authority is confirmed.`;
+    // Take Control must stay available whenever the operator does not already hold a
+    // confirmed OPERATOR authority — LOCAL_AGENT included. Enablement is handoffGate's.
     const authBtn = hasControl
-      ? `<button class="ctl-auth release" data-auth="LOCAL_AGENT"${busy ? " disabled" : ""}>Release Control</button>`
-      : `<button class="ctl-auth engage" data-auth="OPERATOR"${busy || stale || !av.available ? " disabled" : ""}>Take Control</button>`;
+      ? `<button class="ctl-auth release" data-auth="LOCAL_AGENT"${canRelease ? "" : " disabled"}>Release Control</button>`
+      : `<button class="ctl-auth engage" data-auth="OPERATOR"${canTake ? "" : " disabled"}>Take Control</button>`;
+    // Button enablement + disabled reasons come from the SHARED policy (commandGate,
+    // lib/home.js) on the SHARED context (commandGateCtx) — identical to Map's cmdRow,
+    // never a second set of conditions authored here. Authority permits writes; each
+    // command still answers to its own prerequisites (AUTO/RTL/RESUME need a verified
+    // Home; LOITER/MANUAL never do). A Home-interlock disable explains itself on hover.
     const renderCmd = ([type, label]) => {
       const hr = HIGH_RISK.has(type);
       const safety = isSafetyHold(type);
-      const title = safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`;
-      return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}" data-cmd="${type}"${hasControl ? "" : " disabled"} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
+      const g = commandGate(type, gateCtx);
+      const homeLocked = !g.enabled && !!g.reason;   // disabled by the Home interlock, not the authority lock
+      const title = g.reason || (safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`);
+      return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}${homeLocked ? " home-locked" : ""}" data-cmd="${type}"${g.enabled ? "" : " disabled"} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
     };
     const primaryBtns = PRIMARY_CMDS.map(renderCmd).join("");
     const advancedBtns = ADVANCED_CMDS.map(renderCmd).join("");
