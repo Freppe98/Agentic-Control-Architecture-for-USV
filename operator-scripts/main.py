@@ -503,8 +503,11 @@ async def _comms_monitor_loop():
 # --- Event store (see the "Persistent event log" block above) ---
 
 def _append_event(*, severity, message, etype, source, vehicle_id=None,
-                  vehicle=None, ts=None):
-    """Append one event to the server-side log and return it."""
+                  vehicle=None, ts=None, detail=None):
+    """Append one event to the server-side log and return it. `detail` is optional
+    structured context (e.g. a command event's command_id/type/source/stage/outcome) the
+    Events page renders as an expandable detail view — the message string stays the
+    human-readable summary."""
     global _event_seq
     _event_seq += 1
     entry = {
@@ -516,6 +519,7 @@ def _append_event(*, severity, message, etype, source, vehicle_id=None,
         "vehicle_id": vehicle_id,
         "vehicle": vehicle,
         "message": message,
+        "detail": detail,              # structured, type-specific context (or None)
         "acknowledged": False,         # modelled now; POST ack endpoint is a later item
     }
     event_log.append(entry)
@@ -771,17 +775,45 @@ COMMAND_TYPES = {
     "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_HOLD", "SET_MODE_LOITER",
     "SET_MODE_GUIDED", "RTL", "MISSION_PAUSE", "MISSION_RESUME",
     "ARM", "DISARM", "SET_HOME",
+    # Mission-management commands (BACKEND_ROADMAP mission-upload workflow). MISSION_UPLOAD
+    # writes a validated waypoint mission to the Pixhawk; MISSION_CLEAR wipes it. Both are
+    # verified by a Scout read-back (observed count/hash vs the operator's expected), never
+    # by transport success alone — see _annotate_mission_upload_result.
+    "MISSION_UPLOAD", "MISSION_CLEAR",
 }
 # Arming touches the motors, so both ARM and DISARM ALWAYS require an explicit
 # confirm:true (independent of comm-state) — the backend rejects them otherwise.
 # ARM is the higher risk of the two (the vehicle can move under power once armed);
 # its record carries a caution warning. Still just the queue — no execution here.
-CONFIRM_REQUIRED_TYPES = {"ARM", "DISARM", "SET_HOME"}
+# MISSION_UPLOAD/MISSION_CLEAR overwrite the flight controller's stored mission, so they
+# join the confirm-required set (readback-verified, same treatment as SET_HOME).
+CONFIRM_REQUIRED_TYPES = {"ARM", "DISARM", "SET_HOME", "MISSION_UPLOAD", "MISSION_CLEAR"}
 RISK_WARNING = {
     "ARM": "High-risk: the vehicle can move under power once armed. Confirmed by operator.",
     "DISARM": "Disarms the vehicle (motors off). Confirmed by operator.",
     "SET_HOME": "Sets the Pixhawk HOME / RTL recovery point to the Scout's current position. Confirmed by operator.",
+    "MISSION_UPLOAD": "Overwrites the mission stored on the Pixhawk. Verified by read-back. Confirmed by operator.",
+    "MISSION_CLEAR": "Clears the mission stored on the Pixhawk. Verified by read-back. Confirmed by operator.",
 }
+
+# Normalized command source (who authored the record). OPERATOR is the human at this
+# station; LOCAL_AGENT / MISSION_AGENT are autonomy-authored records the contract wants
+# preserved and forwarded even though the operator queue only creates OPERATOR ones today.
+COMMAND_SOURCES = {"OPERATOR", "LOCAL_AGENT", "MISSION_AGENT"}
+
+
+def normalize_source(raw):
+    """Normalize a source/created_by value onto COMMAND_SOURCES. Unknown/blank → OPERATOR
+    (conservative: an operator-station record is operator-authored unless it clearly says
+    otherwise), so older records with only a free-text created_by still carry a valid source."""
+    s = str(raw or "").upper().strip()
+    if s in COMMAND_SOURCES:
+        return s
+    if "MISSION" in s:
+        return "MISSION_AGENT"
+    if "AGENT" in s or "LOCAL" in s or "AUTONOM" in s:
+        return "LOCAL_AGENT"
+    return "OPERATOR"
 COMMAND_TTL_S = 300              # queued commands survive ~5 min of disconnection, then EXPIRE
 TERMINAL_STATUSES = {"EXECUTED", "REJECTED", "FAILED", "EXPIRED"}
 RESULT_STATUSES = {"ACCEPTED", "EXECUTED", "REJECTED", "FAILED"}  # what an Agent may report
@@ -796,14 +828,28 @@ def known_vehicle_ids():
 
 
 def _command_event(cmd, *, severity, message, source):
-    """Record a command lifecycle change as a first-class event (Events page, no change)."""
+    """Record a command lifecycle change as a first-class event, carrying the structured
+    command detail (id, type, source, stage, normalized verification outcome) so the Events
+    page can show it as an expandable detail view — not just a message string."""
+    ver = cmd.get("verification") or {}
     _append_event(
         severity=severity, message=message, etype="command", source=source,
         vehicle_id=cmd["vehicle_id"], vehicle=cmd["vehicle"],
+        detail={
+            "command_id": cmd["id"],
+            "command_type": cmd["type"],
+            "command_source": cmd.get("source"),
+            "stage": cmd["status"],
+            "outcome": ver.get("outcome"),
+            "verified": ver.get("verified"),
+            "expected": ver.get("expected"),
+            "observed": ver.get("observed"),
+            "reason": ver.get("reason") or cmd.get("reason"),
+        },
     )
 
 
-def make_command(*, vid, ctype, params, created_by, comm_state, now):
+def make_command(*, vid, ctype, params, created_by, comm_state, now, source=None):
     """Build + store a QUEUED command record (the spec command object)."""
     cmd = {
         "id": str(uuid.uuid4()),
@@ -812,6 +858,9 @@ def make_command(*, vid, ctype, params, created_by, comm_state, now):
         "type": ctype,
         "params": params or {},
         "status": "QUEUED",
+        # Normalized command source (OPERATOR / LOCAL_AGENT / MISSION_AGENT) — forwarded to
+        # Scout in agent_command_view and preserved in every record/history view.
+        "source": normalize_source(source or created_by),
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(seconds=COMMAND_TTL_S)).isoformat(),
         "created_by": created_by or "operator",
@@ -821,9 +870,19 @@ def make_command(*, vid, ctype, params, created_by, comm_state, now):
         "result": None,                       # Agent-reported result payload/string
         "reason": None,                       # rejection/failure/expiry reason
         "warning": None,                      # e.g. queued while PARTITIONED
+        # Normalized command lifecycle + verification (the spec fields). `verification` is
+        # the ONE type-agnostic outcome the UI reads (verified/outcome/expected/observed/
+        # reason); `lifecycle` is the ordered stage list (backend queue stages merged with
+        # any Scout-provided result.lifecycle); `error` is the structured Scout error.
+        # `scout_lifecycle` retains Scout's own array verbatim. All refreshed on mutation.
+        "error": None,
+        "scout_lifecycle": None,
+        "verification": None,
+        "lifecycle": None,
     }
     commands.append(cmd)
     commands_by_id[cmd["id"]] = cmd
+    _refresh_command_derived(cmd)
     return cmd
 
 
@@ -841,6 +900,7 @@ def expire_commands(now=None):
             cmd["status"] = "EXPIRED"
             cmd["completed_at"] = now.isoformat()
             cmd["reason"] = cmd["reason"] or "Expired before delivery/execution"
+            _refresh_command_derived(cmd)
             _command_event(cmd, severity="warning",
                            message=f"Command {cmd['type']} expired",
                            source="operator-backend")
@@ -999,6 +1059,183 @@ def _annotate_rtl_result(cmd):
         cmd["rtl_result"] = "confirmed"
 
 
+def _annotate_mission_upload_result(cmd):
+    """Classify a MISSION_UPLOAD / MISSION_CLEAR command's own nested Scout result — the
+    mission twin of _annotate_set_home_result / _annotate_rtl_result. Status EXECUTED means
+    only 'the Local Agent completed the attempt against Scout'; a mission write is a verified
+    success ONLY when Scout accepted it AND read it back AND the read-back matches what the
+    operator asked for. Never 'successful' just because the file reached Scout.
+
+    MISSION_UPLOAD is verified when ALL of:
+      - result.accepted is True   (Scout accepted the upload)
+      - result.verified is True   (Scout re-downloaded the mission from the FC)
+      - observed waypoint count == the operator's expected_count (when both are present)
+      - observed hash == the operator's expected_hash (when both are present)
+    MISSION_CLEAR is verified when accepted+verified AND the read-back count is 0.
+    Anything else sets cmd['mission_result'] = 'failed' and replaces cmd['reason'] with
+    Scout's real error (never invented), even though cmd['status'] stays EXECUTED."""
+    if cmd["type"] not in ("MISSION_UPLOAD", "MISSION_CLEAR") or cmd["status"] != "EXECUTED":
+        return
+    result = cmd.get("result") if isinstance(cmd.get("result"), dict) else {}
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+    err_msg = error.get("message") or error.get("code")
+    exp_count = params.get("expected_count")
+    exp_hash = params.get("expected_hash")
+    obs_count = _first_present(result.get("observed_count"), result.get("count"),
+                               result.get("mission_count"))
+    obs_hash = _first_present(result.get("observed_hash"), result.get("hash"),
+                              result.get("mission_hash"))
+
+    failure = None
+    if result.get("accepted") is not True:
+        failure = err_msg or f"{cmd['type']} was not accepted by Scout."
+    elif result.get("verified") is not True:
+        failure = err_msg or "Mission was not verified by Scout's read-back."
+    elif cmd["type"] == "MISSION_CLEAR":
+        if obs_count not in (0, None):
+            failure = f"Mission still holds {obs_count} waypoints after clear."
+    else:  # MISSION_UPLOAD
+        if exp_count is not None and obs_count is not None and int(obs_count) != int(exp_count):
+            failure = f"Pixhawk holds {obs_count} waypoints after upload — expected {exp_count}."
+        elif exp_hash and obs_hash and str(exp_hash) != str(obs_hash):
+            failure = "Uploaded mission does not match the read-back — the on-FC mission differs."
+
+    if failure:
+        cmd["mission_result"] = "failed"
+        cmd["reason"] = failure
+    else:
+        cmd["mission_result"] = "verified"
+
+
+def _annotate_generic_verification(cmd):
+    """Surface a reason for any OTHER command type (mode/arming/mission-pause) whose Scout
+    result carries an explicit verified:false. SET_HOME/RTL/MISSION_* have their own
+    classifiers (skipped here). A command with no `verified` field in its result is a plain
+    EXECUTED success and is left untouched (AUTO/MANUAL/LOITER/… back-compat)."""
+    if cmd["type"] in ("SET_HOME", "RTL", "MISSION_UPLOAD", "MISSION_CLEAR"):
+        return
+    if cmd["status"] != "EXECUTED":
+        return
+    result = cmd.get("result") if isinstance(cmd.get("result"), dict) else {}
+    if result.get("verified") is False:
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        expected, observed = _extract_expected_observed(cmd, result)
+        cmd["reason"] = (cmd.get("reason") or error.get("message") or error.get("code")
+                         or (f"Vehicle reported {observed}, expected {expected}."
+                             if observed and expected else
+                             f"{cmd['type']} was not verified by the vehicle."))
+
+
+def _extract_expected_observed(cmd, result):
+    """(expected, observed) display values for a command's verification, tolerant of the
+    field spellings Scout may use. Mission commands summarise as waypoint counts."""
+    expected = _first_present(
+        result.get("expected_mode"), result.get("requested_mode"),
+        result.get("expected_state"), result.get("expected"))
+    observed = _first_present(
+        result.get("observed_mode"), result.get("observed_state"),
+        result.get("observed"), result.get("mode"))
+    if cmd["type"] in ("MISSION_UPLOAD", "MISSION_CLEAR"):
+        params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+        ec = params.get("expected_count")
+        oc = _first_present(result.get("observed_count"), result.get("count"),
+                            result.get("mission_count"))
+        expected = f"{ec} waypoints" if ec is not None else expected
+        observed = f"{oc} waypoints" if oc is not None else observed
+    return expected, observed
+
+
+def _outcome_label(status, verified):
+    """Normalized terminal outcome vocabulary for the UI:
+      PENDING  — not terminal yet
+      VERIFIED — EXECUTED and the vehicle action was confirmed
+      EXECUTED — EXECUTED with no separate verification (plain success)
+      FAILED   — EXECUTED but verification failed, OR a FAILED status
+      REJECTED / EXPIRED — the corresponding terminal status."""
+    if status not in TERMINAL_STATUSES:
+        return "PENDING"
+    if status == "EXECUTED":
+        if verified is True:
+            return "VERIFIED"
+        if verified is False:
+            return "FAILED"
+        return "EXECUTED"
+    return status
+
+
+def build_command_verification(cmd):
+    """The ONE normalized, type-agnostic verification outcome every UI reads, so no page
+    re-implements per-type logic. Never optimistic: an EXECUTED whose per-type verification
+    did not pass reads verified:false; an unknown/older record with no verification for a
+    command that HAS one (RTL/SET_HOME/MISSION_*) is conservatively unverified, never green.
+
+      verified: True  → confirmed vehicle action
+                False → EXECUTED transport but the vehicle action was NOT confirmed
+                None  → not applicable (not terminal-executed, or a type with no separate
+                        verification reporting nothing) — the plain status stands."""
+    status = cmd["status"]
+    ctype = cmd["type"]
+    result = cmd.get("result") if isinstance(cmd.get("result"), dict) else {}
+    error = cmd.get("error") if isinstance(cmd.get("error"), dict) else (
+        result.get("error") if isinstance(result.get("error"), dict) else {})
+    expected, observed = _extract_expected_observed(cmd, result)
+
+    verified = None
+    if status == "EXECUTED":
+        if ctype == "SET_HOME":
+            verified = cmd.get("home_result") == "verified"
+        elif ctype == "RTL":
+            verified = cmd.get("rtl_result") == "confirmed"
+        elif ctype in ("MISSION_UPLOAD", "MISSION_CLEAR"):
+            verified = cmd.get("mission_result") == "verified"
+        elif "verified" in result:
+            verified = result.get("verified") is True
+        # else: no verification reported for a plain mode/arming command → None (success).
+
+    reason = None
+    if verified is False or status in ("REJECTED", "FAILED", "EXPIRED"):
+        reason = cmd.get("reason") or error.get("message") or error.get("code")
+
+    return {
+        "verified": verified,
+        "outcome": _outcome_label(status, verified),
+        "expected": expected,
+        "observed": observed,
+        "reason": reason,
+    }
+
+
+def command_lifecycle(cmd):
+    """Ordered lifecycle stages with timestamps: the backend-owned queue stages merged with
+    any Scout-provided fine-grained array (result.lifecycle, retained on cmd['scout_lifecycle'])
+    — one list the UI renders as the command's progression, newest logic last."""
+    stages = []
+    if cmd.get("created_at"):
+        stages.append({"stage": "QUEUED", "ts": cmd["created_at"], "by": "operator-backend"})
+    if cmd.get("claimed_at"):
+        stages.append({"stage": "SENT", "ts": cmd["claimed_at"], "by": "operator-backend"})
+    for st in (cmd.get("scout_lifecycle") or []):
+        if isinstance(st, dict):
+            stages.append({
+                "stage": str(st.get("stage") or st.get("status") or st.get("name") or "?").upper(),
+                "ts": st.get("ts") or st.get("timestamp") or st.get("time"),
+                "by": st.get("by") or "scout",
+            })
+        elif st:
+            stages.append({"stage": str(st).upper(), "ts": None, "by": "scout"})
+    if cmd.get("completed_at"):
+        stages.append({"stage": cmd["status"], "ts": cmd["completed_at"], "by": "scout"})
+    return stages
+
+
+def _refresh_command_derived(cmd):
+    """Recompute the normalized verification + lifecycle fields on a record after any state
+    change. Called from every mutation site so a serialized record is always self-consistent."""
+    cmd["verification"] = build_command_verification(cmd)
+    cmd["lifecycle"] = command_lifecycle(cmd)
+
+
 def process_command_result(command_id, raw_status, result, reason, now):
     """Look up a command and apply a Local-Agent-reported result. Single source of truth
     shared by BOTH result endpoints (POST /agent/command_result and the id-in-path
@@ -1021,13 +1258,25 @@ def process_command_result(command_id, raw_status, result, reason, now):
                 "allowed": sorted(RESULT_STATUSES)}
     applied = apply_command_result(cmd, new_status, result, reason, now)
     if applied:
+        # Retain Scout's own structured error + fine-grained lifecycle array verbatim, so
+        # the normalized verification/lifecycle fields can be rebuilt from them.
+        result_obj = cmd.get("result") if isinstance(cmd.get("result"), dict) else {}
+        if isinstance(result_obj.get("error"), dict):
+            cmd["error"] = result_obj["error"]
+        if isinstance(result_obj.get("lifecycle"), list):
+            cmd["scout_lifecycle"] = result_obj["lifecycle"]
         # Command-specific result classifiers run BEFORE the event message so it carries
         # the real reason. Each inspects only its own command type's nested result and
         # may replace cmd['reason']; a bare EXECUTED with no per-type verification (AUTO/
         # MANUAL/LOITER/ARM/…) is left untouched and reads as a normal success.
         _annotate_set_home_result(cmd)
         _annotate_rtl_result(cmd)
-        verify_failed = cmd.get("home_result") == "failed" or cmd.get("rtl_result") == "failed"
+        _annotate_mission_upload_result(cmd)
+        _annotate_generic_verification(cmd)
+        _refresh_command_derived(cmd)
+        # One normalized outcome drives severity + wording (SET_HOME/RTL/MISSION_UPLOAD and
+        # any command Scout reports verified:false for).
+        verify_failed = cmd["verification"]["verified"] is False
         sev = "warning" if new_status in ("REJECTED", "FAILED") or verify_failed else "info"
         # An outer EXECUTED that the command's own verification did not confirm (Set Home
         # not read back, RTL not actually entered) is reported as a verification failure,
@@ -1100,7 +1349,8 @@ async def create_command(request: Request):
                        "Resend with confirm:true to queue it."})
 
     cmd = make_command(vid=vid, ctype=ctype, params=body.get("params"),
-                       created_by=body.get("created_by"), comm_state=comm_state, now=now)
+                       created_by=body.get("created_by"), comm_state=comm_state, now=now,
+                       source=body.get("source"))
 
     # Accumulate any warnings (risk + link state) into the record; a warning implies caution.
     warnings = []
@@ -1134,6 +1384,7 @@ def pending_commands(vehicle_id: str):
         if cmd["status"] == "QUEUED":
             cmd["status"] = "SENT"
             cmd["claimed_at"] = now.isoformat()
+            _refresh_command_derived(cmd)
             _command_event(cmd, severity="info",
                            message=f"Command {cmd['type']} sent to {cmd['vehicle']}",
                            source="operator-backend")
@@ -1150,6 +1401,7 @@ def agent_command_view(cmd):
     return {
         "command_id": cmd["id"],
         "command_type": cmd["type"],
+        "source": cmd["source"],
         "params": cmd["params"] or {},
         "expires_at": cmd["expires_at"],
     }
@@ -1215,6 +1467,7 @@ async def agent_commands(usv_id: str = ""):
             # untouched — claimed_at and the event both stay as they were.
             cmd["status"] = "SENT"
             cmd["claimed_at"] = now.isoformat()
+            _refresh_command_derived(cmd)
             _command_event(cmd, severity="info",
                            message=f"Command {cmd['type']} sent to {cmd['vehicle']}",
                            source="operator-backend")
@@ -1346,6 +1599,7 @@ def cancel_pending_commands(vid: int, now, reason: str):
         cmd["status"] = "EXPIRED"
         cmd["completed_at"] = now.isoformat()
         cmd["reason"] = reason
+        _refresh_command_derived(cmd)
         _command_event(cmd, severity="warning",
                        message=f"Command {cmd['type']} cancelled ({reason})",
                        source="operator-backend")

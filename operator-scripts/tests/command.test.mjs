@@ -8,7 +8,10 @@
 //     nonterminal (the LOITER safety-hold guard).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { commandVerification, hasPendingOfType, isNonterminal } from "../operator/lib/command.js";
+import {
+  commandVerification, hasPendingOfType, isNonterminal,
+  commandSource, commandStages, outcomeFrom,
+} from "../operator/lib/command.js";
 
 // ---- commandVerification --------------------------------------------------
 
@@ -83,4 +86,111 @@ test("hasPendingOfType: safe on empty/non-array input", () => {
   assert.equal(hasPendingOfType([], "RTL"), false);
   assert.equal(hasPendingOfType(null, "RTL"), false);
   assert.equal(hasPendingOfType(undefined, "SET_MODE_LOITER"), false);
+});
+
+// ---- generalized verification: every mode command renders Scout's verification -----
+// The stabilized contract carries a normalized `verification` block for EVERY command
+// type; a mode command Scout marks verified:true is a confirmed success showing
+// expected-vs-observed, and one it marks verified:false is a FAILED attempt.
+
+const MODE_CMDS = ["SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_LOITER", "SET_MODE_HOLD",
+  "ARM", "DISARM", "MISSION_PAUSE", "MISSION_RESUME"];
+
+for (const type of MODE_CMDS) {
+  test(`${type} EXECUTED + backend verification verified:true → verified true (VERIFIED)`, () => {
+    const cmd = { type, status: "EXECUTED",
+      verification: { verified: true, outcome: "VERIFIED", expected: type.replace("SET_MODE_", ""), observed: type.replace("SET_MODE_", "") } };
+    const v = commandVerification(cmd);
+    assert.equal(v.verified, true);
+    assert.equal(v.outcome, "VERIFIED");
+  });
+
+  test(`${type} EXECUTED but Scout verified:false → verified false (renders FAILED)`, () => {
+    const cmd = { type, status: "EXECUTED",
+      result: { verified: false, expected_mode: "AUTO", observed_mode: "MANUAL",
+                error: { message: "Mode did not change" } } };
+    const v = commandVerification(cmd);
+    assert.equal(v.verified, false);
+    assert.equal(v.outcome, "FAILED");
+    assert.equal(v.expected, "AUTO");
+    assert.equal(v.observed, "MANUAL");
+    assert.equal(v.reason, "Mode did not change");
+  });
+}
+
+test("mode command EXECUTED with NO verification (older record) → verified null (plain success)", () => {
+  const v = commandVerification({ type: "SET_MODE_AUTO", status: "EXECUTED" });
+  assert.equal(v.verified, null);
+  assert.equal(v.outcome, "EXECUTED");
+});
+
+test("older RTL/SET_HOME EXECUTED with no verification → conservative (verified false, never green)", () => {
+  assert.equal(commandVerification({ type: "RTL", status: "EXECUTED" }).verified, false);
+  assert.equal(commandVerification({ type: "SET_HOME", status: "EXECUTED" }).verified, false);
+});
+
+test("backend verification block wins over per-type fields when present", () => {
+  // Even a record whose home_result is absent renders per the backend's normalized block.
+  const cmd = { type: "SET_HOME", status: "EXECUTED", verification: { verified: true, outcome: "VERIFIED" } };
+  assert.equal(commandVerification(cmd).verified, true);
+});
+
+test("MISSION_UPLOAD EXECUTED + mission_result verified → verified true", () => {
+  assert.equal(commandVerification({ type: "MISSION_UPLOAD", status: "EXECUTED", mission_result: "verified" }).verified, true);
+});
+test("MISSION_UPLOAD EXECUTED + mission_result failed → verified false (mismatch)", () => {
+  const v = commandVerification({ type: "MISSION_UPLOAD", status: "EXECUTED", mission_result: "failed",
+    reason: "Pixhawk holds 4 waypoints after upload — expected 5." });
+  assert.equal(v.verified, false);
+  assert.equal(v.outcome, "FAILED");
+  assert.match(v.reason, /expected 5/);
+});
+
+// ---- outcomeFrom vocabulary ------------------------------------------------
+test("outcomeFrom: normalized terminal labels", () => {
+  assert.equal(outcomeFrom("QUEUED", null), "PENDING");
+  assert.equal(outcomeFrom("SENT", null), "PENDING");
+  assert.equal(outcomeFrom("EXECUTED", true), "VERIFIED");
+  assert.equal(outcomeFrom("EXECUTED", false), "FAILED");
+  assert.equal(outcomeFrom("EXECUTED", null), "EXECUTED");
+  assert.equal(outcomeFrom("REJECTED", null), "REJECTED");
+  assert.equal(outcomeFrom("EXPIRED", null), "EXPIRED");
+});
+
+// ---- source propagation ----------------------------------------------------
+test("commandSource: OPERATOR / LOCAL_AGENT / MISSION_AGENT, conservative default", () => {
+  assert.equal(commandSource({ source: "OPERATOR" }), "OPERATOR");
+  assert.equal(commandSource({ source: "LOCAL_AGENT" }), "LOCAL_AGENT");
+  assert.equal(commandSource({ source: "MISSION_AGENT" }), "MISSION_AGENT");
+  assert.equal(commandSource({ created_by: "operator" }), "OPERATOR");   // legacy created_by
+  assert.equal(commandSource({}), "OPERATOR");                            // missing → conservative
+});
+
+// ---- lifecycle -------------------------------------------------------------
+test("commandStages: prefers the backend lifecycle, else assembles from timestamps", () => {
+  const backend = { lifecycle: [{ stage: "QUEUED", ts: "t0" }, { stage: "EXECUTED", ts: "t1" }] };
+  assert.deepEqual(commandStages(backend), backend.lifecycle);
+  const legacy = { status: "EXECUTED", created_at: "t0", claimed_at: "t1", completed_at: "t2" };
+  assert.deepEqual(commandStages(legacy), [
+    { stage: "QUEUED", ts: "t0" }, { stage: "SENT", ts: "t1" }, { stage: "EXECUTED", ts: "t2" },
+  ]);
+});
+
+// ---- Map / Vehicle result parity -------------------------------------------
+// Both pages read the SAME commandVerification, so the outcome they render for a given
+// record is identical by construction. Pin that the function is a pure mapping: two
+// separate calls (Map's and Vehicle's) on the same record yield deep-equal results.
+test("Map/Vehicle parity: commandVerification is a pure mapping (same record → same result)", () => {
+  const records = [
+    { type: "RTL", status: "EXECUTED", rtl_result: "confirmed" },
+    { type: "RTL", status: "EXECUTED", rtl_result: "failed", reason: "Pixhawk remained in MANUAL" },
+    { type: "SET_HOME", status: "EXECUTED", home_result: "verified" },
+    { type: "SET_MODE_AUTO", status: "EXECUTED", result: { verified: false, observed_mode: "MANUAL" } },
+    { type: "SET_MODE_LOITER", status: "EXECUTED" },
+    { type: "MISSION_UPLOAD", status: "ACCEPTED" },
+  ];
+  for (const r of records) {
+    assert.deepEqual(commandVerification(r), commandVerification({ ...r }),
+      `parity for ${r.type}/${r.status}`);
+  }
 });

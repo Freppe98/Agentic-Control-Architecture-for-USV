@@ -14,7 +14,7 @@ import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
 import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
-import { commandVerification, hasPendingOfType } from "../lib/command.js";
+import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
 
 const HOME = [56.699893, 13.002148];
@@ -55,6 +55,17 @@ const CMD_PHASE = {
   EXECUTED: ["confirmed", "c"], REJECTED: ["rejected", "d"], FAILED: ["failed", "d"],
   EXPIRED: ["timed out", "u"],
 };
+// Normalized terminal outcome → (label, pill tint) for the "Last command" line.
+const CMD_OUTCOME = {
+  VERIFIED: ["verified", "c"], EXECUTED: ["executed", "c"], FAILED: ["failed", "d"],
+  REJECTED: ["rejected", "d"], EXPIRED: ["timed out", "u"],
+};
+// Compact stage names for the "requested › sent › confirmed" progression line.
+const STAGE_SHORT = {
+  QUEUED: "requested", SENT: "sent", ACCEPTED: "ack", EXECUTING: "executing",
+  EXECUTED: "executed", REJECTED: "rejected", FAILED: "failed", EXPIRED: "expired",
+};
+const CMD_TERMINAL_M = new Set(["EXECUTED", "REJECTED", "FAILED", "EXPIRED"]);
 const CMD_LABEL = Object.fromEntries([...MAP_MODES, ...MAP_SAFETY, ...MAP_MISSION]);
 // Distinct recovery/home glyph for the Vehicle Home (Pixhawk HOME_POSITION) marker —
 // a home inside a location pin, deliberately unlike the numbered mission waypoints and
@@ -1112,19 +1123,23 @@ export function Map(root) {
   function cmdStatus(types) {
     const scoped = types ? cmds.filter((c) => types.has(c.type)) : cmds;
     if (!scoped.length) return "";
-    const TERMINAL = ["EXECUTED", "REJECTED", "FAILED", "EXPIRED"];
-    const c = scoped.find((x) => !TERMINAL.includes(x.status)) || scoped[0];
-    // An outer status EXECUTED only means "the Local Agent completed the attempt". For
-    // the commands the backend verifies against the vehicle (SET_HOME → home_result,
-    // RTL → rtl_result), EXECUTED reads as "confirmed" (green) ONLY when that per-type
-    // verification passed; a failed verification is shown as "failed" (red) with the
-    // real reason on hover — never an optimistic green on transport success alone.
-    // The rule is the shared, tested commandVerification (lib/command.js).
-    let [phase, k] = CMD_PHASE[c.status] || ["—", "u"];
-    if (commandVerification(c).verified === false) { phase = "failed"; k = "d"; }
-    const note = c.reason || c.warning || "";
+    const c = scoped.find((x) => !CMD_TERMINAL_M.has(x.status)) || scoped[0];
+    const v = commandVerification(c);
+    // An outer status EXECUTED only means "the Local Agent completed the attempt". The
+    // terminal pill uses the SHARED normalized outcome (commandVerification, lib/command.js):
+    // VERIFIED/EXECUTED read green, FAILED/REJECTED/EXPIRED red — so a SET_HOME/RTL/
+    // MISSION_UPLOAD that transported but did not verify shows "failed", never an
+    // optimistic green. A still-running command shows its lifecycle phase instead.
+    let phase, k;
+    if (CMD_TERMINAL_M.has(c.status)) [phase, k] = CMD_OUTCOME[v.outcome] || ["—", "u"];
+    else [phase, k] = CMD_PHASE[c.status] || ["—", "u"];
+    // Full compact progression: the lifecycle stages this command actually passed through.
+    const prog = commandStages(c).map((s) => STAGE_SHORT[s.stage] || String(s.stage).toLowerCase()).join(" › ");
+    const eo = (v.expected != null || v.observed != null) ? `${v.expected ?? "—"} → ${v.observed ?? "—"}` : "";
+    const note = v.reason || c.warning || "";
     const title = note ? ` title="${note.replace(/"/g, "&quot;")}"` : "";
-    return `<div class="cmd-status"${title}><span class="lbl">Last command</span><span class="ctl-type mono">${CMD_LABEL[c.type] || c.type}</span><span class="pill ${k}">${phase}</span></div>`;
+    return `<div class="cmd-status"${title}><span class="lbl">Last command</span><span class="ctl-type mono">${CMD_LABEL[c.type] || c.type}</span><span class="pill ${k}">${phase}</span>` +
+      `${prog ? `<div class="cmd-prog mono">${prog}${eo ? ` · ${eo}` : ""}</div>` : ""}</div>`;
   }
 
   function counts() {

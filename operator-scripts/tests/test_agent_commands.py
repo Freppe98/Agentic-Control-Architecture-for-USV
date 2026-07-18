@@ -94,10 +94,12 @@ class TestAgentCommandDelivery(AgentCommandsBase):
         self.assertIsNotNone(main.commands_by_id[cid]["claimed_at"])
 
     def test_delivered_shape_is_exactly_the_scout_contract(self):
-        """Only the Agent's own fields — no internal/operator bookkeeping leaks."""
+        """Only the Agent's own fields — no internal/operator bookkeeping leaks. `source`
+        is forwarded (OPERATOR/LOCAL_AGENT/MISSION_AGENT) per the stabilized contract."""
         self.queue("SET_HOME")
         cmd = self.poll().json()["commands"][0]
-        self.assertEqual(set(cmd), {"command_id", "command_type", "params", "expires_at"})
+        self.assertEqual(set(cmd), {"command_id", "command_type", "source", "params", "expires_at"})
+        self.assertEqual(cmd["source"], "OPERATOR")
         for leaked in ("created_by", "requested_comm_state", "warning", "vehicle", "status"):
             self.assertNotIn(leaked, cmd)
 

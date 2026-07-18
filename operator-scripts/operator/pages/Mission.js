@@ -26,8 +26,10 @@ import { vehicleRows } from "../components/VehicleDock.js";
 import { commState, noTelem } from "../lib/ui.js";
 import { homeStatus, fmtDistance } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
+import { parseMission, missionUploadParams, missionUploadStage, missionUploadCompare, UPLOAD_STAGES } from "../lib/mission-upload.js";
+import { hasPendingOfType } from "../lib/command.js";
 
-const TABS = [["overview", "Overview"], ["replay", "Replay"], ["statistics", "Statistics"], ["export", "Export"]];
+const TABS = [["overview", "Overview"], ["upload", "Upload"], ["replay", "Replay"], ["statistics", "Statistics"], ["export", "Export"]];
 const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v0.01M11 12h1v4h1"/></svg>';
 
 export function Mission(root) {
@@ -40,6 +42,12 @@ export function Mission(root) {
   let commsHist = null;   // comms-state transition log for the selected vehicle
   let events = [];        // full event log, filtered client-side per vehicle below
   let exportNote = null;  // transient export status (e.g. "pop-up blocked")
+  // Mission-upload workflow state (per selected vehicle; reset on switch). `text` is the
+  // pasted mission, `parsed` its validated preview, `cmdId` the tracked MISSION_UPLOAD/
+  // MISSION_CLEAR command (its lifecycle is read from `cmds`), `readbackAt` guards a
+  // single post-verified re-fetch of the Pixhawk mission for the expected-vs-observed compare.
+  let upload = { text: "", parsed: null, cmdId: null, at: 0, error: null, readbackAt: 0 };
+  let authority = null;   // confirmed control authority for the selected vehicle (Scout proxy)
 
   root.className = "app dock-main";
   root.innerHTML =
@@ -94,10 +102,17 @@ export function Mission(root) {
     api.getCommsHistory(id).then((h) => { if (id === selId) { commsHist = h; renderBody(); } }).catch(() => {});
   }
 
+  function loadAuthority(id) {
+    if (id == null) return;
+    api.getControlAuthority(id).then((a) => { if (id === selId) { authority = a; if (tab === "upload") renderBody(); } }).catch(() => {});
+  }
+
   function selectVehicle(id) {
     if (id === selId) return;
     selId = id;
     cmds = []; commsHist = null;
+    upload = { text: "", parsed: null, cmdId: null, at: 0, error: null, readbackAt: 0 };
+    authority = null; loadAuthority(id);
     loadCommands(id); loadCommsHistory(id);
     // Auto-fetch once per vehicle per page visit (this page's whole purpose is
     // showing the mission) — but never re-fetch on every fleet poll; Refresh stays a
@@ -348,11 +363,144 @@ export function Mission(root) {
     });
   }
 
+  // ---- Upload tab (mission upload / clear → Pixhawk, read-back verified) ----------
+  // A validated mission (GeoJSON or canonical waypoint JSON) is queued as MISSION_UPLOAD
+  // via the SAME command pipeline as every other command (api.uploadMission → the queue).
+  // Success is NEVER "the file reached Scout": the lifecycle is tracked Requested →
+  // Accepted → Executing → Verified/Failed (missionUploadStage), and only after Scout
+  // reports it verified do we re-fetch the Pixhawk mission and compare expected vs observed
+  // count/hash (missionUploadCompare). Duplicate presses are suppressed while an upload is
+  // active. No waypoint jumping is offered. Mission clear gets the same confirm + read-back.
+  function escapeHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function trackedUpload() { return upload.cmdId ? (cmds.find((c) => c.id === upload.cmdId) || null) : null; }
+  function hasControl() { return !!(authority && authority.authority === "OPERATOR"); }
+  function uploadActive() { return hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR"); }
+
+  function parseUploadNow() {
+    upload.parsed = upload.text.trim() ? parseMission(upload.text) : null;
+    upload.error = null;
+    renderBody();
+  }
+  async function doUpload(v) {
+    const p = upload.parsed;
+    if (!p || !p.ok || uploadActive() || !hasControl()) return;
+    if (!window.confirm(`Upload ${p.count} waypoints to ${v.name || "USV-" + v.id}'s Pixhawk?\n\nThis OVERWRITES the mission currently stored on the flight controller. It is confirmed ONLY by a read-back after upload — never by the file reaching Scout.`)) return;
+    const res = await api.uploadMission(v.id, missionUploadParams(p));
+    if (res.ok && res.data && res.data.command) {
+      upload.cmdId = res.data.command.id; upload.at = Date.now(); upload.error = null; upload.readbackAt = 0;
+    } else {
+      upload.error = (res.data && (res.data.message || res.data.error)) || "Upload was not accepted by the operator backend.";
+    }
+    loadCommands(v.id); renderBody();
+  }
+  async function doClear(v) {
+    if (uploadActive() || !hasControl()) return;
+    if (!window.confirm(`Clear the mission stored on ${v.name || "USV-" + v.id}'s Pixhawk?\n\nThis wipes ALL waypoints on the flight controller. It is confirmed by a read-back showing an empty mission.`)) return;
+    const res = await api.clearMission(v.id);
+    if (res.ok && res.data && res.data.command) {
+      upload.cmdId = res.data.command.id; upload.at = Date.now(); upload.error = null; upload.readbackAt = 0;
+    } else {
+      upload.error = (res.data && (res.data.message || res.data.error)) || "Clear was not accepted by the operator backend.";
+    }
+    loadCommands(v.id); renderBody();
+  }
+  // After a verified upload, re-fetch the Pixhawk mission ONCE so the compare shows the
+  // real on-FC count/hash — the "fetch the Pixhawk mission again" step in the contract.
+  function maybeReadback(v) {
+    const cmd = trackedUpload();
+    if (!cmd) return;
+    if (missionUploadStage(cmd).state === "done" && !upload.readbackAt) {
+      upload.readbackAt = Date.now();
+      fetchPixhawkMission(v.id);
+    }
+  }
+
+  function renderUpload(v) {
+    const vname = v.name || "USV-" + v.id;
+    maybeReadback(v);
+    const p = upload.parsed;
+    const cmd = trackedUpload();
+    const stg = cmd ? missionUploadStage(cmd) : null;
+    const busy = uploadActive();
+    const control = hasControl();
+
+    const preview = !p ? "" : p.ok
+      ? `<div class="mu-preview">
+           <div class="mrow"><span class="k">Format</span><span class="val">${p.format}</span></div>
+           <div class="mrow"><span class="k">Waypoints</span><span class="val">${p.count}</span></div>
+           <div class="mrow"><span class="k">First waypoint</span><span class="val">${p.first.lat.toFixed(6)}, ${p.first.lng.toFixed(6)}</span></div>
+           <div class="mrow"><span class="k">Last waypoint</span><span class="val">${p.last.lat.toFixed(6)}, ${p.last.lng.toFixed(6)}</span></div>
+           <div class="mrow"><span class="k">Expected hash</span><span class="val">${p.hash}</span></div>
+         </div>`
+      : `<div class="mu-err">${p.errors.map((e) => `• ${e}`).join("<br>")}</div>`;
+
+    const trackHtml = stg ? `<div class="mu-track">${UPLOAD_STAGES.map((name, i) => {
+      let cls = "";
+      if (i < stg.index) cls = "done";
+      else if (i === stg.index) cls = stg.state === "done" ? "done" : stg.state === "failed" ? "failed" : "on";
+      return `<div class="mu-step ${cls}">${stg.state === "failed" && i === stg.index ? "Failed" : name}</div>`;
+    }).join("")}</div>` : "";
+
+    let verdict = "";
+    if (stg) {
+      if (stg.state === "failed") {
+        verdict = `<div class="mu-verdict bad">Upload failed — ${stg.reason || "not verified by read-back"}. The Pixhawk mission may be unchanged or partial — use Overview → Refresh to check.</div>`;
+      } else if (stg.state === "done") {
+        const cmp = missionUploadCompare(cmd.params, (pxm[v.id] && pxm[v.id].mission) || {});
+        const line = cmp.match === true
+          ? `Verified — Pixhawk read back ${cmp.observedCount ?? "?"} waypoints matching the upload${cmp.hashMatch ? " (content hash matches)" : " (Scout reported no hash — matched on count)"}.`
+          : cmp.match === false
+            ? `Read-back MISMATCH — expected ${cmp.expectedCount}/${cmp.expectedHash}, observed ${cmp.observedCount ?? "?"}/${cmp.observedHash ?? "no hash"}. The on-FC mission differs from what was uploaded.`
+            : `Scout reported the upload verified; re-fetching the Pixhawk mission to compare count/hash…`;
+        verdict = `<div class="mu-verdict ${cmp.match === false ? "bad" : "ok"}">${line}</div>`;
+      } else {
+        verdict = `<div class="mu-verdict pending">In progress — ${stg.stage}. An upload is verified only once the read-back matches; the file reaching Scout is not success.</div>`;
+      }
+    }
+
+    const controlNote = control ? "" : `<div class="mu-err">Control authority is ${authority && authority.authority ? authority.authority : "unknown"} — take OPERATOR control (Map or Vehicle page) before uploading. Uploads are disabled until the operator holds authority.</div>`;
+
+    document.getElementById("mbody").innerHTML = `
+      <div class="msect"><span class="lbl">Mission upload</span><span class="tag">${vname} · write a validated mission to the Pixhawk (read-back verified)</span></div>
+      <div style="padding:0 20px 20px">
+        <div class="mu-drop">
+          <textarea id="mu-text" placeholder="Paste a mission — canonical waypoint JSON ( [{lat,lng,alt,seq,command}, …] or {waypoints:[…]} ) or GeoJSON (Point features / a LineString).">${escapeHtml(upload.text)}</textarea>
+          <div class="mu-row">
+            <input type="file" id="mu-file" accept=".json,.geojson,application/json" />
+            <button class="cfg-btn" id="mu-validate">Validate &amp; preview</button>
+            <button class="cfg-btn" id="mu-upload"${(!p || !p.ok || busy || !control) ? " disabled" : ""}>${busy ? "Upload in progress…" : "Upload to Pixhawk"}</button>
+            <button class="diag-btn" id="mu-clear"${busy || !control ? " disabled" : ""} style="margin-left:auto">Clear Pixhawk mission…</button>
+          </div>
+          ${controlNote}
+          ${upload.error ? `<div class="mu-err">${upload.error}</div>` : ""}
+          ${preview}
+        </div>
+        ${trackHtml}${verdict}
+        <div class="ev-note" style="margin-top:14px">${infoIcon}Upload is confirmed only by re-downloading the mission from the Pixhawk and matching the expected waypoint count and content hash — never because the file reached Scout. The expected hash is computed locally; a matching read-back hash also depends on Scout using the same canonicalisation (a Scout-contract assumption still to confirm). Normal mission read-back stays available on the Overview tab. Waypoint jumping is not offered.</div>
+      </div>`;
+
+    const ta = document.getElementById("mu-text");
+    if (ta) ta.oninput = () => { upload.text = ta.value; };   // store only — no re-render (keeps focus)
+    const vb = document.getElementById("mu-validate");
+    if (vb) vb.onclick = () => { if (ta) upload.text = ta.value; parseUploadNow(); };
+    const ub = document.getElementById("mu-upload"); if (ub) ub.onclick = () => doUpload(v);
+    const cb = document.getElementById("mu-clear"); if (cb) cb.onclick = () => doClear(v);
+    const fb = document.getElementById("mu-file");
+    if (fb) fb.onchange = () => {
+      const f = fb.files && fb.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => { upload.text = String(r.result || ""); parseUploadNow(); };
+      r.readAsText(f);
+    };
+  }
+
   function renderBody() {
     const v = currentVehicle();
     document.getElementById("mtitle").textContent = v ? `${v.name || "USV-" + v.id} · ${commState(v)}` : "No vehicle selected";
     if (!v) { document.getElementById("mbody").innerHTML = `<div class="empty-state" style="padding:20px">No vehicle selected</div>`; return; }
     if (tab === "overview") renderOverview(v);
+    else if (tab === "upload") renderUpload(v);
     else if (tab === "replay") renderReplay(v);
     else if (tab === "statistics") renderStatistics(v);
     else renderExport(v);
@@ -395,9 +543,10 @@ export function Mission(root) {
   const stopEvents = api.poll(api.getEventLog, 5000, onEvents, () => {});
   const commsId = setInterval(() => loadCommsHistory(selId), 3000);
   const commandsId = setInterval(() => loadCommands(selId), 3000);
+  const authorityId = setInterval(() => loadAuthority(selId), 3000);  // control-authority gate for Upload
   const clockId = setInterval(() => { updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }); updateFeedIndicator(); }, 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
   updateFeedIndicator();
 
-  return function cleanup() { stopFleet(); stopEvents(); clearInterval(commsId); clearInterval(commandsId); clearInterval(clockId); };
+  return function cleanup() { stopFleet(); stopEvents(); clearInterval(commsId); clearInterval(commandsId); clearInterval(authorityId); clearInterval(clockId); };
 }

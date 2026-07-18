@@ -70,6 +70,7 @@ export async function getEvents() {
       message: e.message,
       type: e.type,
       source: e.source,
+      detail: e.detail,
       acknowledged: e.acknowledged,
     },
   }));
@@ -94,7 +95,8 @@ export async function getEventLog() {
   const list = Array.isArray(data) ? data : (data.events || []);
   return list.map((e) => ({
     id: e.id, ts: e.ts, severity: e.severity, message: e.message,
-    type: e.type, source: e.source, vehicleId: e.vehicle_id, vehicle: e.vehicle,
+    type: e.type, source: e.source, detail: e.detail,
+    vehicleId: e.vehicle_id, vehicle: e.vehicle,
   }));
 }
 
@@ -169,6 +171,21 @@ export function getPixhawkMission(id) { return getJSON(`/api/vehicles/${id}/pixh
 // command's id reach EXECUTED, same as every other command type). See main.py.
 export function setHome(id, { lat, lng }) {
   return createCommand({ vehicle_id: id, type: "SET_HOME", params: { lat, lng }, confirm: true });
+}
+
+// --- Mission upload / clear (write the Pixhawk mission via the command queue) ----------
+// MISSION_UPLOAD / MISSION_CLEAR are normal queued commands (POST /api/commands, confirm-
+// required) — NOT a bespoke transport. `params` for an upload carries the validated
+// waypoints + expected_count + expected_hash (see lib/mission-upload.js missionUploadParams)
+// so the read-back can be verified; the result (accepted/verified/observed_count/hash) lands
+// later as the command's own result, exactly like SET_HOME. Verification is never known at
+// this call — poll getCommands and watch the command reach Verified/Failed. `source`
+// defaults to OPERATOR but is forwarded so a MISSION_AGENT-authored upload is preserved.
+export function uploadMission(id, params, { source = "OPERATOR" } = {}) {
+  return createCommand({ vehicle_id: id, type: "MISSION_UPLOAD", params, confirm: true, source });
+}
+export function clearMission(id, { source = "OPERATOR" } = {}) {
+  return createCommand({ vehicle_id: id, type: "MISSION_CLEAR", params: {}, confirm: true, source });
 }
 
 // --- Feed health (data-freshness diagnostics) -------------------------------
