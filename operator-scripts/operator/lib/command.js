@@ -49,10 +49,13 @@ function expectedObserved(cmd, vf) {
   let expected = firstOf(r.expected_mode, r.requested_mode, r.expected_state, r.expected);
   let observed = firstOf(r.observed_mode, r.observed_state, r.observed, r.mode);
   if (cmd && MISSION_WRITE.has(cmd.type)) {
-    const ec = cmd.params && cmd.params.expected_count;
-    const oc = firstOf(r.observed_count, r.count, r.mission_count);
-    if (ec != null) expected = `${ec} waypoints`;
-    if (oc != null) observed = `${oc} waypoints`;
+    // Summarised as PIXHAWK ITEM counts (route waypoints + Scout's Home at seq 0), which
+    // is what a read-back reports — so expected and observed are the same kind of thing.
+    const ec = cmd.params && cmd.params.expected_pixhawk_item_count;
+    const oc = firstOf(r.observed_pixhawk_item_count, r.pixhawk_item_count,
+                       r.observed_count, r.count, r.mission_count);
+    if (ec != null) expected = `${ec} Pixhawk items`;
+    if (oc != null) observed = `${oc} Pixhawk items`;
   }
   return { expected: expected ?? null, observed: observed ?? null };
 }

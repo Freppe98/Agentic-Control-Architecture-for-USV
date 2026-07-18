@@ -182,17 +182,36 @@ export function setHome(id, { lat, lng } = {}) {
 
 // --- Mission upload / clear (write the Pixhawk mission via the command queue) ----------
 // MISSION_UPLOAD / MISSION_CLEAR are normal queued commands (POST /api/commands, confirm-
-// required) — NOT a bespoke transport. `params` for an upload carries the validated
-// waypoints + expected_count + expected_hash (see lib/mission-upload.js missionUploadParams)
-// so the read-back can be verified; the result (accepted/verified/observed_count/hash) lands
-// later as the command's own result, exactly like SET_HOME. Verification is never known at
-// this call — poll getCommands and watch the command reach Verified/Failed. `source`
-// defaults to OPERATOR but is forwarded so a MISSION_AGENT-authored upload is preserved.
-export function uploadMission(id, params, { source = "OPERATOR" } = {}) {
-  return createCommand({ vehicle_id: id, type: "MISSION_UPLOAD", params, confirm: true, source });
+// required) — NOT a bespoke transport. `params` for an upload is the mission-contract-v1
+// request { contract_version, waypoints } carrying ROUTE waypoints only (see lib/
+// mission-upload.js missionUploadParams); the backend re-validates it and derives the
+// expected route/Pixhawk item counts, which the read-back is then verified against. The
+// result (accepted/verified/observed counts/route_content_hash) lands later as the
+// command's own result, exactly like SET_HOME — verification is never known at this call,
+// so poll getCommands and watch the command reach Verified/Failed.
+//
+// NOTE: no `source` argument. Command provenance is SERVER-owned — main.py stamps every
+// command created through POST /api/commands as OPERATOR and ignores any body-supplied
+// source, so a browser cannot attribute its own command to the autonomy. A LOCAL_AGENT /
+// MISSION_AGENT record must come from a trusted backend path, never from this client.
+export function uploadMission(id, params) {
+  return createCommand({ vehicle_id: id, type: "MISSION_UPLOAD", params, confirm: true });
 }
-export function clearMission(id, { source = "OPERATOR" } = {}) {
-  return createCommand({ vehicle_id: id, type: "MISSION_CLEAR", params: {}, confirm: true, source });
+export function clearMission(id) {
+  return createCommand({ vehicle_id: id, type: "MISSION_CLEAR", params: {}, confirm: true });
+}
+
+/** Which command types the backend can actually deliver today, and why not when it
+ *  cannot ({ commands: { TYPE: {supported, reason} } }). The UI disables a button with
+ *  the backend's real reason instead of hard-coding its own guess about Scout. */
+export function getCommandCapabilities() { return getJSON("/api/commands/capabilities"); }
+
+/** Canonicalize a route WITHOUT queueing it, to preview the expected route content hash
+ *  the operator is about to approve. The backend is the ONLY hash calculator — there is
+ *  deliberately no JavaScript implementation to drift from it — so the preview has to ask
+ *  it. Read-only: no command is created. Returns { ok, params } or a 400 with errors. */
+export function previewMission(body) {
+  return postJSON("/api/missions/preview", body);
 }
 
 // --- Feed health (data-freshness diagnostics) -------------------------------

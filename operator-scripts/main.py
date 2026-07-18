@@ -8,8 +8,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import asyncio
 import json
+import math
 import time
 import uuid
+
+import mission_contract
 
 
 @asynccontextmanager
@@ -238,6 +241,35 @@ def _home_status_source(vid: int, payload: dict):
     return None, False
 
 
+def mission_upload_block(vid: int, payload: dict):
+    """Scout's live background mission-upload worker state (payload.agent.mission_upload),
+    normalized to { active, state, command_id, elapsed_s } — or None when Scout is not
+    reporting it (the Mission page then falls back to the queue status alone).
+
+    DELIBERATELY NOT last-known-backed, unlike home_block. `active` is an instant-in-time
+    claim that a transfer is running RIGHT NOW; replaying a cached `active: true` after
+    Scout goes quiet would leave the UI showing "Executing" forever for an upload that
+    died with the link — inventing progress is exactly the failure this station must not
+    have. A packet that omits the group, or a vehicle that is not CONNECTED, yields None
+    and the UI shows the last real command state instead."""
+    agent = payload.get("agent") if isinstance(payload.get("agent"), dict) else None
+    mu = agent.get("mission_upload") if isinstance(agent, dict) else None
+    if not isinstance(mu, dict):
+        return None
+    if comms_state_by_id.get(vid, "UNKNOWN") != "CONNECTED":
+        return None
+    elapsed = mu.get("elapsed_s")
+    cid = mu.get("command_id")
+    return {
+        "active": bool(mu.get("active")),
+        "state": str(mu["state"]).upper() if mu.get("state") not in (None, "") else None,
+        # Kept as a string: command ids are uuids, and the UI matches them by equality.
+        "command_id": str(cid) if cid not in (None, "") else None,
+        "elapsed_s": round(float(elapsed), 1) if isinstance(elapsed, (int, float)) else None,
+        "source": "scout",
+    }
+
+
 def home_block(vid: int, payload: dict, telemetry: dict):
     """The fleet-payload `home` block for one vehicle — Scout's own fields, verbatim,
     never independently recomputed. `verified`/`ready_for_auto`/`ready_for_rtl` are
@@ -382,6 +414,10 @@ def normalize_agent_message(message: dict) -> dict:
         # last_operator_command. Falls back to the last-known reasoning (marked stale by
         # the frontend via comm-state) when a degraded packet omits the group.
         "agent_status": agent_reasoning or last_known_agent.get(usv_id, {}),
+        # Live background mission-upload state from Scout's upload worker
+        # (payload.agent.mission_upload). Normalized to a stable shape so the Mission page
+        # never has to guess field spellings; None when Scout is not reporting it.
+        "mission_upload": mission_upload_block(usv_id, payload),
         "fleet_info": fleet_info,
         "agent": {
             "groups": payload.get("groups", []),
@@ -865,8 +901,162 @@ def _canonical_set_home_params(raw_params):
     return canonical
 
 
+# --- mission-contract-v1 (Scout-owned mission upload contract) -------------------
+#
+# THE DIVISION OF OWNERSHIP, which every function below depends on:
+#   • The OPERATOR supplies ROUTE waypoints only — the survey legs, nothing else.
+#   • SCOUT owns Pixhawk sequence 0 / Home. The operator never sends a seq-0 item and
+#     never numbers its waypoints; Scout prepends Home when it writes to the FC.
+#   • Therefore the item count the Pixhawk holds after a successful upload is
+#     route waypoint count + 1 — N route legs plus Scout's Home at seq 0.
+# The old operator-side {seq, command, lat, lng, alt} shape encoded the opposite
+# assumption (operator owns sequencing and MAVLink command codes) and is gone.
+MISSION_CONTRACT_VERSION = mission_contract.CONTRACT_VERSION
+
+# Route CONTENT verification is live. The Operator backend is the authoritative expected-hash
+# calculator (mission_contract.route_content_hash) — there is no frontend copy that could
+# drift from it. See mission_contract.py for the canonicalization Scout defines.
+
+# MISSION_CLEAR is queueable: Scout ships POST /agent/clear_mission through the queued
+# LOCAL_AGENT MISSION_CLEAR command, with a result contract carrying the independent empty
+# read-back a clear must be judged by.
+MISSION_CLEAR_SUPPORTED = True
+MISSION_CLEAR_UNSUPPORTED_REASON = None
+
+# The two empty states ArduPilot legitimately reports after a clear. Scout supports BOTH,
+# so a verified clear must accept both: some stacks wipe every item, others retain Home at
+# seq 0. What matters is that no ROUTE remains — hence route count 0 is required while
+# Pixhawk item count is deliberately NOT forced to 0.
+MISSION_EMPTY_REPRESENTATIONS = ("NO_ITEMS", "HOME_ONLY")
+
+# Fields a caller may send per route waypoint. Anything else is refused rather than
+# silently dropped: Scout does not yet accept arbitrary MAVLink items, so previewing a
+# `command`/`frame`/`altitude` the flight controller will never receive would be showing
+# the operator a mission that is not the mission (UI-honesty: never render what the
+# backend cannot back up).
+MISSION_WAYPOINT_FIELDS = {"latitude", "longitude", "loiter_time_s"}
+# Rejected with a specific message naming why, so the operator can fix the file rather
+# than guess. These are exactly the fields Scout would discard on receipt.
+MISSION_UNSUPPORTED_FIELDS = {
+    "command": "MAVLink command codes are Scout-owned — Scout writes every route item as "
+               "a NAV_WAYPOINT. Remove `command`.",
+    "frame": "MAVLink frames are Scout-owned. Remove `frame`.",
+    "altitude": "Altitude is not part of mission-contract-v1 (surface vessel). Remove `altitude`.",
+    "alt": "Altitude is not part of mission-contract-v1 (surface vessel). Remove `alt`.",
+    "seq": "Sequence numbers are Scout-owned — Scout owns seq 0 / Home and numbers the "
+           "route itself. Remove `seq`.",
+}
+
+
+class MissionContractError(ValueError):
+    """A mission upload request that does not satisfy mission-contract-v1. Carries the
+    per-waypoint messages so the UI can list every problem at once, not just the first."""
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        super().__init__("; ".join(self.errors))
+
+
+def _mission_number(raw):
+    """A finite float from a JSON number, or None. Strings are NOT coerced: a quoted
+    coordinate means the producing tool lost its typing, and silently accepting it is how
+    a wrong mission gets uploaded looking correct."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    f = float(raw)
+    return f if math.isfinite(f) else None
+
+
+def canonical_mission_upload_params(raw_params):
+    """Validate + canonicalize a MISSION_UPLOAD request body into the stored params.
+
+    Input (mission-contract-v1, route waypoints ONLY — no seq-0 Home):
+        {"contract_version": "mission-contract-v1",
+         "waypoints": [{"latitude": .., "longitude": .., "loiter_time_s": 0}, ...]}
+
+    Returns the canonical params carrying BOTH counts the read-back is verified against:
+        expected_route_waypoint_count = N        (what the operator supplied)
+        expected_pixhawk_item_count   = N + 1    (N route legs + Scout's Home at seq 0)
+
+    Raises MissionContractError listing every problem. Never partially accepts: a mission
+    with one bad waypoint is refused whole, because uploading "most of" a route to a
+    flight controller is worse than uploading none of it."""
+    raw = raw_params if isinstance(raw_params, dict) else {}
+    errors = []
+
+    version = raw.get("contract_version")
+    if version is not None and str(version) != MISSION_CONTRACT_VERSION:
+        errors.append(
+            f"Unsupported contract_version {version!r} — this station speaks "
+            f"{MISSION_CONTRACT_VERSION}.")
+
+    items = raw.get("waypoints")
+    if not isinstance(items, list):
+        errors.append("Missing `waypoints` — expected a list of route waypoints.")
+        raise MissionContractError(errors)
+    if not items:
+        errors.append("Mission contains no route waypoints.")
+        raise MissionContractError(errors)
+
+    waypoints = []
+    for i, item in enumerate(items):
+        # 1-based position: this is operator-facing text about a route, not an array index,
+        # and it is deliberately NOT a `seq` (the operator does not own sequencing).
+        pos = i + 1
+        if not isinstance(item, dict):
+            errors.append(f"Route waypoint {pos} is not an object.")
+            continue
+        for field, why in MISSION_UNSUPPORTED_FIELDS.items():
+            if field in item:
+                errors.append(f"Route waypoint {pos}: {why}")
+        unknown = set(item) - MISSION_WAYPOINT_FIELDS - set(MISSION_UNSUPPORTED_FIELDS)
+        if unknown:
+            errors.append(
+                f"Route waypoint {pos}: unsupported field(s) {', '.join(sorted(unknown))} — "
+                f"mission-contract-v1 accepts only {', '.join(sorted(MISSION_WAYPOINT_FIELDS))}.")
+
+        lat = _mission_number(item.get("latitude"))
+        lng = _mission_number(item.get("longitude"))
+        if lat is None or abs(lat) > 90:
+            errors.append(f"Route waypoint {pos}: `latitude` must be a number in [-90, 90].")
+        if lng is None or abs(lng) > 180:
+            errors.append(f"Route waypoint {pos}: `longitude` must be a number in [-180, 180].")
+        loiter = item.get("loiter_time_s", 0)
+        loiter_f = _mission_number(loiter)
+        if loiter_f is None or loiter_f < 0:
+            errors.append(f"Route waypoint {pos}: `loiter_time_s` must be a number >= 0.")
+        if lat is None or lng is None or loiter_f is None:
+            continue
+        waypoints.append({"latitude": lat, "longitude": lng, "loiter_time_s": loiter_f})
+
+    if errors:
+        raise MissionContractError(errors)
+
+    n = len(waypoints)
+    return {
+        "contract_version": MISSION_CONTRACT_VERSION,
+        "waypoints": waypoints,
+        "expected_route_waypoint_count": n,
+        # Scout prepends Home at seq 0 — the operator never sends it, but the read-back
+        # must show it, so N+1 is what a correct upload leaves on the flight controller.
+        "expected_pixhawk_item_count": n + 1,
+        # The content axis: the only one that proves the route on the FC is the route the
+        # operator approved. Both counts can be correct for a route with two waypoints
+        # swapped. Computed HERE, in the backend, as the single authoritative calculator —
+        # the browser renders this string and never recomputes it.
+        "expected_route_content_hash": mission_contract.route_content_hash(waypoints),
+    }
+
+
 def make_command(*, vid, ctype, params, created_by, comm_state, now, source=None):
-    """Build + store a QUEUED command record (the spec command object)."""
+    """Build + store a QUEUED command record (the spec command object).
+
+    `source` is deliberately still a parameter even though the ONLY caller today
+    (create_command, the browser-facing endpoint) hard-codes "OPERATOR". It is the seam
+    for the trusted internal paths the contract anticipates — a LOCAL_AGENT- or
+    MISSION_AGENT-authored command must be created by such a function, never by request
+    JSON. Until one exists, normalize_source's non-OPERATOR branches are reachable only
+    from tests; that is scaffolding, not dead code."""
     cmd = {
         "id": str(uuid.uuid4()),
         "vehicle_id": vid,
@@ -1082,12 +1272,33 @@ def _annotate_mission_upload_result(cmd):
     success ONLY when Scout accepted it AND read it back AND the read-back matches what the
     operator asked for. Never 'successful' just because the file reached Scout.
 
-    MISSION_UPLOAD is verified when ALL of:
-      - result.accepted is True   (Scout accepted the upload)
+    MISSION_UPLOAD (mission-contract-v1) is verified when ALL of:
+      - result.accepted is True   (Scout accepted the mission)
+      - result.uploaded is True   (checked only when Scout provides the field)
       - result.verified is True   (Scout re-downloaded the mission from the FC)
-      - observed waypoint count == the operator's expected_count (when both are present)
-      - observed hash == the operator's expected_hash (when both are present)
-    MISSION_CLEAR is verified when accepted+verified AND the read-back count is 0.
+      - observed route waypoint count == expected_route_waypoint_count (N)
+      - observed Pixhawk item count   == expected_pixhawk_item_count   (N + 1, incl. Home)
+      - observed route content hash   == expected_route_content_hash
+    Under mission-contract-v1 every axis is REQUIRED, and a missing expected or observed
+    value is an explicit unverifiable FAILURE — never a silent pass, and never a
+    count-only success dressed up as content-verified. That distinction is the whole point
+    of the hash: the counts cannot detect two swapped waypoints or a wrong coordinate, so
+    "counts matched, hash absent" is exactly the case that must not render as verified.
+    Records without a v1 contract_version (pre-contract history) keep the older
+    count-only path — compatibility that does not weaken the v1 proof, because it cannot
+    apply to a v1 upload. The two counts are deliberately BOTH checked: N alone would miss
+    a Scout that dropped Home, N+1 alone would miss one that dropped a route leg.
+
+    MISSION_CLEAR is verified when ALL of:
+      - result.accepted is True
+      - result.cleared is True
+      - result.verified is True
+      - observed_route_waypoint_count == 0
+      - empty_representation is NO_ITEMS or HOME_ONLY
+    The Pixhawk item count is deliberately NOT required to be 0: Scout supports both
+    ArduPilot empty representations, and a retained Home at seq 0 (item count 1) is a
+    correctly cleared mission. What must be zero is the ROUTE.
+
     Anything else sets cmd['mission_result'] = 'failed' and replaces cmd['reason'] with
     Scout's real error (never invented), even though cmd['status'] stays EXECUTED."""
     if cmd["type"] not in ("MISSION_UPLOAD", "MISSION_CLEAR") or cmd["status"] != "EXECUTED":
@@ -1096,26 +1307,74 @@ def _annotate_mission_upload_result(cmd):
     error = result.get("error") if isinstance(result.get("error"), dict) else {}
     params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
     err_msg = error.get("message") or error.get("code")
-    exp_count = params.get("expected_count")
-    exp_hash = params.get("expected_hash")
-    obs_count = _first_present(result.get("observed_count"), result.get("count"),
-                               result.get("mission_count"))
-    obs_hash = _first_present(result.get("observed_hash"), result.get("hash"),
-                              result.get("mission_hash"))
+
+    exp_route = params.get("expected_route_waypoint_count")
+    exp_items = params.get("expected_pixhawk_item_count")
+    exp_hash = params.get("expected_route_content_hash")
+    obs_route = _first_present(result.get("observed_route_waypoint_count"),
+                               result.get("route_waypoint_count"))
+    obs_items = _first_present(result.get("observed_pixhawk_item_count"),
+                               result.get("pixhawk_item_count"), result.get("observed_count"),
+                               result.get("count"), result.get("mission_count"))
+    # Scout's ROUTE hash (items 1…N), never its full-mission hash — a full-mission hash
+    # includes Home, which the operator never sent and therefore cannot have hashed.
+    obs_hash = _first_present(result.get("observed_route_content_hash"),
+                              result.get("route_content_hash"))
+
+    # Is this command governed by the v1 contract? Only v1 records carry the mandatory
+    # content-hash axis; anything older cannot be held to a proof it never produced.
+    is_v1 = str(params.get("contract_version")) == MISSION_CONTRACT_VERSION
 
     failure = None
     if result.get("accepted") is not True:
         failure = err_msg or f"{cmd['type']} was not accepted by Scout."
+    elif cmd["type"] == "MISSION_UPLOAD" and result.get("uploaded") is False:
+        # Only an explicit False fails — Scout may omit `uploaded` entirely, and absence is
+        # not evidence of a failed write.
+        failure = err_msg or "Scout accepted the mission but did not upload it."
+    elif cmd["type"] == "MISSION_CLEAR" and result.get("cleared") is not True:
+        failure = err_msg or "Scout did not report the mission as cleared."
     elif result.get("verified") is not True:
         failure = err_msg or "Mission was not verified by Scout's read-back."
     elif cmd["type"] == "MISSION_CLEAR":
-        if obs_count not in (0, None):
-            failure = f"Mission still holds {obs_count} waypoints after clear."
+        empty_repr = result.get("empty_representation")
+        if obs_route is None:
+            failure = ("Clear could not be verified — Scout reported no "
+                       "observed_route_waypoint_count.")
+        elif int(obs_route) != 0:
+            failure = f"Mission still holds {obs_route} route waypoints after clear."
+        elif empty_repr not in MISSION_EMPTY_REPRESENTATIONS:
+            # Home-only (item count 1) and no-items (0) are BOTH correct; anything else is
+            # an empty state neither side defined, so it is not a proof of a clear.
+            failure = (f"Clear could not be verified — unrecognised empty representation "
+                       f"{empty_repr!r}.")
     else:  # MISSION_UPLOAD
-        if exp_count is not None and obs_count is not None and int(obs_count) != int(exp_count):
-            failure = f"Pixhawk holds {obs_count} waypoints after upload — expected {exp_count}."
+        if exp_route is not None and obs_route is not None and int(obs_route) != int(exp_route):
+            failure = (f"Pixhawk holds {obs_route} route waypoints after upload — "
+                       f"expected {exp_route}.")
+        elif exp_items is not None and obs_items is not None and int(obs_items) != int(exp_items):
+            # The parenthetical is only added when the route count is actually known — a
+            # record predating this contract would otherwise render "None route waypoints"
+            # straight into the operator-facing failure reason.
+            breakdown = f" ({exp_route} route waypoints + Home)" if exp_route is not None else ""
+            failure = (f"Pixhawk holds {obs_items} items after upload — "
+                       f"expected {exp_items}{breakdown}.")
         elif exp_hash and obs_hash and str(exp_hash) != str(obs_hash):
-            failure = "Uploaded mission does not match the read-back — the on-FC mission differs."
+            failure = "Uploaded route does not match the read-back — the on-FC route differs."
+        elif is_v1 and (obs_route is None or obs_items is None):
+            missing = "route waypoint" if obs_route is None else "Pixhawk item"
+            failure = (f"Upload could not be verified — Scout reported no observed "
+                       f"{missing} count.")
+        elif is_v1 and not exp_hash:
+            # Unreachable for a command built by canonical_mission_upload_params; caught
+            # anyway so a future path that forgets the hash fails loudly rather than
+            # quietly downgrading to count-only verification.
+            failure = ("Route content could not be verified — no expected route content "
+                       "hash was computed for this upload.")
+        elif is_v1 and not obs_hash:
+            failure = ("Route content could not be verified — Scout reported no "
+                       "observed_route_content_hash. The counts matched, but matching "
+                       "counts do not prove the route's contents.")
 
     if failure:
         cmd["mission_result"] = "failed"
@@ -1153,12 +1412,15 @@ def _extract_expected_observed(cmd, result):
         result.get("observed_mode"), result.get("observed_state"),
         result.get("observed"), result.get("mode"))
     if cmd["type"] in ("MISSION_UPLOAD", "MISSION_CLEAR"):
+        # Summarised as PIXHAWK ITEM counts (N+1, Home included) — that is the number the
+        # read-back actually reports, so expected and observed are the same kind of thing.
         params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
-        ec = params.get("expected_count")
-        oc = _first_present(result.get("observed_count"), result.get("count"),
-                            result.get("mission_count"))
-        expected = f"{ec} waypoints" if ec is not None else expected
-        observed = f"{oc} waypoints" if oc is not None else observed
+        ec = params.get("expected_pixhawk_item_count")
+        oc = _first_present(result.get("observed_pixhawk_item_count"),
+                            result.get("pixhawk_item_count"), result.get("observed_count"),
+                            result.get("count"), result.get("mission_count"))
+        expected = f"{ec} Pixhawk items" if ec is not None else expected
+        observed = f"{oc} Pixhawk items" if oc is not None else observed
     return expected, observed
 
 
@@ -1367,10 +1629,27 @@ async def create_command(request: Request):
     params = body.get("params")
     if ctype == "SET_HOME":
         params = _canonical_set_home_params(params)
+    elif ctype == "MISSION_UPLOAD":
+        try:
+            params = canonical_mission_upload_params(params)
+        except MissionContractError as exc:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "mission_contract_violation",
+                "contract_version": MISSION_CONTRACT_VERSION,
+                "message": "Mission does not satisfy " + MISSION_CONTRACT_VERSION + ".",
+                "errors": exc.errors})
 
+    # `source` is SERVER-OWNED, never taken from the request body. Every command created
+    # through this browser-facing endpoint is authored by the human at this station, so it
+    # is OPERATOR by construction. A LOCAL_AGENT / MISSION_AGENT record must be created by
+    # a separate trusted backend function, not by arbitrary request JSON — otherwise any
+    # caller could mint a record attributing its own command to the autonomy, and the
+    # provenance trail that the thesis's authority analysis rests on would be worthless.
+    # A body-supplied `source` is ignored (not an error): the field is simply not the
+    # client's to set, and rejecting would break callers that send a redundant "OPERATOR".
     cmd = make_command(vid=vid, ctype=ctype, params=params,
                        created_by=body.get("created_by"), comm_state=comm_state, now=now,
-                       source=body.get("source"))
+                       source="OPERATOR")
 
     # Accumulate any warnings (risk + link state) into the record; a warning implies caution.
     warnings = []
@@ -1387,6 +1666,48 @@ async def create_command(request: Request):
                    message=f"Command {ctype} created ({comm_state})",
                    source="operator-backend")
     return {"ok": True, "command": cmd}
+
+
+@app.get("/api/commands/capabilities")
+def command_capabilities():
+    """Which command types this station can actually deliver TODAY, and why not when it
+    cannot. The UI reads this to disable a button with the real backend reason instead of
+    hard-coding its own guess about Scout — one source of truth for "is this supported",
+    so a button can never be enabled for a command the backend would refuse.
+    Returns { contract_version, commands: {TYPE: {supported, reason}} }."""
+    caps = {t: {"supported": True, "reason": None} for t in sorted(COMMAND_TYPES)}
+    caps["MISSION_CLEAR"] = {
+        "supported": MISSION_CLEAR_SUPPORTED,
+        "reason": None if MISSION_CLEAR_SUPPORTED else MISSION_CLEAR_UNSUPPORTED_REASON,
+    }
+    return {
+        "ok": True,
+        "contract_version": MISSION_CONTRACT_VERSION,
+        "commands": caps,
+    }
+
+
+@app.post("/api/missions/preview")
+async def mission_preview(request: Request):
+    """Canonicalize a route WITHOUT queueing anything, so the Mission page can show the
+    operator the expected route content hash before they approve the upload.
+
+    This endpoint exists because the browser deliberately has no hash calculator: the
+    backend is the single authoritative one (see mission_contract.py). Previewing the
+    counts locally but the hash not at all would ask the operator to approve a mission
+    whose identity they cannot see, and computing it in JavaScript would create the second
+    implementation the contract exists to avoid. Read-only: no command, no vehicle, no
+    side effects — same validation, same errors, same canonical params as a real upload."""
+    body = await request.json()
+    try:
+        params = canonical_mission_upload_params(body)
+    except MissionContractError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "mission_contract_violation",
+            "contract_version": MISSION_CONTRACT_VERSION,
+            "message": "Mission does not satisfy " + MISSION_CONTRACT_VERSION + ".",
+            "errors": exc.errors})
+    return {"ok": True, "params": params}
 
 
 @app.get("/api/commands/pending/{vehicle_id}")
@@ -1860,12 +2181,17 @@ def _scout_mission_read(vid: int, base: str, now):
         "current_seq": current, "waypoints": waypoints, "partial": partial,
         "source": "scout", "raw_count": reported,
     }
-    # Optional Scout-provided integrity/identity fields for a future mission-compare
-    # (hash of the on-FC mission, whether a mission is loaded, whether it validated).
-    # Passed through ONLY when Scout actually sends them — never fabricated here. The
-    # operator backend stays a pure proxy: it does not compute a hash or a validity of
-    # its own (that would duplicate mission ownership Scout holds).
-    for k in ("hash", "loaded", "valid"):
+    # mission-contract-v1 read-back fields. Passed through ONLY when Scout actually sends
+    # them — never fabricated here. The operator backend stays a pure proxy for the
+    # read-back: it does not compute a hash or a validity of its own, because the whole
+    # value of the comparison is that the two sides derived their numbers independently.
+    #
+    # `route_waypoint_count` and `pixhawk_item_count` are the EXPLICIT counts and are what
+    # verification and the UI use. Legacy `count`/`hash` continue to pass through for
+    # compatibility, but `hash` is the FULL-mission hash (Home included) and must never be
+    # compared against a route content hash — different bytes, different value.
+    for k in ("contract_version", "pixhawk_item_count", "route_waypoint_count",
+              "route_content_hash", "full_mission_hash", "hash", "loaded", "valid"):
         if k in data:
             out[k] = data[k]
     return out

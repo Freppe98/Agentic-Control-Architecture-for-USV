@@ -26,7 +26,7 @@ import { vehicleRows } from "../components/VehicleDock.js";
 import { commState, noTelem } from "../lib/ui.js";
 import { homeStatus, fmtDistance } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
-import { parseMission, missionUploadParams, missionUploadStage, missionUploadCompare, UPLOAD_STAGES } from "../lib/mission-upload.js";
+import { parseMission, missionUploadParams, missionUploadStage, missionUploadCompare, missionClearOutcome, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
 
 const TABS = [["overview", "Overview"], ["upload", "Upload"], ["replay", "Replay"], ["statistics", "Statistics"], ["export", "Export"]];
@@ -46,8 +46,12 @@ export function Mission(root) {
   // pasted mission, `parsed` its validated preview, `cmdId` the tracked MISSION_UPLOAD/
   // MISSION_CLEAR command (its lifecycle is read from `cmds`), `readbackAt` guards a
   // single post-verified re-fetch of the Pixhawk mission for the expected-vs-observed compare.
-  let upload = { text: "", parsed: null, cmdId: null, at: 0, error: null, readbackAt: 0 };
+  let upload = { text: "", parsed: null, expected: null, cmdId: null, at: 0, error: null, readbackAt: 0 };
   let authority = null;   // confirmed control authority for the selected vehicle (Scout proxy)
+  // Backend-declared command capabilities ({TYPE: {supported, reason}}). Fetched once per
+  // page mount: which commands are deliverable is a backend/Scout-contract fact, not a
+  // per-vehicle one, and the UI must never enable a button the backend would refuse.
+  let capabilities = null;
 
   root.className = "app dock-main";
   root.innerHTML =
@@ -372,30 +376,88 @@ export function Mission(root) {
   // count/hash (missionUploadCompare). Duplicate presses are suppressed while an upload is
   // active. No waypoint jumping is offered. Mission clear gets the same confirm + read-back.
   function escapeHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  /** escapeHtml + quotes — REQUIRED for anything interpolated into a quoted HTML
+   *  attribute. escapeHtml alone leaves `"` intact, which would terminate the attribute
+   *  early and inject raw markup; backend-supplied strings (e.g. a capability reason
+   *  echoing a Scout error) are not guaranteed quote-free. */
+  function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
   function trackedUpload() { return upload.cmdId ? (cmds.find((c) => c.id === upload.cmdId) || null) : null; }
   function hasControl() { return !!(authority && authority.authority === "OPERATOR"); }
   function uploadActive() { return hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR"); }
+  /** Backend capability for a command type. Unknown (capabilities not fetched yet) is
+   *  treated as SUPPORTED so a slow fetch does not grey out a working button; the backend
+   *  refuses an unsupported command anyway, so the worst case is an honest error, never a
+   *  silently unverifiable write. */
+  function capabilityOf(type) {
+    const c = capabilities && capabilities.commands && capabilities.commands[type];
+    return c ? { supported: c.supported !== false, reason: c.reason || null }
+             : { supported: true, reason: null };
+  }
+  /** Scout's live background-upload state for the selected vehicle, or null. */
+  function liveUpload(v) { return (v && v.mission_upload) || null; }
 
   function parseUploadNow() {
     upload.parsed = upload.text.trim() ? parseMission(upload.text) : null;
+    upload.expected = null;
     upload.error = null;
     renderBody();
+    // Local parsing gives the counts immediately; the expected route content hash can only
+    // come from the backend, which is the single authoritative calculator (there is no
+    // JavaScript hash implementation, by design). Fetched second so a slow or failed
+    // preview never blocks the operator from seeing their route's errors and counts.
+    if (upload.parsed && upload.parsed.ok) fetchExpected(upload.parsed);
+  }
+  /** Ask the backend to canonicalize the parsed route so the preview can show the exact
+   *  hash that will be verified. Nothing is queued. A failure leaves `expected` null and
+   *  the preview says the hash is unavailable — never a fabricated or locally computed
+   *  stand-in, which is exactly the defect the removed wpm1 hash represented. */
+  async function fetchExpected(p) {
+    const res = await api.previewMission(missionUploadParams(p));
+    if (upload.parsed !== p) return;   // operator edited the route while we were waiting
+    upload.expected = res.ok && res.data && res.data.params ? res.data.params : null;
+    renderBody();
+  }
+  /** First 12 hex characters of a `sha256:…` digest, for a dense readable preview. The
+   *  FULL value is always available in the element's title — abbreviating in the title too
+   *  would leave the operator no way to compare it against Scout's. */
+  function shortHash(h) {
+    if (!h) return null;
+    const hex = String(h).replace(/^sha256:/, "");
+    return "sha256:" + hex.slice(0, 12) + "…";
   }
   async function doUpload(v) {
     const p = upload.parsed;
     if (!p || !p.ok || uploadActive() || !hasControl()) return;
-    if (!window.confirm(`Upload ${p.count} waypoints to ${v.name || "USV-" + v.id}'s Pixhawk?\n\nThis OVERWRITES the mission currently stored on the flight controller. It is confirmed ONLY by a read-back after upload — never by the file reaching Scout.`)) return;
+    if (!window.confirm(
+      `Upload ${p.routeCount} route waypoints to ${v.name || "USV-" + v.id}'s Pixhawk?\n\n` +
+      `The Pixhawk will hold ${p.pixhawkItemCount} items after upload (${p.routeCount} route waypoints + Home at seq 0, which Scout owns and adds).\n\n` +
+      `This OVERWRITES the mission currently stored on the flight controller. It is confirmed ONLY by a read-back after upload — never by the file reaching Scout.`)) return;
     const res = await api.uploadMission(v.id, missionUploadParams(p));
     if (res.ok && res.data && res.data.command) {
       upload.cmdId = res.data.command.id; upload.at = Date.now(); upload.error = null; upload.readbackAt = 0;
     } else {
-      upload.error = (res.data && (res.data.message || res.data.error)) || "Upload was not accepted by the operator backend.";
+      // The backend lists every mission-contract violation it found — show them all, so a
+      // rejected file is fixable in one pass instead of one error at a time.
+      const d = res.data || {};
+      upload.error = Array.isArray(d.errors) && d.errors.length
+        ? d.errors.join(" ")
+        : (d.message || d.error || "Upload was not accepted by the operator backend.");
     }
     loadCommands(v.id); renderBody();
   }
   async function doClear(v) {
+    if (!capabilityOf("MISSION_CLEAR").supported) return;
     if (uploadActive() || !hasControl()) return;
-    if (!window.confirm(`Clear the mission stored on ${v.name || "USV-" + v.id}'s Pixhawk?\n\nThis wipes ALL waypoints on the flight controller. It is confirmed by a read-back showing an empty mission.`)) return;
+    // Every claim in this dialog is one the backend can actually back up: the rejection
+    // conditions are Scout's, Home's survival is an ArduPilot fact (HOME_ONLY is a valid
+    // empty state), and success really is judged by a fresh read-back — not by the
+    // MISSION_CLEAR_ALL message being sent.
+    if (!window.confirm(
+      `Clear the mission stored on ${v.name || "USV-" + v.id}'s Pixhawk?\n\n` +
+      `• The stored ROUTE will be removed from the flight controller.\n` +
+      `• The operation is REJECTED while the vehicle is armed or in AUTO.\n` +
+      `• Home may remain as Pixhawk item 0 — that is a correctly cleared mission, not a failure.\n` +
+      `• Success is confirmed by a fresh read-back showing no route, never merely by sending MISSION_CLEAR_ALL.`)) return;
     const res = await api.clearMission(v.id);
     if (res.ok && res.data && res.data.command) {
       upload.cmdId = res.data.command.id; upload.at = Date.now(); upload.error = null; upload.readbackAt = 0;
@@ -409,7 +471,7 @@ export function Mission(root) {
   function maybeReadback(v) {
     const cmd = trackedUpload();
     if (!cmd) return;
-    if (missionUploadStage(cmd).state === "done" && !upload.readbackAt) {
+    if (missionUploadStage(cmd, liveUpload(v)).state === "done" && !upload.readbackAt) {
       upload.readbackAt = Date.now();
       fetchPixhawkMission(v.id);
     }
@@ -420,19 +482,29 @@ export function Mission(root) {
     maybeReadback(v);
     const p = upload.parsed;
     const cmd = trackedUpload();
-    const stg = cmd ? missionUploadStage(cmd) : null;
+    const live = liveUpload(v);
+    const stg = cmd ? missionUploadStage(cmd, live) : null;
     const busy = uploadActive();
     const control = hasControl();
+    const clearCap = capabilityOf("MISSION_CLEAR");
 
+    // The preview states BOTH counts explicitly. "Route waypoints" is what the operator
+    // supplied; "Pixhawk items after upload" is what the flight controller will hold, and
+    // it is N+1 because Scout owns and prepends Home at seq 0. Showing only one of the two
+    // is how an operator comes to believe a read-back of N+1 items is a mismatch.
     const preview = !p ? "" : p.ok
       ? `<div class="mu-preview">
            <div class="mrow"><span class="k">Format</span><span class="val">${p.format}</span></div>
-           <div class="mrow"><span class="k">Waypoints</span><span class="val">${p.count}</span></div>
-           <div class="mrow"><span class="k">First waypoint</span><span class="val">${p.first.lat.toFixed(6)}, ${p.first.lng.toFixed(6)}</span></div>
-           <div class="mrow"><span class="k">Last waypoint</span><span class="val">${p.last.lat.toFixed(6)}, ${p.last.lng.toFixed(6)}</span></div>
-           <div class="mrow"><span class="k">Expected hash</span><span class="val">${p.hash}</span></div>
+           <div class="mrow"><span class="k">Route waypoints</span><span class="val">${p.routeCount}</span></div>
+           <div class="mrow"><span class="k">Pixhawk items after upload</span><span class="val">${p.pixhawkItemCount} <span style="color:var(--muted)">including Home (seq 0, Scout-owned)</span></span></div>
+           <div class="mrow"><span class="k">First route waypoint</span><span class="val">${p.first.lat.toFixed(6)}, ${p.first.lng.toFixed(6)}</span></div>
+           <div class="mrow"><span class="k">Last route waypoint</span><span class="val">${p.last.lat.toFixed(6)}, ${p.last.lng.toFixed(6)}</span></div>
+           <div class="mrow"><span class="k">Expected route content hash</span><span class="val">${
+             upload.expected && upload.expected.expected_route_content_hash
+               ? `<span title="${escapeAttr(upload.expected.expected_route_content_hash)}" style="font-family:var(--mono,monospace)">${escapeHtml(shortHash(upload.expected.expected_route_content_hash))}</span>`
+               : noTelem("operator backend did not return an expected hash")}</span></div>
          </div>`
-      : `<div class="mu-err">${p.errors.map((e) => `• ${e}`).join("<br>")}</div>`;
+      : `<div class="mu-err">${p.errors.map((e) => `• ${escapeHtml(e)}`).join("<br>")}</div>`;
 
     const trackHtml = stg ? `<div class="mu-track">${UPLOAD_STAGES.map((name, i) => {
       let cls = "";
@@ -444,17 +516,68 @@ export function Mission(root) {
     let verdict = "";
     if (stg) {
       if (stg.state === "failed") {
-        verdict = `<div class="mu-verdict bad">Upload failed — ${stg.reason || "not verified by read-back"}. The Pixhawk mission may be unchanged or partial — use Overview → Refresh to check.</div>`;
+        verdict = `<div class="mu-verdict bad">Upload failed — ${escapeHtml(stg.reason || "not verified by read-back")}. The Pixhawk mission may be unchanged or partial — use Overview → Refresh to check.</div>`;
+      } else if (stg.state === "done" && cmd.type === "MISSION_CLEAR") {
+        // A clear is judged on its own contract, not the upload's: what must be empty is
+        // the ROUTE, and Home surviving as item 0 is a correct outcome, not a failure.
+        const rb = (pxm[v.id] && pxm[v.id].mission) || {};
+        const rbRoute = rb.waypoints ? classifyMissionWaypoints(rb.waypoints).route.length : null;
+        const out = missionClearOutcome(cmd.result, rb, rbRoute);
+        const haveReadback = !!(rb && (rb.waypoints || rb.route_waypoint_count != null
+                                       || rb.pixhawk_item_count != null || rb.count != null));
+        if (out.verified && !haveReadback) {
+          verdict = `<div class="mu-verdict pending">Scout reported the mission cleared; re-fetching the Pixhawk mission to confirm independently…</div>`;
+        } else if (out.verified) {
+          const shape = out.representation === "HOME_ONLY"
+            ? "Home remains as Pixhawk item 0 — a correctly cleared mission on this flight controller."
+            : "The flight controller holds no mission items at all.";
+          const disagree = out.readbackAgrees === false
+            ? ` <b>But the fresh read-back still lists ${out.readbackRoute} route waypoints — the flight controller disagrees with Scout.</b>`
+            : "";
+          verdict = `<div class="mu-verdict ${out.readbackAgrees === false ? "bad" : "ok"}">Mission cleared — verified route count 0, empty representation ${escapeHtml(out.representation)}. ${shape}${disagree}</div>`;
+        } else {
+          verdict = `<div class="mu-verdict bad">Clear NOT verified — ${escapeHtml(out.reasons.join("; "))}. The mission on the flight controller may be unchanged — use Overview → Refresh to check.</div>`;
+        }
       } else if (stg.state === "done") {
-        const cmp = missionUploadCompare(cmd.params, (pxm[v.id] && pxm[v.id].mission) || {});
-        const line = cmp.match === true
-          ? `Verified — Pixhawk read back ${cmp.observedCount ?? "?"} waypoints matching the upload${cmp.hashMatch ? " (content hash matches)" : " (Scout reported no hash — matched on count)"}.`
-          : cmp.match === false
-            ? `Read-back MISMATCH — expected ${cmp.expectedCount}/${cmp.expectedHash}, observed ${cmp.observedCount ?? "?"}/${cmp.observedHash ?? "no hash"}. The on-FC mission differs from what was uploaded.`
-            : `Scout reported the upload verified; re-fetching the Pixhawk mission to compare count/hash…`;
-        verdict = `<div class="mu-verdict ${cmp.match === false ? "bad" : "ok"}">${line}</div>`;
+        // Observed ROUTE count comes from the same Home/route split the map overlay uses
+        // (lib/mission.js), so "route waypoints" means the same thing on both pages.
+        const rb = (pxm[v.id] && pxm[v.id].mission) || {};
+        const obsRoute = rb.waypoints ? classifyMissionWaypoints(rb.waypoints).route.length : null;
+        const cmp = missionUploadCompare(cmd.params, rb, obsRoute);
+        const hashCell = (h) => h
+          ? `<span title="${escapeAttr(h)}" style="font-family:var(--mono,monospace)">${escapeHtml(shortHash(h))}</span>`
+          : "—";
+        // The post-verified read-back is fetched once, asynchronously. Until it lands there
+        // is nothing to compare, and that is NOT a failure — showing "not verified" during
+        // the fetch would cry wolf on every successful upload.
+        const haveReadback = !!(rb && (rb.waypoints || rb.route_waypoint_count != null
+                                       || rb.pixhawk_item_count != null || rb.count != null));
+        let line;
+        if (!haveReadback) {
+          verdict = `<div class="mu-verdict pending">Scout reported the upload verified; re-fetching the Pixhawk mission to compare counts and route content hash…</div>`;
+          line = null;
+        } else if (cmp.match === true) {
+          // All three axes agreed. Each is named with its verified value, because "Verified"
+          // alone does not tell the operator WHAT was proven.
+          line = `Verified — verified route count ${cmp.observedRoute}, verified Pixhawk item count ${cmp.observedItems} (including Home), verified route content hash ${hashCell(cmp.observedHash)}. The route on the flight controller is byte-for-byte the route you approved.`;
+        } else if (cmp.hashUnavailable) {
+          // The dangerous case: counts can agree while the content was never compared.
+          // Rendering this as success is the false assurance the contract exists to remove.
+          line = `NOT VERIFIED — the route content hash could not be compared (${cmp.expectedHash ? "Scout reported no route_content_hash" : "no expected hash was computed for this upload"}). The counts ${cmp.routeMatch === false || cmp.itemsMatch === false ? "also disagree" : "agree, but matching counts do not prove the route's contents"} — two swapped waypoints have the same counts.`;
+        } else if (cmp.hashMatch === false) {
+          line = `Read-back MISMATCH — route content hash differs. Expected ${hashCell(cmp.expectedHash)}, observed ${hashCell(cmp.observedHash)}. The counts may agree, but the on-FC route is NOT the route you approved.`;
+        } else {
+          line = `Read-back MISMATCH — expected ${cmp.expectedRoute} route waypoints / ${cmp.expectedItems} Pixhawk items, observed ${cmp.observedRoute ?? "?"} / ${cmp.observedItems ?? "?"}. The on-FC mission differs from what was uploaded.`;
+        }
+        if (line !== null) verdict = `<div class="mu-verdict ${cmp.match === true ? "ok" : "bad"}">${line}</div>`;
       } else {
-        verdict = `<div class="mu-verdict pending">In progress — ${stg.stage}. An upload is verified only once the read-back matches; the file reaching Scout is not success.</div>`;
+        // Executing is Scout's OWN live worker state for THIS command id — never inferred
+        // from "some upload is running". elapsed_s is Scout's, not a local timer.
+        const elapsed = stg.elapsedS != null ? ` (${Math.round(stg.elapsedS)}s elapsed, reported by Scout)` : "";
+        const detail = stg.stage === "Executing"
+          ? `Scout's upload worker is writing the mission to the Pixhawk${elapsed}.`
+          : `Queued for delivery — Scout has not started the transfer yet.`;
+        verdict = `<div class="mu-verdict pending">In progress — ${stg.stage}. ${detail} An upload is verified only once the read-back matches; the file reaching Scout is not success.</div>`;
       }
     }
 
@@ -464,19 +587,21 @@ export function Mission(root) {
       <div class="msect"><span class="lbl">Mission upload</span><span class="tag">${vname} · write a validated mission to the Pixhawk (read-back verified)</span></div>
       <div style="padding:0 20px 20px">
         <div class="mu-drop">
-          <textarea id="mu-text" placeholder="Paste a mission — canonical waypoint JSON ( [{lat,lng,alt,seq,command}, …] or {waypoints:[…]} ) or GeoJSON (Point features / a LineString).">${escapeHtml(upload.text)}</textarea>
+          <textarea id="mu-text" placeholder='Paste a route — route waypoints only: {"contract_version":"mission-contract-v1","waypoints":[{"latitude":56.6501,"longitude":12.8701,"loiter_time_s":0}]} — or GeoJSON (Point features / a LineString). Do NOT include seq, command, frame or altitude: Scout owns those and owns Home at seq 0.'>${escapeHtml(upload.text)}</textarea>
           <div class="mu-row">
             <input type="file" id="mu-file" accept=".json,.geojson,application/json" />
             <button class="cfg-btn" id="mu-validate">Validate &amp; preview</button>
-            <button class="cfg-btn" id="mu-upload"${(!p || !p.ok || busy || !control) ? " disabled" : ""}>${busy ? "Upload in progress…" : "Upload to Pixhawk"}</button>
-            <button class="diag-btn" id="mu-clear"${busy || !control ? " disabled" : ""} style="margin-left:auto">Clear Pixhawk mission…</button>
+            <button class="cfg-btn" id="mu-upload"${(!p || !p.ok || busy || !control) ? " disabled" : ""}>${busy ? "Upload in progress…" : "Upload route to Pixhawk"}</button>
+            <button class="diag-btn" id="mu-clear"${(busy || !control || !clearCap.supported) ? " disabled" : ""} style="margin-left:auto"
+              title="${escapeAttr(clearCap.supported ? "Clears the mission stored on the Pixhawk." : clearCap.reason)}">Clear Pixhawk mission…</button>
           </div>
+          ${clearCap.supported ? "" : `<div class="cfg-note" style="border-color:var(--caution);color:var(--caution)">${infoIcon}<span><b>Clear Pixhawk mission unavailable.</b> ${escapeHtml(clearCap.reason || "The operator backend does not currently accept MISSION_CLEAR.")}</span></div>`}
           ${controlNote}
-          ${upload.error ? `<div class="mu-err">${upload.error}</div>` : ""}
+          ${upload.error ? `<div class="mu-err">${escapeHtml(upload.error)}</div>` : ""}
           ${preview}
         </div>
         ${trackHtml}${verdict}
-        <div class="ev-note" style="margin-top:14px">${infoIcon}Upload is confirmed only by re-downloading the mission from the Pixhawk and matching the expected waypoint count and content hash — never because the file reached Scout. The expected hash is computed locally; a matching read-back hash also depends on Scout using the same canonicalisation (a Scout-contract assumption still to confirm). Normal mission read-back stays available on the Overview tab. Waypoint jumping is not offered.</div>
+        <div class="ev-note" style="margin-top:14px">${infoIcon}You supply <b>route waypoints only</b>. Scout owns Pixhawk sequence 0 / Home and prepends it, so a route of N waypoints leaves <b>N + 1</b> items on the flight controller — that is a correct upload, not a mismatch. <code>seq</code>, <code>command</code>, <code>frame</code> and <code>altitude</code> are rejected rather than previewed, because Scout would discard them and you would have approved a mission that is not the one uploaded. Upload is confirmed only by re-downloading the mission from the Pixhawk and matching the expected counts <b>and the route content hash</b> — never because the file reached Scout. The hash is a SHA-256 over the canonical route (Home excluded), computed by the operator backend and compared against Scout's; it is the only axis that can catch two swapped waypoints or a wrong coordinate, which have the same counts as a correct route. An upload whose hash is missing or differs is reported as NOT verified, never as a count-only success. Normal mission read-back stays available on the Overview tab. Waypoint jumping is not offered.</div>
       </div>`;
 
     const ta = document.getElementById("mu-text");
@@ -538,6 +663,11 @@ export function Mission(root) {
     else if (ageS <= 12) updateRibbon({ feed: { cls: "warn", label: `DELAYED ${Math.round(ageS)}s` } });
     else updateRibbon({ feed: { cls: "bad", label: `UNREACHABLE ${Math.round(ageS)}s` } });
   }
+
+  // Command capabilities are a backend/Scout-contract fact, not per-vehicle state — fetched
+  // once per mount. A failure leaves `capabilities` null, which capabilityOf() treats as
+  // supported (the backend still refuses an unsupported command).
+  api.getCommandCapabilities().then((c) => { capabilities = c; if (tab === "upload") renderBody(); }).catch(() => {});
 
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeedIndicator, "fleet");
   const stopEvents = api.poll(api.getEventLog, 5000, onEvents, () => {});

@@ -3,12 +3,15 @@ agnostic `verification` block + `lifecycle` array, and the MISSION_UPLOAD / MISS
 read-back-verified workflow. Run:  python -m unittest tests.test_command_model
 
 These pin the parts of the operator command model the frontend depends on:
-  • source is normalized (OPERATOR / LOCAL_AGENT / MISSION_AGENT) and forwarded to Scout.
+  • source is SERVER-owned on POST /api/commands — always OPERATOR, never client-settable —
+    and is forwarded to Scout in the agent-facing view.
   • every command carries a normalized verification.outcome; EXECUTED + verified:false is
     reported as a verification FAILURE, never a success.
   • a plain mode command with no verification reported stays a plain EXECUTED success.
-  • MISSION_UPLOAD is verified only by a matching read-back (accepted+verified+count/hash),
-    never by transport success alone; a mismatch / rejection / timeout is a failure.
+  • MISSION_UPLOAD (mission-contract-v1) is verified only by a matching read-back —
+    accepted + verified + route waypoint count (N) + Pixhawk item count (N+1, Home
+    included) + route content hash — never by transport success alone; a mismatch /
+    rejection / timeout is a failure.
 """
 import os
 import sys
@@ -17,6 +20,7 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import main  # noqa: E402
+import mission_contract  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 VID = 2
@@ -46,22 +50,30 @@ class CommandModelBase(unittest.TestCase):
 
 
 class SourceTests(CommandModelBase):
+    """`source` is SERVER-owned on the browser-facing endpoint. It used to be taken from
+    the request body, which meant any caller could mint a record attributing its own
+    command to the autonomy — and the provenance trail the thesis's authority analysis
+    rests on would not survive that. Spoofing is covered in depth in
+    tests/test_mission_contract.py TestCommandSourceIsServerOwned."""
+
     def test_default_source_is_operator(self):
         cmd = self.create("SET_MODE_LOITER").json()["command"]
         self.assertEqual(cmd["source"], "OPERATOR")
 
-    def test_explicit_mission_agent_source_is_preserved(self):
+    def test_body_supplied_source_is_ignored(self):
         cmd = self.create("SET_MODE_LOITER", source="MISSION_AGENT").json()["command"]
-        self.assertEqual(cmd["source"], "MISSION_AGENT")
-
-    def test_local_agent_source_normalizes(self):
-        cmd = self.create("SET_MODE_LOITER", source="local_agent").json()["command"]
-        self.assertEqual(cmd["source"], "LOCAL_AGENT")
+        self.assertEqual(cmd["source"], "OPERATOR")
 
     def test_source_is_forwarded_to_scout_in_agent_command_view(self):
-        self.create("SET_MODE_AUTO", source="MISSION_AGENT")
+        self.create("SET_MODE_AUTO")
         cmd = self.client.get(f"/agent/commands?usv_id=usv-{VID}").json()["commands"][0]
-        self.assertEqual(cmd["source"], "MISSION_AGENT")
+        self.assertEqual(cmd["source"], "OPERATOR")
+
+    def test_normalize_source_still_serves_trusted_backend_callers(self):
+        # The normalizer is unchanged — only the browser endpoint stopped consulting the
+        # request body. A trusted internal path can still author an autonomy record.
+        self.assertEqual(main.normalize_source("MISSION_AGENT"), "MISSION_AGENT")
+        self.assertEqual(main.normalize_source("local_agent"), "LOCAL_AGENT")
 
 
 class NormalizedVerificationTests(CommandModelBase):
@@ -112,8 +124,17 @@ class NormalizedVerificationTests(CommandModelBase):
 
 
 class MissionUploadTests(CommandModelBase):
-    GOOD = {"expected_count": 3, "expected_hash": "wpm1:abc123",
-            "waypoints": [{"seq": 0, "lat": 56.7, "lng": 13.0}]}
+    """MISSION_UPLOAD through the real queue, under mission-contract-v1: the request is a
+    ROUTE (no seq-0 Home), and the backend derives expected_route_waypoint_count = N /
+    expected_pixhawk_item_count = N+1. Contract validation itself is covered in
+    tests/test_mission_contract.py; these pin the lifecycle around it."""
+
+    # Three ROUTE waypoints → 3 route / 4 Pixhawk items after Scout prepends Home.
+    GOOD = {"contract_version": "mission-contract-v1", "waypoints": [
+        {"latitude": 56.70, "longitude": 13.00, "loiter_time_s": 0},
+        {"latitude": 56.71, "longitude": 13.01, "loiter_time_s": 0},
+        {"latitude": 56.72, "longitude": 13.02, "loiter_time_s": 0},
+    ]}
 
     def test_mission_upload_is_a_recognized_confirm_required_type(self):
         self.assertIn("MISSION_UPLOAD", main.COMMAND_TYPES)
@@ -132,30 +153,54 @@ class MissionUploadTests(CommandModelBase):
         self.assertEqual(cmd["status"], "ACCEPTED")
         self.assertEqual(cmd["verification"]["outcome"], "PENDING")
 
-    def test_verified_upload_matches_count_and_hash(self):
+    def test_backend_derives_both_expected_counts_from_the_route(self):
+        params = self.create("MISSION_UPLOAD", confirm=True,
+                             params=self.GOOD).json()["command"]["params"]
+        self.assertEqual(params["expected_route_waypoint_count"], 3)
+        self.assertEqual(params["expected_pixhawk_item_count"], 4)   # + Scout's Home
+
+    def test_verified_upload_matches_both_counts_and_the_route_hash(self):
+        # The observed hash is the one the backend itself computed for this route — i.e.
+        # a Scout that read back exactly what was sent. All three axes must agree.
         cmd = self.executed("MISSION_UPLOAD", {
-            "accepted": True, "verified": True,
-            "observed_count": 3, "observed_hash": "wpm1:abc123"},
+            "accepted": True, "uploaded": True, "verified": True,
+            "observed_route_waypoint_count": 3, "observed_pixhawk_item_count": 4,
+            "observed_route_content_hash": mission_contract.route_content_hash(
+                self.GOOD["waypoints"])},
             confirm=True, params=self.GOOD)
         self.assertEqual(cmd["mission_result"], "verified")
         self.assertEqual(cmd["verification"]["verified"], True)
         self.assertEqual(cmd["verification"]["outcome"], "VERIFIED")
 
-    def test_count_mismatch_is_a_failure_not_a_success(self):
+    def test_route_count_mismatch_is_a_failure_not_a_success(self):
         cmd = self.executed("MISSION_UPLOAD", {
             "accepted": True, "verified": True,
-            "observed_count": 2, "observed_hash": "wpm1:abc123"},
+            "observed_route_waypoint_count": 2, "observed_pixhawk_item_count": 3},
             confirm=True, params=self.GOOD)
         self.assertEqual(cmd["status"], "EXECUTED")           # transport worked...
         self.assertEqual(cmd["mission_result"], "failed")     # ...upload did not match
         self.assertEqual(cmd["verification"]["outcome"], "FAILED")
         self.assertIn("expected 3", cmd["reason"])
 
-    def test_hash_mismatch_is_a_failure(self):
+    def test_pixhawk_item_count_mismatch_is_a_failure(self):
+        # Correct route, but Home missing from the flight controller: 3 items, not 4.
         cmd = self.executed("MISSION_UPLOAD", {
             "accepted": True, "verified": True,
-            "observed_count": 3, "observed_hash": "wpm1:DIFFERENT"},
+            "observed_route_waypoint_count": 3, "observed_pixhawk_item_count": 3},
             confirm=True, params=self.GOOD)
+        self.assertEqual(cmd["mission_result"], "failed")
+        self.assertIn("expected 4", cmd["reason"])
+
+    def test_route_content_hash_mismatch_is_a_failure(self):
+        cid = self.create("MISSION_UPLOAD", confirm=True, params=self.GOOD).json()["command"]["id"]
+        # Simulate the day Scout's canonicalization lands: an expected route hash exists.
+        main.commands_by_id[cid]["params"]["expected_route_content_hash"] = "sha256:aaa"
+        self.client.get(f"/agent/commands?usv_id=usv-{VID}")
+        self.client.post("/agent/command_result", json={"command_id": cid, "status": "executed", "result": {
+            "accepted": True, "verified": True,
+            "observed_route_waypoint_count": 3, "observed_pixhawk_item_count": 4,
+            "observed_route_content_hash": "sha256:bbb"}})
+        cmd = main.commands_by_id[cid]
         self.assertEqual(cmd["mission_result"], "failed")
         self.assertIn("does not match", cmd["reason"])
 
@@ -190,17 +235,13 @@ class MissionUploadTests(CommandModelBase):
         self.assertEqual(cmd["status"], "FAILED")
         self.assertEqual(cmd["verification"]["outcome"], "FAILED")
 
-    def test_mission_clear_verified_when_readback_empty(self):
-        cmd = self.executed("MISSION_CLEAR", {
-            "accepted": True, "verified": True, "observed_count": 0}, confirm=True, params={})
-        self.assertEqual(cmd["mission_result"], "verified")
-        self.assertEqual(cmd["verification"]["outcome"], "VERIFIED")
-
-    def test_mission_clear_failed_when_waypoints_remain(self):
-        cmd = self.executed("MISSION_CLEAR", {
-            "accepted": True, "verified": True, "observed_count": 2}, confirm=True, params={})
-        self.assertEqual(cmd["mission_result"], "failed")
-        self.assertIn("still holds 2", cmd["reason"])
+    def test_mission_clear_is_queueable(self):
+        # Scout ships POST /agent/clear_mission with a result contract carrying the
+        # independent empty read-back a clear is judged by.
+        # Full coverage in tests/test_mission_contract.py TestMissionClear.
+        r = self.create("MISSION_CLEAR", confirm=True, params={})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(main.commands), 1)
 
 
 if __name__ == "__main__":

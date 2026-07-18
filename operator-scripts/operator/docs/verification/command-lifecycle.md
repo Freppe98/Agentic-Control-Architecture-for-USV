@@ -45,13 +45,16 @@ verification/lifecycle layer is added on top. All frontend requests still route 
   minor Scout schema change is a one-file change. Also `commandSource`, `commandStages`,
   `outcomeFrom`. **Map and Vehicle both call this one function → result parity by
   construction** (`tests/command.test.mjs`).
-- `lib/mission-upload.js` — `parseMission` (canonical waypoint JSON **or** GeoJSON
-  Point/LineString → count, first/last, deterministic `wpm1:` hash, validation),
-  `missionUploadParams`, `missionUploadStage` (Requested → Accepted → Executing →
-  Verified/Failed), `missionUploadCompare` (expected vs observed count/hash).
+- `lib/mission-upload.js` — `parseMission` (route-waypoint JSON **or** GeoJSON
+  Point/LineString → route count, Pixhawk item count, first/last, validation),
+  `missionUploadParams`, `missionUploadStage` (Requested → Executing → Verified/Failed),
+  `missionUploadCompare` (expected vs observed route count / Pixhawk item count / route
+  content hash), `liveUploadMatches`. **No hash is computed here** — see
+  `mission-contract-v1` below.
 - `services/api.js` — `uploadMission(id, params)` / `clearMission(id)` route through
-  `createCommand` (`confirm:true`, forwards `source`). `getEvents`/`getEventLog` pass the
-  structured `detail` through.
+  `createCommand` (`confirm:true`). **No `source` argument** — provenance is server-owned.
+  `getCommandCapabilities()` reports which command types the backend can deliver today.
+  `getEvents`/`getEventLog` pass the structured `detail` through.
 
 ## Pages
 
@@ -66,40 +69,91 @@ verification/lifecycle layer is added on top. All frontend requests still route 
 - **Agent** — "Latest action" line under Recent Transitions shows the most recent command's
   type + Scout-reported result (executed / blocked / failed / pending). Sourced only from
   emitted command events — no invented reasoning.
-- **Mission** — new **Upload** tab: paste/file a GeoJSON or waypoint-JSON mission → preview
-  (count, first/last, expected hash) → `Upload to Pixhawk` (confirm, OPERATOR-gated,
-  duplicate-suppressed while active) → progress track → after verified, re-fetch the
-  Pixhawk mission and show **expected vs observed count/hash**. `Clear Pixhawk mission`
-  gets the same confirm + read-back. Normal read-back stays on Overview. No waypoint
-  jumping.
+- **Mission** — **Upload** tab: paste/file a GeoJSON or route-waypoint JSON route → preview
+  (**Route waypoints: N**, **Pixhawk items after upload: N+1 including Home**, first/last)
+  → `Upload route to Pixhawk` (confirm, OPERATOR-gated, duplicate-suppressed while active)
+  → progress track driven by Scout's live `agent.mission_upload` → after verified, re-fetch
+  the Pixhawk mission and show **expected vs observed route count / Pixhawk item count**.
+  `Clear Pixhawk mission` is enabled under ordinary command gating and is verified by an
+  independent empty read-back. Normal read-back stays on Overview. No waypoint jumping.
 
 ## Manual browser verification
 
 1. `uvicorn main:app --reload`, open `/app` → **Mission** → **Upload**.
 2. Take OPERATOR control on **Map** or **Vehicle** first (Upload is disabled otherwise,
    with a note).
-3. Paste `[{"seq":0,"lat":56.70,"lng":13.00},{"seq":1,"lat":56.71,"lng":13.01}]` → **Validate
-   & preview** shows format `waypoints`, 2 waypoints, first/last, an expected `wpm1:` hash.
-4. **Upload to Pixhawk** → confirm. The button is suppressed while active. The progress
-   track advances Requested → Accepted → Executing → Verified/Failed as Scout reports
-   results; a verified upload re-fetches the Pixhawk mission and shows the count/hash compare
-   (or a MISMATCH verdict). A transport-only EXECUTED without accepted/verified reads Failed.
-5. **Vehicle** → Control card: command history shows lifecycle timestamps + expected/observed.
-   **Map**: "Last command" shows the progression + terminal pill. **Events** → Commands
-   filter: structured command rows. **Agent**: "Latest action" reflects executed/blocked.
-6. GeoJSON: paste a `FeatureCollection` of `Point` features (coordinates `[lng, lat]`) — the
-   preview un-swaps them to lat/lng.
+3. Paste
+   `{"contract_version":"mission-contract-v1","waypoints":[{"latitude":56.6501,"longitude":12.8701,"loiter_time_s":0},{"latitude":56.6512,"longitude":12.8725,"loiter_time_s":0}]}`
+   → **Validate & preview** shows format `waypoints`, **Route waypoints: 2**, **Pixhawk
+   items after upload: 3 including Home (seq 0, Scout-owned)**, first/last, and
+   **Expected route content hash** abbreviated to `sha256:5fe4c2352fc9…` (hover for the full
+   value; it must read
+   `sha256:5fe4c2352fc9183e121538a8e199131159cdda66658ccb755c7db1ff54672bfd`). The hash comes
+   from the backend via `POST /api/missions/preview` — the browser never computes it.
+4. Paste the OLD schema `[{"seq":0,"command":16,"lat":56.70,"lng":13.00,"alt":0}]` → it is
+   **rejected**, naming `seq`, `command` and `alt` as Scout-owned. Nothing is uploaded.
+5. **Upload route to Pixhawk** → confirm (the dialog states both counts). The button is
+   suppressed while active. The progress track advances Requested → Executing → Verified/
+   Failed: **Executing** appears while Scout's `agent.mission_upload.active` is true *and*
+   its `command_id` matches this command. A verified upload re-fetches the Pixhawk mission
+   and shows the count compare (or a MISMATCH verdict). A transport-only EXECUTED without
+   accepted/verified reads Failed.
+6. `Clear Pixhawk mission…` is **enabled** (given OPERATOR control and no upload in flight).
+   Its confirm dialog states: the stored route will be removed; the operation is rejected
+   while armed or in AUTO; Home may remain as Pixhawk item 0; and success comes from a fresh
+   read-back, not from sending MISSION_CLEAR_ALL. After a verified clear the Pixhawk mission
+   is re-fetched and the empty representation (`NO_ITEMS` or `HOME_ONLY`) is shown.
+7. **Vehicle** → Control card: command history shows lifecycle timestamps + expected/observed
+   (as **Pixhawk items**). **Map**: "Last command" shows the progression + terminal pill.
+   **Events** → Commands filter: structured command rows. **Agent**: "Latest action"
+   reflects executed/blocked.
+8. GeoJSON: paste a `FeatureCollection` of `Point` features (coordinates `[lng, lat]`) — the
+   preview un-swaps them to lat/lng and defaults `loiter_time_s` to 0.
+9. Provenance: `curl -X POST /api/commands -d '{"vehicle_id":2,"type":"SET_MODE_LOITER",
+   "confirm":true,"source":"MISSION_AGENT"}'` → the returned record reads
+   `"source": "OPERATOR"`. A browser cannot attribute its command to the autonomy.
+
+## mission-contract-v1 — ownership
+
+The **operator supplies route waypoints only**. **Scout owns Pixhawk sequence 0 / Home** and
+prepends it, so `Pixhawk item count = route waypoint count + 1`. Nothing operator-side emits
+a `seq`, MAVLink `command`, `frame` or `altitude`; a file supplying them is rejected rather
+than previewed, because Scout would discard them and the operator would have approved a
+mission that is not the one uploaded.
 
 ## Scout-contract assumptions still to confirm
 
-- **Mission hash agreement** — the expected hash is computed operator-side (`wpm1:` FNV-1a
-  over `[seq,command,lat(7dp),lng(7dp),alt(2dp)]`). Hash-level read-back verification is
-  only meaningful if Scout's `GET /agent/pixhawk_mission` reports a hash computed with the
-  **same** canonicalisation. Until confirmed, the compare falls back to **count** match
-  (still honest — never claims a hash match it can't prove).
-- **`MISSION_UPLOAD` result shape** — assumed `{accepted, verified, observed_count,
-  observed_hash?, error?, lifecycle?}` (tolerant of `count`/`mission_count`,
-  `hash`/`mission_hash` spellings). Fine-grained `EXECUTING` progress relies on Scout
-  emitting a `result.lifecycle` array; without it the track shows Accepted, not Executing.
-- **`source` on delivery** — Scout must tolerate the added `source` field on
-  `GET /agent/commands` (additive; existing agents ignore unknown fields).
+- **Route content hash — IMPLEMENTED.** The **Operator backend** is the authoritative
+  calculator (`mission_contract.route_content_hash`); there is deliberately no frontend
+  implementation, and none may be reintroduced — a second calculator is a second thing that
+  can drift from Scout. Canonicalization: route items only (Home excluded), 1-based
+  `sequence`, fixed `MAV_CMD_NAV_WAYPOINT` / `MAV_FRAME_GLOBAL_RELATIVE_ALT`, lat/lng to 7
+  dp, altitude `0.0`, `loiter_time_s` → `param1` to 3 dp, `param2..4` `0.0`, then
+  `json.dumps(sort_keys=True, separators=(",", ":"))`, UTF-8, SHA-256, `sha256:` prefix.
+  Pinned against Scout's golden hash in `tests/fixtures/mission-contract-v1.json`.
+  A missing expected or observed route hash is an explicit verification **failure**, never a
+  count-only pass. *(Superseded history: an earlier operator-side `wpm1:` FNV-1a hash was
+  locally invented, never computed by Scout, and was removed rather than re-guessed.)*
+- **`MISSION_UPLOAD` result shape** — `{accepted, uploaded?, verified,
+  observed_route_waypoint_count, observed_pixhawk_item_count, observed_route_content_hash,
+  error?}` (tolerant of `route_waypoint_count` / `pixhawk_item_count` / `observed_count` /
+  `count` spellings). `uploaded` is checked only when present. Scout's **full-mission**
+  `hash` / `full_mission_hash` is never compared against the route hash — it includes the
+  Home the operator never sent, so it is a different value over different bytes.
+- **`MISSION_CLEAR` result shape** — `{contract_version, accepted, cleared, verified,
+  observed_pixhawk_item_count, observed_route_waypoint_count, empty_representation,
+  acknowledgement, error}`. Verified requires `accepted` + `cleared` + `verified` +
+  `observed_route_waypoint_count == 0` + `empty_representation` ∈ {`NO_ITEMS`, `HOME_ONLY`}.
+  The Pixhawk item count is **not** required to be 0 — ArduPilot may keep Home at seq 0.
+- **`agent.mission_upload`** — assumed `{active, state, command_id, elapsed_s}` in the
+  status payload's `agent` group, with `command_id` equal to the operator's command id.
+  Progress is mapped **only** on an id match; without the group the track shows Requested
+  until the terminal result lands. Scout is **not** required to post an intermediate
+  ACCEPTED command result (the backend redelivers nonterminal commands, so it would simply
+  be redelivered).
+- **`MISSION_CLEAR`** — no Scout result contract yet, so the command is refused `501` and
+  the button is disabled with that reason. The classifier (accepted + verified + empty
+  read-back) is already written and tested for the day it lands.
+- **`source` on delivery** — Scout must tolerate the `source` field on
+  `GET /agent/commands` (additive; existing agents ignore unknown fields). It is always
+  `OPERATOR` for records created through the browser endpoint.
