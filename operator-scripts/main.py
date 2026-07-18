@@ -849,6 +849,22 @@ def _command_event(cmd, *, severity, message, source):
     )
 
 
+def _canonical_set_home_params(raw_params):
+    """SET_HOME always means "Scout's own current position at execution time" — a
+    browser-supplied lat/lng is a snapshot from whenever the operator last had a fix and
+    can be stale, or simply wrong, by the time the Local Agent actually calls Scout Flask.
+    The only authoritative field is mode:"current_position"; Scout chooses and verifies
+    its own position. Any lat/lng the caller supplied is kept, nested and clearly
+    separate, ONLY as non-authoritative audit metadata (what the operator's UI showed at
+    click time) — never as a target coordinate."""
+    canonical = {"mode": "current_position"}
+    raw = raw_params if isinstance(raw_params, dict) else {}
+    lat, lng = raw.get("lat"), raw.get("lng")
+    if lat is not None and lng is not None:
+        canonical["requested_position"] = {"lat": lat, "lng": lng}
+    return canonical
+
+
 def make_command(*, vid, ctype, params, created_by, comm_state, now, source=None):
     """Build + store a QUEUED command record (the spec command object)."""
     cmd = {
@@ -1348,7 +1364,11 @@ async def create_command(request: Request):
             "message": "Vehicle is DISCONNECTED — command will queue until next contact. "
                        "Resend with confirm:true to queue it."})
 
-    cmd = make_command(vid=vid, ctype=ctype, params=body.get("params"),
+    params = body.get("params")
+    if ctype == "SET_HOME":
+        params = _canonical_set_home_params(params)
+
+    cmd = make_command(vid=vid, ctype=ctype, params=params,
                        created_by=body.get("created_by"), comm_state=comm_state, now=now,
                        source=body.get("source"))
 
@@ -1488,9 +1508,12 @@ async def command_result(command_id: str, request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         body = {}
+    print(f"[COMMAND-RESULT] POST /api/commands/{command_id}/result body={body!r}")
     outcome = process_command_result(
         command_id, _pick(body, _RESULT_STATUS_KEYS),
         body.get("result"), _pick(body, _RESULT_REASON_KEYS), now)
+    print(f"[COMMAND-RESULT] command_id={command_id} found={outcome['found']} "
+          f"applied={outcome['applied']} error={outcome.get('error')}")
     if not outcome["found"]:
         return JSONResponse(status_code=404, content={
             "ok": False, "error": outcome.get("error", "unknown command id"),
@@ -1512,16 +1535,24 @@ async def agent_command_result(request: Request):
     Tolerant of field spellings (command_id/id/cmd_id, status/outcome, reason/error) and
     status aliases (TIMEOUT/ACK/DONE → the queue vocabulary). Idempotent by the uuid
     command id: replayed/duplicate results are no-ops (applied:false) — a flushed buffer
-    never creates duplicate history rows or re-executes. ALWAYS 2xx (per-item found/
-    applied flags carry the detail) so a buffered Agent can drain its backlog and stop
-    retrying even when some ids are unknown/already-terminal here."""
+    never creates duplicate history rows or re-executes.
+
+    A SINGLE result gets an honest HTTP status — 404 unknown command id, 400 invalid/
+    missing id or status — exactly like /api/commands/{id}/result. A silent 200 here
+    would tell the Agent its result "worked" while the command record stays non-terminal
+    and keeps being redelivered by GET /agent/commands until the TTL, forever looking
+    like the Agent never reported anything. A BATCH (2+ items, a flushed backlog) stays
+    ALWAYS 2xx — per-item found/applied/error carries the detail — so one unknown/
+    already-terminal id in a backlog never fails the whole flush; see _result_items."""
     now = datetime.now(timezone.utc)
     try:
         body = await request.json()
     except Exception:
         body = None
+    print(f"[COMMAND-RESULT] POST /agent/command_result body={body!r}")
     items = _result_items(body)
     if not items:
+        print("[COMMAND-RESULT] rejected: no command results in body")
         return JSONResponse(status_code=400, content={
             "ok": False, "error": "no command results in body",
             "expected": "{command_id, status} | [ ... ] | {results:[ ... ]}"})
@@ -1532,14 +1563,29 @@ async def agent_command_result(request: Request):
             it.get("result"), _pick(it, _RESULT_REASON_KEYS), now)
         for it in items
     ]
+    applied_n = sum(1 for r in results if r["applied"])
+    for r in results:
+        print(f"[COMMAND-RESULT] command_id={r['command_id']} found={r['found']} "
+              f"applied={r['applied']} status={r.get('status')} error={r.get('error')}")
+
     # Strip the full command echo from batch items to keep the ack compact; a single
     # result keeps it for parity with the id-in-path endpoint.
-    applied_n = sum(1 for r in results if r["applied"])
     if len(results) == 1:
         r = results[0]
-        return {"ok": True, "applied": r["applied"], "found": r["found"],
-                "error": r.get("error"), "command": r.get("command"),
-                "received": 1, "applied_count": applied_n}
+        # "missing command id" is a malformed request (400), not an unresolvable lookup
+        # (404) — the item never had an id to look up in the first place.
+        if r.get("error") == "missing command id":
+            status_code = 400
+        elif not r["found"]:
+            status_code = 404
+        elif r.get("error"):
+            status_code = 400
+        else:
+            status_code = 200
+        return JSONResponse(status_code=status_code, content={
+            "ok": status_code == 200, "applied": r["applied"], "found": r["found"],
+            "error": r.get("error"), "command": r.get("command"),
+            "received": 1, "applied_count": applied_n})
     compact = [{k: v for k, v in r.items() if k != "command"} for r in results]
     return {"ok": True, "received": len(results), "applied_count": applied_n,
             "results": compact}

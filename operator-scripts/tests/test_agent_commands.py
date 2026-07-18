@@ -86,7 +86,13 @@ class TestAgentCommandDelivery(AgentCommandsBase):
         self.assertEqual(len(cmds), 1)
         self.assertEqual(cmds[0]["command_id"], cid)
         self.assertEqual(cmds[0]["command_type"], "SET_HOME")
-        self.assertEqual(cmds[0]["params"], {"lat": 56.7, "lng": 13.0})
+        # Canonical contract: mode:"current_position" is authoritative (Scout picks and
+        # verifies its own fix); the browser-supplied lat/lng survives only as
+        # non-authoritative audit metadata under requested_position.
+        self.assertEqual(cmds[0]["params"], {
+            "mode": "current_position",
+            "requested_position": {"lat": 56.7, "lng": 13.0},
+        })
         self.assertTrue(cmds[0]["expires_at"])
 
         # The fetch is the claim.

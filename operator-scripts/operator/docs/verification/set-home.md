@@ -46,9 +46,15 @@ behalf.
 No dedicated route, no direct HTTP call to Scout from the operator backend — exactly
 the same command infrastructure as AUTO/RTL/LOITER/ARM/DISARM/PAUSE/RESUME:
 
-1. `POST /api/commands`  body `{ vehicle_id, type: "SET_HOME", params: { lat, lng },
+1. `POST /api/commands`  body `{ vehicle_id, type: "SET_HOME", params?: { lat, lng },
    confirm: true }` (confirm is required — SET_HOME is in `CONFIRM_REQUIRED_TYPES`,
-   same as ARM/DISARM) → `{ ok, command }`, `command.status` is `QUEUED`.
+   same as ARM/DISARM) → `{ ok, command }`, `command.status` is `QUEUED`. The backend
+   (`main.create_command` → `_canonical_set_home_params`) rewrites `params` for every
+   `SET_HOME` to the canonical `{ mode: "current_position", requested_position?: { lat,
+   lng } }` regardless of what was sent — Scout picks and verifies its OWN current
+   position; any lat/lng supplied is kept only as non-authoritative audit metadata under
+   `requested_position`, never as the target (see `commands.md`, "Command-result contract
+   hardening + SET_HOME canonicalization").
 2. The Local Agent claims it via `GET /api/commands/pending/{vehicle_id}` (QUEUED → SENT).
 3. The Local Agent reports the outcome via `POST /agent/command_result` or
    `POST /api/commands/{id}/result` — `status` ∈ `ACCEPTED|EXECUTED|REJECTED|FAILED`,
