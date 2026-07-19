@@ -756,12 +756,17 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .mu-step.on { color:var(--text); } .mu-step.on::before { background:var(--partitioned); }
 .mu-step.done { color:var(--connected); } .mu-step.done::before { background:var(--connected); }
 .mu-step.failed { color:var(--disconnected); } .mu-step.failed::before { background:var(--disconnected); }
+/* Scout reported success but the Operator's independent read-back is missing — deliberately
+   its own colour: neither the green of a confirmed mission nor the red of a failed one. */
+.mu-step.caution { color:var(--caution); } .mu-step.caution::before { background:var(--caution); }
 .mu-step::after { content:""; position:absolute; top:8px; left:-50%; width:100%; height:1px; background:var(--line); z-index:-1; }
 .mu-step:first-child::after { display:none; }
 .mu-verdict { font-size:12px; padding:10px 12px; border-radius:var(--r-sm); border:1px solid var(--line); margin-top:8px; }
 .mu-verdict.ok { color:var(--connected); border-color:rgba(62,207,142,.28); }
 .mu-verdict.bad { color:var(--disconnected); border-color:rgba(229,72,77,.28); }
 .mu-verdict.pending { color:var(--partitioned); border-color:rgba(242,169,59,.28); }
+/* Caution ≠ pending and ≠ ok: the operation is finished, but only Scout's word supports it. */
+.mu-verdict.caution { color:var(--caution); border-color:rgba(242,169,59,.35); background:rgba(242,169,59,.05); }
 
 .ctl-cmd.home-locked:disabled { opacity:.5; color:var(--caution); border-color:rgba(242,169,59,.28); }
 /* A command already sent and awaiting the vehicle's result — visibly still present (a

@@ -134,6 +134,36 @@ mission that is not the one uploaded.
   A missing expected or observed route hash is an explicit verification **failure**, never a
   count-only pass. *(Superseded history: an earlier operator-side `wpm1:` FNV-1a hash was
   locally invented, never computed by Scout, and was removed rather than re-guessed.)*
+- **Coordinate/loiter precision — CROSS-SYSTEM ARTIFACT-VERIFIED (no longer an assumption).**
+  The golden route carries only 4 decimals and so could never discriminate a coordinate
+  precision of 4 from one of 9 — that gap was real and is now closed. A high-precision
+  two-waypoint probe (11-decimal coordinates, 5-decimal loiter) was run **independently on
+  Scout and on the Operator**, and both produced
+  `sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad`.
+  The digest moves if `COORDINATE_PRECISION` leaves 7 or `LOITER_PRECISION` leaves 3, so the
+  agreement is evidence about the rounding itself rather than a relayed specification. Both
+  systems' values are recorded separately in the fixture's `high_precision_probe` and
+  asserted equal (`TestHighPrecisionProbeIsCrossSystemVerified`).
+- **Maximum route waypoints — SCOUT-OWNED (200).** mission-contract-v1 defines and enforces
+  `MAX_ROUTE_WAYPOINTS = 200`; Scout refuses an oversized mission with the structured error
+  `{code: "MISSION_TOO_LARGE", maximum_route_waypoints, observed_route_waypoints}`.
+  `main.MAX_ROUTE_WAYPOINTS` **mirrors** that number — it is not an independent Operator
+  judgement and must not be tuned locally; if Scout's limit changes, this constant follows.
+  It is enforced inside `canonical_mission_upload_params`, the one function both
+  `POST /api/missions/preview` and `POST /api/commands` call, so a route that previews can
+  never be refused on send. Published as `max_route_waypoints_source: "scout-contract"` on
+  `/api/commands/capabilities`.
+  **Why the Operator validates too, given Scout enforces it:** local rejection fails the
+  mission at *preview* — before anything is queued and before a byte reaches the vehicle —
+  rather than after a round trip. Scout remains the **authority**: its refusal is final, and
+  a `MISSION_TOO_LARGE` it returns is rendered from Scout's own two numbers
+  (`main.mission_error_text` / `missionErrorText`), never padded with generic wording and
+  never back-filled from the local constant when Scout omits a count.
+- **Preview is read-only by construction.** `POST /api/missions/preview` creates no command,
+  appends no event, and mutates no authority or vehicle state; it calls only the shared
+  canonicalizer. A browser-supplied `expected_route_content_hash` (or either expected count)
+  is **refused**, never echoed — a caller that could supply the expected hash would be
+  choosing the value its own upload is later "verified" against.
 - **`MISSION_UPLOAD` result shape** — `{accepted, uploaded?, verified,
   observed_route_waypoint_count, observed_pixhawk_item_count, observed_route_content_hash,
   error?}` (tolerant of `route_waypoint_count` / `pixhawk_item_count` / `observed_count` /
@@ -151,9 +181,15 @@ mission that is not the one uploaded.
   until the terminal result lands. Scout is **not** required to post an intermediate
   ACCEPTED command result (the backend redelivers nonterminal commands, so it would simply
   be redelivered).
-- **`MISSION_CLEAR`** — no Scout result contract yet, so the command is refused `501` and
-  the button is disabled with that reason. The classifier (accepted + verified + empty
-  read-back) is already written and tested for the day it lands.
+- **Independent read-back** — after Scout reports a terminal verified result, the Operator
+  fetches `GET /api/vehicles/{id}/pixhawk-mission` **again**, as its own second observation.
+  Scout verifying its own write is Scout marking its own homework, so the UI reports
+  **Verified** only once that independent fetch agrees. While it is outstanding the state is
+  *Awaiting independent readback* (**never** Failed — a Failed that flickers on every
+  successful upload teaches the operator to discount the real one); if it cannot be obtained
+  the state is a **caution** (*Scout verified; independent Operator readback unavailable*),
+  not a green result; if it disagrees with Scout the state is a high-severity
+  **verification conflict**.
 - **`source` on delivery** — Scout must tolerate the `source` field on
   `GET /agent/commands` (additive; existing agents ignore unknown fields). It is always
   `OPERATOR` for records created through the browser endpoint.

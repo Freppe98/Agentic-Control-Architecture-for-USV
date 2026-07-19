@@ -22,7 +22,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   parseMission, missionUploadParams, missionUploadStage, missionUploadCompare,
-  missionClearOutcome,
+  missionClearOutcome, missionOperationState, missionEvidence,
+  missionErrorText, missionErrorOf, MISSION_TOO_LARGE,
+  READBACK_PENDING, READBACK_AVAILABLE, READBACK_UNAVAILABLE,
 } from "../operator/lib/mission-upload.js";
 import { classifyMissionWaypoints } from "../operator/lib/mission.js";
 
@@ -326,4 +328,233 @@ test("the Clear button is gated by ordinary command gating only — no Scout-sup
   assert.equal(clearDisabled(false, true, true), false, "enabled under ordinary gating");
   assert.equal(clearDisabled(true, true, true), true, "an upload in flight still blocks it");
   assert.equal(clearDisabled(false, false, true), true, "no control authority still blocks it");
+});
+
+// ── The INDEPENDENT read-back axis ────────────────────────────────────────────
+// Scout verifying its own write is Scout marking its own homework. These tests pin the
+// three states that exist because collapsing them would misinform the operator: a pending
+// read-back is not a failure, a missing read-back is not a full verification, and a
+// disagreeing read-back is the most serious thing this page can report.
+const DONE = { stage: "Verified", index: 2, state: "done", reason: null, elapsedS: null };
+const RUNNING = { stage: "Executing", index: 1, state: "pending", reason: null, elapsedS: 3 };
+const FAILED = { stage: "Failed", index: 2, state: "failed", reason: "read-back mismatch", elapsedS: null };
+
+test("Scout verified + read-back still in flight is Awaiting independent readback, never Failed", () => {
+  const s = missionOperationState(DONE, READBACK_PENDING, null);
+  assert.equal(s.state, "awaiting_readback");
+  assert.equal(s.label, "Awaiting independent readback");
+  assert.equal(s.severity, "pending");
+  assert.notEqual(s.severity, "bad", "a normal successful upload must not flash Failed");
+  assert.match(s.detail, /not a failure/i);
+});
+
+test("an unobtainable independent read-back is a caution, not a full Verified", () => {
+  const s = missionOperationState(DONE, READBACK_UNAVAILABLE, null);
+  assert.equal(s.state, "readback_unavailable");
+  assert.equal(s.severity, "caution");
+  assert.equal(s.label, "Scout verified; independent Operator readback unavailable");
+  assert.notEqual(s.state, "verified", "Scout's word alone is not an independent verification");
+  assert.notEqual(s.severity, "ok");
+});
+
+test("a read-back we have but cannot compare is also a caution, not a conflict", () => {
+  // agrees === null means "available, but nothing comparable in it". Calling that a
+  // conflict would accuse Scout of lying when the truth is that we could not check.
+  const s = missionOperationState(DONE, READBACK_AVAILABLE, null);
+  assert.equal(s.state, "readback_unavailable");
+  assert.equal(s.severity, "caution");
+});
+
+test("a read-back that disagrees with Scout is a high-severity verification conflict", () => {
+  const s = missionOperationState(DONE, READBACK_AVAILABLE, false);
+  assert.equal(s.state, "conflict");
+  assert.equal(s.severity, "critical");
+  assert.match(s.label, /conflict/i);
+  assert.match(s.detail, /disagrees/i);
+});
+
+test("only Scout verified AND an agreeing independent read-back is Verified", () => {
+  const s = missionOperationState(DONE, READBACK_AVAILABLE, true);
+  assert.equal(s.state, "verified");
+  assert.equal(s.severity, "ok");
+});
+
+test("a Scout failure stays Failed regardless of the read-back status", () => {
+  for (const status of [READBACK_PENDING, READBACK_AVAILABLE, READBACK_UNAVAILABLE]) {
+    const s = missionOperationState(FAILED, status, null);
+    assert.equal(s.state, "failed", status);
+    assert.equal(s.severity, "bad", status);
+  }
+});
+
+test("an in-flight upload is never mistaken for an awaiting-read-back state", () => {
+  const s = missionOperationState(RUNNING, READBACK_PENDING, null);
+  assert.equal(s.state, "in_progress");
+  assert.equal(s.label, "Executing");
+});
+
+test("a hash-less read-back maps to caution, and a hash mismatch maps to conflict", () => {
+  // Mirrors Mission.js's real `agrees` derivation from missionUploadCompare.
+  const params = { expected_route_waypoint_count: 2, expected_pixhawk_item_count: 3,
+                   expected_route_content_hash: FIXTURE.scout_golden_route_hash };
+  const noHash = missionUploadCompare(params, { route_waypoint_count: 2, pixhawk_item_count: 3 }, 2);
+  const agreesNoHash = noHash.hashUnavailable ? null : noHash.match;
+  assert.equal(missionOperationState(DONE, READBACK_AVAILABLE, agreesNoHash).state,
+    "readback_unavailable", "counts agreed but content was never compared");
+
+  const wrongHash = missionUploadCompare(params, {
+    route_waypoint_count: 2, pixhawk_item_count: 3, route_content_hash: "sha256:beef" }, 2);
+  const agreesWrong = wrongHash.hashUnavailable ? null : wrongHash.match;
+  assert.equal(missionOperationState(DONE, READBACK_AVAILABLE, agreesWrong).state, "conflict");
+});
+
+// ── Exportable evidence ───────────────────────────────────────────────────────
+
+const EVIDENCE_CMD = {
+  id: "cmd-77", type: "MISSION_UPLOAD", status: "EXECUTED", source: "OPERATOR",
+  params: { contract_version: "mission-contract-v1", expected_route_waypoint_count: 2,
+            expected_pixhawk_item_count: 3,
+            expected_route_content_hash: FIXTURE.scout_golden_route_hash },
+  result: FIXTURE.verified_result,
+  created_at: "2026-07-18T10:00:00Z", claimed_at: "2026-07-18T10:00:01Z",
+  completed_at: "2026-07-18T10:00:09Z",
+};
+
+test("mission evidence export carries the six required top-level sections", () => {
+  const ev = missionEvidence({ cmd: EVIDENCE_CMD, readbackStatus: READBACK_AVAILABLE });
+  assert.deepEqual(Object.keys(ev).sort(),
+    ["command", "comparison", "independent_readback", "lifecycle", "scout_result", "timestamps"]);
+});
+
+test("mission evidence records the command, Scout's result and OUR read-back separately", () => {
+  const readback = FIXTURE.readback;
+  const comparison = missionUploadCompare(EVIDENCE_CMD.params, readback, 2);
+  const ev = missionEvidence({
+    cmd: EVIDENCE_CMD, readback, readbackStatus: READBACK_AVAILABLE,
+    readbackAt: Date.parse("2026-07-18T10:00:12Z"),
+    comparison, operationState: missionOperationState(DONE, READBACK_AVAILABLE, true),
+    requestedAt: Date.parse("2026-07-18T10:00:00Z"),
+  });
+  assert.equal(ev.command.command_id, "cmd-77");
+  assert.equal(ev.command.contract_version, "mission-contract-v1");
+  // Scout's claim and our own observation must stay distinguishable in the artifact —
+  // merging them would destroy the only thing that makes it evidence.
+  assert.equal(ev.scout_result.observed_route_content_hash, FIXTURE.scout_golden_route_hash);
+  assert.equal(ev.independent_readback.mission.route_content_hash, FIXTURE.scout_golden_route_hash);
+  assert.equal(ev.independent_readback.status, READBACK_AVAILABLE);
+  assert.equal(ev.independent_readback.fetched_at, "2026-07-18T10:00:12.000Z");
+  assert.equal(ev.comparison.match, true);
+  assert.equal(ev.lifecycle.operation_state, "verified");
+  assert.equal(ev.timestamps.completed_at, "2026-07-18T10:00:09Z");
+});
+
+test("mission evidence exports absences as null rather than omitting them", () => {
+  // A reader must be able to tell "not reported" from "not exported".
+  const ev = missionEvidence({ cmd: { id: "cmd-1", type: "MISSION_CLEAR" },
+                               readbackStatus: READBACK_UNAVAILABLE });
+  assert.equal(ev.scout_result, null);
+  assert.equal(ev.comparison, null);
+  assert.equal(ev.independent_readback.mission, null);
+  assert.equal(ev.independent_readback.fetched_at, null);
+  assert.equal(ev.command.contract_version, null);
+  assert.equal(ev.timestamps.completed_at, null);
+});
+
+test("mission evidence never attributes another command's Scout worker block to this one", () => {
+  const foreign = { active: true, state: "UPLOADING", command_id: "cmd-OTHER", elapsed_s: 4 };
+  const mineBlock = { active: true, state: "UPLOADING", command_id: "cmd-77", elapsed_s: 4 };
+  assert.equal(missionEvidence({ cmd: EVIDENCE_CMD, live: foreign }).lifecycle.scout_worker, null);
+  assert.deepEqual(missionEvidence({ cmd: EVIDENCE_CMD, live: mineBlock }).lifecycle.scout_worker,
+    mineBlock);
+});
+
+test("mission evidence is JSON-serializable round-trip", () => {
+  const ev = missionEvidence({ cmd: EVIDENCE_CMD, readback: FIXTURE.readback,
+                               readbackStatus: READBACK_AVAILABLE, readbackAt: Date.now() });
+  assert.deepEqual(JSON.parse(JSON.stringify(ev)), ev);
+});
+
+// ── Scout's structured MISSION_TOO_LARGE error ────────────────────────────────
+// The limit (200) is SCOUT'S, defined and enforced by mission-contract-v1. When Scout
+// refuses an oversized route it states both numbers, and those numbers ARE the
+// explanation — the operator must see the maximum and what they actually submitted.
+
+const TOO_LARGE_ERR = { code: "MISSION_TOO_LARGE",
+                        maximum_route_waypoints: 200, observed_route_waypoints: 250 };
+
+test("MISSION_TOO_LARGE renders BOTH the maximum and the submitted count", () => {
+  const text = missionErrorText(TOO_LARGE_ERR);
+  assert.match(text, /200/, "must state the maximum Scout allows");
+  assert.match(text, /250/, "must state what this route submitted");
+  assert.match(text, /mission-contract-v1/);
+});
+
+test("MISSION_TOO_LARGE is never rendered as a bare error code", () => {
+  const text = missionErrorText(TOO_LARGE_ERR);
+  assert.notEqual(text, "MISSION_TOO_LARGE");
+  assert.match(text, /route waypoints/);
+});
+
+test("a structured Scout error is not padded with generic explanation", () => {
+  // The generic tail fits any failure and helps with none; MISSION_TOO_LARGE is fully
+  // actionable on its own.
+  const text = missionErrorText(TOO_LARGE_ERR);
+  assert.doesNotMatch(text, /may be unchanged or partial/i);
+  assert.doesNotMatch(text, /not verified by read-back/i);
+});
+
+test("MISSION_TOO_LARGE without its counts says so — never back-filled from a local constant", () => {
+  // Substituting the Operator's own 200 for a maximum Scout omitted would present an
+  // Operator number as Scout's word.
+  const text = missionErrorText({ code: "MISSION_TOO_LARGE" });
+  assert.match(text, /did not report both counts/);
+  assert.doesNotMatch(text, /200/);
+});
+
+test("missionErrorText returns null when Scout supplied nothing structured", () => {
+  // Null is the signal for the caller to use its own generic wording.
+  assert.equal(missionErrorText(null), null);
+  assert.equal(missionErrorText({}), null);
+  assert.equal(missionErrorText({ message: "boom" }), "boom");
+  assert.equal(missionErrorText({ code: "SOME_OTHER" }), "SOME_OTHER");
+});
+
+test("missionErrorOf finds Scout's structured error on the record, or null", () => {
+  assert.deepEqual(missionErrorOf({ result: { error: TOO_LARGE_ERR } }), TOO_LARGE_ERR);
+  assert.deepEqual(missionErrorOf({ error: TOO_LARGE_ERR }), TOO_LARGE_ERR);
+  assert.equal(missionErrorOf({ result: { error: "just a string" } }), null);
+  assert.equal(missionErrorOf({}), null);
+  assert.equal(missionErrorOf(null), null);
+});
+
+test("the UI failure branch prefers Scout's structured error over the generic reason", () => {
+  // Mirrors Mission.js's real verdict selection: structured error wins, and when it wins
+  // the generic "may be unchanged or partial" tail is not rendered at all.
+  const cmd = { id: "c1", type: "MISSION_UPLOAD", status: "EXECUTED",
+                mission_result: "failed", reason: "MISSION_TOO_LARGE",
+                result: { accepted: false, verified: false, error: TOO_LARGE_ERR } };
+  const stg = missionUploadStage(cmd, null);
+  assert.equal(stg.state, "failed");
+  const structured = missionErrorText(missionErrorOf(cmd));
+  assert.ok(structured, "a structured error must be found for this record");
+  assert.match(structured, /200/);
+  assert.match(structured, /250/);
+});
+
+test("an unstructured failure still falls back to the generic reason", () => {
+  const cmd = { id: "c2", type: "MISSION_UPLOAD", status: "EXECUTED",
+                mission_result: "failed", reason: "Mission was not verified by read-back.",
+                result: { accepted: true, verified: false } };
+  assert.equal(missionErrorText(missionErrorOf(cmd)), null, "nothing structured to render");
+  assert.match(missionUploadStage(cmd, null).reason, /not verified/i);
+});
+
+test("a MISSION_TOO_LARGE record exports both numeric fields in the evidence JSON", () => {
+  const cmd = { id: "c3", type: "MISSION_UPLOAD", status: "EXECUTED",
+                params: { contract_version: "mission-contract-v1" },
+                result: { accepted: false, verified: false, error: TOO_LARGE_ERR } };
+  const ev = missionEvidence({ cmd, readbackStatus: READBACK_UNAVAILABLE });
+  assert.equal(ev.scout_result.error.maximum_route_waypoints, 200);
+  assert.equal(ev.scout_result.error.observed_route_waypoints, 250);
+  assert.equal(ev.scout_result.error.code, MISSION_TOO_LARGE);
 });

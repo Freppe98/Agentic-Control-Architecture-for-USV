@@ -49,8 +49,18 @@ The rounding is load-bearing in both directions. It is what lets a float that ar
 int `0` and a float `0.0` loiter canonicalize to the same bytes. Changing either
 precision changes every hash and silently breaks agreement with Scout.
 
-Pinned cross-system golden value — see tests/fixtures/mission-contract-v1.json and
-tests/test_mission_contract.py, which fail loudly if this module ever drifts from it.
+THE PRECISIONS ARE CROSS-SYSTEM ARTIFACT-VERIFIED (not merely spec-relayed).
+The 4-decimal golden route cannot discriminate a coordinate precision of 4 from one of 9,
+so agreement on it never proved the precisions. A high-precision two-waypoint probe —
+coordinates carrying 11 decimals, loiter carrying 5 — was therefore run INDEPENDENTLY on
+Scout and on this module, and both produced the identical digest:
+
+    sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad
+
+That digest moves if COORDINATE_PRECISION leaves 7 or LOITER_PRECISION leaves 3, so the
+agreement is evidence about the rounding itself, produced by two implementations rather
+than relayed from a document. See tests/fixtures/mission-contract-v1.json
+(high_precision_probe) and tests/test_mission_contract.py, which fail loudly on drift.
 """
 
 import hashlib

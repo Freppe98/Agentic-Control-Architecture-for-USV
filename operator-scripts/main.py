@@ -929,6 +929,44 @@ MISSION_CLEAR_UNSUPPORTED_REASON = None
 # Pixhawk item count is deliberately NOT forced to 0.
 MISSION_EMPTY_REPRESENTATIONS = ("NO_ITEMS", "HOME_ONLY")
 
+# Maximum route waypoints in ONE upload. THE single limit — canonical_mission_upload_params
+# enforces it, and both callers (POST /api/missions/preview and POST /api/commands) go
+# through that function, so preview can never accept a route the upload would refuse. A
+# preview that succeeds for a mission the command endpoint rejects is the specific defect
+# this shared constant exists to prevent.
+#
+# PROVENANCE — SCOUT OWNS THIS NUMBER. mission-contract-v1 defines and enforces
+# MAX_ROUTE_WAYPOINTS = 200, and Scout refuses an oversized mission with the structured
+# error {code: "MISSION_TOO_LARGE", maximum_route_waypoints, observed_route_waypoints}.
+# The value here MIRRORS Scout's; it is not an independent Operator judgement, and it must
+# not be tuned locally. If Scout changes its limit, this constant follows — changing it
+# here alone would put the two systems back out of agreement, which is exactly what the
+# earlier Operator-chosen placeholder risked.
+#
+# WHY THE OPERATOR STILL VALIDATES, given Scout enforces it too: rejecting locally means an
+# oversized mission fails at preview — before anything is queued and before a single byte
+# reaches the vehicle — instead of being transmitted, refused, and reported back as a failed
+# command. Scout remains the AUTHORITY (its refusal is final and its structured error is
+# what the operator is shown); this check is a fail-fast mirror of that authority, never a
+# second opinion about what the limit is.
+MAX_ROUTE_WAYPOINTS = 200
+MAX_ROUTE_WAYPOINTS_SOURCE = "scout-contract"
+
+# Scout's structured error code for an oversized mission (mission-contract-v1). Rendered
+# with Scout's OWN numbers — see mission_error_text.
+MISSION_TOO_LARGE_CODE = "MISSION_TOO_LARGE"
+
+# Keys a caller may NOT supply at the top level of a mission request. `expected_*` are
+# DERIVED by this backend, which is the single authoritative calculator — accepting a
+# browser-supplied expected_route_content_hash would let the client choose the value its
+# own upload is later "verified" against, which is not a verification at all. Refused
+# loudly rather than ignored, so an attempt to inject one is visible instead of silent.
+MISSION_DERIVED_ONLY_FIELDS = (
+    "expected_route_content_hash",
+    "expected_route_waypoint_count",
+    "expected_pixhawk_item_count",
+)
+
 # Fields a caller may send per route waypoint. Anything else is refused rather than
 # silently dropped: Scout does not yet accept arbitrary MAVLink items, so previewing a
 # `command`/`frame`/`altitude` the flight controller will never receive would be showing
@@ -946,6 +984,34 @@ MISSION_UNSUPPORTED_FIELDS = {
     "seq": "Sequence numbers are Scout-owned — Scout owns seq 0 / Home and numbers the "
            "route itself. Remove `seq`.",
 }
+
+
+def mission_error_text(error):
+    """Operator-facing text for a STRUCTURED Scout mission error, or None when Scout sent
+    nothing structured enough to render.
+
+    Returning None is the important half: the caller then falls back to its own generic
+    wording. This function NEVER invents a explanation, and never pads Scout's structured
+    error with a guess — when Scout says MISSION_TOO_LARGE and states both numbers, those
+    numbers ARE the explanation, and appending "the mission may not have been uploaded"
+    style filler would bury a precise, actionable fact under boilerplate.
+
+    A MISSION_TOO_LARGE whose numbers are missing renders what Scout actually sent and says
+    the counts were not reported — it does not substitute MAX_ROUTE_WAYPOINTS for the
+    maximum Scout omitted, because that would present an Operator constant as Scout's word.
+    """
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if code == MISSION_TOO_LARGE_CODE:
+        maximum = error.get("maximum_route_waypoints")
+        observed = error.get("observed_route_waypoints")
+        if maximum is not None and observed is not None:
+            return (f"Mission too large — Scout accepts at most {maximum} route waypoints "
+                    f"under {MISSION_CONTRACT_VERSION}; this route submitted {observed}.")
+        return ("Mission too large — Scout refused the route as MISSION_TOO_LARGE but did "
+                "not report both counts.")
+    return error.get("message") or (str(code) if code else None)
 
 
 class MissionContractError(ValueError):
@@ -990,12 +1056,31 @@ def canonical_mission_upload_params(raw_params):
             f"Unsupported contract_version {version!r} — this station speaks "
             f"{MISSION_CONTRACT_VERSION}.")
 
+    # A client may not supply what the backend derives — above all the expected hash, which
+    # is the value the upload is later verified against. See MISSION_DERIVED_ONLY_FIELDS.
+    for field in MISSION_DERIVED_ONLY_FIELDS:
+        if field in raw:
+            errors.append(
+                f"`{field}` is derived by the operator backend and may not be supplied by "
+                f"the caller — remove it.")
+
     items = raw.get("waypoints")
     if not isinstance(items, list):
         errors.append("Missing `waypoints` — expected a list of route waypoints.")
         raise MissionContractError(errors)
     if not items:
         errors.append("Mission contains no route waypoints.")
+        raise MissionContractError(errors)
+    # Checked BEFORE per-waypoint validation: a 5000-waypoint route should report the one
+    # actionable problem, not 5000 derived ones.
+    if len(items) > MAX_ROUTE_WAYPOINTS:
+        # Worded as Scout's limit because it IS Scout's — the operator should not be told a
+        # local policy refused their mission when the flight system's contract did.
+        errors.append(
+            f"Route has {len(items)} route waypoints — mission-contract-v1 accepts at most "
+            f"{MAX_ROUTE_WAYPOINTS} (Scout-enforced). Refused here before transmission; "
+            f"Scout would reject it as {MISSION_TOO_LARGE_CODE}. "
+            f"Split the mission into shorter routes.")
         raise MissionContractError(errors)
 
     waypoints = []
@@ -1306,7 +1391,9 @@ def _annotate_mission_upload_result(cmd):
     result = cmd.get("result") if isinstance(cmd.get("result"), dict) else {}
     error = result.get("error") if isinstance(result.get("error"), dict) else {}
     params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
-    err_msg = error.get("message") or error.get("code")
+    # A structured Scout error (e.g. MISSION_TOO_LARGE with its two counts) is rendered from
+    # Scout's OWN fields, and takes precedence over every generic fallback below.
+    err_msg = mission_error_text(error)
 
     exp_route = params.get("expected_route_waypoint_count")
     exp_items = params.get("expected_pixhawk_item_count")
@@ -1684,6 +1771,14 @@ def command_capabilities():
         "ok": True,
         "contract_version": MISSION_CONTRACT_VERSION,
         "commands": caps,
+        # Published so the UI can state the real limit instead of hard-coding a second copy
+        # of it. `source` is here because the number's PROVENANCE is operator-facing:
+        # "scout-contract" means mission-contract-v1 defines and enforces this limit and the
+        # Operator mirrors it, which is what the UI tells the operator. A locally chosen
+        # limit would have to say so instead — the field exists so the two can never be
+        # confused for one another.
+        "max_route_waypoints": MAX_ROUTE_WAYPOINTS,
+        "max_route_waypoints_source": MAX_ROUTE_WAYPOINTS_SOURCE,
     }
 
 
@@ -1696,9 +1791,27 @@ async def mission_preview(request: Request):
     backend is the single authoritative one (see mission_contract.py). Previewing the
     counts locally but the hash not at all would ask the operator to approve a mission
     whose identity they cannot see, and computing it in JavaScript would create the second
-    implementation the contract exists to avoid. Read-only: no command, no vehicle, no
-    side effects — same validation, same errors, same canonical params as a real upload."""
-    body = await request.json()
+    implementation the contract exists to avoid.
+
+    READ-ONLY BY CONSTRUCTION, and this is load-bearing: it creates no command, appends no
+    event, and touches no authority or vehicle state. The only thing it calls is
+    canonical_mission_upload_params — the SAME function POST /api/commands calls — so the
+    validation, the error list, the waypoint limit (MAX_ROUTE_WAYPOINTS) and the derived
+    params are identical by construction rather than by two implementations agreeing. A
+    preview that accepted a route the upload would refuse would show the operator a hash for
+    a mission they cannot actually send; the shared function is what makes that impossible.
+    Nothing in the request body reaches the derived fields — an `expected_route_content_hash`
+    supplied by the browser is REFUSED, never echoed back as if it had been computed."""
+    try:
+        body = await request.json()
+    except Exception:
+        # A malformed body is the caller's error, not a 500. Same shape as the contract
+        # violation below so the UI has one error path to render.
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "mission_contract_violation",
+            "contract_version": MISSION_CONTRACT_VERSION,
+            "message": "Request body is not valid JSON.",
+            "errors": ["Request body is not valid JSON."]})
     try:
         params = canonical_mission_upload_params(body)
     except MissionContractError as exc:

@@ -30,7 +30,7 @@
 // produce a hash comparison that is worse than none — it reports mismatch for correct
 // routes and, worse, can agree for the wrong reason. An earlier version did compute a
 // local "wpm1:" FNV-1a hash that Scout never computed; it is gone and stays gone.
-import { commandVerification } from "./command.js";
+import { commandVerification, commandStages } from "./command.js";
 
 export const MISSION_CONTRACT_VERSION = "mission-contract-v1";
 
@@ -333,6 +333,166 @@ export function missionUploadCompare(params, readback, routeCount) {
     hashUnavailable: hashMatch === null,
     // Whether the read-back's route count came from Scout or from our local derivation.
     routeCountSource: r.route_waypoint_count != null ? "scout" : "derived",
+  };
+}
+
+/** Scout's structured error code for an oversized mission (mission-contract-v1). */
+export const MISSION_TOO_LARGE = "MISSION_TOO_LARGE";
+
+/**
+ * Operator-facing text for a STRUCTURED Scout mission error, or null when Scout sent
+ * nothing structured enough to render. Mirrors main.mission_error_text — the backend
+ * renders this for records it classifies, and the UI renders it for what it holds live;
+ * both read Scout's own fields and neither invents.
+ *
+ * Returning null is the important half: the caller falls back to its generic wording only
+ * when Scout gave it nothing. When Scout DID supply a structured error, that error is the
+ * whole explanation — wrapping it in "the upload could not be verified by read-back"
+ * boilerplate would bury a precise, actionable fact (you sent 250, the limit is 200) under
+ * generic text that fits any failure and helps with none.
+ *
+ * A MISSION_TOO_LARGE missing its counts renders what Scout actually sent and says so; it
+ * does NOT substitute a local constant for the maximum Scout omitted, because presenting an
+ * Operator number as Scout's word is precisely the fabrication this contract forbids.
+ */
+export function missionErrorText(err) {
+  if (!err || typeof err !== "object") return typeof err === "string" && err ? err : null;
+  if (err.code === MISSION_TOO_LARGE) {
+    const max = err.maximum_route_waypoints, obs = err.observed_route_waypoints;
+    if (max != null && obs != null) {
+      return `Mission too large — Scout accepts at most ${max} route waypoints under ` +
+             `${MISSION_CONTRACT_VERSION}; this route submitted ${obs}.`;
+    }
+    return "Mission too large — Scout refused the route as MISSION_TOO_LARGE but did not " +
+           "report both counts.";
+  }
+  return err.message || (err.code ? String(err.code) : null);
+}
+
+/** Scout's structured error for a command record, wherever it landed. Never a string
+ *  assembled here — just the object Scout sent, or null. */
+export function missionErrorOf(cmd) {
+  if (!cmd) return null;
+  const fromResult = cmd.result && typeof cmd.result === "object" ? cmd.result.error : null;
+  const err = fromResult || cmd.error;
+  return err && typeof err === "object" ? err : null;
+}
+
+// ── The INDEPENDENT read-back axis ──────────────────────────────────────────────
+// Scout reporting "verified" is Scout marking its own homework: Scout wrote the mission,
+// Scout read it back, Scout compared. The Operator's own post-operation fetch of the
+// Pixhawk mission is a SECOND, independent observation, and the difference between the two
+// is exactly what a verification claim is worth. So the UI state is not a function of
+// Scout's result alone — it is a function of Scout's result AND what our own read-back
+// found, including the case where our read-back could not be obtained at all.
+/** Status of the Operator's own post-operation read-back. */
+export const READBACK_PENDING = "pending";          // fetch in flight / not yet started
+export const READBACK_AVAILABLE = "available";      // we have our own observation
+export const READBACK_UNAVAILABLE = "unavailable";  // Scout/FC unreachable, fetch failed
+
+/**
+ * Fold Scout's terminal result together with the Operator's INDEPENDENT read-back into the
+ * one state the UI renders. Three states here exist specifically because collapsing them
+ * misinforms the operator:
+ *
+ *   • `awaiting_readback` — Scout says verified, our fetch has not landed. This must NOT
+ *     render as Failed. The read-back is asynchronous and normally takes a moment; showing
+ *     Failed for that window would cry wolf on every single successful upload, and an
+ *     operator who learns that "Failed" flickers on success will discount a real Failed.
+ *   • `readback_unavailable` — our fetch could not be obtained. This must NOT render as
+ *     full Verified: we have Scout's word and nothing else. It is a CAUTION — the operation
+ *     probably succeeded, but the independent axis is missing, which is precisely the
+ *     situation the operator needs to know they are in.
+ *   • `conflict` — our read-back disagrees with Scout's terminal result. Highest severity
+ *     of anything here: it means one of the two systems is reporting something untrue about
+ *     the flight controller, and neither can be trusted about this mission until resolved.
+ *
+ * @param stg missionUploadStage result (Scout-side lifecycle)
+ * @param readbackStatus one of READBACK_PENDING / READBACK_AVAILABLE / READBACK_UNAVAILABLE
+ * @param agrees true / false / null — does the independent read-back agree with Scout?
+ *   null means "available but nothing comparable in it" (treated as unavailable evidence).
+ * @returns {{ state, severity, label, detail }} severity: info|pending|caution|bad|critical|ok
+ */
+export function missionOperationState(stg, readbackStatus, agrees) {
+  if (!stg || stg.state === "idle") {
+    return { state: "idle", severity: "info", label: "Idle", detail: null };
+  }
+  if (stg.state === "failed") {
+    return { state: "failed", severity: "bad", label: "Failed",
+             detail: stg.reason || "The operation was not verified." };
+  }
+  if (stg.state !== "done") {
+    return { state: "in_progress", severity: "pending", label: stg.stage,
+             detail: "Scout has not reported a terminal result yet." };
+  }
+  // Scout reports verified. What the Operator independently observed now decides.
+  if (readbackStatus === READBACK_PENDING) {
+    return { state: "awaiting_readback", severity: "pending",
+             label: "Awaiting independent readback",
+             detail: "Scout reported the operation verified. Fetching the Pixhawk mission " +
+                     "independently to confirm — this is not a failure." };
+  }
+  if (readbackStatus === READBACK_UNAVAILABLE || agrees === null) {
+    return { state: "readback_unavailable", severity: "caution",
+             label: "Scout verified; independent Operator readback unavailable",
+             detail: "Scout reported success, but the Operator could not obtain its own " +
+                     "read-back of the flight controller. Only Scout's word supports this " +
+                     "result — the independent axis is missing." };
+  }
+  if (agrees === false) {
+    return { state: "conflict", severity: "critical", label: "Verification conflict",
+             detail: "Scout reported this operation verified, but the Operator's own " +
+                     "read-back of the flight controller disagrees. Do not trust either " +
+                     "report about this mission until the disagreement is resolved." };
+  }
+  return { state: "verified", severity: "ok", label: "Verified",
+           detail: "Scout's result and the Operator's independent read-back agree." };
+}
+
+/**
+ * Build the exportable evidence record for ONE mission operation — the artifact a bench
+ * test or the thesis writeup cites. Deliberately a pure function over data already on the
+ * page: it INVENTS nothing, and every absent value is exported as null rather than omitted,
+ * so a reader can tell "not reported" from "not exported".
+ *
+ * @returns {{ command, lifecycle, scout_result, independent_readback, comparison, timestamps }}
+ */
+export function missionEvidence({ cmd, live, readback, readbackStatus, readbackAt,
+                                  comparison, operationState, requestedAt } = {}) {
+  const c = cmd || {};
+  return {
+    command: {
+      command_id: c.id ?? null,
+      type: c.type ?? null,
+      status: c.status ?? null,
+      source: c.source ?? null,
+      contract_version: (c.params && c.params.contract_version) ?? null,
+      params: c.params ?? null,
+    },
+    lifecycle: {
+      stages: commandStages(c),
+      scout_lifecycle: c.scout_lifecycle ?? null,
+      operation_state: operationState ? operationState.state : null,
+      severity: operationState ? operationState.severity : null,
+      // Scout's live worker block, but only when it is THIS command's — an unmatched
+      // block describes some other upload and would be misleading evidence.
+      scout_worker: liveUploadMatches(live, c.id) ? live : null,
+    },
+    scout_result: c.result ?? null,
+    independent_readback: {
+      status: readbackStatus ?? null,
+      fetched_at: readbackAt ? new Date(readbackAt).toISOString() : null,
+      mission: readback ?? null,
+    },
+    comparison: comparison ?? null,
+    timestamps: {
+      requested_at: requestedAt ? new Date(requestedAt).toISOString() : null,
+      created_at: c.created_at ?? null,
+      claimed_at: c.claimed_at ?? null,
+      completed_at: c.completed_at ?? null,
+      readback_at: readbackAt ? new Date(readbackAt).toISOString() : null,
+      exported_at: new Date().toISOString(),
+    },
   };
 }
 

@@ -13,12 +13,12 @@
     "digest from the request waypoints — that agreement is what makes this a real",
     "cross-system proof rather than a self-consistent local one.",
     "",
-    "KNOWN RESIDUAL RISK: this route's coordinates carry only 4 decimal places, so the",
-    "golden hash does NOT discriminate between coordinate rounding precisions of 4 through",
-    "9, nor loiter precisions of 0 through 3. The implemented values (7 and 3) come from",
-    "Scout's spec, not from this fixture. A route with 5+ decimal coordinates would pin",
-    "them; adding one requires a golden hash computed by Scout. Until then the precision is",
-    "spec-verified but not artifact-verified. See high_precision_probe below."
+    "COORDINATE/LOITER PRECISION IS NOW CROSS-SYSTEM ARTIFACT-VERIFIED. This golden route's",
+    "coordinates carry only 4 decimal places, so this hash alone does NOT discriminate",
+    "coordinate precisions 4-9 or loiter precisions 0-3 — that gap was real and is now",
+    "closed by high_precision_probe below, whose digest Scout and the Operator computed",
+    "INDEPENDENTLY and which agreed exactly. The precisions (7 and 3) are therefore",
+    "artifact-verified, not merely relayed from Scout's specification."
   ],
 
   "contract_version": "mission-contract-v1",
@@ -82,17 +82,28 @@
 
   "high_precision_probe": {
     "_comment": [
-      "NOT a Scout-pinned value — computed by the Operator implementation only. It exists so",
-      "a precision drift is at least detectable locally: if someone changes coordinate or",
-      "loiter precision, this hash moves while the golden hash above does not. Replace with",
-      "a Scout-computed hash to turn this into a real cross-system precision proof."
+      "THE PRECISION PROOF. The golden route above carries only 4 decimals and therefore",
+      "cannot detect a change to COORDINATE_PRECISION or LOITER_PRECISION. This probe can:",
+      "its coordinates carry 11 decimals and its loiter values 5, so the digest moves if",
+      "either precision leaves 7 / 3 respectively.",
+      "",
+      "This probe was executed INDEPENDENTLY on Scout and on the Operator, and the two",
+      "systems produced the identical digest. The precisions are therefore cross-system",
+      "artifact-verified — established by two implementations agreeing on a computed",
+      "artifact, not by a specification being relayed verbally and trusted.",
+      "",
+      "Both hashes are recorded separately and asserted EQUAL by the test suite. Keeping one",
+      "field would collapse the very distinction that makes this evidence: a single value",
+      "cannot show that two systems agreed."
     ],
     "waypoints": [
       { "latitude": 56.65012345678, "longitude": 12.87016789012, "loiter_time_s": 12.34567 },
       { "latitude": 56.65127654321, "longitude": 12.87259876543, "loiter_time_s": 0.9994 }
     ],
-    "operator_computed_canonical_json": "[{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6501235,\"longitude\":12.8701679,\"param1\":12.346,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":1},{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6512765,\"longitude\":12.8725988,\"param1\":0.999,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":2}]",
-    "operator_computed_route_content_hash": "sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad"
+    "canonical_json": "[{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6501235,\"longitude\":12.8701679,\"param1\":12.346,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":1},{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6512765,\"longitude\":12.8725988,\"param1\":0.999,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":2}]",
+    "scout_computed_route_content_hash": "sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad",
+    "operator_computed_route_content_hash": "sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad",
+    "cross_system_verified": true
   },
 
   "verified_result": {
