@@ -122,6 +122,52 @@ class NormalizedVerificationTests(CommandModelBase):
             "verified": False, "error": {"code": "NO_ACK", "message": "No ack"}})
         self.assertEqual(cmd["error"], {"code": "NO_ACK", "message": "No ack"})
 
+    def test_numeric_observed_mode_renders_canonically_with_raw_retained(self):
+        # Scout reports the observed mode as a numeric custom_mode (10 = AUTO). The
+        # verification display must canonicalize it to AUTO (never leak the bare number),
+        # while retaining the raw value as observed_raw.
+        cmd = self.executed("SET_MODE_AUTO", {
+            "verified": True, "requested_mode": "AUTO", "observed_mode": 10})
+        self.assertEqual(cmd["verification"]["verified"], True)
+        self.assertEqual(cmd["verification"]["outcome"], "VERIFIED")
+        self.assertEqual(cmd["verification"]["observed"], "AUTO")
+        self.assertEqual(cmd["verification"]["observed_raw"], 10)
+
+    def test_numeric_observed_loiter_5_renders_canonically(self):
+        cmd = self.executed("SET_MODE_LOITER", {
+            "verified": True, "requested_mode": "LOITER", "observed_mode": 5})
+        self.assertEqual(cmd["verification"]["observed"], "LOITER")
+        self.assertEqual(cmd["verification"]["observed_raw"], 5)
+
+
+class CommandByIdLookupTests(CommandModelBase):
+    """The single-command debug read route GET /api/command/{command_id}. It exists because
+    the plural GET /api/commands/{vehicle_id} takes a VEHICLE id, so a command uuid probed
+    there parses to vehicle_id -1 and returns nothing — a confusing false negative."""
+
+    def test_lookup_returns_the_command_by_uuid(self):
+        cid = self.create("SET_MODE_AUTO").json()["command"]["id"]
+        r = self.client.get(f"/api/command/{cid}")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["command"]["id"], cid)
+        self.assertIn("verification", body["command"])
+
+    def test_unknown_command_id_is_a_clean_json_404(self):
+        r = self.client.get("/api/command/no-such-command")
+        self.assertEqual(r.status_code, 404)
+        self.assertFalse(r.json()["ok"])
+        self.assertEqual(r.json()["command_id"], "no-such-command")
+
+    def test_plural_route_still_treats_its_path_arg_as_a_vehicle_id(self):
+        # Documents the existing (unchanged) behavior the singular route works around: a
+        # uuid handed to the plural per-vehicle route parses to vehicle_id -1, empty list.
+        r = self.client.get("/api/commands/70fb95b6-c51d-42cc-aed4-04f816373772")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["vehicle_id"], -1)
+        self.assertEqual(r.json()["commands"], [])
+
 
 class MissionUploadTests(CommandModelBase):
     """MISSION_UPLOAD through the real queue, under mission-contract-v1: the request is a

@@ -34,7 +34,14 @@ function firstOf(...vals) {
 function perTypeVerified(cmd) {
   if (!cmd || cmd.status !== "EXECUTED") return null;
   if (cmd.type === "SET_HOME") return cmd.home_result === "verified";
-  if (cmd.type === "RTL") return cmd.rtl_result === "confirmed";
+  if (cmd.type === "RTL") {
+    // Tri-state mirror of the backend: 'confirmed' → true (green), 'unverified' → null
+    // (EXECUTED, not a failure — Scout verified the mode change but the observed
+    // representation could not be canonically confirmed), anything else → false.
+    if (cmd.rtl_result === "confirmed") return true;
+    if (cmd.rtl_result === "unverified") return null;
+    return false;
+  }
   if (MISSION_WRITE.has(cmd.type)) return cmd.mission_result === "verified";
   const r = cmd.result;
   if (r && typeof r === "object" && "verified" in r) return r.verified === true;

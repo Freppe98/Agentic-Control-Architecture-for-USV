@@ -29,6 +29,30 @@ test("RTL EXECUTED with NO rtl_result → verified false (never optimistic on tr
   assert.equal(commandVerification({ type: "RTL", status: "EXECUTED" }).verified, false);
 });
 
+test("RTL EXECUTED + rtl_result unverified → verified null (EXECUTED, not a failure)", () => {
+  // The backend's 'unverified' state: Scout verified the RTL but the observed mode was an
+  // unrecognised representation. It must render as EXECUTED (not a red FAILED, not a green
+  // VERIFIED) so Scout's authority is respected without a silent success.
+  const vf = commandVerification({ type: "RTL", status: "EXECUTED", rtl_result: "unverified" });
+  assert.equal(vf.verified, null);
+  assert.equal(vf.outcome, "EXECUTED");
+});
+
+test("RTL with backend verification block for numeric-11 case → VERIFIED (11 canonicalizes to RTL)", () => {
+  // The field-test record: outer EXECUTED, rtl_result confirmed, and the backend-normalized
+  // verification block already showing observed 'RTL' with the raw custom_mode retained.
+  const cmd = {
+    type: "RTL", status: "EXECUTED", rtl_result: "confirmed",
+    result: { accepted: true, verified: true, requested_mode: "RTL", observed_mode: 11 },
+    verification: { verified: true, outcome: "VERIFIED", expected: "RTL", observed: "RTL",
+                    observed_raw: 11, reason: null },
+  };
+  const vf = commandVerification(cmd);
+  assert.equal(vf.verified, true);
+  assert.equal(vf.outcome, "VERIFIED");
+  assert.equal(vf.observed, "RTL");
+});
+
 test("RTL not-yet-EXECUTED (SENT) → verified null (rule not applicable yet)", () => {
   assert.equal(commandVerification({ type: "RTL", status: "SENT" }).verified, null);
 });

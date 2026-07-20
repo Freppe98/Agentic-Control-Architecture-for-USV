@@ -383,6 +383,15 @@ def normalize_agent_message(message: dict) -> dict:
     if speed is None:
         speed = lk.get("groundspeed", lk.get("speed"))
 
+    # Canonicalize the live flight mode for display with the SAME normalizer command
+    # verification uses, so a raw numeric custom_mode (11) renders as its name (RTL) and the
+    # live-mode chip can never disagree with a command's verified mode. Only rewritten when
+    # recognised; the untouched raw value is kept as mode_raw. Scout usually sends the name.
+    if isinstance(telemetry, dict) and telemetry.get("mode") is not None:
+        canon_mode = normalize_rover_mode(telemetry.get("mode"))
+        if canon_mode is not None and canon_mode != telemetry.get("mode"):
+            telemetry = {**telemetry, "mode": canon_mode, "mode_raw": telemetry.get("mode")}
+
     return {
         "id": usv_id,
         "name": payload.get("name") or name_of(usv_id),
@@ -831,6 +840,66 @@ RISK_WARNING = {
     "MISSION_UPLOAD": "Overwrites the mission stored on the Pixhawk. Verified by read-back. Confirmed by operator.",
     "MISSION_CLEAR": "Clears the mission stored on the Pixhawk. Verified by read-back. Confirmed by operator.",
 }
+
+# --- Canonical ArduPilot Rover flight-mode normalization -------------------------------
+# A Rover reports its flight mode as a numeric custom_mode over MAVLink (HEARTBEAT.custom_
+# mode). Depending on where in the Scout → Local Agent → Operator chain a value is read,
+# the SAME mode can arrive three different ways: the raw number (11), its numeric string
+# ("11"), or the already-resolved name ("RTL"/"rtl"). The verification bug behind
+# "Pixhawk reported mode 11, not RTL." was a direct string compare of a numeric custom_mode
+# against the name "RTL". This ONE table + normalizer is the canonical mapping every
+# consumer uses (command verification, event rendering, live-mode display) so those three
+# representations always compare equal. Numbers are ArduPilot Rover's Mode::Number enum.
+ROVER_MODE_NUMBER_TO_NAME = {
+    0: "MANUAL", 1: "ACRO", 3: "STEERING", 4: "HOLD", 5: "LOITER", 6: "FOLLOW",
+    7: "SIMPLE", 8: "DOCK", 9: "CIRCLE", 10: "AUTO", 11: "RTL", 12: "SMART_RTL",
+    15: "GUIDED", 16: "INITIALISING",
+}
+ROVER_MODE_NAMES = set(ROVER_MODE_NUMBER_TO_NAME.values())
+
+# Outcome vocabulary for a canonical mode comparison — distinguishes a genuine vehicle-side
+# mismatch (a different KNOWN mode) from a mere representation gap (an unrecognised value),
+# so a normalization miss never masquerades as a vehicle rejection.
+MODE_VERIFY_VERIFIED = "VERIFIED"                       # canonical expected == canonical observed
+MODE_VERIFY_FAILED = "FAILED"                           # both known, genuinely different modes
+MODE_VERIFY_UNKNOWN = "UNKNOWN_MODE_REPRESENTATION"     # observed present but not recognised
+MODE_VERIFY_UNVERIFIED = "EXECUTED_UNVERIFIED"          # nothing observed to compare against
+
+
+def normalize_rover_mode(mode):
+    """Canonical upper-case ArduPilot Rover mode name for a value Scout may report as a
+    numeric custom_mode (11), a numeric string ("11") or an already-resolved name ("RTL",
+    "rtl", "Rtl"). Returns None when the value is absent, empty, or NOT a mode this table
+    recognises — an unknown representation is never silently coerced into a name."""
+    if mode is None or isinstance(mode, bool):
+        return None
+    if isinstance(mode, int):
+        return ROVER_MODE_NUMBER_TO_NAME.get(mode)
+    s = str(mode).strip()
+    if s == "":
+        return None
+    if s.isdigit():
+        return ROVER_MODE_NUMBER_TO_NAME.get(int(s))
+    name = s.upper()
+    return name if name in ROVER_MODE_NAMES else None
+
+
+def verify_mode_match(expected, observed):
+    """Compare a mode command's expected state against the vehicle's observed mode, each
+    canonicalized first, and return an outcome from MODE_VERIFY_*. The whole point is that
+    a numeric custom_mode (11) and its name ("RTL") are the SAME mode, so
+    verify_mode_match("RTL", 11) is VERIFIED — Scout authority is not overturned by a
+    representation difference. A genuinely different KNOWN mode (RTL vs MANUAL) is FAILED;
+    an observed value that cannot be normalized is UNKNOWN_MODE_REPRESENTATION (not a
+    rejection); no observed value at all is EXECUTED_UNVERIFIED. Raw values stay the
+    caller's to preserve as observed_raw."""
+    exp = normalize_rover_mode(expected)
+    obs = normalize_rover_mode(observed)
+    if exp is not None and obs is not None:
+        return MODE_VERIFY_VERIFIED if exp == obs else MODE_VERIFY_FAILED
+    if observed is None or (isinstance(observed, str) and observed.strip() == ""):
+        return MODE_VERIFY_UNVERIFIED
+    return MODE_VERIFY_UNKNOWN
 
 # Normalized command source (who authored the record). OPERATOR is the human at this
 # station; LOCAL_AGENT / MISSION_AGENT are autonomy-authored records the contract wants
@@ -1302,8 +1371,10 @@ def _annotate_set_home_result(cmd):
 
 
 def _mode_is_rtl(mode) -> bool:
-    """True when a reported flight-mode string names RTL (ArduRover reports 'RTL')."""
-    return mode is not None and "RTL" in str(mode).upper()
+    """True when a reported flight mode is RTL, canonicalizing first so a numeric
+    custom_mode (11) and its numeric string ("11") count exactly like the name "RTL".
+    SMART_RTL (12) is deliberately NOT RTL — it is a distinct recovery mode."""
+    return normalize_rover_mode(mode) == "RTL"
 
 
 def _annotate_rtl_result(cmd):
@@ -1316,8 +1387,18 @@ def _annotate_rtl_result(cmd):
     An RTL is a verified success ONLY when ALL of:
       - result.accepted is True   (MAVLink accepted the mode change)
       - result.verified is True   (Scout read the mode back)
-      - result.observed_mode confirms RTL (the read-back mode IS RTL — the ack alone is
-        not trusted; a vehicle can ack then revert)
+      - result.observed_mode canonicalizes to RTL (the read-back mode IS RTL — the ack
+        alone is not trusted; a vehicle can ack then revert)
+    Crucially, observed_mode is canonicalized (normalize_rover_mode) BEFORE the compare, so
+    a numeric custom_mode 11 (or the string "11") is recognised as RTL and never rejected
+    as 'mode 11, not RTL' — that false-negative was the whole reason for this change. The
+    raw value is retained as cmd['observed_raw']. When Scout's accepted+verified evidence
+    is present but the read-back is an UNRECOGNISED representation (or absent), the outcome
+    is 'unverified' — EXECUTED but not independently confirmed, and NOT a vehicle rejection:
+    Scout's verified=true is authoritative and must not be overturned by a representation
+    gap (see verify_mode_match / MODE_VERIFY_*). A genuinely DIFFERENT known mode (RTL vs
+    MANUAL) is still a real 'failed'.
+
     Anything else — including the legacy optimistic {"status": "Returning home"} shape,
     which carries no accepted/verified flags — sets cmd['rtl_result'] = 'failed' and
     replaces cmd['reason'] with Scout's real error / observed mode (never invented),
@@ -1328,11 +1409,18 @@ def _annotate_rtl_result(cmd):
     error = result.get("error") if isinstance(result.get("error"), dict) else {}
     accepted = result.get("accepted")
     verified = result.get("verified")
-    observed = result.get("observed_mode")
-    previous = result.get("previous_mode")
+    observed_raw = result.get("observed_mode")
+    previous_raw = result.get("previous_mode")
     err_msg = error.get("message") or error.get("code")
 
+    # Canonical forms for the classification/wording; the untouched raw value is preserved.
+    observed = normalize_rover_mode(observed_raw)
+    previous = normalize_rover_mode(previous_raw)
+    if observed_raw is not None:
+        cmd["observed_raw"] = observed_raw
+
     failure_reason = None
+    unverifiable = None
     if accepted is not True:
         # No explicit acceptance — covers a rejected mode change AND the legacy
         # {"status":"Returning home"} HTTP-200 shape (no accepted flag at all). Never a
@@ -1341,21 +1429,33 @@ def _annotate_rtl_result(cmd):
     elif verified is not True:
         if err_msg:
             failure_reason = err_msg
-        elif observed is not None and not _mode_is_rtl(observed):
+        elif observed is not None and observed != "RTL":
             failure_reason = (f"Mode reverted from RTL to {observed}"
-                              if _mode_is_rtl(previous) else f"Pixhawk remained in {observed}")
+                              if previous == "RTL" else f"Pixhawk remained in {observed}")
         else:
             failure_reason = "RTL verification timed out."
-    elif not _mode_is_rtl(observed):
-        # Accepted + verified, but the read-back mode is not RTL (or was not reported) —
-        # refuse to call it success on the ack alone.
-        failure_reason = (err_msg or
-                          (f"Pixhawk reported mode {observed}, not RTL." if observed is not None
-                           else "Scout confirmed RTL without reporting the observed flight mode."))
+    else:
+        # accepted AND verified — Scout's authoritative vehicle-side evidence that RTL took.
+        # Compare canonically: 11 / "11" / "RTL" all confirm; only a different KNOWN mode
+        # overturns it, and an unrecognised representation is 'unverified', never a failure.
+        verdict = verify_mode_match("RTL", observed_raw)
+        if verdict == MODE_VERIFY_VERIFIED:
+            pass  # confirmed — the read-back canonicalizes to RTL
+        elif verdict == MODE_VERIFY_FAILED:
+            failure_reason = f"Pixhawk reported {observed}, not RTL."
+        elif verdict == MODE_VERIFY_UNKNOWN:
+            unverifiable = (f"Scout verified RTL but reported an unrecognised observed mode "
+                            f"{observed_raw!r}; the RTL representation could not be confirmed.")
+        else:  # MODE_VERIFY_UNVERIFIED — verified with no observed mode reported at all
+            unverifiable = "Scout confirmed RTL without reporting the observed flight mode."
 
     if failure_reason:
         cmd["rtl_result"] = "failed"
         cmd["reason"] = failure_reason
+    elif unverifiable:
+        # Respect Scout's authority (not a failure) but refuse a silent green success.
+        cmd["rtl_result"] = "unverified"
+        cmd["reason"] = unverifiable
     else:
         cmd["rtl_result"] = "confirmed"
 
@@ -1518,6 +1618,12 @@ def _extract_expected_observed(cmd, result):
                             result.get("count"), result.get("mission_count"))
         expected = f"{ec} Pixhawk items" if ec is not None else expected
         observed = f"{oc} Pixhawk items" if oc is not None else observed
+        return expected, observed
+    # Mode/arming commands: display the CANONICAL Rover mode name so a bare numeric
+    # custom_mode (11) never reaches the operator where it means a named mode (RTL). An
+    # unrecognised value (or a non-mode state like ARMED) falls through to its raw form.
+    expected = normalize_rover_mode(expected) or expected
+    observed = normalize_rover_mode(observed) or observed
     return expected, observed
 
 
@@ -1555,13 +1661,25 @@ def build_command_verification(cmd):
     error = cmd.get("error") if isinstance(cmd.get("error"), dict) else (
         result.get("error") if isinstance(result.get("error"), dict) else {})
     expected, observed = _extract_expected_observed(cmd, result)
+    # The vehicle's observed mode/state exactly as Scout reported it (numeric custom_mode,
+    # numeric string or name), before canonicalization — kept so the raw evidence behind a
+    # normalized display value is never lost (e.g. observed "RTL" with observed_raw 11).
+    observed_raw = cmd.get("observed_raw")
+    if observed_raw is None:
+        observed_raw = _first_present(
+            result.get("observed_mode"), result.get("observed_state"),
+            result.get("observed"), result.get("mode"))
 
     verified = None
     if status == "EXECUTED":
         if ctype == "SET_HOME":
             verified = cmd.get("home_result") == "verified"
         elif ctype == "RTL":
-            verified = cmd.get("rtl_result") == "confirmed"
+            # Tri-state: 'confirmed' → True (green), 'unverified' → None (EXECUTED, not a
+            # failure — Scout's authority respected despite an unconfirmable representation),
+            # anything else (incl. 'failed' / missing) → False.
+            rr = cmd.get("rtl_result")
+            verified = True if rr == "confirmed" else (None if rr == "unverified" else False)
         elif ctype in ("MISSION_UPLOAD", "MISSION_CLEAR"):
             verified = cmd.get("mission_result") == "verified"
         elif "verified" in result:
@@ -1571,12 +1689,17 @@ def build_command_verification(cmd):
     reason = None
     if verified is False or status in ("REJECTED", "FAILED", "EXPIRED"):
         reason = cmd.get("reason") or error.get("message") or error.get("code")
+    elif verified is None and status == "EXECUTED" and cmd.get("rtl_result") == "unverified":
+        # Surface WHY an EXECUTED RTL is not a confirmed success (representation gap), so the
+        # UI can explain the EXECUTED_UNVERIFIED state rather than showing a bare green.
+        reason = cmd.get("reason")
 
     return {
         "verified": verified,
         "outcome": _outcome_label(status, verified),
         "expected": expected,
         "observed": observed,
+        "observed_raw": observed_raw,
         "reason": reason,
     }
 
@@ -2464,6 +2587,33 @@ def pixhawk_mission(vehicle_id: str):
 # Agent successfully called Scout Flask" — see _annotate_set_home_result for how the
 # command's own nested result is classified for immediate feedback, and home_block()
 # above for why the PERMANENT verified/not-verified state never comes from this at all.
+
+
+@app.get("/api/command/{command_id}")
+def command_by_id(command_id: str):
+    """Look up ONE command by its uuid command id — the single-command read endpoint.
+
+    Why this exists (see BACKEND_ROADMAP / commands read routes): the plural
+    GET /api/commands/{vehicle_id} takes a VEHICLE id, so probing it with a command uuid
+    quietly parses to vehicle_id -1 and returns an empty list — a confusing false negative
+    when debugging a specific command. There is no GET /api/commands (only POST), so a
+    bare GET there is 405. This SINGULAR /api/command/{command_id} route does not collide
+    with either and resolves a command uuid directly against commands_by_id (the same dedup
+    map the result endpoints use), returning the fully-derived record (verification +
+    lifecycle refreshed) or a clean JSON 404. Read-only; never mutates the queue."""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+    cmd = commands_by_id.get(str(command_id))
+    if cmd is None:
+        # Distinguish a genuinely unknown command from an orphaned historical result the
+        # backend archived after a restart — an operator debugging a uuid wants to know it
+        # was seen, even though the live command is gone.
+        orphan = orphaned_command_results.get(str(command_id))
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown command id", "command_id": command_id,
+            "orphaned_result": orphan})
+    _refresh_command_derived(cmd)
+    return {"ok": True, "command_id": command_id, "command": cmd}
 
 
 @app.get("/api/commands/history/{vehicle_id}")
