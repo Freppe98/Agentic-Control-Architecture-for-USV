@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import requests
 from contextlib import asynccontextmanager
@@ -2614,11 +2614,9 @@ def environment():
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(BASE_DIR / "static" / "index.html")
+    return RedirectResponse(url="/app/", status_code=307)
 
 
-# New operator station (design-system frontend). Served alongside the classic
-# dashboard at "/" during incremental migration — existing routes are unchanged.
+# Operator station (design-system frontend) — the only supported dashboard.
+# The classic static/ frontend has been retired; "/" redirects here.
 app.mount("/app", StaticFiles(directory=BASE_DIR / "operator", html=True), name="operator")
-
-app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")

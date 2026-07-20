@@ -6,7 +6,7 @@ description: Launch and drive the USV operator station (/app) to verify a fronte
 # Verify the operator station
 
 The app is a static ES-module frontend (`operator/`) served by FastAPI (`main.py`)
-at `/app`, alongside the classic dashboard at `/`. Pages poll `api.getFleet()`
+at `/app` — the only supported dashboard; `GET /` redirects there. Pages poll `api.getFleet()`
 (`GET /api/fleet/status`) every ~2s. There is one live-vehicle slot: the most
 recent `POST /agent/status` payload replaces the matching template vehicle in
 `FLEET_TEMPLATE`; the rest stay UNKNOWN.

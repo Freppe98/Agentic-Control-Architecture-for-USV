@@ -1,4 +1,4 @@
-# Launch the operator-station backend (FastAPI/uvicorn) on 0.0.0.0:8200.
+# Launch the operator-station backend (FastAPI/uvicorn) on this laptop.
 #
 # Binds to 0.0.0.0 (all interfaces) on purpose: Scout's Local Agent posts status to
 # this machine over the network, so the backend must be reachable from other hosts —
@@ -7,13 +7,15 @@
 # Scout at whichever computer is running this.
 Set-Location -Path $PSScriptRoot
 
-$port = 8200
+# This laptop's operator backend port. Change here only — every use below reads
+# this one variable, so the number is never duplicated.
+$OperatorBackendPort = 8210
 
 # --- Show this PC's LAN addresses so you know what to set on Scout -------------------
 # Scout's OPERATOR_URLS must point at one of these (whichever is on the same network
 # as the vehicle/router). See RUNBOOK.md.
 Write-Host ""
-Write-Host "Operator backend -> binding 0.0.0.0:$port (reachable from the network)" -ForegroundColor Cyan
+Write-Host "Operator backend -> binding 0.0.0.0:$OperatorBackendPort (reachable from the network)" -ForegroundColor Cyan
 try {
     $addrs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
         Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
@@ -21,9 +23,9 @@ try {
     if ($addrs) {
         Write-Host "This PC's addresses (set Scout OPERATOR_URLS to one of these):" -ForegroundColor Cyan
         foreach ($a in $addrs) {
-            Write-Host ("   http://{0}:{1}   [{2}]" -f $a.IPAddress, $port, $a.InterfaceAlias)
+            Write-Host ("   http://{0}:{1}   [{2}]" -f $a.IPAddress, $OperatorBackendPort, $a.InterfaceAlias)
         }
-        Write-Host "On Scout, verify with:  curl http://<operator-ip>:$port/api/fleet/status" -ForegroundColor DarkGray
+        Write-Host "On Scout, verify with:  curl http://<operator-ip>:$OperatorBackendPort/api/fleet/status" -ForegroundColor DarkGray
     } else {
         Write-Host "No non-local IPv4 address found. Run 'ipconfig' to find this PC's IP." -ForegroundColor Yellow
     }
@@ -36,4 +38,4 @@ Write-Host ""
 # --no-access-log: the operator backend is polled every 2-3s by the UI (per open page)
 # and by Scout's status posts, so uvicorn's default per-request "GET/POST ... 200 OK"
 # line floods the terminal. Startup/shutdown/error logging stays on (unaffected).
-python -m uvicorn main:app --host 0.0.0.0 --port $port --no-access-log
+python -m uvicorn main:app --host 0.0.0.0 --port $OperatorBackendPort --no-access-log
