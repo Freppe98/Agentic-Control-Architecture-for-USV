@@ -25,6 +25,7 @@ import { commState, cls, fmtAge, pad3, noTelem } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { isSafetyHold, SAFETY_HOLD_TITLE, homeStatus, commandGate, commandGateCtx } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts } from "../lib/mission.js";
+import { commandVerification, commandSource, commandStages } from "../lib/command.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
@@ -62,7 +63,34 @@ const ADVANCED_CMDS = [["SET_MODE_HOLD", "HOLD"], ["SET_MODE_GUIDED", "GUIDED"]]
 const CMDS = [...PRIMARY_CMDS, ...ADVANCED_CMDS];  // combined lookup (labels, routing)
 const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
 const CMD_STATUS_CLS = { QUEUED: "u", SENT: "p", ACCEPTED: "p", EXECUTED: "c", REJECTED: "d", FAILED: "d", EXPIRED: "u" };
+// Normalized outcome → pill tint (VERIFIED/EXECUTED success green; FAILED/REJECTED/EXPIRED
+// red; non-terminal amber/grey). One mapping for the detailed command history.
+const OUTCOME_CLS = { VERIFIED: "c", EXECUTED: "c", FAILED: "d", REJECTED: "d", EXPIRED: "u", PENDING: "p", QUEUED: "u", SENT: "p", ACCEPTED: "p" };
+const CMD_TERMINAL_V = new Set(["EXECUTED", "REJECTED", "FAILED", "EXPIRED"]);
 const fmtClock = (iso) => { if (!iso) return "—"; const d = new Date(iso); return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour12: false }); };
+const escAttr = (s) => String(s).replace(/"/g, "&quot;");
+
+// One detailed command-history row: type + normalized source + verification-aware
+// outcome, the lifecycle stages with timestamps, expected-vs-observed state, and the
+// structured failure reason. Outcome/verification come from the SHARED, tested
+// commandVerification (lib/command.js) so this can never disagree with the Map panel.
+function stageLine(cm) {
+  return commandStages(cm).map((s) => `${s.stage}${s.ts ? " " + fmtClock(s.ts) : ""}`).join("  →  ");
+}
+function commandRow(cm) {
+  const v = commandVerification(cm);
+  const outcome = CMD_TERMINAL_V.has(cm.status) ? v.outcome : cm.status;
+  const clsx = OUTCOME_CLS[outcome] || "u";
+  const eo = (v.expected != null || v.observed != null)
+    ? `<div class="ctl-eo">expected <b>${v.expected ?? "—"}</b> · observed <b>${v.observed ?? "—"}</b></div>` : "";
+  const reason = v.reason || cm.warning || "";
+  const note = reason ? `<div class="ctl-note" title="${escAttr(reason)}">${reason}</div>` : "";
+  return `<div class="ctl-row col">
+    <div class="ctl-row-h"><span class="ctl-type mono">${cm.type}</span><span class="src-chip">${commandSource(cm)}</span><span class="pill ${clsx}">${outcome}</span></div>
+    <div class="ctl-life">${stageLine(cm)}</div>
+    ${eo}${note}
+  </div>`;
+}
 const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
 
 export function Vehicle(root) {
@@ -371,12 +399,7 @@ export function Vehicle(root) {
     const primaryBtns = PRIMARY_CMDS.map(renderCmd).join("");
     const advancedBtns = ADVANCED_CMDS.map(renderCmd).join("");
     const queueHtml = cmds.length
-      ? cmds.slice(0, 8).map((cm) => {
-          const clsx = CMD_STATUS_CLS[cm.status] || "u";
-          const when = cm.completed_at || cm.claimed_at || cm.created_at;
-          const note = cm.reason || cm.warning || "";
-          return `<div class="ctl-row"><span class="ctl-type mono">${cm.type}</span><span class="pill ${clsx}">${cm.status}</span><span class="ctl-when mono">${fmtClock(when)}</span>${note ? `<span class="ctl-note" title="${note.replace(/"/g, "&quot;")}">${note}</span>` : ""}</div>`;
-        }).join("")
+      ? cmds.slice(0, 10).map(commandRow).join("")
       : `<div class="ctl-empty">No commands issued for ${vname} yet.</div>`;
     const controlCard = panelCard("Control", controlCond, controlClass,
       `<div class="metrics">

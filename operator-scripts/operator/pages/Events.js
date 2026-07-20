@@ -12,10 +12,12 @@ import { Table } from "../components/Table.js";
 import { SEV, evSeverity, evText, evTime, commState } from "../lib/ui.js";
 
 const FILTERS = [
-  ["all", "All"], ["unack", "Unacknowledged"],
+  ["all", "All"], ["unack", "Unacknowledged"], ["command", "Commands"],
   ["emergency", "Emergency"], ["warning", "Warning"], ["caution", "Caution"], ["info", "Info"],
 ];
 const isAckable = (sev) => sev && SEV[sev].rank >= SEV.caution.rank;
+// Normalized command outcome → tint for the structured command-event detail.
+const OUTCOME_TINT = { VERIFIED: "c", EXECUTED: "c", FAILED: "d", REJECTED: "d", EXPIRED: "u", PENDING: "p" };
 
 export function Events(root) {
   let items = [];              // normalized + sorted (newest first)
@@ -62,6 +64,22 @@ export function Events(root) {
     if (e.source) m.push(`src ${e.source}`);
     return m.length ? `<span class="evmeta">${m.join(" · ")}</span>` : "";
   };
+  // Structured command detail (command id/type/source/stage/verification outcome), shown
+  // for command lifecycle events. The message stays the summary; this is the expandable
+  // detail the operator can scan — command source and normalized outcome are first-class,
+  // never re-derived from the message text.
+  const cmdDetail = (it) => {
+    const d = it.event && it.event.detail;
+    if (!d || it.event.type !== "command") return "";
+    const bits = [];
+    if (d.command_type) bits.push(`<b>${d.command_type}</b>`);
+    if (d.command_source) bits.push(`src ${d.command_source}`);
+    if (d.stage) bits.push(`stage ${d.stage}`);
+    if (d.outcome) bits.push(`<span class="pill ${OUTCOME_TINT[d.outcome] || "u"}">${d.outcome}</span>`);
+    if (d.expected != null || d.observed != null) bits.push(`${d.expected ?? "—"} → ${d.observed ?? "—"}`);
+    const idLine = d.command_id ? `<div class="evcmd-id mono">id ${d.command_id}</div>` : "";
+    return `<div class="evcmd">${bits.join(" · ")}${idLine}</div>`;
+  };
   const ackCell = (it) =>
     isAckable(it.sev)
       ? `<button class="ev-ack${it.acked ? " done" : ""}" data-key="${it.key}">${it.acked ? "Acked" : "Ack"}</button>`
@@ -71,21 +89,24 @@ export function Events(root) {
     { key: "time", label: "Time", render: (it) => it.time ? `<span class="mono">${it.time.label}</span>` : `<span class="mono" style="color:var(--dim)">—</span>` },
     { key: "sev", label: "Severity", render: (it) => sevChip(it.sev) },
     { key: "veh", label: "Vehicle", render: (it) => `<span class="vname"><b>${it.vehicle || "USV-" + it.vehicleId}</b></span>` },
-    { key: "msg", label: "Message", render: (it) => `<span class="tx">${it.text}</span>${metaOf(it)}` },
+    { key: "msg", label: "Message", render: (it) => `<span class="tx">${it.text}</span>${metaOf(it)}${cmdDetail(it)}` },
     { key: "ack", label: "", align: "num", render: ackCell },
   ];
 
   const unackCount = () => items.filter((it) => isAckable(it.sev) && !it.acked).length;
 
+  const isCommand = (it) => it.event && it.event.type === "command";
+
   function shown() {
     if (filter === "all") return items;
     if (filter === "unack") return items.filter((it) => isAckable(it.sev) && !it.acked);
+    if (filter === "command") return items.filter(isCommand);
     return items.filter((it) => it.sev === filter);
   }
 
   function renderFilters() {
-    const counts = { all: items.length, unack: unackCount(), emergency: 0, warning: 0, caution: 0, info: 0 };
-    items.forEach((it) => { if (it.sev) counts[it.sev]++; });
+    const counts = { all: items.length, unack: unackCount(), command: 0, emergency: 0, warning: 0, caution: 0, info: 0 };
+    items.forEach((it) => { if (it.sev) counts[it.sev]++; if (isCommand(it)) counts.command++; });
     document.getElementById("evfilters").innerHTML = FILTERS.map(([k, l]) =>
       `<button class="chip${filter === k ? " on" : ""}" data-f="${k}">${l}<span class="cc">${counts[k] ?? 0}</span></button>`
     ).join("");

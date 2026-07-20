@@ -14,6 +14,7 @@ import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
 import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
+import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
 
 const HOME = [56.699893, 13.002148];
@@ -54,6 +55,17 @@ const CMD_PHASE = {
   EXECUTED: ["confirmed", "c"], REJECTED: ["rejected", "d"], FAILED: ["failed", "d"],
   EXPIRED: ["timed out", "u"],
 };
+// Normalized terminal outcome → (label, pill tint) for the "Last command" line.
+const CMD_OUTCOME = {
+  VERIFIED: ["verified", "c"], EXECUTED: ["executed", "c"], FAILED: ["failed", "d"],
+  REJECTED: ["rejected", "d"], EXPIRED: ["timed out", "u"],
+};
+// Compact stage names for the "requested › sent › confirmed" progression line.
+const STAGE_SHORT = {
+  QUEUED: "requested", SENT: "sent", ACCEPTED: "ack", EXECUTING: "executing",
+  EXECUTED: "executed", REJECTED: "rejected", FAILED: "failed", EXPIRED: "expired",
+};
+const CMD_TERMINAL_M = new Set(["EXECUTED", "REJECTED", "FAILED", "EXPIRED"]);
 const CMD_LABEL = Object.fromEntries([...MAP_MODES, ...MAP_SAFETY, ...MAP_MISSION]);
 // Distinct recovery/home glyph for the Vehicle Home (Pixhawk HOME_POSITION) marker —
 // a home inside a location pin, deliberately unlike the numbered mission waypoints and
@@ -89,6 +101,12 @@ export function Map(root) {
   // `shown` toggles the map overlay WITHOUT refetching (toggling never hits Scout).
   const pxm = {};
   let missionLayer = null;   // the single Leaflet layer group currently drawn (selected vehicle)
+  // Command types with a POST in flight right now — a synchronous guard against a rapid
+  // double-press queuing a duplicate before the queue poll catches up (matters most for
+  // LOITER, which has no confirmation modal to slow a double-click). Cleared per type in
+  // sendCommand's finally; the queue-derived hasPendingOfType keeps the button disabled
+  // afterwards until the outstanding command reaches a terminal state.
+  const sending = new Set();
 
   root.className = "app has-dock";
   root.innerHTML =
@@ -763,29 +781,39 @@ export function Map(root) {
   }
 
   async function sendCommand(type) {
+    // Ignore a duplicate press while one of the same type is already in flight or still
+    // nonterminal in the queue (the synchronous `sending` guard closes the double-click
+    // window before the queue poll catches up). See cmdBtns for the matching disable.
+    if (sending.has(type) || hasPendingOfType(cmds, type)) return;
     const v = fleet.find((x) => x.id === selId);
     const vname = v ? (v.name || "USV-" + v.id) : "vehicle";
     const label = CMD_LABEL[type] || type;
     const highRisk = HIGH_RISK.has(type);
-    if (highRisk) {
-      const bodyHtml = CMD_CONFIRM_COPY[type]
-        ? CMD_CONFIRM_COPY[type](vname)
-        : `<p>Confirm ${label} for <b>${vname}</b>?</p><p>The command is queued for the vehicle to execute — it is NOT applied until the local agent reports back.</p>`;
-      const ok = await confirmModal({ title: `${label}?`, bodyHtml, cancelLabel: "Cancel", confirmLabel: label });
-      if (!ok) return;
+    sending.add(type);
+    renderInspector();   // reflect the in-flight disable immediately
+    try {
+      if (highRisk) {
+        const bodyHtml = CMD_CONFIRM_COPY[type]
+          ? CMD_CONFIRM_COPY[type](vname)
+          : `<p>Confirm ${label} for <b>${vname}</b>?</p><p>The command is queued for the vehicle to execute — it is NOT applied until the local agent reports back.</p>`;
+        const ok = await confirmModal({ title: `${label}?`, bodyHtml, cancelLabel: "Cancel", confirmLabel: label });
+        if (!ok) return;
+      }
+      let res = await api.createCommand({ vehicle_id: selId, type, confirm: highRisk });
+      if (!res.ok && res.data && res.data.needs_confirmation) {
+        const ok = await confirmModal({
+          title: `${label} needs confirmation`,
+          bodyHtml: `<p>${res.data.message}</p><p>Queue the command anyway?</p>`,
+          cancelLabel: "Cancel", confirmLabel: "Queue anyway",
+        });
+        if (!ok) return;
+        res = await api.createCommand({ vehicle_id: selId, type, confirm: true });
+      }
+      if (!res.ok) showToast((res.data && res.data.message) || "Command was not accepted.", "warn");
+    } finally {
+      sending.delete(type);
+      loadCommands(selId);   // always refresh the queue (and re-render) after the attempt
     }
-    let res = await api.createCommand({ vehicle_id: selId, type, confirm: highRisk });
-    if (!res.ok && res.data && res.data.needs_confirmation) {
-      const ok = await confirmModal({
-        title: `${label} needs confirmation`,
-        bodyHtml: `<p>${res.data.message}</p><p>Queue the command anyway?</p>`,
-        cancelLabel: "Cancel", confirmLabel: "Queue anyway",
-      });
-      if (!ok) return;
-      res = await api.createCommand({ vehicle_id: selId, type, confirm: true });
-    }
-    if (!res.ok) showToast((res.data && res.data.message) || "Command was not accepted.", "warn");
-    loadCommands(selId);
   }
 
   // ---- Vehicle Home (deployment: set + read-back-verify HOME_POSITION) ------------
@@ -1034,10 +1062,16 @@ export function Map(root) {
         const hr = HIGH_RISK.has(type);
         const safety = isSafetyHold(type);       // LOITER — the primary anti-drift safety hold
         const g = commandGate(type, gateCtx);
-        const dis = !g.enabled;
-        const homeLocked = dis && !!g.reason;   // disabled specifically by the Home interlock
-        const title = g.reason || (safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`);
-        return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}${homeLocked ? " home-locked" : ""}" data-cmd="${type}"${dis ? " disabled" : ""} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
+        // A same-type command already in flight (POST pending, or a nonterminal record in
+        // the queue) suppresses a duplicate press. The button stays VISIBLE — LOITER must
+        // remain an at-a-glance safety option — but disabled with an "awaiting result"
+        // hint until the outstanding command reaches a terminal state.
+        const busy = sending.has(type) || hasPendingOfType(cmds, type);
+        const dis = !g.enabled || busy;
+        const homeLocked = !g.enabled && !!g.reason;   // disabled specifically by the Home interlock
+        const title = busy ? `${label} already sent — awaiting the vehicle's result.`
+          : g.reason || (safety ? SAFETY_HOLD_TITLE : `${type}${hr ? " · confirmation required" : ""}`);
+        return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}${homeLocked ? " home-locked" : ""}${busy ? " awaiting" : ""}" data-cmd="${type}"${dis ? " disabled" : ""} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
       }).join("") + `</div>`;
   }
   function lockNote(hasControl, av, stale) {
@@ -1089,18 +1123,23 @@ export function Map(root) {
   function cmdStatus(types) {
     const scoped = types ? cmds.filter((c) => types.has(c.type)) : cmds;
     if (!scoped.length) return "";
-    const TERMINAL = ["EXECUTED", "REJECTED", "FAILED", "EXPIRED"];
-    const c = scoped.find((x) => !TERMINAL.includes(x.status)) || scoped[0];
-    // SET_HOME's outer status EXECUTED only means "the Local Agent called Scout Flask"
-    // — home_result (main._annotate_set_home_result) is what says whether Set Home
-    // itself was verified. Never let a generic EXECUTED read as "confirmed" (green)
-    // when home_result says the verification actually failed.
-    const [phase, k] = (c.type === "SET_HOME" && c.status === "EXECUTED" && c.home_result === "failed")
-      ? ["failed", "d"]
-      : CMD_PHASE[c.status] || ["—", "u"];
-    const note = c.reason || c.warning || "";
+    const c = scoped.find((x) => !CMD_TERMINAL_M.has(x.status)) || scoped[0];
+    const v = commandVerification(c);
+    // An outer status EXECUTED only means "the Local Agent completed the attempt". The
+    // terminal pill uses the SHARED normalized outcome (commandVerification, lib/command.js):
+    // VERIFIED/EXECUTED read green, FAILED/REJECTED/EXPIRED red — so a SET_HOME/RTL/
+    // MISSION_UPLOAD that transported but did not verify shows "failed", never an
+    // optimistic green. A still-running command shows its lifecycle phase instead.
+    let phase, k;
+    if (CMD_TERMINAL_M.has(c.status)) [phase, k] = CMD_OUTCOME[v.outcome] || ["—", "u"];
+    else [phase, k] = CMD_PHASE[c.status] || ["—", "u"];
+    // Full compact progression: the lifecycle stages this command actually passed through.
+    const prog = commandStages(c).map((s) => STAGE_SHORT[s.stage] || String(s.stage).toLowerCase()).join(" › ");
+    const eo = (v.expected != null || v.observed != null) ? `${v.expected ?? "—"} → ${v.observed ?? "—"}` : "";
+    const note = v.reason || c.warning || "";
     const title = note ? ` title="${note.replace(/"/g, "&quot;")}"` : "";
-    return `<div class="cmd-status"${title}><span class="lbl">Last command</span><span class="ctl-type mono">${CMD_LABEL[c.type] || c.type}</span><span class="pill ${k}">${phase}</span></div>`;
+    return `<div class="cmd-status"${title}><span class="lbl">Last command</span><span class="ctl-type mono">${CMD_LABEL[c.type] || c.type}</span><span class="pill ${k}">${phase}</span>` +
+      `${prog ? `<div class="cmd-prog mono">${prog}${eo ? ` · ${eo}` : ""}</div>` : ""}</div>`;
   }
 
   function counts() {

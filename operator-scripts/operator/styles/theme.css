@@ -321,12 +321,16 @@ a { color:inherit; }
 .cmd-status .lbl { margin-right:2px; }
 .cmd-status .ctl-type { font-size:12px; color:var(--text); }
 .cmd-status[title] { cursor:help; }
+.cmd-prog { flex-basis:100%; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.03em; color:var(--dim); }
 
 /* Agent status readout under the map Agent Commands buttons (current + previous only) */
 .agent-status { margin-top:10px; padding-top:9px; border-top:1px solid var(--line); display:flex; flex-direction:column; gap:7px; }
 .asrow { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .asrow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
 .asrow .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); display:flex; align-items:center; gap:8px; }
+.agent-last-action { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 15px 4px; }
+.agent-last-action .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
+.agent-last-action .v { display:flex; align-items:center; gap:8px; font-size:12px; }
 
 /* ---------- generic page toolbar ---------- */
 .toolbar { display:flex; align-items:center; gap:16px; padding:13px 20px; border-bottom:1px solid var(--line); }
@@ -476,6 +480,10 @@ table.dt tbody tr.acked td { opacity:.5; }
 table.dt tbody tr.acked td:first-child { opacity:1; }
 
 .evmeta { display:block; margin-top:2px; font-family:var(--font-mono); font-size:10px; color:var(--dim); }
+.evcmd { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:4px; font-size:11px; color:var(--muted); }
+.evcmd b { color:var(--text); }
+.evcmd .pill { font-size:9px; padding:1px 6px; }
+.evcmd-id { flex-basis:100%; font-size:9.5px; color:var(--dim); }
 .ev-ack { padding:4px 12px; border:1px solid var(--line-strong); border-radius:6px; background:var(--panel-2); color:var(--text); font-family:var(--font-mono); font-size:11px; cursor:pointer; transition:border-color var(--t-hover), color var(--t-hover); }
 .ev-ack:hover { border-color:var(--accent); color:var(--accent); }
 .ev-ack.done { color:var(--muted); border-style:dashed; cursor:default; }
@@ -722,7 +730,48 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .ctl-note { flex-basis:100%; font-size:11px; color:var(--muted); padding-left:2px; }
 .ctl-empty { padding:14px 13px; font-size:12px; color:var(--muted); }
 
+/* Detailed command-history row (Vehicle page): stacked, with source, normalized
+   outcome, lifecycle stage timestamps and expected/observed state. */
+.ctl-row.col { flex-direction:column; align-items:stretch; gap:5px; }
+.ctl-row-h { display:flex; align-items:center; gap:10px; }
+.ctl-row-h .ctl-type { min-width:auto; }
+.ctl-row-h .pill { margin-left:auto; }
+.src-chip { font-family:var(--font-mono); font-size:9px; letter-spacing:.06em; color:var(--dim); border:1px solid var(--line); border-radius:var(--r-sm); padding:1px 5px; }
+.ctl-life { font-family:var(--font-mono); font-size:10px; color:var(--muted); word-break:break-word; }
+.ctl-eo { font-size:11px; color:var(--muted); }
+.ctl-eo b { color:var(--text); font-weight:600; }
+.ctl-row.col .ctl-note { flex-basis:auto; color:var(--disconnected); }
+
+/* Mission upload workflow (Mission page Upload tab). */
+.mu-drop { border:1px dashed var(--line); border-radius:var(--r); background:var(--panel-2); padding:14px; }
+.mu-drop textarea { width:100%; min-height:120px; box-sizing:border-box; resize:vertical; font-family:var(--font-mono); font-size:11px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:var(--r-sm); padding:9px; }
+.mu-row { display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
+.mu-preview { display:grid; grid-template-columns:1fr 1fr; gap:8px 20px; margin-top:12px; }
+.mu-preview .mrow { display:flex; justify-content:space-between; gap:12px; padding:4px 0; border-bottom:1px solid var(--line); font-size:12px; }
+.mu-preview .k { color:var(--muted); } .mu-preview .val { color:var(--text); font-family:var(--font-mono); }
+.mu-err { color:var(--disconnected); font-size:11.5px; margin-top:8px; }
+.mu-track { display:flex; align-items:center; gap:0; margin:14px 0 6px; }
+.mu-step { flex:1; text-align:center; font-family:var(--font-mono); font-size:10px; letter-spacing:.04em; color:var(--dim); position:relative; padding-top:16px; }
+.mu-step::before { content:""; position:absolute; top:4px; left:50%; width:9px; height:9px; margin-left:-4.5px; border-radius:50%; background:var(--line); }
+.mu-step.on { color:var(--text); } .mu-step.on::before { background:var(--partitioned); }
+.mu-step.done { color:var(--connected); } .mu-step.done::before { background:var(--connected); }
+.mu-step.failed { color:var(--disconnected); } .mu-step.failed::before { background:var(--disconnected); }
+/* Scout reported success but the Operator's independent read-back is missing — deliberately
+   its own colour: neither the green of a confirmed mission nor the red of a failed one. */
+.mu-step.caution { color:var(--caution); } .mu-step.caution::before { background:var(--caution); }
+.mu-step::after { content:""; position:absolute; top:8px; left:-50%; width:100%; height:1px; background:var(--line); z-index:-1; }
+.mu-step:first-child::after { display:none; }
+.mu-verdict { font-size:12px; padding:10px 12px; border-radius:var(--r-sm); border:1px solid var(--line); margin-top:8px; }
+.mu-verdict.ok { color:var(--connected); border-color:rgba(62,207,142,.28); }
+.mu-verdict.bad { color:var(--disconnected); border-color:rgba(229,72,77,.28); }
+.mu-verdict.pending { color:var(--partitioned); border-color:rgba(242,169,59,.28); }
+/* Caution ≠ pending and ≠ ok: the operation is finished, but only Scout's word supports it. */
+.mu-verdict.caution { color:var(--caution); border-color:rgba(242,169,59,.35); background:rgba(242,169,59,.05); }
+
 .ctl-cmd.home-locked:disabled { opacity:.5; color:var(--caution); border-color:rgba(242,169,59,.28); }
+/* A command already sent and awaiting the vehicle's result — visibly still present (a
+   command like LOITER must stay an at-a-glance option) but held, not lockout-grey. */
+.ctl-cmd.awaiting:disabled { opacity:.7; color:var(--muted); border-style:dashed; cursor:progress; }
 
 /* Deployment-readiness checklist. */
 .rdy { display:flex; flex-direction:column; gap:5px; margin-bottom:9px; }

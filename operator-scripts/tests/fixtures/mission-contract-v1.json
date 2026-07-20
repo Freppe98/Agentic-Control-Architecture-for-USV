@@ -1,0 +1,160 @@
+{
+  "_provenance": [
+    "mission-contract-v1 cross-contract fixture.",
+    "",
+    "PROVENANCE — read this before trusting the hash. Scout's `mission_contract_v1_fixture.json`",
+    "was NOT available in this repository when this file was written. It was reconstructed",
+    "from Scout's canonicalization specification (MISSION_CONTRACT_v1.md, relayed field by",
+    "field) and is pinned to Scout's authoritative golden route hash, which the Operator's",
+    "own implementation reproduces exactly. It is spec-faithful, not byte-copied.",
+    "",
+    "The golden hash below is Scout's pinned value, not an Operator invention. The Operator",
+    "backend (mission_contract.route_content_hash) independently computes the identical",
+    "digest from the request waypoints — that agreement is what makes this a real",
+    "cross-system proof rather than a self-consistent local one.",
+    "",
+    "COORDINATE/LOITER PRECISION IS NOW CROSS-SYSTEM ARTIFACT-VERIFIED. This golden route's",
+    "coordinates carry only 4 decimal places, so this hash alone does NOT discriminate",
+    "coordinate precisions 4-9 or loiter precisions 0-3 — that gap was real and is now",
+    "closed by high_precision_probe below, whose digest Scout and the Operator computed",
+    "INDEPENDENTLY and which agreed exactly. The precisions (7 and 3) are therefore",
+    "artifact-verified, not merely relayed from Scout's specification."
+  ],
+
+  "contract_version": "mission-contract-v1",
+
+  "request": {
+    "contract_version": "mission-contract-v1",
+    "waypoints": [
+      { "latitude": 56.6501, "longitude": 12.8701, "loiter_time_s": 0 },
+      { "latitude": 56.6512, "longitude": 12.8725, "loiter_time_s": 30 }
+    ]
+  },
+
+  "expected": {
+    "expected_route_waypoint_count": 2,
+    "expected_pixhawk_item_count": 3,
+    "expected_route_content_hash": "sha256:5fe4c2352fc9183e121538a8e199131159cdda66658ccb755c7db1ff54672bfd"
+  },
+
+  "canonical_items": [
+    {
+      "sequence": 1,
+      "command": "MAV_CMD_NAV_WAYPOINT",
+      "frame": "MAV_FRAME_GLOBAL_RELATIVE_ALT",
+      "latitude": 56.6501,
+      "longitude": 12.8701,
+      "altitude": 0.0,
+      "param1": 0.0,
+      "param2": 0.0,
+      "param3": 0.0,
+      "param4": 0.0
+    },
+    {
+      "sequence": 2,
+      "command": "MAV_CMD_NAV_WAYPOINT",
+      "frame": "MAV_FRAME_GLOBAL_RELATIVE_ALT",
+      "latitude": 56.6512,
+      "longitude": 12.8725,
+      "altitude": 0.0,
+      "param1": 30.0,
+      "param2": 0.0,
+      "param3": 0.0,
+      "param4": 0.0
+    }
+  ],
+
+  "canonical_json": "[{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6501,\"longitude\":12.8701,\"param1\":0.0,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":1},{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6512,\"longitude\":12.8725,\"param1\":30.0,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":2}]",
+
+  "scout_golden_route_hash": "sha256:5fe4c2352fc9183e121538a8e199131159cdda66658ccb755c7db1ff54672bfd",
+
+  "canonicalization": {
+    "home_excluded": true,
+    "sequence_base": 1,
+    "coordinate_precision": 7,
+    "loiter_precision": 3,
+    "json_sort_keys": true,
+    "json_separators": [",", ":"],
+    "encoding": "utf-8",
+    "digest": "sha256",
+    "prefix": "sha256:"
+  },
+
+  "high_precision_probe": {
+    "_comment": [
+      "THE PRECISION PROOF. The golden route above carries only 4 decimals and therefore",
+      "cannot detect a change to COORDINATE_PRECISION or LOITER_PRECISION. This probe can:",
+      "its coordinates carry 11 decimals and its loiter values 5, so the digest moves if",
+      "either precision leaves 7 / 3 respectively.",
+      "",
+      "This probe was executed INDEPENDENTLY on Scout and on the Operator, and the two",
+      "systems produced the identical digest. The precisions are therefore cross-system",
+      "artifact-verified — established by two implementations agreeing on a computed",
+      "artifact, not by a specification being relayed verbally and trusted.",
+      "",
+      "Both hashes are recorded separately and asserted EQUAL by the test suite. Keeping one",
+      "field would collapse the very distinction that makes this evidence: a single value",
+      "cannot show that two systems agreed."
+    ],
+    "waypoints": [
+      { "latitude": 56.65012345678, "longitude": 12.87016789012, "loiter_time_s": 12.34567 },
+      { "latitude": 56.65127654321, "longitude": 12.87259876543, "loiter_time_s": 0.9994 }
+    ],
+    "canonical_json": "[{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6501235,\"longitude\":12.8701679,\"param1\":12.346,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":1},{\"altitude\":0.0,\"command\":\"MAV_CMD_NAV_WAYPOINT\",\"frame\":\"MAV_FRAME_GLOBAL_RELATIVE_ALT\",\"latitude\":56.6512765,\"longitude\":12.8725988,\"param1\":0.999,\"param2\":0.0,\"param3\":0.0,\"param4\":0.0,\"sequence\":2}]",
+    "scout_computed_route_content_hash": "sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad",
+    "operator_computed_route_content_hash": "sha256:125c779021c1521fae67462719cdab588f871c3b44d808b362c0630f221998ad",
+    "cross_system_verified": true
+  },
+
+  "verified_result": {
+    "contract_version": "mission-contract-v1",
+    "accepted": true,
+    "uploaded": true,
+    "verified": true,
+    "observed_route_waypoint_count": 2,
+    "observed_pixhawk_item_count": 3,
+    "observed_route_content_hash": "sha256:5fe4c2352fc9183e121538a8e199131159cdda66658ccb755c7db1ff54672bfd",
+    "full_mission_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "acknowledgement": "MAV_MISSION_ACCEPTED",
+    "error": null
+  },
+
+  "clear_result_no_items": {
+    "contract_version": "mission-contract-v1",
+    "accepted": true,
+    "cleared": true,
+    "verified": true,
+    "observed_pixhawk_item_count": 0,
+    "observed_route_waypoint_count": 0,
+    "empty_representation": "NO_ITEMS",
+    "acknowledgement": "MAV_MISSION_ACCEPTED",
+    "error": null
+  },
+
+  "clear_result_home_only": {
+    "contract_version": "mission-contract-v1",
+    "accepted": true,
+    "cleared": true,
+    "verified": true,
+    "observed_pixhawk_item_count": 1,
+    "observed_route_waypoint_count": 0,
+    "empty_representation": "HOME_ONLY",
+    "acknowledgement": "MAV_MISSION_ACCEPTED",
+    "error": null
+  },
+
+  "readback": {
+    "contract_version": "mission-contract-v1",
+    "pixhawk_item_count": 3,
+    "route_waypoint_count": 2,
+    "route_content_hash": "sha256:5fe4c2352fc9183e121538a8e199131159cdda66658ccb755c7db1ff54672bfd",
+    "full_mission_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "count": 3,
+    "current_seq": 0,
+    "waypoints": [
+      { "seq": 0, "command": 16, "lat": 56.6400, "lng": 12.8600, "frame": 0 },
+      { "seq": 1, "command": 16, "lat": 56.6501, "lng": 12.8701, "frame": 3 },
+      { "seq": 2, "command": 16, "lat": 56.6512, "lng": 12.8725, "frame": 3 }
+    ]
+  }
+}

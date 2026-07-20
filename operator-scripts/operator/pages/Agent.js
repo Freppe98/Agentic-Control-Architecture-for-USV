@@ -204,7 +204,8 @@ export function Agent(root) {
 
     // ================= Recent Transitions (compact chain) =================
     const vEvents = events.filter((e) => e.vehicleId === v.id || e.vehicleId == null);
-    const transitionsCard = card("Recent Transitions", "", "idle", transitionChain(vEvents, st, decision), false);
+    const transitionsCard = card("Recent Transitions", "", "idle",
+      latestActionRow(vEvents) + transitionChain(vEvents, st, decision), false);
 
     // ================= Observed State (detailed inputs) + full timeline =================
     const inputsCard = observedStateCard(v, { st, connected, stale, hasContact, age, t, comm, md, mav, battery, missionState, authVal, av, freshSlot });
@@ -291,6 +292,26 @@ export function Agent(root) {
       const vehicleSide = name !== "Operator";
       return { name, state, stale: stale && vehicleSide && state !== "UNKNOWN" };
     });
+  }
+
+  // Latest operator/agent ACTION and whether Scout reported it executed or blocked —
+  // sourced ONLY from the backend's command lifecycle events (which carry structured
+  // detail: command_type/source/stage/outcome). Never invents an outcome: "blocked" is a
+  // REJECTED result, "executed" a VERIFIED/EXECUTED one, "failed" a FAILED/EXPIRED one —
+  // all Scout-reported. Renders nothing until a command event exists for this vehicle.
+  function latestActionRow(vEvents) {
+    const cmdEv = vEvents.filter((e) => e.type === "command" && e.detail).slice(-1)[0];
+    if (!cmdEv) return "";
+    const d = cmdEv.detail;
+    const outcome = d.outcome || d.stage || "";
+    const verb = outcome === "REJECTED" ? ["blocked", "d"]
+      : (outcome === "VERIFIED" || outcome === "EXECUTED") ? ["executed", "c"]
+      : (outcome === "FAILED" || outcome === "EXPIRED") ? ["failed", "d"]
+      : ["pending", "p"];
+    return `<div class="agent-last-action">
+      <span class="k">Latest action</span>
+      <span class="v"><span class="ctl-type mono">${d.command_type || "—"}</span> ${pill(verb[0], verb[1])}${d.command_source ? `<span class="src-chip">${d.command_source}</span>` : ""}</span>
+    </div>`;
   }
 
   // A compact vertical chain of the recent comms transitions ending in the current
