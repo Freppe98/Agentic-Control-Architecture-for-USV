@@ -16,8 +16,11 @@ const FILTERS = [
   ["emergency", "Emergency"], ["warning", "Warning"], ["caution", "Caution"], ["info", "Info"],
 ];
 const isAckable = (sev) => sev && SEV[sev].rank >= SEV.caution.rank;
-// Normalized command outcome → tint for the structured command-event detail.
-const OUTCOME_TINT = { VERIFIED: "c", EXECUTED: "c", FAILED: "d", REJECTED: "d", EXPIRED: "u", PENDING: "p" };
+// Normalized command outcome → tint for the structured command-event detail. ORPHANED is a
+// terminal result reported for a command this backend no longer holds (queue lost on restart /
+// unknown id): it is an AUDIT note, tinted muted grey ("u") — never the red of a live command
+// failure — and always carried on an INFO-severity event by the backend.
+const OUTCOME_TINT = { VERIFIED: "c", EXECUTED: "c", FAILED: "d", REJECTED: "d", EXPIRED: "u", PENDING: "p", ORPHANED: "u" };
 
 export function Events(root) {
   let items = [];              // normalized + sorted (newest first)
@@ -72,6 +75,9 @@ export function Events(root) {
     const d = it.event && it.event.detail;
     if (!d || it.event.type !== "command") return "";
     const bits = [];
+    // An orphaned historical result is an audit note, not a live command — flag it as such
+    // up front so it never reads as a command the operator issued and is now watching fail.
+    if (d.outcome === "ORPHANED" || d.stage === "ORPHANED") bits.push(`<span class="pill u">AUDIT</span>`);
     if (d.command_type) bits.push(`<b>${d.command_type}</b>`);
     if (d.command_source) bits.push(`src ${d.command_source}`);
     if (d.stage) bits.push(`stage ${d.stage}`);

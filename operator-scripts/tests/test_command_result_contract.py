@@ -46,6 +46,7 @@ class ContractTestBase(unittest.TestCase):
         self.client = TestClient(main.app)
         main.commands.clear()
         main.commands_by_id.clear()
+        main.orphaned_command_results.clear()
         main.event_log.clear()
         main.comms_state_by_id[SCOUT_VID] = "CONNECTED"
 
@@ -149,15 +150,22 @@ class TestCommandResultSingleItemHonestStatus(ContractTestBase):
         self.assertFalse(second.json()["applied"], "a replay must not re-apply or flip the reason")
         self.assertEqual(main.commands_by_id[cid]["reason"], "x")
 
-    def test_unknown_command_id_is_a_clear_404_not_a_silent_200(self):
-        """THE BUG: this used to return 200 ok:true, applied:false — Scout inspecting
-        only the status code would believe its result was accepted."""
+    def test_unknown_command_id_is_a_terminal_200_orphan_not_a_retryable_404(self):
+        """PROTOCOL CHANGE (stabilization): an unknown-but-present command id is an ORPHANED
+        HISTORICAL RESULT — a terminal result for a command this process no longer holds (the
+        in-memory queue was lost on a restart, or the id is bogus). The store is append-only
+        within a process, so the id can NEVER become known; a 404 (the prior contract) only
+        made Scout retry an unresolvable result forever. It now gets a TERMINAL 2xx that stops
+        the retry, with found:false, orphaned:true, applied:false keeping the answer honest for
+        a body-inspecting Agent. (A *missing* id — no id at all — is still a 400; see below.)"""
         r = self.client.post("/agent/command_result",
-                             json={"command_id": "does-not-exist", "status": "failed"})
-        self.assertEqual(r.status_code, 404, r.text)
-        self.assertFalse(r.json()["ok"])
+                             json={"command_id": "does-not-exist", "status": "failed",
+                                   "vehicle_id": "usv-2"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["ok"])
         self.assertFalse(r.json()["applied"])
         self.assertFalse(r.json()["found"])
+        self.assertTrue(r.json()["orphaned"])
 
     def test_invalid_status_is_a_clear_400_not_a_silent_200(self):
         """THE BUG: an unrecognized status string used to be silently swallowed as 200
@@ -181,6 +189,102 @@ class TestCommandResultSingleItemHonestStatus(ContractTestBase):
     def test_garbage_body_is_a_clear_400(self):
         r = self.client.post("/agent/command_result", json={"nonsense": True})
         self.assertEqual(r.status_code, 400, r.text)
+
+
+class TestOrphanedHistoricalResult(ContractTestBase):
+    """Stabilization requirement: a terminal result reported for a command this backend has
+    no record of — an ORPHANED HISTORICAL RESULT (the in-memory queue was lost on a restart,
+    or the id is bogus) — must NOT loop forever and must NOT masquerade as a live command
+    failure. It is acknowledged terminally, archived as a low-severity audit trail, and never
+    touches any current command. This is kept strictly distinct from a MALFORMED result (no id
+    at all, or an invalid status on a known command), which is rejected 400."""
+
+    ORPHAN_ID = "orphan-from-a-previous-backend-process"
+
+    def _claimed_set_home(self):
+        cid = self.queue_set_home()
+        self.claim()
+        return cid
+
+    def test_unknown_historical_result_is_acknowledged_as_orphaned_and_archived(self):
+        r = self.client.post("/agent/command_result", json={
+            "command_id": self.ORPHAN_ID, "status": "failed",
+            "reason": "reported after a backend restart", "vehicle_id": "usv-2"})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["orphaned"])
+        self.assertFalse(body["found"])
+        self.assertFalse(body["applied"])
+        # Archived, keyed by command id, with the reported status/reason preserved for audit.
+        self.assertIn(self.ORPHAN_ID, main.orphaned_command_results)
+        rec = main.orphaned_command_results[self.ORPHAN_ID]
+        self.assertEqual(rec["count"], 1)
+        self.assertEqual(rec["last_status"], "FAILED")
+        self.assertEqual(rec["vehicle_id"], SCOUT_VID)
+
+    def test_orphan_is_a_low_severity_command_audit_event_not_a_failure(self):
+        self.client.post("/agent/command_result", json={
+            "command_id": self.ORPHAN_ID, "status": "failed", "vehicle_id": "usv-2"})
+        orphan_events = [e for e in main.event_log
+                         if (e.get("detail") or {}).get("command_id") == self.ORPHAN_ID]
+        self.assertEqual(len(orphan_events), 1, "exactly one archived audit event")
+        ev = orphan_events[0]
+        self.assertEqual(ev["severity"], "info", "audit note, never a warning/failure severity")
+        self.assertEqual(ev["type"], "command")
+        self.assertEqual(ev["detail"]["outcome"], "ORPHANED")
+        self.assertEqual(ev["detail"]["stage"], "ORPHANED")
+
+    def test_replayed_orphan_is_idempotent_one_audit_event_only(self):
+        """Scout draining its buffer may re-POST the same orphan many times before it stops on
+        the 200. Each is acknowledged, but the audit trail records it ONCE (count increments)."""
+        for _ in range(3):
+            r = self.client.post("/agent/command_result",
+                                 json={"command_id": self.ORPHAN_ID, "status": "failed"})
+            self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(main.orphaned_command_results[self.ORPHAN_ID]["count"], 3)
+        orphan_events = [e for e in main.event_log
+                         if (e.get("detail") or {}).get("command_id") == self.ORPHAN_ID]
+        self.assertEqual(len(orphan_events), 1, "a retry storm must not flood the event log")
+
+    def test_orphan_does_not_mutate_a_live_command_of_the_same_vehicle(self):
+        """An orphaned result for a gone command must never touch a DIFFERENT, still-pending
+        command — no state change, no spurious terminal event on the live one."""
+        live = self._claimed_set_home()
+        before = dict(main.commands_by_id[live])
+        events_before = len(main.event_log)
+        r = self.client.post("/agent/command_result", json={
+            "command_id": self.ORPHAN_ID, "status": "executed", "vehicle_id": "usv-2"})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = main.commands_by_id[live]
+        self.assertEqual(after["status"], "SENT", "the live command is untouched")
+        self.assertEqual(after["status"], before["status"])
+        self.assertIsNone(after["completed_at"])
+        self.assertEqual(after["result"], before["result"])
+        # The live command is still redelivered (it genuinely never got a result) — the orphan
+        # changed nothing about it.
+        self.assertEqual([c["command_id"] for c in self.claim()], [live])
+        # The only new event is the orphan's own audit note — no event was attributed to `live`.
+        new_events = main.event_log[events_before:]
+        self.assertTrue(all((e.get("detail") or {}).get("command_id") != live for e in new_events))
+
+    def test_missing_id_is_malformed_400_and_never_archived_as_orphan(self):
+        """The orphan/ malformed distinction: no command id at all is a MALFORMED request
+        (400), not an orphaned lookup — nothing is archived."""
+        r = self.client.post("/agent/command_result", json={"status": "failed"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertFalse(r.json()["ok"])
+        self.assertEqual(main.orphaned_command_results, {})
+
+    def test_invalid_status_on_known_command_is_malformed_400_not_orphaned(self):
+        """A well-formed lookup that fails on the STATUS value is malformed (400) and leaves
+        the command exactly as it was — it is a known command, so it is never an orphan."""
+        cid = self._claimed_set_home()
+        r = self.client.post("/agent/command_result",
+                             json={"command_id": cid, "status": "kaboom"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertFalse(r.json().get("orphaned", False))
+        self.assertEqual(main.commands_by_id[cid]["status"], "SENT")
+        self.assertNotIn(cid, main.orphaned_command_results)
 
 
 class TestCommandResultBatchStillAlways2xx(ContractTestBase):
@@ -366,10 +470,16 @@ class TestCanonicalMessageEnvelope(ContractTestBase):
                              json=_envelope(None, "executed", result=SUCCESS_RESULT))
         self.assertEqual(r.status_code, 400, r.text)
 
-    def test_envelope_unknown_command_id_is_a_clear_404(self):
+    def test_envelope_unknown_command_id_is_a_terminal_200_orphan(self):
+        """Same orphan contract through the canonical message envelope: an unknown id in the
+        payload is archived and acknowledged terminally (200, orphaned:true), never a 404 that
+        would make the buffered result replay forever."""
         r = self.client.post("/agent/command_result",
                              json=_envelope("does-not-exist", "failed"))
-        self.assertEqual(r.status_code, 404, r.text)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["orphaned"])
+        self.assertFalse(r.json()["found"])
+        self.assertFalse(r.json()["applied"])
 
 
 class TestRedeliveryIsExplicitlyBoundedByTTL(ContractTestBase):

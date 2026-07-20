@@ -856,6 +856,15 @@ RESULT_STATUSES = {"ACCEPTED", "EXECUTED", "REJECTED", "FAILED"}  # what an Agen
 
 commands = []              # append-only [ command record ] (see the spec object below)
 commands_by_id = {}        # {id: record} — uuid id is the dedup key (no duplicate execution)
+# Terminal results reported for a command this process has no record of — an ORPHANED
+# HISTORICAL RESULT. Because commands_by_id is append-only within a process (never pruned)
+# an unknown id can only mean the command belonged to a PRIOR process (the in-memory queue
+# was lost on restart) or is simply bogus: either way no current command exists to apply it
+# to, and none ever will. We archive it here for audit (keyed by command id, so a replayed
+# orphan is recorded once, not once per retry) instead of failing the report — see
+# process_command_result. { command_id: {first_seen, last_seen, count, last_status,
+# last_reason, vehicle_id} }.
+orphaned_command_results = {}
 
 
 def known_vehicle_ids():
@@ -1215,6 +1224,7 @@ def apply_command_result(cmd, new_status, result, reason, now):
 _RESULT_ID_KEYS = ("command_id", "id", "cmd_id", "commandId", "uuid")
 _RESULT_STATUS_KEYS = ("status", "result_status", "outcome", "state")
 _RESULT_REASON_KEYS = ("reason", "error", "message", "detail")
+_RESULT_VEHICLE_KEYS = ("vehicle_id", "usv_id", "vehicleId", "vid")
 # A Local Agent may report TIMEOUT/ACK/DONE/OK — normalize to the lifecycle vocabulary
 # the queue owns (RESULT_STATUSES) so no valid outcome is dropped as "invalid".
 _RESULT_STATUS_ALIASES = {
@@ -1601,21 +1611,76 @@ def _refresh_command_derived(cmd):
     cmd["lifecycle"] = command_lifecycle(cmd)
 
 
-def process_command_result(command_id, raw_status, result, reason, now):
+def _archive_orphaned_result(command_id, status, reason, vehicle_id, now):
+    """Record a terminal result reported for a command this process has no record of — an
+    ORPHANED HISTORICAL RESULT (the queue was lost on restart, or the id is bogus). We do
+    NOT apply it to any current command and never fabricate one; we keep it as a low-severity
+    audit trail so an operator can see Scout reported *something* whose command is gone,
+    without it masquerading as a live command failure. Idempotent by command id: a replayed
+    orphan (Scout draining its buffer) updates the seen count but emits the audit event only
+    ONCE, so a retry storm never floods the event log."""
+    key = str(command_id)
+    rec = orphaned_command_results.get(key)
+    vid = None
+    if vehicle_id is not None:
+        try:
+            vid = int(str(vehicle_id).lower().replace("usv-", ""))
+        except (TypeError, ValueError):
+            vid = None
+    if rec is None:
+        orphaned_command_results[key] = {
+            "command_id": key, "first_seen": now.isoformat(), "last_seen": now.isoformat(),
+            "count": 1, "last_status": status, "last_reason": reason, "vehicle_id": vid,
+        }
+        # First sighting only → one audit event. Severity INFO: this is an audit note about a
+        # command that no longer exists, NOT a failure of any command the operator is watching.
+        _append_event(
+            severity="info", etype="command",
+            source=(f"usv-{vid}" if vid is not None else "operator-backend"),
+            vehicle_id=vid, vehicle=(name_of(vid) if vid is not None else None),
+            message=(f"Orphaned command result archived — reported {status or 'result'} for "
+                     f"unknown command {key} (no current command; not applied)"),
+            detail={
+                "command_id": key, "command_type": None, "command_source": "LOCAL_AGENT",
+                "stage": "ORPHANED", "outcome": "ORPHANED", "verified": None,
+                "expected": None, "observed": None,
+                "reason": reason or "command not found in this backend (queue lost on restart or unknown id)",
+            },
+        )
+    else:
+        rec["last_seen"] = now.isoformat()
+        rec["count"] += 1
+        rec["last_status"] = status
+        rec["last_reason"] = reason
+        if vid is not None:
+            rec["vehicle_id"] = vid
+
+
+def process_command_result(command_id, raw_status, result, reason, now, vehicle_id=None):
     """Look up a command and apply a Local-Agent-reported result. Single source of truth
     shared by BOTH result endpoints (POST /agent/command_result and the id-in-path
     /api/commands/{id}/result). Idempotent by the uuid command id: a duplicate/replayed
     result on an already-terminal command is a no-op (applied:false) — no double history
-    row, no double execution. Returns a per-item dict; never raises."""
+    row, no double execution. Returns a per-item dict; never raises.
+
+    An unknown command id is an ORPHANED HISTORICAL RESULT (found:false, orphaned:true),
+    NOT a malformed request: the item is well-formed, it just names a command this process
+    no longer holds. It is archived for audit (idempotently) and never mutates any current
+    command; the /agent/command_result endpoint answers it with a TERMINAL 2xx so Scout
+    stops retrying, while a *missing* id (no id at all → orphaned:false) stays a 400."""
     if not command_id:
         return {"command_id": command_id, "found": False, "applied": False,
-                "error": "missing command id"}
+                "orphaned": False, "error": "missing command id"}
     cmd = commands_by_id.get(str(command_id))
     if cmd is None:
-        # Unknown id: acknowledge without failing so a buffered backlog can still flush
-        # (the Agent drops it from its buffer) — the record simply no longer exists here.
+        # Unknown id: no current command exists (and none ever will — the store is append-only
+        # within a process, so this id belonged to a prior process or is bogus). Archive it as
+        # an orphaned audit event and acknowledge terminally — a 404 here just makes Scout
+        # retry an unresolvable result forever. Current command state is untouched.
+        _archive_orphaned_result(command_id, normalize_result_status(raw_status) or raw_status,
+                                 reason, vehicle_id, now)
         return {"command_id": command_id, "found": False, "applied": False,
-                "error": "unknown command id"}
+                "orphaned": True, "error": "unknown command id"}
     new_status = normalize_result_status(raw_status)
     if new_status is None:
         return {"command_id": command_id, "found": True, "applied": False,
@@ -1968,13 +2033,17 @@ async def command_result(command_id: str, request: Request):
     print(f"[COMMAND-RESULT] POST /api/commands/{command_id}/result body={body!r}")
     outcome = process_command_result(
         command_id, _pick(body, _RESULT_STATUS_KEYS),
-        body.get("result"), _pick(body, _RESULT_REASON_KEYS), now)
+        body.get("result"), _pick(body, _RESULT_REASON_KEYS), now,
+        vehicle_id=_pick(body, _RESULT_VEHICLE_KEYS))
     print(f"[COMMAND-RESULT] command_id={command_id} found={outcome['found']} "
           f"applied={outcome['applied']} error={outcome.get('error')}")
     if not outcome["found"]:
+        # The id lives in the PATH here: an unknown one is an unknown REST resource, so this
+        # endpoint keeps the idiomatic 404 (Scout posts to /agent/command_result, not here, so
+        # this 404 never drives a retry loop). The orphan was still archived for audit above.
         return JSONResponse(status_code=404, content={
             "ok": False, "error": outcome.get("error", "unknown command id"),
-            "command_id": command_id})
+            "orphaned": outcome.get("orphaned", False), "command_id": command_id})
     if outcome.get("error"):
         return JSONResponse(status_code=400, content={
             "ok": False, "error": outcome["error"], "status": outcome.get("status"),
@@ -2004,12 +2073,21 @@ async def agent_command_result(request: Request):
     command id: replayed/duplicate results are no-ops (applied:false) — a flushed buffer
     never creates duplicate history rows or re-executes.
 
-    A SINGLE result gets an honest HTTP status — 404 unknown command id, 400 invalid/
-    missing id or status — exactly like /api/commands/{id}/result. A silent 200 here
-    would tell the Agent its result "worked" while the command record stays non-terminal
-    and keeps being redelivered by GET /agent/commands until the TTL, forever looking
-    like the Agent never reported anything. A BATCH (2+ items, a flushed backlog) stays
-    ALWAYS 2xx — per-item found/applied/error carries the detail — so one unknown/
+    A SINGLE result gets an honest HTTP status that distinguishes three outcomes:
+      • MALFORMED (400) — no command id at all, or an invalid status on a KNOWN command:
+        the request is broken and would stay broken on replay. A silent 200 here would tell
+        the Agent its result "worked" while a known command stays non-terminal and keeps
+        being redelivered by GET /agent/commands until the TTL, looking like the Agent never
+        reported anything.
+      • ORPHANED HISTORICAL RESULT (200, orphaned:true) — a well-formed result whose command
+        id this process no longer holds (the in-memory queue was lost on a restart, or the id
+        is bogus). Because the store is append-only within a process the id can never become
+        known, so a 404 would only make the Agent retry an unresolvable result forever; we
+        instead acknowledge it terminally and archive it as a low-severity audit event.
+      • APPLIED / IDEMPOTENT NO-OP (200) — a known command, valid status: applied once,
+        replays are no-ops (applied:false).
+    A BATCH (2+ items, a flushed backlog) stays
+    ALWAYS 2xx — per-item found/applied/orphaned/error carries the detail — so one unknown/
     already-terminal id in a backlog never fails the whole flush; see _result_items."""
     now = datetime.now(timezone.utc)
     try:
@@ -2027,7 +2105,8 @@ async def agent_command_result(request: Request):
     results = [
         process_command_result(
             _pick(it, _RESULT_ID_KEYS), _pick(it, _RESULT_STATUS_KEYS),
-            it.get("result"), _pick(it, _RESULT_REASON_KEYS), now)
+            it.get("result"), _pick(it, _RESULT_REASON_KEYS), now,
+            vehicle_id=_pick(it, _RESULT_VEHICLE_KEYS))
         for it in items
     ]
     applied_n = sum(1 for r in results if r["applied"])
@@ -2039,10 +2118,16 @@ async def agent_command_result(request: Request):
     # result keeps it for parity with the id-in-path endpoint.
     if len(results) == 1:
         r = results[0]
-        # "missing command id" is a malformed request (400), not an unresolvable lookup
-        # (404) — the item never had an id to look up in the first place.
+        # "missing command id" is a MALFORMED request (400) — the item never had an id to
+        # look up. An unknown-but-present id is an ORPHANED HISTORICAL RESULT: the command is
+        # gone (queue lost on restart / bogus id) and can never come back, so a 404 would only
+        # make Scout retry it forever. We answer 200 — a TERMINAL ack that stops the retry —
+        # having archived it as a low-severity audit event; found:false, orphaned:true and
+        # applied:false in the body keep the answer honest for a body-inspecting Agent.
         if r.get("error") == "missing command id":
             status_code = 400
+        elif r.get("orphaned"):
+            status_code = 200
         elif not r["found"]:
             status_code = 404
         elif r.get("error"):
@@ -2051,8 +2136,8 @@ async def agent_command_result(request: Request):
             status_code = 200
         return JSONResponse(status_code=status_code, content={
             "ok": status_code == 200, "applied": r["applied"], "found": r["found"],
-            "error": r.get("error"), "command": r.get("command"),
-            "received": 1, "applied_count": applied_n})
+            "orphaned": r.get("orphaned", False), "error": r.get("error"),
+            "command": r.get("command"), "received": 1, "applied_count": applied_n})
     compact = [{k: v for k, v in r.items() if k != "command"} for r in results]
     return {"ok": True, "received": len(results), "applied_count": applied_n,
             "results": compact}
