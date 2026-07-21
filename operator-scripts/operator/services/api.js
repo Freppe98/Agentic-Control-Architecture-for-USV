@@ -30,6 +30,17 @@ async function postJSON(path, body) {
   return { ok: res.ok, status: res.status, data };
 }
 
+/** DELETE helper, same non-throwing { ok, status, data } shape as postJSON. */
+async function delJSON(path) {
+  const res = await fetch(BASE + path, {
+    method: "DELETE",
+    headers: { "Accept": "application/json" },
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* empty body */ }
+  return { ok: res.ok, status: res.status, data };
+}
+
 /** Full fleet, already normalized server-side (comm_state, last_seen_age_s, telemetry, …). */
 export function getFleet() {
   return getJSON("/api/fleet/status");
@@ -227,6 +238,28 @@ export function getFeedHealth(key) {
   const h = feedHealth.get(key);
   return h ? { ...h } : null;
 }
+
+// --- Network-impairment experiment (thesis experiment control, NOT a vehicle command) ---
+// PROPOSED CONTRACT — there is deliberately NO backend implementation in this repo. The
+// operator station only issues the request and renders the state the experiment controller
+// confirms; the actual impairment (Linux `tc netem` for delay/jitter/loss/rate/duplication/
+// reordering, a firewall DROP rule for full disconnect) belongs to a separate controller
+// alongside the Operator↔Scout link, never to browser JavaScript. Until that service exists
+// these calls answer 404/unreachable and the page shows an honest "experiment API
+// unavailable" (a backend gap), never a fabricated "active". See BACKEND_ROADMAP.md.
+//
+//   GET    /api/experiment/network        → current confirmed state (stable schema)
+//   POST   /api/experiment/network        → apply an impairment profile (body: normalizePayload)
+//   DELETE /api/experiment/network        → stop / clear the active impairment
+
+/** Confirmed network-impairment state. Never optimistic — the badge follows this, not the click. */
+export function getNetworkExperiment() { return getJSON("/api/experiment/network"); }
+
+/** Apply an impairment profile. body = lib/experiment.js normalizePayload(). Returns { ok, status, data }. */
+export function applyNetworkExperiment(body) { return postJSON("/api/experiment/network", body); }
+
+/** Remove the active impairment immediately. Returns { ok, status, data }. */
+export function stopNetworkExperiment() { return delJSON("/api/experiment/network"); }
 
 /** Small polling helper so pages don't each reinvent setInterval + error handling.
  *  `key` is optional — pass one (e.g. "fleet") to make this feed's health readable

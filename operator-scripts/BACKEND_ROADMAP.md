@@ -123,6 +123,24 @@ Updated 2026-07-12: the operator backend now **consumes** real MAVLink/heartbeat
 
 Until Scout forwards these, the two checks correctly read **Not available** (which never fails the overall System Check). The `battery` / `RC receiver` / `camera` / `mission service` checks likewise stay **Not available** while those subsystems are disabled. The **RC receiver detected/healthy** signal still has no telemetry field — Vehicle.js now separates the three RC concerns (override *policy* = always-available invariant; *receiver detected* = no telem; *override active* = derived from effective authority `== RC`).
 
+## Experiment — communication impairment (thesis experiment control)
+The Experiment page injects controlled comms impairment between the Operator Station and Scout (latency/jitter/loss/bandwidth/duplication/reordering via `tc netem`; full disconnect via a firewall rule) so degraded and **asymmetric** links can be reproduced during experiments. The frontend is done and honest: it issues a structured request and renders **only** the state the API confirms — never optimistically "active". There is **no backend implementation in this repo**, and by design the browser never runs `tc`/firewall/shell commands. This impairment is a **comms-link experiment, not a Pixhawk command**, so there is deliberately no OPERATOR/LOCAL_AGENT authority gate on it.
+
+| Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
+|---|---|---|---|---|---|---|---|
+| **network-impairment experiment API** (`GET/POST/DELETE /api/experiment/network`) | Experiment | Experiment controller (Scout, `tc netem`) + Operator backend (thin proxy, same pattern as `control_authority`) | B-field | on action | C | Confirmed state (was **Unavailable**) | **DONE (Stage 1)** — Operator proxy implemented in `main.py`; forwards to `{SCOUT_API_BASE}/agent/experiment/network`, backend-owned `experiment_id`, capability-gated, never optimistic (see `verification/experiment.md`, `tests/test_experiment_network.py`). Stage 2+ (`operator_to_scout` / `both` / bandwidth / duplication / reordering / full_disconnect) rejected with a clear 400 until Scout implements them. |
+| durable experiment log (persisted actions across reloads) | Experiment | Experiment controller / Operator backend | B-field | append | C → `GET /api/experiment/network/history` | Session-local only → **backend history live** | P2 · in-process append-only history + `GET /api/experiment/network/history` implemented (same pattern as `event_log`); cross-restart durable storage still a gap |
+
+**Proposed contract** (frontend service functions in `operator/services/api.js`; payload from `operator/lib/experiment.js normalizePayload`):
+
+- `GET /api/experiment/network` → stable schema:
+  `{ status: "inactive"|"applying"|"active"|"stopping"|"failed", active: bool, experiment_id, started_at, ends_at, remaining_s, direction, profile, error }`. **`active` is the ONLY thing that drives the ACTIVE badge** — a `status:"active"` without `active:true` is never rendered active.
+- `POST /api/experiment/network` (apply) body:
+  `{ vehicle_id, latency_ms, jitter_ms, packet_loss_pct, bandwidth_kbit_s|null, duplication_pct, reordering_pct, full_disconnect, direction, duration_s }`.
+- `DELETE /api/experiment/network` (stop) → removes the active impairment immediately.
+- Direction values (asymmetry is first-class): `operator_to_scout` · `scout_to_operator` · `both`.
+- Mechanism split the controller must honor: `tc netem` for delay/jitter/loss/rate/duplication/reordering; a **firewall DROP rule** for `full_disconnect` (not netem).
+
 ## Video / Pilot (pages not yet migrated)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|

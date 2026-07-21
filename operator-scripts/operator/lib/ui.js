@@ -83,7 +83,8 @@ export function evTime(e) {
 export const NAV = [
   ["map", "Map"], ["fleet", "Fleet"], ["mission", "Mission"], ["autonomy", "Agent"],
   ["video", "Video"], ["pilot", "Pilot"], ["vehicle", "Vehicle"], ["events", "Events"],
-  ["config", "Configuration"], ["_sep", ""], ["terminal", "Terminal"], ["messages", "Messages"],
+  ["experiment", "Experiment"], ["config", "Configuration"], ["_sep", ""],
+  ["terminal", "Terminal"], ["messages", "Messages"],
 ];
 
 export const ICON = {
@@ -96,6 +97,7 @@ export const ICON = {
   vehicle: '<path d="M3 13h18l-2 6H5l-2-6Z"/><path d="M7 13V7h6l3 6"/><path d="M12 7V4"/>',
   events: '<path d="M4 6h16M4 12h16M4 18h10"/>',
   config: '<circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
+  experiment: '<path d="M9.5 3h5M10.5 3v6.2L5.4 18a1.7 1.7 0 0 0 1.5 2.6h10.2A1.7 1.7 0 0 0 18.6 18l-5.1-8.8V3"/><path d="M7.8 14.5h8.4"/>',
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>',
   messages: '<path d="M4 5h16v11H9l-4 3V5Z"/>',
 };

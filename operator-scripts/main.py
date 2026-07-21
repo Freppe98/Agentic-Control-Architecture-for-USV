@@ -5,6 +5,7 @@ import requests
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 import asyncio
 import json
@@ -2845,6 +2846,423 @@ def environment():
         return {**base, **{k: None for k in _ENV_KEYS}, "available": False,
                 "stale": False, "source": "open-meteo", "source_age_s": None,
                 "error": str(e)}
+
+
+# --- Network-impairment experiment (Stage 1) — Operator→Scout orchestration proxy ---
+# A thin proxy to Scout's experiment controller (GET/POST/DELETE {base}/agent/experiment/
+# network), resolved through the SAME SCOUT_API_BASE map as control_authority / pixhawk_
+# mission — never a hard-coded address, and never one the browser owns. The Operator backend:
+#   • validates the frontend profile against STAGE-1 CAPABILITIES before forwarding, so an
+#     unsupported field fails HERE with a clear 400 instead of a Scout 500;
+#   • GENERATES the experiment_id (a UUID per accepted apply) — the browser never sends one;
+#   • forwards a normalized request to Scout and returns ONLY Scout-confirmed state (never
+#     optimistically active — GET polling is the source of truth);
+#   • records durable-within-process history (same in-memory append-only pattern as
+#     event_log / commands) and mirrors each action into the operator event log.
+#
+# Scope: thesis experiment infrastructure on the Operator↔Scout communications link — NOT a
+# Pixhawk vehicle command. It is deliberately INDEPENDENT of control authority and of the
+# comm-state command gate (no OPERATOR/LOCAL_AGENT check anywhere in this block).
+EXPERIMENT_STAGE = 1
+# Stage 1 is scout_to_operator netem only. Everything else is a known Scout gap.
+EXPERIMENT_SUPPORTED_DIRECTIONS = {"scout_to_operator"}
+
+# Range limits — MIRROR the frontend LIMITS (operator/lib/experiment.js) so a value the UI
+# accepts is never rejected here for a different reason (and vice-versa).
+EXPERIMENT_LIMITS = {
+    "latency_ms": (0, 10000),
+    "jitter_ms": (0, 5000),
+    "packet_loss_pct": (0, 100),
+    "duration_s": (1, 3600),
+}
+
+# Timeout policy. connect is fixed and short; read is LATENCY-AWARE because a scout_to_operator
+# impairment delays Scout's RESPONSE — a fixed short read timeout would misclassify a
+# legitimately-delayed latency experiment as a failure. Firmly upper-bounded (READ_CAP) so a
+# pathological latency value can never hang the endpoint. GET/DELETE size their read timeout
+# from the KNOWN active profile (a big latency experiment delays their responses too).
+EXPERIMENT_CONNECT_TIMEOUT = 3.0
+EXPERIMENT_READ_BASE = 5.0
+EXPERIMENT_READ_CAP = 20.0
+EXPERIMENT_READ_SAFETY = 2.0
+
+MAX_EXPERIMENT_HISTORY = 1000
+# Append-only, in-memory (resets on restart), exactly like event_log / commands / comms
+# history — the established persistence pattern in this process, not a new database.
+experiment_history = []          # [ {timestamp, experiment_id, vehicle_id, action, direction,
+                                 #    profile, duration_s, result, detail} ]
+# The no-id GET the frontend issues resolves to the last vehicle a POST/DELETE targeted;
+# defaults to the single configured Scout vehicle.
+_last_experiment_vehicle_id = next(iter(SCOUT_API_BASE), 2)
+# Per-vehicle tracking so GET can (a) size its own latency-aware read timeout from the known
+# active profile and (b) record confirmed_active / expired_automatically exactly once per
+# experiment_id as Scout's polled state transitions.
+_experiment_tracked = {}         # {vid: {experiment_id, active, direction, profile, recorded:set}}
+
+
+def _experiment_read_timeout(latency_ms=0, jitter_ms=0):
+    """Read timeout that ACCOUNTS for the requested (or active) Scout→Operator delay, with a
+    firm upper bound. A 500 ms latency experiment must not be called a failure just because
+    the ack took ~500 ms; a pathological 10 s value must still never hang past READ_CAP."""
+    try:
+        delay_s = (float(latency_ms or 0) + float(jitter_ms or 0)) / 1000.0
+    except (TypeError, ValueError):
+        delay_s = 0.0
+    return max(EXPERIMENT_READ_BASE,
+               min(EXPERIMENT_READ_CAP, EXPERIMENT_READ_BASE + EXPERIMENT_READ_SAFETY * delay_s))
+
+
+def _experiment_tracker(vid):
+    return _experiment_tracked.setdefault(
+        vid, {"experiment_id": None, "active": False, "direction": None,
+              "profile": {}, "recorded": set()})
+
+
+def _record_experiment_history(*, vehicle_id, action, result, experiment_id=None,
+                               direction=None, profile=None, duration_s=None, detail=None,
+                               severity="info", event=True):
+    """Append one experiment-history record and (by default) mirror it into the operator
+    event log so the Events page shows it. `action` ∈ requested | confirmed_active | rejected
+    | apply_failed | stopped_manually | expired_automatically."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "experiment_id": experiment_id,
+        "vehicle_id": vehicle_id,
+        "action": action,
+        "direction": direction,
+        "profile": profile or {},
+        "duration_s": duration_s,
+        "result": result,
+        "detail": detail,
+    }
+    experiment_history.append(entry)
+    if len(experiment_history) > MAX_EXPERIMENT_HISTORY:
+        del experiment_history[0:len(experiment_history) - MAX_EXPERIMENT_HISTORY]
+    if event:
+        _append_event(
+            severity=severity,
+            message=f"Experiment {action.replace('_', ' ')} ({result})",
+            etype="experiment", source="operator-backend",
+            vehicle_id=vehicle_id, vehicle=name_of(vehicle_id),
+            detail={"experiment_id": experiment_id, "action": action, "result": result,
+                    "direction": direction, "profile": profile or {}, "duration_s": duration_s},
+        )
+    return entry
+
+
+def _experiment_num(v):
+    """Coerce a numeric field; None for blank, the "INVALID" sentinel for non-numeric."""
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return "INVALID"
+
+
+def _experiment_positive(v):
+    n = _experiment_num(v)
+    return isinstance(n, float) and n > 0
+
+
+def experiment_unsupported(body):
+    """Stage-1-unsupported aspects of a requested profile (empty list => all Stage 1).
+    Rejected loudly rather than forwarded, so an unsupported field never becomes a Scout 500."""
+    unsupported = []
+    direction = str(body.get("direction") or "").strip()
+    if direction and direction not in EXPERIMENT_SUPPORTED_DIRECTIONS:
+        unsupported.append(f"direction={direction}")
+    if body.get("bandwidth_kbit_s") not in (None, ""):
+        unsupported.append("bandwidth_kbit_s")
+    if _experiment_positive(body.get("duplication_pct")):
+        unsupported.append("duplication_pct")
+    if _experiment_positive(body.get("reordering_pct")):
+        unsupported.append("reordering_pct")
+    if body.get("full_disconnect") is True:
+        unsupported.append("full_disconnect")
+    return unsupported
+
+
+def experiment_invalid_ranges(body):
+    """Out-of-range / non-numeric SUPPORTED fields (empty dict => all in range)."""
+    invalid = {}
+    for field, (lo, hi) in EXPERIMENT_LIMITS.items():
+        n = _experiment_num(body.get(field))
+        if n is None or n == "INVALID":
+            invalid[field] = "must be a number"
+        elif n < lo or n > hi:
+            invalid[field] = f"must be between {lo} and {hi}"
+    return invalid
+
+
+def _stable_experiment_state(vid, *, status, active, experiment_id=None, started_at=None,
+                             ends_at=None, remaining_s=None, direction=None, profile=None,
+                             error=None, available=True):
+    """The ONE stable schema every experiment endpoint returns — so the frontend never has
+    to guess field presence. `active` is the ONLY thing that may drive the ACTIVE badge."""
+    return {
+        "status": status, "active": bool(active), "experiment_id": experiment_id,
+        "vehicle_id": vid, "started_at": started_at, "ends_at": ends_at,
+        "remaining_s": remaining_s, "direction": direction, "profile": profile,
+        "error": error, "available": available,
+    }
+
+
+def _normalize_scout_experiment(vid, data):
+    """Scout's confirmed experiment state → the stable operator schema. Tolerant of field
+    spellings and of a flat profile; `active` follows Scout's own flag, never assumed."""
+    if not isinstance(data, dict):
+        data = {}
+    active = bool(data.get("active"))
+    exp_id = data.get("experiment_id") or data.get("id")
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else None
+    if profile is None and active:
+        flat = {k: data.get(k) for k in ("latency_ms", "jitter_ms", "packet_loss_pct",
+                "bandwidth_kbit_s", "duplication_pct", "reordering_pct", "full_disconnect")
+                if data.get(k) is not None}
+        profile = flat or None
+    return _stable_experiment_state(
+        vid,
+        status="active" if active else "inactive",
+        active=active,
+        experiment_id=exp_id,
+        started_at=_first_present(data.get("started_at"), data.get("start")),
+        ends_at=_first_present(data.get("ends_at"), data.get("end")),
+        remaining_s=_first_present(data.get("remaining_s"), data.get("remaining")),
+        direction=data.get("direction"),
+        profile=profile,
+        error=data.get("error"),
+        available=True,
+    )
+
+
+def _observe_experiment_state(vid, state):
+    """React to a Scout-confirmed state (from POST or a GET poll). Records confirmed_active /
+    expired_automatically exactly ONCE per experiment_id as the state transitions, and keeps
+    the tracked profile fresh so GET's read timeout stays latency-aware. GET is the source of
+    truth for these lifecycle events — never optimistic."""
+    global _last_experiment_vehicle_id
+    t = _experiment_tracker(vid)
+    exp_id = state.get("experiment_id")
+    if state.get("active") is True:
+        _last_experiment_vehicle_id = vid
+        t["experiment_id"] = exp_id
+        t["direction"] = state.get("direction")
+        if isinstance(state.get("profile"), dict):
+            t["profile"] = state["profile"]
+        key = ("confirmed_active", exp_id)
+        if exp_id and key not in t["recorded"]:
+            t["recorded"].add(key)
+            _record_experiment_history(
+                vehicle_id=vid, action="confirmed_active", result="active",
+                experiment_id=exp_id, direction=state.get("direction"),
+                profile=state.get("profile"))
+        t["active"] = True
+    else:
+        prev_id = t.get("experiment_id")
+        if t.get("active") and prev_id and ("terminal", prev_id) not in t["recorded"]:
+            t["recorded"].add(("terminal", prev_id))
+            _record_experiment_history(
+                vehicle_id=vid, action="expired_automatically", result="expired",
+                experiment_id=prev_id, direction=t.get("direction"),
+                profile=t.get("profile"))
+        t["active"] = False
+        t["profile"] = {}
+
+
+@app.get("/api/experiment/network")
+def get_network_experiment(vehicle_id: Optional[int] = None):
+    """Confirmed Scout experiment state for the selected/last-targeted vehicle, in the stable
+    schema. Never 500s: an unreachable Scout is a deliberate, handled unavailable response so
+    the frontend's 2 s poll renders an honest "Unavailable" (its convention for a failed
+    experiment GET) rather than a fabricated inactive/active state."""
+    vid = vehicle_id if vehicle_id is not None else _last_experiment_vehicle_id
+    base = scout_api_base(vid)
+    if base is None:
+        return JSONResponse(status_code=200, content=_stable_experiment_state(
+            vid, status="unavailable", active=False, available=False,
+            error="No Scout experiment controller configured for this vehicle"))
+    prof = (_experiment_tracked.get(vid) or {}).get("profile") or {}
+    read = _experiment_read_timeout(prof.get("latency_ms"), prof.get("jitter_ms"))
+    try:
+        r = requests.get(f"{base}/agent/experiment/network",
+                         timeout=(EXPERIMENT_CONNECT_TIMEOUT, read))
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException:
+        # Non-500, stable, documented: 503 makes the existing frontend show "Unavailable"
+        # (a failed GET is its honest unavailable signal) without any frontend change.
+        return JSONResponse(status_code=503, content=_stable_experiment_state(
+            vid, status="unavailable", active=False, available=False,
+            error="Scout experiment controller unreachable"))
+    state = _normalize_scout_experiment(vid, data)
+    _observe_experiment_state(vid, state)
+    return state
+
+
+@app.post("/api/experiment/network")
+async def apply_network_experiment(request: Request):
+    """Apply an impairment profile: validate (capabilities + ranges) → generate the
+    experiment UUID → forward the normalized request to Scout → return Scout-confirmed state.
+    Never optimistically active. Because scout_to_operator impairment can delay or drop the
+    apply ack, a forward failure is recorded but NOT declared a failed experiment — GET polling
+    remains the source of truth."""
+    global _last_experiment_vehicle_id
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    raw_vid = body.get("vehicle_id")
+    if isinstance(raw_vid, bool):
+        raw_vid = None
+    if isinstance(raw_vid, (int, float)):
+        vid = int(raw_vid)
+    elif isinstance(raw_vid, str) and raw_vid.strip().isdigit():
+        vid = int(raw_vid)
+    else:
+        vid = _last_experiment_vehicle_id
+
+    base = scout_api_base(vid)
+    if base is None:
+        return JSONResponse(status_code=409, content=_stable_experiment_state(
+            vid, status="unavailable", active=False, available=False,
+            error="No Scout experiment controller configured for this vehicle"))
+
+    # Capability gate (Stage 1) — reject clearly, never forward to a Scout 500.
+    unsupported = experiment_unsupported(body)
+    if unsupported:
+        _record_experiment_history(
+            vehicle_id=vid, action="rejected", result="unsupported",
+            direction=body.get("direction"), detail={"unsupported": unsupported},
+            severity="caution")
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "unsupported experiment profile",
+            "unsupported": unsupported, "supported_stage": EXPERIMENT_STAGE})
+
+    # Range gate — reject out-of-range values BEFORE forwarding.
+    invalid = experiment_invalid_ranges(body)
+    if invalid:
+        _record_experiment_history(
+            vehicle_id=vid, action="rejected", result="invalid_range",
+            direction=body.get("direction"), detail={"invalid": invalid},
+            severity="caution")
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "invalid experiment parameters", "invalid": invalid})
+
+    experiment_id = str(uuid.uuid4())     # backend-owned; the browser never supplies one
+    _last_experiment_vehicle_id = vid
+
+    # Normalized forward payload (Stage 1). The unsupported fields have all been validated to
+    # their harmless defaults above, so they are forwarded verbatim — matching the Scout
+    # contract shape exactly, with experiment_id injected and vehicle_id dropped.
+    scout_payload = {
+        "experiment_id": experiment_id,
+        "latency_ms": body.get("latency_ms"),
+        "jitter_ms": body.get("jitter_ms"),
+        "packet_loss_pct": body.get("packet_loss_pct"),
+        "bandwidth_kbit_s": body.get("bandwidth_kbit_s"),
+        "duplication_pct": body.get("duplication_pct", 0),
+        "reordering_pct": body.get("reordering_pct", 0),
+        "full_disconnect": bool(body.get("full_disconnect", False)),
+        "direction": "scout_to_operator",
+        "duration_s": body.get("duration_s"),
+    }
+    profile = {k: scout_payload[k] for k in (
+        "latency_ms", "jitter_ms", "packet_loss_pct", "bandwidth_kbit_s",
+        "duplication_pct", "reordering_pct", "full_disconnect")}
+    _record_experiment_history(
+        vehicle_id=vid, action="requested", result="forwarded",
+        experiment_id=experiment_id, direction="scout_to_operator",
+        profile=profile, duration_s=scout_payload["duration_s"])
+
+    read = _experiment_read_timeout(scout_payload["latency_ms"], scout_payload["jitter_ms"])
+    try:
+        r = requests.post(f"{base}/agent/experiment/network", json=scout_payload,
+                          timeout=(EXPERIMENT_CONNECT_TIMEOUT, read))
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException as exc:
+        _record_experiment_history(
+            vehicle_id=vid, action="apply_failed", result="scout_unreachable",
+            experiment_id=experiment_id, direction="scout_to_operator", profile=profile,
+            duration_s=scout_payload["duration_s"], detail={"error": str(exc)},
+            severity="warning")
+        return JSONResponse(status_code=502, content=_stable_experiment_state(
+            vid, status="unavailable", active=False, available=False,
+            experiment_id=experiment_id, direction="scout_to_operator", profile=profile,
+            error="Scout experiment controller did not acknowledge — poll for confirmed state"))
+
+    state = _normalize_scout_experiment(vid, data)
+    if not state.get("experiment_id"):
+        state["experiment_id"] = experiment_id   # carry ours if Scout echoed none
+    _observe_experiment_state(vid, state)
+    return state
+
+
+@app.delete("/api/experiment/network")
+def stop_network_experiment(vehicle_id: Optional[int] = None):
+    """Stop / clear the active impairment. Idempotent and safe when nothing is active. Proxies
+    to Scout and returns Scout-confirmed state — never an optimistic inactive before Scout
+    confirms it. A confirmed stop is recorded as a manual stop in experiment history."""
+    global _last_experiment_vehicle_id
+    vid = vehicle_id if vehicle_id is not None else _last_experiment_vehicle_id
+    base = scout_api_base(vid)
+    if base is None:
+        return JSONResponse(status_code=409, content=_stable_experiment_state(
+            vid, status="unavailable", active=False, available=False,
+            error="No Scout experiment controller configured for this vehicle"))
+    _last_experiment_vehicle_id = vid
+    t = _experiment_tracker(vid)
+    prof = t.get("profile") or {}
+    read = _experiment_read_timeout(prof.get("latency_ms"), prof.get("jitter_ms"))
+    stopped_id = t.get("experiment_id")
+    try:
+        r = requests.delete(f"{base}/agent/experiment/network",
+                            timeout=(EXPERIMENT_CONNECT_TIMEOUT, read))
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException as exc:
+        _record_experiment_history(
+            vehicle_id=vid, action="apply_failed", result="scout_unreachable",
+            experiment_id=stopped_id, detail={"error": str(exc), "op": "stop"},
+            severity="warning")
+        return JSONResponse(status_code=503, content=_stable_experiment_state(
+            vid, status="unavailable", active=False, available=False,
+            error="Scout experiment controller unreachable"))
+
+    state = _normalize_scout_experiment(vid, data)
+    if state.get("active") is True:
+        # Scout says it is still active — do NOT fabricate an inactive result; reflect truth.
+        _observe_experiment_state(vid, state)
+        return state
+
+    # Scout confirms inactive. Record a manual stop only when there was actually something to
+    # stop (a known active experiment, or one Scout named), and mark it terminal so a following
+    # GET does not ALSO log an expiry for the same experiment. A repeated DELETE with nothing
+    # active is harmless and quiet.
+    rec_id = stopped_id or state.get("experiment_id")
+    if rec_id and ("terminal", rec_id) not in t["recorded"]:
+        t["recorded"].add(("terminal", rec_id))
+        _record_experiment_history(
+            vehicle_id=vid, action="stopped_manually", result="stopped",
+            experiment_id=rec_id, direction=t.get("direction"), profile=prof or None)
+    t["active"] = False
+    t["experiment_id"] = None
+    t["profile"] = {}
+    return state
+
+
+@app.get("/api/experiment/network/history")
+def get_experiment_history(limit: int = 200):
+    """Durable-within-process experiment history (requested / confirmed / rejected / apply
+    failed / stopped / expired / unreachable). The proposed durable-log endpoint from
+    BACKEND_ROADMAP — chronological, capped to the most recent `limit`."""
+    now = datetime.now(timezone.utc)
+    items = experiment_history[-limit:] if limit and limit > 0 else list(experiment_history)
+    return {"history": items, "count": len(experiment_history), "generated_at": now.isoformat()}
 
 
 @app.get("/", include_in_schema=False)

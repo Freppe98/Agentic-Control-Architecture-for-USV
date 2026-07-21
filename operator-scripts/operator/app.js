@@ -10,9 +10,10 @@ import { Events } from "./pages/Events.js";
 import { Config } from "./pages/Config.js";
 import { Pilot } from "./pages/Pilot.js";
 import { Terminal } from "./pages/Terminal.js";
+import { Experiment } from "./pages/Experiment.js";
 import { Stub } from "./pages/Stub.js";
 
-const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, autonomy: Agent, events: Events, config: Config, pilot: Pilot, terminal: Terminal };
+const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, autonomy: Agent, events: Events, experiment: Experiment, config: Config, pilot: Pilot, terminal: Terminal };
 const root = document.getElementById("app");
 let cleanup = null;
 

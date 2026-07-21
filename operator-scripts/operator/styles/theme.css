@@ -65,16 +65,17 @@ a { color:inherit; }
 .clock .t { font-family:var(--font-mono); font-size:var(--fs-lg); font-variant-numeric:tabular-nums; }
 
 /* ---------- nav rail ---------- */
-.rail { grid-row:2; grid-column:1; background:var(--panel-2); border-right:1px solid var(--line); display:flex; flex-direction:column; align-items:center; padding:9px 0; gap:3px; }
+.rail { grid-row:2; grid-column:1; background:var(--panel-2); border-right:1px solid var(--line); display:flex; flex-direction:column; align-items:center; padding:11px 0; gap:5px; }
 .nav { position:relative; width:var(--nav-size); height:var(--nav-size); border-radius:var(--r); display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:pointer; transition:color var(--t-base), background var(--t-base); }
-.nav svg { width:20px; height:20px; }
+.nav svg { width:var(--nav-icon); height:var(--nav-icon); }
 .nav:hover { color:var(--text); background:var(--raise); }
 .nav:active { background:rgba(132,152,172,.14); }
 .nav.active { color:var(--accent); background:var(--accent-dim); }
-.nav.active::before { content:""; position:absolute; left:-9px; top:9px; bottom:9px; width:2px; background:var(--accent); border-radius:0 2px 2px 0; }
-.nav .tip { position:absolute; left:47px; top:50%; transform:translateY(-50%); background:#020509; border:1px solid var(--line-strong); color:var(--text); padding:4px 9px; border-radius:var(--r-sm); font-size:var(--fs-sm); white-space:nowrap; opacity:0; pointer-events:none; transition:opacity var(--t-hover); z-index:40; box-shadow:var(--shadow-2); }
+.nav.active::before { content:""; position:absolute; left:-9px; top:13px; bottom:13px; width:2px; background:var(--accent); border-radius:0 2px 2px 0; }
+/* tooltip clears the widened button (rail 78 − ~9px left margin − 60px button ≈ right edge 69) */
+.nav .tip { position:absolute; left:calc(var(--nav-size) + 12px); top:50%; transform:translateY(-50%); background:#020509; border:1px solid var(--line-strong); color:var(--text); padding:4px 9px; border-radius:var(--r-sm); font-size:var(--fs-sm); white-space:nowrap; opacity:0; pointer-events:none; transition:opacity var(--t-hover); z-index:40; box-shadow:var(--shadow-2); }
 .nav:hover .tip { opacity:1; }
-.rail .sep { width:22px; height:1px; background:var(--line); margin:8px 0; }
+.rail .sep { width:34px; height:1px; background:var(--line); margin:9px 0; }
 
 /* ---------- status primitives ---------- */
 .dot { width:8px; height:8px; border-radius:50%; flex:none; }
@@ -818,3 +819,64 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .modal-cancel:hover { border-color:var(--muted); color:var(--text); }
 .modal-confirm { color:var(--accent-bright); background:var(--accent-dim); border:1px solid rgba(76,141,255,.45); }
 .modal-confirm:hover { border-color:var(--accent); background:rgba(76,141,255,.24); }
+
+/* ---------- experiment (communication-impairment controls) ---------- */
+.cfg-btn.primary { color:var(--accent-bright); background:var(--accent-dim); border-color:rgba(76,141,255,.4); font-weight:600; }
+.cfg-btn.primary:hover:not(:disabled) { border-color:var(--accent); background:rgba(76,141,255,.22); }
+.cfg-btn:disabled { opacity:.45; cursor:not-allowed; }
+
+/* form field: label left, control + inline error stacked on the right */
+.exp-fld .fld-c { flex:none; display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
+.exp-input-wrap { display:inline-flex; align-items:center; gap:7px; }
+.exp-input { font-family:var(--font-mono); font-size:13px; color:var(--text); background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:7px 10px; width:120px; text-align:right; font-variant-numeric:tabular-nums; transition:border-color var(--t-base); }
+.exp-input.sm { width:74px; }
+.exp-input:hover:not(:disabled) { border-color:var(--accent); }
+.exp-input:disabled { opacity:.5; cursor:not-allowed; }
+.exp-unit { font-family:var(--font-mono); font-size:11px; color:var(--muted); min-width:38px; }
+.exp-slider-row { display:flex; align-items:center; gap:12px; }
+.exp-range { width:180px; accent-color:var(--accent); cursor:pointer; }
+.exp-range:disabled { opacity:.5; cursor:not-allowed; }
+.exp-err { font-size:11px; color:var(--disconnected); min-height:13px; text-align:right; }
+
+/* netem fields dimmed while Full Disconnect owns the mechanism */
+.exp-impair.dimmed, .exp-impair-adv.dimmed { opacity:.45; }
+.exp-impair.dimmed .fld-lbl, .exp-impair-adv.dimmed .fld-lbl { color:var(--muted); }
+
+/* Full Disconnect — an experiment control, deliberately NOT styled like an emergency
+   vehicle command (no red button); a neutral panel that tints amber only when armed. */
+.exp-disconnect { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:13px 14px; border:1px solid var(--line-strong); border-radius:var(--r); background:var(--panel-2); }
+.exp-disconnect.armed { border-color:rgba(242,169,59,.5); background:rgba(242,169,59,.07); }
+.exp-disconnect-l { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.exp-disconnect.armed .fld-lbl { color:var(--caution); }
+
+.exp-actions { flex-wrap:wrap; }
+.exp-form-note { font-size:11.5px; color:var(--muted); }
+.exp-form-note.err { color:var(--disconnected); }
+
+/* status badge (own axis — reuses the health palette, not the comms axis) */
+.exp-badge { display:inline-flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:11px; letter-spacing:.05em; text-transform:uppercase; font-weight:600; padding:5px 11px; border-radius:var(--r); border:1px solid var(--line-strong); color:var(--muted); background:var(--panel-2); white-space:nowrap; }
+.exp-badge i { width:8px; height:8px; border-radius:50%; background:currentColor; flex:none; }
+.exp-badge.ok { color:var(--ok); border-color:rgba(62,207,142,.34); background:rgba(62,207,142,.08); }
+.exp-badge.pending { color:var(--accent-bright); border-color:rgba(76,141,255,.4); background:var(--accent-dim); }
+.exp-badge.pending i { animation:auth-pulse 1.1s ease-in-out infinite; }
+.exp-badge.warn { color:var(--warn); border-color:rgba(229,72,77,.36); background:rgba(229,72,77,.08); }
+.exp-badge.idle { color:var(--dim); }
+.exp-badge.gap { color:var(--dim); border-style:dashed; }
+
+/* compact live summary of a CONFIRMED-active experiment */
+.exp-live { border:1px solid rgba(62,207,142,.34); background:rgba(62,207,142,.06); border-radius:var(--r); padding:12px 14px; display:flex; flex-direction:column; gap:3px; }
+.exp-live-h { font-family:var(--font-mono); font-size:12px; font-weight:700; letter-spacing:.08em; color:var(--connected); margin-bottom:3px; }
+.exp-live-l { font-family:var(--font-mono); font-size:12.5px; color:var(--text); }
+.exp-requested { display:flex; align-items:baseline; gap:10px; padding:9px 12px; border:1px dashed var(--line-strong); border-radius:var(--r); background:var(--panel-2); font-size:12px; color:var(--muted); }
+.exp-requested .lbl { color:var(--partitioned); }
+
+.exp-status-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+@media (max-width:640px){ .exp-status-grid { grid-template-columns:1fr; } }
+.exp-srow { display:flex; align-items:baseline; justify-content:space-between; gap:12px; background:var(--panel); padding:10px 13px; }
+.exp-srow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
+.exp-srow .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); font-variant-numeric:tabular-nums; text-align:right; }
+
+/* experiment history table */
+.exp-log tbody td { height:40px; }
+.exp-log-empty { color:var(--muted); font-style:italic; text-align:center; }
+.exp-adv { margin:2px 0; }

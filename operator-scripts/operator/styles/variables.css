@@ -61,9 +61,15 @@
   --t-slow:.2s;
 
   /* ---- layout ---- */
-  --rail-w:52px;
+  /* Left navigation pillar: --rail-w is the fixed grid column for the rail AND the
+     ribbon brand cell; --nav-size is the square icon button. Widened ~50% (was 52/40)
+     for a larger, easier target — the only place these sizes live, so the whole grid,
+     the content offset and the ribbon brand track them automatically. --nav-icon is the
+     glyph size inside each button. */
+  --rail-w:78px;
   --dock-w:240px;
   --inspector-w:344px;
   --ribbon-h:48px;
-  --nav-size:40px;
+  --nav-size:60px;
+  --nav-icon:30px;
 }
