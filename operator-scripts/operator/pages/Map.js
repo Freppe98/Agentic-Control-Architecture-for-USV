@@ -1179,6 +1179,12 @@ export function Map(root) {
       selId = defaultSelection();
       loadCommsHistory(selId); loadAuthority(selId); loadCommands(selId);
     }
+    // FUTURE EXTENSION POINT (mission-revision auto-refresh): every fleet poll lands here
+    // with the latest per-vehicle payload. When the backend starts surfacing a revision
+    // signal (active_revision_id / mission_changed_at — see main.py normalize_agent_message),
+    // detect a change for the SELECTED vehicle here and call fetchPixhawkMission(selId) — the
+    // existing, self-contained overlay refresh (it clears and redraws, never duplicates). No
+    // new transport is needed; deliberately NOT wired yet.
     updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
     updateRibbon({ counts: counts() });
   }

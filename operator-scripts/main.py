@@ -406,6 +406,14 @@ def normalize_agent_message(message: dict) -> dict:
         "speed": speed,
         "mission": mission.get("mission_state", payload.get("mission", "Unknown")),
         "coverage": payload.get("coverage"),
+        # FUTURE EXTENSION POINT (mission-revision notification / auto-refresh): this dict is
+        # the SINGLE place the fleet payload's per-vehicle shape is built, so a lightweight
+        # revision signal Scout may start reporting — active_revision_id / active_route_hash /
+        # mission_changed_at — is surfaced HERE (read it off `mission`/`payload`, e.g.
+        # mission.get("active_revision_id")). The frontend already refetches the mission via
+        # Map.js fetchPixhawkMission(); onFleet only has to compare this field to trigger it.
+        # NOT added yet — see BACKEND_ROADMAP.md; the read-back proxy has its own passthrough
+        # list in _scout_mission_read for the same fields on the pixhawk-mission response.
         "lat": lat,
         "lng": lng,
         # Vehicle Home (Pixhawk HOME_POSITION / RTL recovery point) + the operator's
@@ -2151,7 +2159,14 @@ async def command_result(command_id: str, request: Request):
     EXECUTED. Scout may instead POST /agent/command_result with the id in the body
     (same lifecycle, backlog-friendly) — both share process_command_result."""
     now = datetime.now(timezone.utc)
-    body = await request.json()
+    # A non-JSON / malformed body must not 500 this endpoint — a Local Agent that acks
+    # with the wrong content-type (or an empty body) still carries the command id in the
+    # PATH, so we treat an unparseable body as an empty result and let the lifecycle logic
+    # answer honestly (400 "missing status"), mirroring /agent/command_result's tolerance.
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
     if not isinstance(body, dict):
         body = {}
     print(f"[COMMAND-RESULT] POST /api/commands/{command_id}/result body={body!r}")

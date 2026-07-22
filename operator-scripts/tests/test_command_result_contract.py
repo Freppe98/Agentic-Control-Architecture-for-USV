@@ -501,5 +501,44 @@ class TestRedeliveryIsExplicitlyBoundedByTTL(ContractTestBase):
         self.assertEqual(main.commands_by_id[cid]["status"], "EXPIRED")
 
 
+class TestMalformedBodyNeverCrashesTheResultEndpoint(ContractTestBase):
+    """Requirement: neither result endpoint may 500 on a non-JSON / empty body. A Local
+    Agent that acks with the wrong content-type (or an empty body) must get an honest
+    lifecycle answer, never a server crash — a 500 looks like the operator backend fell
+    over and is exactly the kind of stray failure that would break a future
+    revision-ack → refetch flow. The id-in-path endpoint carries the command id in the
+    URL, so an unparseable body degrades to an empty result, mirroring the tolerance
+    /agent/command_result already had."""
+
+    def test_id_in_path_non_json_body_is_not_a_500(self):
+        cid = self.queue_set_home()
+        self.claim()
+        r = self.client.post(f"/api/commands/{cid}/result",
+                             content="this is not json",
+                             headers={"Content-Type": "text/plain"})
+        # No status in the (empty) body → an honest 400, never a 500.
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertFalse(r.json()["ok"])
+        self.assertEqual(main.commands_by_id[cid]["status"], "SENT",
+                         "a malformed ack must not mutate the command")
+
+    def test_id_in_path_empty_body_is_not_a_500(self):
+        cid = self.queue_set_home()
+        self.claim()
+        r = self.client.post(f"/api/commands/{cid}/result",
+                             content="", headers={"Content-Type": "application/json"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_both_result_endpoints_agree_on_a_non_json_body(self):
+        """Parity: /agent/command_result already tolerated a non-JSON body (400); the
+        id-in-path endpoint must not diverge and 500."""
+        a = self.client.post("/agent/command_result",
+                             content="not json", headers={"Content-Type": "text/plain"})
+        b = self.client.post("/api/commands/whatever/result",
+                             content="not json", headers={"Content-Type": "text/plain"})
+        self.assertNotEqual(a.status_code, 500)
+        self.assertNotEqual(b.status_code, 500)
+
+
 if __name__ == "__main__":
     unittest.main()
