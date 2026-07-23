@@ -14,6 +14,7 @@ import time
 import uuid
 
 import mission_contract
+import planning
 
 
 @asynccontextmanager
@@ -2041,6 +2042,190 @@ async def mission_preview(request: Request):
             "message": "Mission does not satisfy " + MISSION_CONTRACT_VERSION + ".",
             "errors": exc.errors})
     return {"ok": True, "params": params}
+
+
+# ── Survey mission planning (Plan page) ──────────────────────────────────────────────
+# Planning is OPERATOR-owned: the Plan page constructs a side-scan survey and hands Scout a
+# finalized, validated mission package. Generation/validation are deterministic and run
+# without a live Scout — they are pure geometry over the operator's inputs (see planning.py,
+# which ports Scout's tested lawnmower + return-path generators). Upload is deliberately NOT
+# a new endpoint here: a generated route is route waypoints, uploaded through the SAME
+# POST /api/commands MISSION_UPLOAD path as a pasted mission, so there is exactly one
+# mission-upload framework, one contract and one read-back verification — never a second.
+#
+# Drafts are editable planning documents (NOT uploaded missions), persisted as JSON files in
+# the existing lightweight style (the backend has no database; see SYSTEM_INFORMATION_MODEL).
+PLANNING_DRAFTS_DIR = BASE_DIR / "planning_drafts"
+
+
+def _planning_unavailable_response():
+    """Honest 503 when the geometry stack is not installed — never a 500, and never a
+    fabricated empty route. UI-honesty applied to a whole feature."""
+    return JSONResponse(status_code=503, content={
+        "ok": False, "error": "planning_unavailable",
+        "message": ("Survey planning is unavailable in this backend — it requires shapely, "
+                    "pyproj and numpy, which are not installed. Install them to enable the "
+                    "Plan page's route generation."),
+        "detail": planning.PLANNING_IMPORT_ERROR})
+
+
+@app.post("/api/planning/generate")
+async def planning_generate(request: Request):
+    """Generate a segmented side-scan survey route from the operator's planning inputs.
+
+    Body: { boundary (GeoJSON Polygon or ring), shoreline_clearance_m, no_go_zones[],
+    lane_spacing_m, primary_angle_deg, dual_pass, secondary_angle_deg, home?,
+    transit_waypoints[]?, survey_speed_mps? }. Returns segments (typed geometry for the map),
+    route_waypoints (flat mission-contract route), metrics, intersections and warnings.
+    Deterministic and read-only: no command is created, no vehicle state is touched."""
+    if not planning.PLANNING_AVAILABLE:
+        return _planning_unavailable_response()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "bad_request", "message": "Request body is not valid JSON."})
+    try:
+        result = planning.generate_survey(body, max_route_waypoints=MAX_ROUTE_WAYPOINTS)
+    except ValueError as exc:
+        # A planning-input problem the operator can fix (empty inset, no coverage, bad
+        # geometry) — a 400 with the specific reason(s), not a 500.
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "planning_input_invalid", "message": str(exc),
+            "errors": str(exc).split("; ")})
+    result["max_route_waypoints"] = MAX_ROUTE_WAYPOINTS
+    return result
+
+
+@app.post("/api/planning/validate")
+async def planning_validate(request: Request):
+    """Deterministically validate a generated plan before upload. Body carries the planning
+    inputs plus the generated `route_waypoints` and `segments`. Returns {ok, errors,
+    warnings, checks}. Errors block upload; warnings do not. Read-only."""
+    if not planning.PLANNING_AVAILABLE:
+        return _planning_unavailable_response()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "bad_request", "message": "Request body is not valid JSON."})
+    result = planning.validate_plan(body, max_route_waypoints=MAX_ROUTE_WAYPOINTS)
+    return result
+
+
+def _draft_path(draft_id: str):
+    """Resolve a draft id to its JSON file, refusing any id that escapes the drafts dir."""
+    name = Path(str(draft_id)).name  # strip any path components
+    if not name or name != str(draft_id):
+        return None
+    return PLANNING_DRAFTS_DIR / f"{name}.json"
+
+
+def _load_draft(draft_id: str):
+    path = _draft_path(draft_id)
+    if path is None or not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _draft_summary(draft: dict):
+    return {
+        "id": draft.get("id"),
+        "name": draft.get("name"),
+        "created_at": draft.get("created_at"),
+        "updated_at": draft.get("updated_at"),
+        "vehicle_id": draft.get("vehicle_id"),
+        "waypoint_count": ((draft.get("plan") or {}).get("metrics") or {}).get("waypoint_count"),
+        "state": draft.get("state"),
+    }
+
+
+@app.post("/api/planning/drafts")
+async def create_draft(request: Request):
+    """Save a new planning draft (an editable planning document, never an uploaded mission).
+    Body: { name?, vehicle_id?, state?, plan: {...geometry, params, generated route...} }.
+    Returns the stored draft with its assigned id."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    now = datetime.now(timezone.utc).isoformat()
+    draft_id = uuid.uuid4().hex[:12]
+    draft = {
+        "id": draft_id,
+        "name": str(body.get("name") or f"Draft {draft_id}"),
+        "vehicle_id": body.get("vehicle_id"),
+        "state": body.get("state"),
+        "created_at": now,
+        "updated_at": now,
+        "plan": body.get("plan") or {},
+    }
+    PLANNING_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PLANNING_DRAFTS_DIR / f"{draft_id}.json", "w", encoding="utf-8") as f:
+        json.dump(draft, f, indent=2)
+    return {"ok": True, "draft": draft}
+
+
+@app.get("/api/planning/drafts")
+def list_drafts():
+    """List saved planning drafts (summaries only), newest first."""
+    drafts = []
+    if PLANNING_DRAFTS_DIR.exists():
+        for path in PLANNING_DRAFTS_DIR.glob("*.json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    drafts.append(_draft_summary(json.load(f)))
+            except Exception:
+                continue
+    drafts.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    return {"ok": True, "drafts": drafts}
+
+
+@app.get("/api/planning/drafts/{draft_id}")
+def get_draft(draft_id: str):
+    draft = _load_draft(draft_id)
+    if draft is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
+    return {"ok": True, "draft": draft}
+
+
+@app.put("/api/planning/drafts/{draft_id}")
+async def update_draft(draft_id: str, request: Request):
+    """Overwrite an existing draft's editable fields, preserving id + created_at."""
+    existing = _load_draft(draft_id)
+    if existing is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    existing["name"] = str(body.get("name") or existing.get("name"))
+    if "vehicle_id" in body:
+        existing["vehicle_id"] = body.get("vehicle_id")
+    if "state" in body:
+        existing["state"] = body.get("state")
+    if "plan" in body:
+        existing["plan"] = body.get("plan") or {}
+    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(PLANNING_DRAFTS_DIR / f"{existing['id']}.json", "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2)
+    return {"ok": True, "draft": existing}
+
+
+@app.delete("/api/planning/drafts/{draft_id}")
+def delete_draft(draft_id: str):
+    path = _draft_path(draft_id)
+    if path is None or not path.exists():
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
+    try:
+        path.unlink()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+    return {"ok": True, "deleted": draft_id}
 
 
 @app.get("/api/commands/pending/{vehicle_id}")

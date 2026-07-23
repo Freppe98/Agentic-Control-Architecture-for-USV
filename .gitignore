@@ -1,3 +1,8 @@
 # Python build artifacts
 __pycache__/
 *.py[cod]
+
+# Scout reference material (provided for porting; not part of the operator station)
+operator-scripts/_scout_ref/
+operator-scripts/services - scout USV.zip
+operator-scripts/planning_drafts/

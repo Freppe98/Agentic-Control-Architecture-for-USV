@@ -3,6 +3,7 @@
 // read "Agent"); the Agent page module lives in pages/Agent.js.
 import { Map } from "./pages/Map.js";
 import { Fleet } from "./pages/Fleet.js";
+import { Plan } from "./pages/Plan.js";
 import { Vehicle } from "./pages/Vehicle.js";
 import { Mission } from "./pages/Mission.js";
 import { Agent } from "./pages/Agent.js";
@@ -13,7 +14,7 @@ import { Terminal } from "./pages/Terminal.js";
 import { Experiment } from "./pages/Experiment.js";
 import { Stub } from "./pages/Stub.js";
 
-const routes = { map: Map, fleet: Fleet, vehicle: Vehicle, mission: Mission, autonomy: Agent, events: Events, experiment: Experiment, config: Config, pilot: Pilot, terminal: Terminal };
+const routes = { map: Map, fleet: Fleet, plan: Plan, vehicle: Vehicle, mission: Mission, autonomy: Agent, events: Events, experiment: Experiment, config: Config, pilot: Pilot, terminal: Terminal };
 const root = document.getElementById("app");
 let cleanup = null;
 

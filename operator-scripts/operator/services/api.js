@@ -30,6 +30,18 @@ async function postJSON(path, body) {
   return { ok: res.ok, status: res.status, data };
 }
 
+/** PUT helper, same non-throwing { ok, status, data } shape as postJSON. */
+async function putJSON(path, body) {
+  const res = await fetch(BASE + path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* empty body */ }
+  return { ok: res.ok, status: res.status, data };
+}
+
 /** DELETE helper, same non-throwing { ok, status, data } shape as postJSON. */
 async function delJSON(path) {
   const res = await fetch(BASE + path, {
@@ -224,6 +236,37 @@ export function getCommandCapabilities() { return getJSON("/api/commands/capabil
 export function previewMission(body) {
   return postJSON("/api/missions/preview", body);
 }
+
+// --- Survey mission planning (Plan page) ------------------------------------
+// Generation + validation are deterministic backend geometry (planning.py), NOT vehicle
+// commands and NOT a second mission-upload path: a generated route is uploaded through the
+// existing uploadMission() (MISSION_UPLOAD) above. Drafts are editable planning documents
+// persisted server-side as JSON files — never uploaded missions.
+
+/** Generate a segmented survey route from planning inputs (lib/planning.js planningInputs).
+ *  Returns the raw backend result { ok, segments, route_waypoints, metrics, warnings, ... }
+ *  on 200, or { ok:false, ... } / a 503 body when planning is unavailable or inputs invalid. */
+export async function generatePlan(inputs) {
+  const r = await postJSON("/api/planning/generate", inputs);
+  return r.data || { ok: false, error: "no_response" };
+}
+
+/** Validate a generated plan (inputs + route_waypoints + segments) before upload. */
+export async function validatePlan(body) {
+  const r = await postJSON("/api/planning/validate", body);
+  return r.data || { ok: false, error: "no_response" };
+}
+
+/** List saved planning drafts (summaries). */
+export function listDrafts() { return getJSON("/api/planning/drafts"); }
+/** Load one draft in full. */
+export function getDraft(id) { return getJSON(`/api/planning/drafts/${id}`); }
+/** Create a draft (lib/planning.js toDraft). Returns { ok, status, data }. */
+export function createDraft(body) { return postJSON("/api/planning/drafts", body); }
+/** Overwrite an existing draft. Returns { ok, status, data }. */
+export function updateDraft(id, body) { return putJSON(`/api/planning/drafts/${id}`, body); }
+/** Delete a draft. Returns { ok, status, data }. */
+export function deleteDraft(id) { return delJSON(`/api/planning/drafts/${id}`); }
 
 // --- Feed health (data-freshness diagnostics) -------------------------------
 // poll() below is the ONLY polling primitive in the app, so tracking success/

@@ -81,7 +81,7 @@ export function evTime(e) {
 
 /** Frozen navigation model (order + labels + icons). Keys are router routes. */
 export const NAV = [
-  ["map", "Map"], ["fleet", "Fleet"], ["mission", "Mission"], ["autonomy", "Agent"],
+  ["map", "Map"], ["fleet", "Fleet"], ["plan", "Plan"], ["mission", "Mission"], ["autonomy", "Agent"],
   ["video", "Video"], ["pilot", "Pilot"], ["vehicle", "Vehicle"], ["events", "Events"],
   ["experiment", "Experiment"], ["config", "Configuration"], ["_sep", ""],
   ["terminal", "Terminal"], ["messages", "Messages"],
@@ -90,6 +90,7 @@ export const NAV = [
 export const ICON = {
   map: '<path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2Z"/><path d="M9 4v14M15 6v14"/>',
   fleet: '<path d="M3 14h18l-2 5H5l-2-5Z"/><path d="M6 14V6l6-3 6 3v8"/><path d="M12 3v11"/>',
+  plan: '<path d="M4 5l5-2 6 2 5-2v14l-5 2-6-2-5 2Z"/><path d="M4 15l4-4 3 3 5-6 4 4" stroke-dasharray="2 2"/>',
   mission: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3"/>',
   autonomy: '<circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><path d="M8.4 12h3.6a2 2 0 0 0 2-2l1.6-2M8.4 12h3.6a2 2 0 0 1 2 2l1.6 2"/>',
   video: '<rect x="2" y="6" width="13" height="12" rx="2"/><path d="M15 10l6-3v10l-6-3"/>',
