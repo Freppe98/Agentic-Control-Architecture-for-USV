@@ -24,6 +24,7 @@ import { commState, noTelem } from "../lib/ui.js";
 import * as P from "../lib/planning.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
+import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
 import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { pickInitialView, getSavedViewport, setSavedViewport, isValidLatLng, isNullIsland,
          TOFTASJON, DEFAULT_ZOOM, VIEW_RANK } from "../lib/map-view.js";
@@ -586,14 +587,21 @@ export function Plan(root) {
   function renderActions() {
     const st = P.planState(model);
     const genLabel = P.hasRoute(model) ? (P.isOutdated(model) ? "Regenerate" : "Regenerate") : "Generate route";
+    const gate = uploadGate();
+    // Show the upload eligibility hint once a route exists for the selected vehicle (block or
+    // armed-warn), so the AUTO → LOITER → Upload workflow is guided. Text-carried, not colour-only.
+    const showHint = model.vehicleId != null && P.hasRoute(model) && !P.isOutdated(model)
+      && (gate.level === UPLOAD_LEVEL.BLOCK || gate.level === UPLOAD_LEVEL.WARN);
+    const hint = showHint ? `<span class="pl-upload-hint ${gate.level}" title="${esc(gate.message)}">${esc(gate.message)}</span>` : "";
     document.getElementById("plan-actions").innerHTML = `
       <button class="pl-act" id="act-clear">Clear</button>
       <button class="pl-act" id="act-savedraft">Save draft</button>
       <button class="pl-act" id="act-loaddraft">Load draft${drafts.length ? ` (${drafts.length})` : ""}</button>
       <div class="pl-act-grow"></div>
+      ${hint}
       <button class="pl-act primary" id="act-generate" ${P.canGenerate(model) && !busyGen ? "" : "disabled"}>${busyGen ? "Generating…" : genLabel}</button>
       <button class="pl-act" id="act-validate" ${P.hasRoute(model) && !P.isOutdated(model) && !busyVal ? "" : "disabled"}>${busyVal ? "Validating…" : "Validate"}</button>
-      <button class="pl-act success" id="act-upload" ${P.canUpload(model) ? "" : "disabled"} title="${uploadTitle()}">Finish &amp; Upload</button>`;
+      <button class="pl-act success" id="act-upload" ${P.canUpload(model) && gate.allowed ? "" : "disabled"} title="${esc(uploadTitle(gate))}">Finish &amp; Upload</button>`;
     bind("act-clear", clearAll);
     bind("act-savedraft", saveDraft);
     bind("act-loaddraft", openLoadDraft);
@@ -601,13 +609,13 @@ export function Plan(root) {
     bind("act-validate", doValidate);
     bind("act-upload", doUpload);
   }
-  function uploadTitle() {
+  function uploadTitle(gate) {
     if (model.vehicleId == null) return "Select a vehicle first";
     if (!P.hasRoute(model)) return "Generate a route first";
     if (P.isOutdated(model)) return "Route is outdated — regenerate first";
     if (!(model.validation && model.validation.ok)) return "Validate the route first";
-    if (!hasControl()) return "Take OPERATOR control (Map/Vehicle page) before uploading";
-    return "Finalize and upload the mission through the verified path";
+    if (gate && !gate.allowed) return gate.reason;
+    return gate ? gate.message : "Finalize and upload the mission through the verified path";
   }
   function renderBanner() {
     const st = P.planState(model);
@@ -645,10 +653,36 @@ export function Plan(root) {
 
   // ═══════════════ UPLOAD (existing verified MISSION_UPLOAD path) ═══════════════
   function hasControl() { return !!(authority && authority.authority === "OPERATOR"); }
+  function selectedVehicle() { return model.vehicleId != null ? fleet.find((x) => x.id === model.vehicleId) : null; }
+
+  // Operator-side upload eligibility (armed + confirmed-LOITER policy). Early feedback only —
+  // Scout remains the safety authority and performs the final stationary/groundspeed check.
+  function uploadGate() {
+    const v = selectedVehicle();
+    const t = (v && v.telemetry) || {};
+    const connected = v ? commState(v) === "connected" : false;
+    const groundspeed = v && v.speed != null ? v.speed : (t.groundspeed != null ? t.groundspeed : null);
+    const missionPending = model.upload.phase === "uploading"
+      || hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR");
+    return uploadEligibility({
+      connected,
+      armed: t.armed == null ? null : t.armed,
+      mode: t.mode == null ? null : t.mode,
+      modeFresh: connected,
+      groundspeed,
+      hasAuthority: hasControl(),
+      authorityRequired: true,
+      missionPending,
+    });
+  }
   function trackedUpload() { return model.upload.cmdId ? (cmds.find((c) => c.id === model.upload.cmdId) || null) : null; }
   async function doUpload() {
     if (!P.canUpload(model)) return;
-    if (!hasControl()) { showToast("Take OPERATOR control on the Map or Vehicle page before uploading.", "warn"); return; }
+    // Operator-side gate (armed + confirmed-LOITER policy). Scout still performs the final
+    // authoritative safety check; this only avoids an obviously-doomed submit and guides the
+    // AUTO → LOITER → Upload workflow. Never auto-commands LOITER.
+    const gate = uploadGate();
+    if (!gate.allowed) { showToast(gate.reason, "warn"); return; }
     const payload = P.finalizePayload(model);
     if (!payload) { showToast("The generated route could not be prepared for upload.", "warn"); return; }
     const v = fleet.find((x) => x.id === model.vehicleId);

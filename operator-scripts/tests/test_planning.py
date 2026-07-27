@@ -459,6 +459,27 @@ class TestMissionRecord(unittest.TestCase):
         self.assertEqual(rec["upload_status"], "FAILED")
         self.assertTrue(rec["segments"], "plan geometry preserved on failure")
 
+    def test_upload_context_threads_into_command_params(self):
+        # Optional additive metadata is forwarded VERBATIM into the command params (which
+        # agent_command_view forwards to Scout) without affecting the verification fields.
+        pkg = planning.generate_survey(
+            base_inputs(home=[12.9995, 56.6985], approach_waypoints=[[12.9998, 56.6988]]),
+            max_route_waypoints=200)
+        res = self.client.post("/api/missions/finalize", json={
+            "vehicle_id": SCOUT_VID, "mission_package": pkg, "confirm": True,
+            "upload_context": "OPERATOR_REPLACEMENT"})
+        self.assertEqual(res.status_code, 200)
+        params = res.json()["command"]["params"]
+        self.assertEqual(params["upload_context"], "OPERATOR_REPLACEMENT")
+        # Verification-critical fields are still present and untouched by the extra key.
+        self.assertIn("expected_route_content_hash", params)
+        self.assertIn("expected_pixhawk_item_count", params)
+
+    def test_upload_context_absent_when_not_supplied(self):
+        # Backward compatibility: no field supplied → params carry no upload_context key.
+        _, res = self._finalize()
+        self.assertNotIn("upload_context", res.json()["command"]["params"])
+
 
 if __name__ == "__main__":
     unittest.main()

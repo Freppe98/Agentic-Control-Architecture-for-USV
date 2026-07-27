@@ -158,6 +158,10 @@ a { color:inherit; }
 .pxm-actions button:hover:not(:disabled), .pxm-btns button:hover:not(:disabled), .pxm-btns2 button:hover:not(:disabled) { border-color:var(--accent); background:var(--accent-dim); }
 .pxm-actions button:active:not(:disabled), .pxm-btns button:active:not(:disabled), .pxm-btns2 button:active:not(:disabled) { transform:translateY(1px); }
 .pxm-actions button:disabled, .pxm-btns button:disabled, .pxm-btns2 button:disabled { opacity:.42; cursor:not-allowed; }
+/* Single stateful Show/Hide mission toggle: icon + label; spans two grid columns beside Center. */
+.pxm-toggle { grid-column:span 2; display:inline-flex; align-items:center; justify-content:center; gap:6px; }
+.pxm-toggle svg { width:14px; height:14px; flex:none; }
+.pxm-toggle[aria-pressed="true"]:not(:disabled) { border-color:var(--connected); }
 
 /* mission overlay — small, discreet numbered waypoints that stay subordinate to the
    round comm-colored vehicle dot. Rounded-square so they never read as a vehicle. */
@@ -959,6 +963,10 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .plan-viewctl { top:14px; right:14px; display:flex; gap:6px; padding:6px; z-index:600; }
 .plan-viewctl button { font-family:var(--font-mono); font-size:10px; letter-spacing:.03em; padding:5px 9px; border-radius:var(--r); background:var(--panel-2); border:1px solid var(--line-strong); color:var(--text); cursor:pointer; }
 .plan-viewctl button:hover { border-color:var(--accent-bright); color:var(--accent-bright); }
+/* Upload eligibility hint in the action bar (armed+LOITER policy). Text-carried, not colour-only. */
+.pl-upload-hint { max-width:320px; padding:4px 9px; border-radius:var(--r-sm); font-size:11px; line-height:1.3; border:1px solid var(--line-strong); background:var(--panel-2); color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pl-upload-hint.warn { border-color:rgba(242,169,59,.5); color:var(--text); }
+.pl-upload-hint.block { border-color:rgba(229,72,77,.5); color:var(--text); }
 .plan-legend .pl-sw { display:inline-block; width:16px; height:0; border-top-width:3px; border-top-style:solid; margin-right:8px; vertical-align:middle; }
 .plan-legend .li { display:flex; align-items:center; font-size:10.5px; color:var(--text); }
 .pl-sw.boundary { border-top-color:#4C8DFF; }

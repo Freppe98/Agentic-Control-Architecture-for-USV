@@ -355,9 +355,16 @@ export function uploadParamsFromModel(model) {
  *  (segments, planning inputs, navigable geometry, execution order) AND creates the
  *  unchanged MISSION_UPLOAD command in one call — so the Operator no longer loses the
  *  geometry after flattening it for the Pixhawk. Returns null when there is no route. */
+// Optional metadata telling Scout this upload REPLACES the on-vehicle mission from the
+// operator (vs. an autonomy-authored one). Older Scouts ignore the field — it is additive and
+// carries no authority. See main.py finalize_mission (threaded into the command params).
+export const UPLOAD_CONTEXT_OPERATOR_REPLACEMENT = "OPERATOR_REPLACEMENT";
 export function finalizePayload(model) {
   if (!hasRoute(model) || model.vehicleId == null) return null;
-  return { vehicle_id: model.vehicleId, mission_package: model.generated, confirm: true };
+  return {
+    vehicle_id: model.vehicleId, mission_package: model.generated, confirm: true,
+    upload_context: UPLOAD_CONTEXT_OPERATOR_REPLACEMENT,
+  };
 }
 
 /** The mission identity to show after a successful finalized upload. */

@@ -348,7 +348,12 @@ def normalize_agent_message(message: dict) -> dict:
     # "no fix"/last-known and the map does not plot a fabricated marker.
     lk = last_known_telemetry.get(usv_id, {})
     battery = telemetry.get("battery")
-    if battery is None:
+    # A MAVLink battery_remaining of -1 means "unknown/unavailable this packet" — it is a
+    # transient absence, NOT a real 0% or a deliberate clear. Treat it exactly like a missing
+    # field: fall back to the last real value so a single -1 packet cannot flip a valid 97% to
+    # "—" and back on the next poll (the two-second telemetry flicker). See receive_agent_status,
+    # which also refuses to STORE -1 into last_known_telemetry so the fallback stays valid.
+    if battery is None or battery == -1:
         battery = lk.get("battery", payload.get("battery"))
 
     lat = telemetry.get("lat") or payload.get("lat") or lk.get("lat")
@@ -2388,6 +2393,14 @@ async def finalize_mission(request: Request):
             "message": "The mission package route_hash does not match its route waypoints — "
                        "regenerate the plan before finalizing."})
 
+    # Optional, additive upload metadata forwarded VERBATIM to Scout in the command params
+    # (agent_command_view). It carries no authority and does not affect the route/hash/counts
+    # verification — a purely descriptive tag (e.g. "OPERATOR_REPLACEMENT"). Older Scouts ignore
+    # an unknown params key, so this never breaks compatibility.
+    upload_context = body.get("upload_context")
+    if isinstance(upload_context, str) and upload_context.strip():
+        params["upload_context"] = upload_context.strip()[:64]
+
     comm_state = comms_state_by_id.get(vid, "UNKNOWN")
     cmd = make_command(vid=vid, ctype="MISSION_UPLOAD", params=params,
                        created_by=body.get("created_by"), comm_state=comm_state, now=now,
@@ -3067,7 +3080,11 @@ async def receive_agent_status(request: Request):
         tel = payload.get("telemetry") if isinstance(payload, dict) else None
         if isinstance(tel, dict) and tel:
             lk = last_known_telemetry.setdefault(vid, {})
-            lk.update({k: v for k, v in tel.items() if v is not None})
+            # Carry forward only REAL readings. A battery of -1 (MAVLink "unknown") is a
+            # transient absence, not a value — storing it would poison the last-known fallback
+            # and let it flip a valid 97% to "—" on the next poll.
+            lk.update({k: v for k, v in tel.items()
+                       if v is not None and not (k == "battery" and v == -1)})
         # Same carry-forward for the agent reasoning group (payload.agent.*), and record
         # any agent-decision / mission-state CHANGE as a first-class event (deduped).
         agent_block = payload.get("agent") if isinstance(payload, dict) else None

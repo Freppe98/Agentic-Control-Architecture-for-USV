@@ -19,6 +19,8 @@ import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSe
 import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
 import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
+import { missionShowable, nextVisibility, toggleVisibility, toggleButton } from "../lib/mission-visibility.js";
+import { createTelemetryCache } from "../lib/telemetry-cache.js";
 
 const HOME = [56.699893, 13.002148];
 
@@ -78,6 +80,10 @@ const vehHomeSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 export function Map(root) {
   const L = window.L;
   let fleet = [], selId = null, env = null, map = null;
+  // Per-USV last-known telemetry merge. Guards against a partial fleet poll (a null numeric
+  // field, e.g. a momentarily-absent battery) erasing a valid displayed value and flickering
+  // it at the 2 s poll rate. Keyed by USV id so one vehicle never affects another.
+  const telemCache = createTelemetryCache();
   let commsHist = null;          // comms-state transition log for the selected vehicle
   let cmds = [];                 // command queue + history for the selected vehicle
   // Control-authority state machine (pending → confirmed/rejected/timeout). Re-renders
@@ -148,13 +154,11 @@ export function Map(root) {
     fetchMission: (id) => api.getPixhawkMission(id),
     onMission: (id, res, meta) => {
       applyMissionRead(id, res);
-      if (id === selId) {
-        // Progress text (current WP / %) always refreshes; the map overlay is rebuilt only
-        // when the GEOMETRY changed OR execution PROGRESS (current_seq) moved — unchanged
-        // geometry at the same progress is never needlessly redrawn.
-        renderPxm(); renderDock();
-        if ((meta.geometryChanged || meta.progressChanged) && pxmState(id).shown) drawMissionOverlay(id);
-      }
+      // Default-visible: a newly loaded valid mission shows automatically; a successful
+      // upload/replan/clear (geometryChanged) re-shows/updates it; an unchanged periodic read
+      // never overrides an explicit hide. Progress text (current WP / %) always refreshes.
+      applyReadVisibility(id, meta.geometryChanged, meta.geometryChanged || meta.progressChanged);
+      if (id === selId) { renderPxm(); renderDock(); }
     },
     onError: (kind, id, err) => {
       if (kind === "mission" && id === selId) { pxmState(id).note = "error"; renderPxm(); }
@@ -307,7 +311,30 @@ export function Map(root) {
 
   // ---- Pixhawk mission (view-only readback + map overlay) ------------------
   function pxmState(id) {
-    return pxm[id] || (pxm[id] = { mission: null, fetchedAt: 0, loading: false, note: null, shown: false });
+    // `shown` = overlay currently drawn; `userHidden` = the operator EXPLICITLY hid this
+    // USV's overlay, so the default-visible rule must not force it back on until the mission
+    // geometry changes. Both are PER-USV — never a global visibility flag.
+    return pxm[id] || (pxm[id] = { mission: null, fetchedAt: 0, loading: false, note: null, shown: false, userHidden: false });
+  }
+
+  // Whether the SELECTED/target vehicle's cached mission may be shown as a valid overlay.
+  function missionIsShowable(id) {
+    const s = pxm[id];
+    return missionShowable(s && s.mission, positionedWaypoints(id).length);
+  }
+
+  // Recompute per-USV visibility after a fresh read, then reflect it on the map. Never draws
+  // an invalid/empty mission; a geometry change re-shows a newly loaded mission by default
+  // (unless the operator hid this USV); an unchanged read never overrides an explicit hide.
+  function applyReadVisibility(id, geometryChanged, changed) {
+    const s = pxmState(id);
+    const wasShown = s.shown;
+    const showable = missionIsShowable(id);
+    const nv = nextVisibility(s, { showable, geometryChanged });
+    s.shown = nv.shown; s.userHidden = nv.userHidden;
+    if (id !== selId || !map) return;
+    if (!s.shown) { clearMissionOverlay(); return; }
+    if (!wasShown || changed) drawMissionOverlay(id);   // newly visible, or geometry/progress moved
   }
 
   // Fetch the mission stored on the vehicle's Pixhawk (a live Scout proxy). A reachable
@@ -322,15 +349,19 @@ export function Map(root) {
     if (id == null) return;
     const s = pxmState(id);
     s.loading = true; renderPxm();
+    let geometryChanged = false;
     try {
       const res = await api.getPixhawkMission(id);
       applyMissionRead(id, res);
-      if (res && res.reachable) refreshController.tracker.noteFetched(id, res);
+      if (res && res.reachable) { geometryChanged = refreshController.tracker.noteFetched(id, res).geometryChanged; }
     } catch (e) {
       s.note = "error";
     } finally {
       s.loading = false;
-      if (id === selId) { renderPxm(); renderDock(); if (s.shown) drawMissionOverlay(id); }
+      // A manual Fetch of a valid mission shows it by default too (same rule as auto-fetch);
+      // force a redraw since the operator explicitly asked for the latest.
+      applyReadVisibility(id, geometryChanged, true);
+      if (id === selId) { renderPxm(); renderDock(); }
     }
   }
 
@@ -531,14 +562,17 @@ export function Map(root) {
     applyMissionZoom();
   }
 
-  function showMissionOverlay() {
+  // The single stateful Show/Hide toggle's click. Derives the next state from ACTUAL
+  // visibility (not the last label): hiding remembers the explicit choice for this USV,
+  // showing clears it. No-op while loading or when there is no valid mission to show.
+  function toggleMissionOverlay() {
     if (selId == null) return;
     const s = pxmState(selId);
-    s.shown = true; drawMissionOverlay(selId); renderPxm();
-  }
-  function hideMissionOverlay() {
-    if (selId == null) return;
-    pxmState(selId).shown = false; clearMissionOverlay(); renderPxm();
+    if (s.loading || !missionIsShowable(selId)) return;
+    const nv = toggleVisibility(s);
+    s.shown = nv.shown; s.userHidden = nv.userHidden;
+    if (s.shown) drawMissionOverlay(selId); else clearMissionOverlay();
+    renderPxm();
   }
 
   // Fit the map to the mission's bounds WITHOUT refetching — a pure client-side view
@@ -552,17 +586,23 @@ export function Map(root) {
     const pts = route.length ? route : positionedWaypoints(selId);
     if (!pts.length) return;
     const s = pxmState(selId);
-    if (!s.shown) { s.shown = true; drawMissionOverlay(selId); renderPxm(); }
+    // Centering is an explicit "show me the mission" action — clear any prior hide.
+    if (!s.shown) { s.shown = true; s.userHidden = false; drawMissionOverlay(selId); renderPxm(); }
     const bounds = L.latLngBounds(pts.map((w) => [w.lat, w.lng]));
     map.fitBounds(bounds, { padding: [56, 56], maxZoom: 17 });
   }
 
-  // Switch the overlay to follow the selected vehicle: drop the old one, redraw the new
-  // vehicle's mission only if the operator had it shown. Called from select().
+  // Switch the overlay to follow the selected vehicle: drop the old one, then restore THIS
+  // USV's own visibility. A vehicle with a cached valid mission it never hid shows by default;
+  // one it explicitly hid stays hidden — per-USV state, restored on every switch/return.
   function syncMissionOverlay() {
     clearMissionOverlay();
-    const s = selId != null ? pxm[selId] : null;
-    if (s && s.shown) drawMissionOverlay(selId);
+    if (selId == null) return;
+    const s = pxmState(selId);
+    const showable = missionIsShowable(selId);
+    const nv = nextVisibility(s, { showable, geometryChanged: false });
+    s.shown = nv.shown; s.userHidden = nv.userHidden;
+    if (s.shown) drawMissionOverlay(selId);
   }
 
   // The chip carries the CURRENT communication / fetch status only — it is deliberately
@@ -588,6 +628,14 @@ export function Map(root) {
     return `${Math.floor(s / 3600)}h ago`;
   }
   function pxmAgeText(s) { return s && s.fetchedAt ? fmtSince(s.fetchedAt) : "—"; }
+
+  // Toggle glyph — a shape per state so it reads without relying on colour: an open eye when
+  // shown, a struck-through eye when hidden, an empty/None slash otherwise.
+  const eyeOpenSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 12S5 5 12 5s10.5 7 10.5 7-3.5 7-10.5 7S1.5 12 1.5 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+  const eyeOffSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.6 6.2A9.6 9.6 0 0 1 12 6c7 0 10.5 6.5 10.5 6.5a15.8 15.8 0 0 1-3.3 3.9M6.2 7.6A15.9 15.9 0 0 0 1.5 12.5S5 19 12 19a9.5 9.5 0 0 0 4.2-1M3 3l18 18"/></svg>';
+  function toggleIcon(state) {
+    return state === "shown" ? eyeOpenSvg : eyeOffSvg;
+  }
 
   function renderPxm() {
     const box = document.getElementById("pxm");
@@ -632,9 +680,11 @@ export function Map(root) {
       : (mc.home && mc.home.seq === cur) ? `Home (seq ${cur})`
       : (execCount != null ? `WP ${cur} / ${execCount}` : `WP ${cur}`);
 
-    const hasWps = positionedWaypoints(id).length > 0;
     const shown = !!(s && s.shown);
     const fetched = !!(s && s.fetchedAt);
+    // Single stateful Show/Hide toggle — derived from ACTUAL loading/showable/shown state,
+    // never from the last click. (No separate Show and Hide buttons remain.)
+    const tb = toggleButton({ loading: !!(s && s.loading), showable: id != null && missionIsShowable(id), shown });
 
     // A cached mission is being shown while the live link is down / degraded — say so
     // explicitly so the operator never mistakes last-known counts for a live readback.
@@ -707,16 +757,14 @@ export function Map(root) {
           <button data-pxm="set-home" ${g.enabled ? "" : "disabled"} title="${setHomeTitle}">${setHomeLabel}</button>
         </div>
         <div class="pxm-btns">
-          <button data-pxm="show" ${hasWps && !shown ? "" : "disabled"} title="Show the mission overlay on the map">Show</button>
-          <button data-pxm="center" ${hasWps ? "" : "disabled"} title="Fit the map to the mission (no refetch)">Center</button>
-          <button data-pxm="hide" ${shown ? "" : "disabled"} title="Hide the mission overlay">Hide</button>
+          <button data-pxm="toggle" class="pxm-toggle ${tb.state}" ${tb.disabled ? "disabled" : ""} aria-pressed="${tb.ariaPressed}" title="${tb.title.replace(/"/g, "&quot;")}">${toggleIcon(tb.state)}<span>${tb.label}</span></button>
+          <button data-pxm="center" ${id != null && missionIsShowable(id) ? "" : "disabled"} title="Fit the map to the mission (no refetch)">Center</button>
         </div>
       </div>`;
 
     box.querySelector('[data-pxm="fetch"]').onclick = () => fetchPixhawkMission(selId);
-    box.querySelector('[data-pxm="show"]').onclick = () => showMissionOverlay();
+    box.querySelector('[data-pxm="toggle"]').onclick = () => toggleMissionOverlay();
     box.querySelector('[data-pxm="center"]').onclick = () => centerMission();
-    box.querySelector('[data-pxm="hide"]').onclick = () => hideMissionOverlay();
     const setHomeBtn = box.querySelector('[data-pxm="set-home"]');
     if (setHomeBtn) setHomeBtn.onclick = () => doSetHome();
     renderMissionBar();
@@ -1268,7 +1316,11 @@ export function Map(root) {
   }
 
   function onFleet(data) {
-    fleet = Array.isArray(data) ? data : [];
+    // Merge each vehicle against its own last-known telemetry BEFORE it replaces the fleet —
+    // a null battery/speed/heading in this poll keeps the previous valid value instead of
+    // rendering "—". Freshness is untouched (comm_state/last_seen_age_s carry through), so a
+    // retained value is still marked stale when the link degrades.
+    fleet = telemCache.mergeFleet(Array.isArray(data) ? data : []);
     if (selId == null && fleet.length) {
       // First fleet payload: adopt the shared selection if it still names a real vehicle,
       // else fall back to a reporting vehicle. Routing through select() gives the controller
