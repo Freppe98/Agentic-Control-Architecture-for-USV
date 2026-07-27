@@ -1,0 +1,18 @@
+# Operator Station — ignore local, generated and machine-specific files.
+# (The repo-root .gitignore also covers Scout reference material and Python bytecode;
+#  this file scopes the setup/bootstrap artefacts to the operator-scripts subtree.)
+
+# Python virtual environment created by install_operator.ps1
+.venv/
+
+# Node dependencies restored by `npm ci` (frontend/test tooling)
+node_modules/
+
+# Local configuration copied from .env.example — never commit (may hold machine-specific
+# port/host); the committed template is .env.example
+.env
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+.pytest_cache/

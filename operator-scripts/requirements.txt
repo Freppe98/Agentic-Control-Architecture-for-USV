@@ -1,25 +1,35 @@
-# Operator Station backend dependencies.
+# Operator Station backend — direct Python runtime dependencies.
 #
 # Reproducible install (do NOT rely on packages happening to be on the workstation):
-#     python -m pip install -r requirements.txt
+#     .venv\Scripts\python.exe -m pip install -r requirements.txt
+# (install_operator.ps1 does this for you into a project-local .venv.)
 #
-# The core station runs on FastAPI + requests + the Python stdlib. Survey planning (the Plan
-# page, planning.py) adds the geometry stack — shapely/pyproj/numpy — used to port Scout's
-# tested lawnmower + return-path generators AND to compute the shared safe-connector grid A*.
-# These are OPTIONAL at runtime: planning.py guards their import and the /api/planning
-# endpoints (and /api/missions/finalize's package geometry) degrade to an honest 503 when
-# they are absent, so the rest of the backend still runs without them.
-fastapi>=0.110
-uvicorn>=0.29
-requests>=2.31
+# These are the DIRECT imports only — transitive dependencies (starlette, pydantic,
+# anyio, click, certifi, …) are resolved by pip and intentionally NOT listed here. This
+# is a hand-reviewed manifest, not the output of `pip freeze`.
+#
+# Versions are pinned exactly (==) to the releases the current passing backend test
+# suite (tests/, 354 tests) was verified against. Pin exactly rather than with ranges:
+# the geometry stack (shapely/pyproj/numpy) occasionally changes buffer/UTM edge
+# behaviour between releases, which would move generated survey routes — and their
+# content hashes — out from under the mission-contract tests.
 
-# Survey planning (Plan page) — required for route generation/validation/safe connectors.
-# Pinned to the versions this branch was developed and tested against; newer releases of the
-# geometry stack occasionally change buffer/UTM edge behaviour, which would move generated
-# routes (and their content hashes).
-shapely>=2.0,<3
-pyproj>=3.6,<4
-numpy>=1.26,<3
+# --- Core station (FastAPI + requests + the Python stdlib) --------------------------
+fastapi==0.138.0
+uvicorn==0.49.0
+requests==2.32.3
 
-# TestClient dependency for the backend unittest suite (fastapi.testclient).
-httpx>=0.27
+# --- Survey planning (Plan page, planning.py) ---------------------------------------
+# The geometry stack used to port Scout's tested lawnmower + return-path generators and
+# to compute the shared safe-connector grid A*. planning.py guards these imports: when
+# they are absent the /api/planning endpoints (and /api/missions/finalize's package
+# geometry) degrade to an honest 503 planning_unavailable and the rest of the backend
+# still runs. They are listed here because a complete Operator Station needs the Plan
+# page to work.
+shapely==2.1.2
+pyproj==3.7.2
+numpy==2.2.2
+
+# --- Test-only ----------------------------------------------------------------------
+# fastapi.testclient (TestClient) imports httpx; the backend unittest suite needs it.
+httpx==0.28.1
