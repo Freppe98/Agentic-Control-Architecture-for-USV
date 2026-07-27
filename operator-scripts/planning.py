@@ -35,8 +35,12 @@ mission-contract route waypoints it emits are {latitude, longitude, loiter_time_
 route-only shape mission_contract.py hashes and POST /api/commands (MISSION_UPLOAD) accepts.
 """
 
+import hashlib
+import json
 import math
 from datetime import datetime, timezone
+
+import mission_contract  # stdlib-only (hashlib/json) — safe even when geometry deps absent
 
 try:  # heavy geometry stack — see module docstring "GRACEFUL DEGRADATION"
     import numpy as np
@@ -683,6 +687,277 @@ def compute_return_path(polygon_coords, spacing_meters, safety_meters, last_wayp
 # Plan-page-specific layer built on top of the two ported generators above.
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
+# The finalized survey-plan package version. Distinct from the mission-contract-v1 ROUTE
+# contract (which the Pixhawk upload still uses verbatim): a package carries the richer
+# operator geometry/segmentation the immutable original-mission record retains for later
+# Local Agent replanning — see main.py's mission record and PART 6 of the task.
+MISSION_PACKAGE_VERSION = "operator-survey-plan-v1"
+ROUTE_CONTRACT_VERSION = "mission-contract-v1"
+
+# Ordered route segment kinds. Every displayed section maps to one of these, and the flat
+# Pixhawk route is exactly their concatenation — there are no implicit straight jumps between
+# arrays (each gap between coverage/operator sections is an EXPLICIT connector segment, which
+# is the whole point of the redesign: a segment endpoint is always the next segment's start).
+SEGMENT_KINDS = (
+    "start_connector",       # route start (planning home) → first approach waypoint
+    "approach",              # operator-approved approach waypoints, in numbered order
+    "survey_entry_connector",  # last approach WP (or start) → primary coverage entry
+    "primary",               # primary coverage pass (internal lane turns kept safe)
+    "pass_transition",       # primary end → secondary start (dual pass only)
+    "secondary",             # secondary coverage pass
+    "return_connector",      # coverage end → first return waypoint (or planning home)
+    "return_approach",       # operator-approved return waypoints, in numbered order
+    "final_home_connector",  # last return WP → planning home
+)
+
+ROUTE_START_MODES = ("planning_home", "first_approach")
+
+# Safe-connector resolution bound. A grid finer than this many cells on an axis is refused as
+# an excessive-resolution generation error rather than silently blowing up runtime/memory —
+# the operator increases lane spacing or shrinks the survey (see _NavGrid._build_grid).
+MAX_GRID_CELLS_PER_AXIS = 400
+
+# Metre tolerances (UTM/projected space). COVER_TOL absorbs the projection/rounding noise at
+# the inset edge the generator clips exactly to; a real excursion is far larger.
+COVER_TOL_M = 0.5
+CONNECTOR_EPS_M = 1.0
+# Degrees: two route points closer than this are the same join point (≈1 cm), used to detect
+# the shared endpoint between adjacent segments so the flat route carries no duplicate.
+JOIN_TOL_DEG = 1e-7
+
+
+class ConnectorError(ValueError):
+    """No safe connector could be found between two approved route points inside the
+    navigable region. Raised rather than emitting an invalid straight connector that leaves
+    the shoreline-offset area or crosses a no-go interior. main.py maps it to a 400 with the
+    specific reason, exactly like other planning-input errors."""
+
+
+class DisconnectedNavigableError(ValueError):
+    """The navigable region splits into more than one connected component after applying the
+    shoreline clearance and no-go zones. Survey generation currently requires ONE connected
+    navigable region (task PART 6); generation is blocked with a clear message rather than
+    silently drawing connectors across excluded water."""
+
+
+def _close(a, b, tol=JOIN_TOL_DEG):
+    """True when two [lng,lat] points are the same join point (within ~1 cm)."""
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+class _NavGrid:
+    """The shared navigable model + safe point-to-point connector for one generation.
+
+    Built ONCE per generate_survey call so every connector (coverage lane turns, no-go-split
+    sections, pass transition, survey-entry/return connectors) is judged against, and routed
+    inside, the identical navigable geometry. The navigable region is the survey boundary
+    inset by the shoreline clearance MINUS the union of the no-go zones — the exact space a
+    coverage/inter-coverage connector must stay within.
+
+    ONE strategy, deterministic: a direct segment is accepted only when it is covered by the
+    navigable polygon (within COVER_TOL_M) and clears no-go interiors; otherwise a bounded
+    4-neighbour grid A* (adapted from the ported compute_return_path) finds an orthogonal
+    safe path. No diagonal shortcuts, no second planner."""
+
+    def __init__(self, boundary, clearance, zones, step_m):
+        self.to_proj, self.to_deg = _utm_for(boundary)
+        poly_deg = Polygon([(c[0], c[1]) for c in boundary])
+        if not poly_deg.is_valid:
+            poly_deg = poly_deg.buffer(0)
+        inset = transform(self.to_proj.transform, poly_deg)
+        if clearance and clearance > TOLERANCE:
+            inset = inset.buffer(-abs(clearance), join_style=2)
+        self.inset = inset  # projected; may be empty
+
+        zpolys = []
+        for z in zones or []:
+            zp = Polygon([(c[0], c[1]) for c in z])
+            if not zp.is_valid:
+                zp = zp.buffer(0)
+            try:
+                zpolys.append(transform(self.to_proj.transform, zp))
+            except Exception:
+                continue
+        self.nogo = unary_union(zpolys) if zpolys else None
+
+        nav = inset
+        if self.nogo is not None and not nav.is_empty:
+            nav = nav.difference(self.nogo)
+        self.navigable = nav
+
+        # Connected components with real area (a sliver from a buffer artefact is ignored).
+        if isinstance(nav, MultiPolygon):
+            comps = [g for g in nav.geoms if g.area > 1.0]
+        elif nav.is_empty:
+            comps = []
+        else:
+            comps = [nav]
+        self.components = comps
+
+        self.step = step_m if step_m and step_m > 1e-6 else 10.0
+        self._grid = None
+        self._bounds = None
+
+    @property
+    def empty(self):
+        return self.navigable is None or self.navigable.is_empty
+
+    @property
+    def disconnected(self):
+        return len(self.components) > 1
+
+    def _build_grid(self):
+        if self._grid is not None:
+            return
+        minx, miny, maxx, maxy = self.navigable.bounds
+        span_x, span_y = maxx - minx, maxy - miny
+        step = self.step
+        cols = int(span_x / step) + 1
+        rows = int(span_y / step) + 1
+        if cols > MAX_GRID_CELLS_PER_AXIS or rows > MAX_GRID_CELLS_PER_AXIS:
+            raise ConnectorError(
+                "A safe connector could not be computed at the required resolution — the "
+                "navigable area is too large for the chosen lane spacing. Increase the lane "
+                "spacing or reduce the survey area.")
+        # A cell is free (0) when its centre is inside the navigable region (already excludes
+        # no-go and shore). A small buffer keeps cells exactly on the clipped inset edge free.
+        nav = self.navigable.buffer(COVER_TOL_M)
+        grid = []
+        for r in range(rows):
+            y = miny + r * step
+            row = [0 if nav.contains(Point(minx + c * step, y)) else 1 for c in range(cols)]
+            grid.append(row)
+        self._grid = grid
+        self._bounds = (minx, miny, maxx, maxy, cols, rows)
+
+    def _seg_covered(self, line_proj):
+        """True when a projected segment stays inside the navigable region (within tol)."""
+        outside = line_proj.difference(self.navigable.buffer(COVER_TOL_M))
+        return outside.is_empty or outside.length < CONNECTOR_EPS_M
+
+    def _seg_clears_nogo(self, line_proj):
+        if self.nogo is None:
+            return True
+        try:
+            return line_proj.intersection(self.nogo.buffer(-COVER_TOL_M)).length < CONNECTOR_EPS_M
+        except Exception:
+            return True
+
+    def segment_is_safe(self, a_deg, b_deg, require_inside=True):
+        """Is the straight segment a→b (both [lng,lat]) an acceptable connector?
+
+        require_inside=True (coverage-internal turns, pass transition, survey-entry / return
+        connectors): the whole segment must lie inside the navigable region — which already
+        excludes no-go. require_inside=False (operator approach/return legs, home connectors,
+        which legitimately run to/from shore outside the inset): only the no-go interiors
+        must be cleared, never assuming a manually drawn line is safe."""
+        try:
+            line = transform(self.to_proj.transform, LineString([a_deg, b_deg]))
+        except Exception:
+            return False
+        if require_inside:
+            return self._seg_covered(line)
+        return self._seg_clears_nogo(line)
+
+    def safe_connector(self, a_deg, b_deg, require_inside=True):
+        """A safe [[lng,lat],...] path from a to b. The direct segment when it is safe;
+        otherwise a bounded grid A* path inside the navigable region. Raises ConnectorError
+        when neither the direct segment nor any bounded safe path exists."""
+        import heapq
+        if self.segment_is_safe(a_deg, b_deg, require_inside=require_inside):
+            return [list(a_deg), list(b_deg)]
+
+        self._build_grid()
+        minx, miny, maxx, maxy, cols, rows = self._bounds
+        grid, step = self._grid, self.step
+
+        def to_grid(pt):
+            x, y = self.to_proj.transform(pt[0], pt[1])
+            return (int(round((y - miny) / step)), int(round((x - minx) / step)))
+
+        def to_coord(rc):
+            r, c = rc
+            lng, lat = self.to_deg.transform(minx + c * step, miny + r * step)
+            return [lng, lat]
+
+        def is_free(r, c):
+            if r < 0 or r >= rows or c < 0 or c >= cols:
+                return False
+            return grid[r][c] == 0
+
+        def nearest_free(r, c):
+            if is_free(r, c):
+                return (r, c)
+            for dist in range(1, max(rows, cols)):
+                for dr in range(-dist, dist + 1):
+                    for dc in range(-dist, dist + 1):
+                        if is_free(r + dr, c + dc):
+                            return (r + dr, c + dc)
+            return None
+
+        start = nearest_free(*to_grid(a_deg))
+        goal = nearest_free(*to_grid(b_deg))
+        if start is None or goal is None:
+            raise ConnectorError(
+                "No safe connector exists between two approved route points — the navigable "
+                "region does not reach one of them.")
+
+        def h(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        open_set = [(h(start, goal), 0, start, None)]
+        came = {}
+        gscore = {start: 0}
+        closed = set()
+        found = False
+        while open_set:
+            _, g, node, parent = heapq.heappop(open_set)
+            if node in closed:
+                continue
+            came[node] = parent
+            if node == goal:
+                found = True
+                break
+            closed.add(node)
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr, nc = node[0] + dr, node[1] + dc
+                if is_free(nr, nc):
+                    ng = g + 1
+                    if (nr, nc) not in gscore or ng < gscore[(nr, nc)]:
+                        gscore[(nr, nc)] = ng
+                        heapq.heappush(open_set, (ng + h((nr, nc), goal), ng, (nr, nc), node))
+        if not found:
+            raise ConnectorError(
+                "No safe connector could be routed between two approved route points inside "
+                "the navigable region.")
+
+        cells, cur = [], goal
+        while cur is not None:
+            cells.append(cur)
+            cur = came[cur]
+        cells.reverse()
+
+        path = [list(a_deg)] + [to_coord(rc) for rc in cells] + [list(b_deg)]
+        return _dedup(path)
+
+    def repair_path(self, coords_deg):
+        """Walk an ordered coverage path and replace every UNSAFE straight hop with a safe
+        connector, leaving safe hops (the scan lines themselves) untouched. This is what
+        removes the classic failure: on an asymmetric/concave polygon a lane-to-lane turn or
+        a no-go-split bridge can leave the navigable polygon even when each scan line is
+        individually valid. Raises ConnectorError if any hop cannot be made safe."""
+        if len(coords_deg) < 2:
+            return list(coords_deg)
+        out = [list(coords_deg[0])]
+        for a, b in zip(coords_deg, coords_deg[1:]):
+            if self.segment_is_safe(a, b, require_inside=True):
+                out.append(list(b))
+            else:
+                conn = self.safe_connector(a, b, require_inside=True)
+                out.extend(conn[1:])  # a already present as out[-1]
+        return _dedup(out)
+
+
 _GEOD = None
 
 
@@ -735,6 +1010,15 @@ def _point_of(pt):
     return None
 
 
+def _first_present(*vals):
+    """First value that is not None (used to merge candidate field spellings, e.g. the
+    approach/return migration accepting old `transit_waypoints`)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
 def _num(v):
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
@@ -782,6 +1066,37 @@ def _route_waypoints(coords):
     """[[lng,lat],...] execution path -> mission-contract route waypoints (route only)."""
     return [{"latitude": round(float(c[1]), 7), "longitude": round(float(c[0]), 7),
              "loiter_time_s": 0} for c in _dedup(coords)]
+
+
+def _route_hash(route_waypoints):
+    """The canonical route content hash — the SAME calculator the Pixhawk upload path uses
+    (mission_contract.route_content_hash), so the finalized package's identity is byte-for-
+    byte the one the MISSION_UPLOAD command is verified against. Not a second hash."""
+    return mission_contract.route_content_hash(route_waypoints)
+
+
+def _input_revision(inp):
+    """A stable digest over EVERY generation-affecting normalized input. Lets validation
+    confirm a submitted route was generated from the inputs it is being validated against
+    (mirrors the frontend's inputRevision), and lets a stored draft know its route is stale.
+    Deterministic: identical inputs → identical revision."""
+    def rd(pt):
+        return [round(float(pt[0]), 7), round(float(pt[1]), 7)] if pt else None
+    canonical = {
+        "b": [rd(p) for p in (inp.get("boundary") or [])],
+        "z": [[rd(p) for p in z] for z in (inp.get("no_go_zones") or [])],
+        "h": rd(inp.get("home")),
+        "a": [rd(p) for p in (inp.get("approach_waypoints") or [])],
+        "r": [rd(p) for p in (inp.get("return_waypoints") or [])],
+        "c": inp.get("shoreline_clearance_m"),
+        "s": inp.get("lane_spacing_m"),
+        "pa": inp.get("primary_angle_deg"),
+        "d": inp.get("dual_pass"),
+        "sa": inp.get("secondary_angle_deg"),
+        "m": inp.get("route_start_mode"),
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return "rev:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def normalize_generate_inputs(raw):
@@ -836,13 +1151,38 @@ def normalize_generate_inputs(raw):
 
     home = _point_of(raw.get("home")) if raw.get("home") is not None else None
 
-    transit = []
-    for i, p in enumerate(raw.get("transit_waypoints") or []):
+    # Approach waypoints (renamed from "transit"): operator-approved route INTO the survey,
+    # visited in numbered order before coverage begins. MIGRATION: old drafts/callers that
+    # still send `transit_waypoints` / `transit` are accepted transparently so a saved plan
+    # never silently breaks — the new field wins when both are present.
+    raw_approach = _first_present(
+        raw.get("approach_waypoints"), raw.get("transit_waypoints"), raw.get("transit"))
+    approach = []
+    for i, p in enumerate(raw_approach or []):
         pt = _point_of(p)
         if pt is None:
-            errors.append(f"Transit waypoint {i + 1} is not a valid [lng, lat] point.")
+            errors.append(f"Approach waypoint {i + 1} is not a valid [lng, lat] point.")
         else:
-            transit.append(pt)
+            approach.append(pt)
+
+    # Return waypoints: operator-approved route OUT of the survey, back toward planning home.
+    # A separate list — never an implicit reversal of the approach (the operator asks for a
+    # reversed copy explicitly on the page). Migration keeps old spelling working too.
+    raw_return = _first_present(raw.get("return_waypoints"), raw.get("return_wps"))
+    ret = []
+    for i, p in enumerate(raw_return or []):
+        pt = _point_of(p)
+        if pt is None:
+            errors.append(f"Return waypoint {i + 1} is not a valid [lng, lat] point.")
+        else:
+            ret.append(pt)
+
+    # Where the executed route begins. Default planning_home (prototype preference); if the
+    # requested mode cannot apply (no home, or first_approach with no approach WPs) the route
+    # falls back at generation time, and a warning is emitted there — not an error here.
+    start_mode = str(raw.get("route_start_mode") or "planning_home").lower()
+    if start_mode not in ROUTE_START_MODES:
+        start_mode = "planning_home"
 
     if errors:
         raise ValueError("; ".join(errors))
@@ -857,18 +1197,64 @@ def normalize_generate_inputs(raw):
         "survey_speed_mps": speed,
         "no_go_zones": zones,
         "home": home,
-        "transit_waypoints": transit,
+        "route_start_mode": start_mode,
+        "approach_waypoints": approach,
+        "return_waypoints": ret,
     }
 
 
-def generate_survey(raw_inputs, max_route_waypoints=None):
-    """Generate a segmented side-scan survey from the operator's planning inputs.
+def _flatten_segments(segments):
+    """Concatenate typed segments into one ordered route, dropping the duplicate join point
+    where a segment's start coincides with the previous segment's end, and stamp each segment
+    with the execution-sequence range it occupies. Guarantees, by construction, that the flat
+    route equals the segment flattening and that segment[i].end is segment[i+1].start — no
+    invisible straight jump between arrays.
 
-    Returns a dict with `segments` (typed geometry for the map overlay), `route_waypoints`
-    (the flat, ordered mission-contract route), `metrics`, `intersections` (dual-pass
-    primary∩secondary as planning metadata) and `warnings`. Segment purpose is preserved —
-    the flat route never loses which leg is transit / primary / transition / secondary /
-    return. Deterministic: the same inputs always produce the same route."""
+    Returns (route_coords, original_execution_order). Segments are mutated in place with
+    start_execution_seq / end_execution_seq."""
+    route = []                 # [[lng,lat], ...]
+    order = []                 # [{execution_seq, latitude, longitude, source_segment_id, ...}]
+    for seg in segments:
+        seg["start_execution_seq"] = None
+        for idx, c in enumerate(seg["coordinates"]):
+            if route and _close(route[-1], c):
+                # Shared join with the previous segment's end — no new route point, but this
+                # segment still STARTS at that shared execution index.
+                if seg["start_execution_seq"] is None:
+                    seg["start_execution_seq"] = len(route) - 1
+                continue
+            if seg["start_execution_seq"] is None:
+                seg["start_execution_seq"] = len(route)
+            route.append([float(c[0]), float(c[1])])
+            order.append({
+                "execution_seq": len(route) - 1,
+                "latitude": round(float(c[1]), 7),
+                "longitude": round(float(c[0]), 7),
+                "source_segment_id": seg["segment_id"],
+                "source_segment_kind": seg["kind"],
+                "source_index": idx,
+            })
+        seg["end_execution_seq"] = max(0, len(route) - 1)
+    return route, order
+
+
+def generate_survey(raw_inputs, max_route_waypoints=None):
+    """Generate ONE safe, unambiguous, fully segmented survey mission from the operator's
+    planning inputs.
+
+    Execution order (each gap is an EXPLICIT connector segment, never an implicit jump):
+      START/APPROACH → APPROACH WAYPOINTS → SURVEY ENTRY CONNECTOR → PRIMARY COVERAGE →
+      PASS TRANSITION (dual) → SECONDARY COVERAGE → RETURN CONNECTOR → RETURN APPROACH →
+      FINAL HOME CONNECTOR.
+
+    Every connector is produced by the shared _NavGrid.safe_connector, so a coverage lane
+    turn, a no-go-split bridge or a pass transition can never leave the navigable region on
+    an asymmetric/concave boundary. Returns the finalized operator-survey-plan-v1 package:
+    typed `segments` (with execution-seq ranges), the flat `route_waypoints`, the canonical
+    `route_hash`, `original_execution_order`, echoed `planning_inputs`, `navigable_boundary`,
+    `metrics`, `intersections` and `warnings`. Deterministic. Raises ValueError /
+    ConnectorError / DisconnectedNavigableError for anything unroutable, never a silent bad
+    connector."""
     _require_available()
     inp = normalize_generate_inputs(raw_inputs)
 
@@ -876,74 +1262,149 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     clearance = inp["shoreline_clearance_m"]
     spacing = inp["lane_spacing_m"]
     zones = inp["no_go_zones"]
+    home = inp["home"]
+    approach = inp["approach_waypoints"]
+    returns = inp["return_waypoints"]
     warnings = []
 
-    # The navigable region: boundary inset by the shoreline clearance. A non-empty inset is
-    # a hard precondition for any coverage — reported as an error, not silently empty.
     inset = _inset_polygon(boundary, clearance)
     if inset is None or inset.is_empty:
         raise ValueError(
             "The survey boundary is empty after applying the shoreline clearance — "
             "reduce the clearance or enlarge the boundary.")
 
-    primary_coords = _dedup(run_lawnmower_with_obstacles(
+    grid = _NavGrid(boundary, clearance, zones, step_m=spacing)
+    if grid.empty:
+        raise ValueError(
+            "The navigable area is empty after applying the shoreline clearance and no-go "
+            "zones — reduce the clearance/zones or enlarge the boundary.")
+    if grid.disconnected:
+        raise DisconnectedNavigableError(
+            f"The shoreline clearance and no-go zones split the survey into "
+            f"{len(grid.components)} disconnected navigable regions. Survey generation "
+            f"currently requires one connected navigable region — split the survey into "
+            f"separate missions, or adjust the clearance / no-go zones.")
+
+    # Coverage passes: the ported lawnmower, then every UNSAFE internal hop repaired inside
+    # the navigable region (this is the fix for outside-polygon lane connectors).
+    primary_raw = _dedup(run_lawnmower_with_obstacles(
         boundary, spacing, inp["primary_angle_deg"], clearance, zones or None))
-    if len(primary_coords) < 2:
+    if len(primary_raw) < 2:
         raise ValueError(
             "No coverage route could be generated — the navigable area may be too small "
             "for the chosen lane spacing, or fully blocked by no-go zones.")
+    primary_coords = grid.repair_path(primary_raw)
 
-    segments = []
-    exec_coords = []
-
-    # 1. Transit (optional) — operator-supplied waypoints from home toward the survey start.
-    #    Home is NOT emitted as a route waypoint: Scout owns Pixhawk seq 0 / Home and an
-    #    upload must never silently move HOME_POSITION.
-    if inp["transit_waypoints"]:
-        transit_pts = list(inp["transit_waypoints"])
-        segments.append(_seg("transit", transit_pts))
-        exec_coords.extend(transit_pts)
-
-    # 2. Primary coverage pass.
-    segments.append(_seg("primary", primary_coords))
-    exec_coords.extend(primary_coords)
-
+    secondary_coords = None
     intersections = []
     if inp["dual_pass"]:
-        secondary_coords = _dedup(run_lawnmower_with_obstacles(
+        secondary_raw = _dedup(run_lawnmower_with_obstacles(
             boundary, spacing, inp["secondary_angle_deg"], clearance, zones or None))
-        if len(secondary_coords) < 2:
+        if len(secondary_raw) < 2:
             warnings.append("Dual pass requested, but the secondary pass produced no route; "
                             "only the primary pass was generated.")
         else:
-            # 3. Approved transition — a single straight connector from the primary pass end
-            #    to the secondary pass start, kept as its OWN segment (not an arbitrary
-            #    diagonal graph — exactly one connector, explicitly labelled).
-            transition = [primary_coords[-1], secondary_coords[0]]
-            segments.append(_seg("transition", transition))
-            exec_coords.append(secondary_coords[0])
-            # 4. Secondary coverage pass.
-            segments.append(_seg("secondary", secondary_coords))
-            exec_coords.extend(secondary_coords[1:])
+            secondary_coords = grid.repair_path(secondary_raw)
             intersections = _pass_intersections(primary_coords, secondary_coords)
 
-    # 5. Return / transit home (optional) — only when a planning home is defined.
-    if inp["home"]:
-        ret = _dedup(compute_return_path(
-            boundary, spacing, clearance, exec_coords[-1], inp["home"], zones or None))
-        if len(ret) >= 2:
-            segments.append(_seg("return", ret))
-            exec_coords.extend(ret[1:] if ret[0] == exec_coords[-1] else ret)
-        else:
+    survey_entry = primary_coords[0]
+    coverage_end = (secondary_coords[-1] if secondary_coords else primary_coords[-1])
+
+    # ── Resolve the route-start mode (with honest fallbacks + warnings) ──────────────────
+    start_mode = inp["route_start_mode"]
+    if start_mode == "planning_home" and home is None:
+        start_mode = "first_approach"
+        warnings.append("Route start was set to planning home, but no planning home is set — "
+                        "the route begins at the first approach waypoint (or survey entry).")
+    if start_mode == "first_approach" and not approach and home is not None:
+        # No approach points to start from, but a home exists — use it as the start anchor.
+        start_mode = "planning_home"
+
+    segments = []
+    seq = [0]
+
+    def new_seg(kind, coords):
+        seq[0] += 1
+        return {"segment_id": f"seg-{seq[0]:02d}-{kind}", "kind": kind,
+                "coordinates": [[float(c[0]), float(c[1])] for c in _dedup(coords)],
+                "length_m": round(_path_length_m(_dedup(coords)), 2)}
+
+    def connect(a, b, kind, require_inside):
+        """Append a connector segment a→b if a and b are not already the same point."""
+        if _close(a, b):
+            return
+        path = grid.safe_connector(a, b, require_inside=require_inside)
+        if len(path) >= 2:
+            segments.append(new_seg(kind, path))
+
+    # 1. START CONNECTOR + APPROACH + SURVEY ENTRY CONNECTOR
+    start_anchor = home if start_mode == "planning_home" else None
+    if approach:
+        if start_anchor is not None:
+            connect(start_anchor, approach[0], "start_connector", require_inside=False)
+        # The approach polyline, each hop validated (a manually drawn line is not assumed
+        # safe): safe hops kept straight, unsafe hops routed around no-go interiors.
+        approach_path = [approach[0]]
+        for a, b in zip(approach, approach[1:]):
+            if grid.segment_is_safe(a, b, require_inside=False):
+                approach_path.append(b)
+            else:
+                approach_path.extend(grid.safe_connector(a, b, require_inside=False)[1:])
+        # A single approach WP is not a drawable polyline — it is already threaded as the
+        # shared endpoint of the start/survey-entry connectors, so only emit the approach
+        # SEGMENT when there are >= 2 points to draw. The A1 marker still renders from the
+        # echoed planning_inputs.approach_waypoints regardless.
+        if len(approach_path) >= 2:
+            segments.append(new_seg("approach", approach_path))
+        connect(approach[-1], survey_entry, "survey_entry_connector", require_inside=True)
+    elif start_anchor is not None:
+        # No approach WPs: planning home → survey entry is the single entry connector.
+        connect(start_anchor, survey_entry, "survey_entry_connector", require_inside=True)
+    else:
+        warnings.append("No planning home and no approach waypoints — the route begins "
+                        "directly at the survey entry.")
+
+    # 2. PRIMARY COVERAGE
+    segments.append(new_seg("primary", primary_coords))
+
+    # 3. PASS TRANSITION + SECONDARY COVERAGE
+    if secondary_coords:
+        connect(primary_coords[-1], secondary_coords[0], "pass_transition", require_inside=True)
+        segments.append(new_seg("secondary", secondary_coords))
+
+    # 4. RETURN CONNECTOR + RETURN APPROACH + FINAL HOME CONNECTOR
+    if returns:
+        connect(coverage_end, returns[0], "return_connector", require_inside=True)
+        return_path = [returns[0]]
+        for a, b in zip(returns, returns[1:]):
+            if grid.segment_is_safe(a, b, require_inside=False):
+                return_path.append(b)
+            else:
+                return_path.extend(grid.safe_connector(a, b, require_inside=False)[1:])
+        if len(return_path) >= 2:
+            segments.append(new_seg("return_approach", return_path))
+        if home is not None:
+            connect(returns[-1], home, "final_home_connector", require_inside=False)
+    elif home is not None:
+        # No explicit return WPs: a safe generated connector straight back to planning home.
+        try:
+            connect(coverage_end, home, "return_connector", require_inside=True)
+        except ConnectorError:
             warnings.append("No safe return route to the planning home could be found inside "
                             "the navigable area — the route ends at the last coverage waypoint.")
-        if _point_in_any_zone(inp["home"], zones):
-            warnings.append("The planning home lies inside a no-go zone.")
     else:
         warnings.append("No planning home is set — no return route was generated.")
 
-    exec_coords = _dedup(exec_coords)
-    route_waypoints = _route_waypoints(exec_coords)
+    if home is not None and _point_in_any_zone(home, zones):
+        warnings.append("The planning home lies inside a no-go zone.")
+    if not approach:
+        warnings.append("No approach waypoints are defined — the route enters the survey "
+                        "directly.")
+
+    # ── Flatten to the ordered route + provenance (the single source of the upload route) ──
+    route_coords, original_execution_order = _flatten_segments(segments)
+    route_coords = _dedup(route_coords)
+    route_waypoints = _route_waypoints(route_coords)
     n = len(route_waypoints)
 
     if max_route_waypoints is not None and n > max_route_waypoints:
@@ -956,13 +1417,18 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
             f"Route has {n} waypoints, approaching the supported mission limit of "
             f"{max_route_waypoints}.")
 
-    coverage_len = sum(s["length_m"] for s in segments if s["kind"] in ("primary", "secondary"))
-    transit_len = sum(s["length_m"] for s in segments if s["kind"] in ("transit", "transition", "return"))
+    coverage_kinds = ("primary", "secondary")
+    connector_kinds = ("start_connector", "approach", "survey_entry_connector",
+                       "pass_transition", "return_connector", "return_approach",
+                       "final_home_connector")
+    coverage_len = sum(s["length_m"] for s in segments if s["kind"] in coverage_kinds)
+    transit_len = sum(s["length_m"] for s in segments if s["kind"] in connector_kinds)
     total_len = round(coverage_len + transit_len, 2)
 
     speed = inp["survey_speed_mps"] or DEFAULT_PLANNING_SPEED_MPS
     duration_s = round(total_len / speed, 1) if speed > 0 else None
 
+    navigable_boundary = _navigable_rings_deg(boundary, clearance)
     metrics = {
         "boundary_area_m2": round(_polygon_area_m2(boundary), 2),
         "navigable_area_m2": round(abs(inset.area) if hasattr(inset, "area") else 0.0, 2),
@@ -976,21 +1442,45 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "secondary_angle_deg": inp["secondary_angle_deg"] if inp["dual_pass"] else None,
         "dual_pass": inp["dual_pass"],
         "no_go_zone_count": len(zones),
+        "approach_waypoint_count": len(approach),
+        "return_waypoint_count": len(returns),
+        "route_start_mode": start_mode,
         "survey_speed_mps": speed,
         "survey_speed_is_default": inp["survey_speed_mps"] is None,
         "estimated_duration_s": duration_s,
     }
 
+    input_revision = _input_revision(inp)
+    planning_inputs = {
+        "boundary": boundary,
+        "shoreline_clearance_m": clearance,
+        "navigable_boundary": navigable_boundary,
+        "no_go_zones": zones,
+        "lane_spacing_m": spacing,
+        "primary_angle_deg": inp["primary_angle_deg"],
+        "dual_pass": inp["dual_pass"],
+        "secondary_angle_deg": inp["secondary_angle_deg"] if inp["dual_pass"] else None,
+        "planning_home": home,
+        "route_start_mode": start_mode,
+        "approach_waypoints": approach,
+        "return_waypoints": returns,
+    }
+
     return {
         "ok": True,
-        "contract_version": "mission-contract-v1",
+        "mission_package_version": MISSION_PACKAGE_VERSION,
+        "contract_version": ROUTE_CONTRACT_VERSION,
+        "planning_inputs": planning_inputs,
         "segments": segments,
+        "original_execution_order": original_execution_order,
         "route_waypoints": route_waypoints,
+        "route_hash": _route_hash(route_waypoints),
         "metrics": metrics,
         "intersections": intersections,
-        "navigable_boundary": _navigable_rings_deg(boundary, clearance),
+        "navigable_boundary": navigable_boundary,
         "warnings": warnings,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input_revision": input_revision,
     }
 
 
@@ -1069,11 +1559,22 @@ def _pass_intersections(primary_coords, secondary_coords):
     return [[round(x, 7), round(y, 7)] for x, y in pts]
 
 
+# Segment kinds whose ENTIRE geometry must stay inside the navigable region: the coverage
+# passes and the transition between them (both endpoints are coverage points inside the
+# inset). The survey-entry and return CONNECTORS deliberately bridge operator transit points
+# that sit near-shore OUTSIDE the inset, so — like the approach/return legs and home
+# connectors — they are validated for no-go clearance only, never full containment.
+_INSIDE_KINDS = ("primary", "secondary", "pass_transition")
+_COVERAGE_KINDS = ("primary", "secondary")
+
+
 def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
-    """Deterministic pre-upload validation of a generated plan. `raw` carries the planning
-    inputs plus the generated `route_waypoints` (as produced by generate_survey). Returns
-    {ok, errors, warnings, checks} — errors block upload; warnings do not. Never repairs
-    geometry, only reports."""
+    """Deterministic, independent pre-upload validation — the final defence even though
+    generate_survey already returns a structurally valid route. `raw` carries the planning
+    inputs plus the generated `segments`, `route_waypoints` and (optionally) `route_hash` /
+    `input_revision`. Returns {ok, errors, warnings, checks}; errors block upload, warnings do
+    not. Never repairs geometry — it only reports, and it names the offending segment where
+    it can."""
     _require_available()
     errors = []
     warnings = []
@@ -1093,6 +1594,16 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
     checks["inset_nonempty"] = bool(inset and not inset.is_empty)
     if not checks["inset_nonempty"]:
         errors.append("The survey boundary is empty after applying the shoreline clearance.")
+
+    grid = None
+    try:
+        grid = _NavGrid(boundary, clearance, zones, step_m=inp["lane_spacing_m"])
+        checks["navigable_connected"] = not grid.disconnected and not grid.empty
+        if grid.disconnected:
+            errors.append("The navigable region is not connected — survey generation "
+                          "requires one connected navigable region.")
+    except Exception:
+        checks["navigable_connected"] = None
 
     for i, z in enumerate(zones):
         try:
@@ -1125,50 +1636,118 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
     if max_route_waypoints is not None and n > max_route_waypoints:
         errors.append(f"Route has {n} waypoints, above the supported limit of {max_route_waypoints}.")
 
-    # Coverage must stay inside the navigable (inset) region; the whole route must clear
-    # no-go interiors. Transit/return legs legitimately leave the navigable area (they run
-    # to/from shore), so the inset check applies to COVERAGE segments only — which is why
-    # validate consumes the generated `segments`, not just the flat route.
-    if inset is not None and not inset.is_empty and coords:
-        c = Polygon([(p[0], p[1]) for p in boundary]).centroid
-        zone = int((c.x + 180) / 6) + 1
-        hemi = 6 if c.y >= 0 else 7
-        to_proj = pyproj.Transformer.from_crs("EPSG:4326", f"EPSG:32{hemi}{zone:02d}", always_xy=True)
-        line_proj = transform(to_proj.transform, LineString(coords))
+    segs = raw.get("segments") if isinstance(raw, dict) else None
+    segs = segs if isinstance(segs, list) else []
 
-        segs = raw.get("segments") if isinstance(raw, dict) else None
-        coverage_pts = []
-        if isinstance(segs, list):
-            for s in segs:
-                if isinstance(s, dict) and s.get("kind") in ("primary", "secondary"):
-                    coverage_pts.extend([(p[0], p[1]) for p in (s.get("coordinates") or [])])
-        if len(coverage_pts) >= 2:
-            cov_proj = transform(to_proj.transform, LineString(coverage_pts))
-            # A small tolerance buffer absorbs projection/rounding noise at the boundary
-            # itself (the generator clips exactly to the inset edge); a real excursion is
-            # far larger.
-            outside = cov_proj.difference(inset.buffer(0.5))
-            checks["coverage_within_navigable"] = outside.is_empty or outside.length < 1.0
-            if not checks["coverage_within_navigable"]:
-                warnings.append("Part of the coverage route lies outside the navigable "
-                                "(shoreline-inset) area — review the route before upload.")
-        else:
-            checks["coverage_within_navigable"] = None  # no segment metadata to check against
+    # ── Structural integrity of the segmentation ────────────────────────────────────────
+    if segs:
+        # Every segment has enough points, and adjacent segment endpoints coincide (there is
+        # no invisible straight jump that becomes a real Pixhawk leg only after flattening).
+        prev_end = None
+        no_jump = True
+        for i, s in enumerate(segs):
+            sc = s.get("coordinates") or []
+            if len(sc) < 2:
+                errors.append(f"Segment {i + 1} ({s.get('kind')}) has fewer than 2 points.")
+                continue
+            if prev_end is not None and not _close(prev_end, sc[0]):
+                no_jump = False
+                errors.append(
+                    f"Invisible jump between segment {i} and {i + 1} — "
+                    f"{s.get('kind')} does not start where the previous segment ends.")
+            prev_end = sc[-1]
+        checks["no_invisible_jumps"] = no_jump
 
-        crosses = []
-        for i, z in enumerate(zones):
+        # Segment flattening must reproduce route_waypoints EXACTLY (7-dp), so the displayed
+        # segments and the uploaded flat route are provably the same geometry.
+        flat, _ = _flatten_segments([{**s, "segment_id": s.get("segment_id", f"seg-{i}"),
+                                      "coordinates": s.get("coordinates") or []}
+                                     for i, s in enumerate(segs)])
+        flat_r = _route_waypoints(_dedup(flat))
+        checks["flatten_matches_route"] = (
+            [(w["latitude"], w["longitude"]) for w in flat_r]
+            == [(round(_num(w.get("latitude")), 7), round(_num(w.get("longitude")), 7))
+                for w in route if isinstance(w, dict) and _num(w.get("latitude")) is not None])
+        if checks["flatten_matches_route"] is False:
+            errors.append("The segment flattening does not equal the route waypoints — "
+                          "the displayed segments and the upload route disagree.")
+    else:
+        checks["no_invisible_jumps"] = None
+        checks["flatten_matches_route"] = None
+
+    # ── Geometry containment (per segment, against the navigable region) ─────────────────
+    if grid is not None and not grid.empty and segs:
+        inside_ok = True
+        clears_ok = True
+        for i, s in enumerate(segs):
+            sc = [(p[0], p[1]) for p in (s.get("coordinates") or [])]
+            if len(sc) < 2:
+                continue
             try:
-                zp = transform(to_proj.transform, Polygon([(pt[0], pt[1]) for pt in z]).buffer(0))
-                if line_proj.intersection(zp.buffer(-0.5)).length > 1.0:
-                    crosses.append(i + 1)
+                lp = transform(grid.to_proj.transform, LineString(sc))
             except Exception:
                 continue
-        checks["route_clears_no_go"] = not crosses
-        if crosses:
-            errors.append(f"The route crosses the interior of no-go zone(s) {crosses}.")
+            if s.get("kind") in _INSIDE_KINDS and not grid._seg_covered(lp):
+                inside_ok = False
+                errors.append(f"Segment {i + 1} ({s.get('kind')}) leaves the navigable "
+                              f"(shoreline-offset) area.")
+            if not grid._seg_clears_nogo(lp):
+                clears_ok = False
+                errors.append(f"Segment {i + 1} ({s.get('kind')}) crosses a no-go interior.")
+        checks["segments_within_navigable"] = inside_ok
+        checks["coverage_within_navigable"] = all(
+            grid._seg_covered(transform(grid.to_proj.transform,
+                                        LineString([(p[0], p[1]) for p in s["coordinates"]])))
+            for s in segs if s.get("kind") in _COVERAGE_KINDS and len(s.get("coordinates") or []) >= 2)
+        checks["route_clears_no_go"] = clears_ok
+    else:
+        checks["segments_within_navigable"] = None
+        checks["coverage_within_navigable"] = None
+        checks["route_clears_no_go"] = None
+
+    # ── Operator approach/return points appear in the executed order ─────────────────────
+    def _in_route(pt):
+        return any(_close([lng, lat], pt) for (lng, lat) in coords)
+
+    if inp["approach_waypoints"]:
+        missing = [i + 1 for i, p in enumerate(inp["approach_waypoints"]) if not _in_route(p)]
+        checks["approach_in_execution_order"] = not missing
+        if missing:
+            errors.append(f"Approach waypoint(s) {missing} are not in the executed route.")
+    if inp["return_waypoints"]:
+        missing = [i + 1 for i, p in enumerate(inp["return_waypoints"]) if not _in_route(p)]
+        checks["return_in_execution_order"] = not missing
+        if missing:
+            errors.append(f"Return waypoint(s) {missing} are not in the executed route.")
+
+    # ── Mission identity: the route must canonicalize + hash, and match a supplied hash ──
+    try:
+        computed_hash = _route_hash(route)
+        checks["hash_ok"] = True
+        supplied_hash = raw.get("route_hash") if isinstance(raw, dict) else None
+        if supplied_hash and str(supplied_hash) != str(computed_hash):
+            errors.append("The submitted route hash does not match the route — the plan may "
+                          "have been altered after generation.")
+        checks["hash_matches"] = (supplied_hash is None) or (str(supplied_hash) == str(computed_hash))
+    except Exception:
+        checks["hash_ok"] = False
+        errors.append("The route could not be canonicalized/hashed for upload.")
+
+    # input_revision, when supplied, must match the inputs being validated (route not stale).
+    supplied_rev = raw.get("input_revision") if isinstance(raw, dict) else None
+    if supplied_rev is not None:
+        checks["input_revision_matches"] = (str(supplied_rev) == _input_revision(inp))
+        if not checks["input_revision_matches"]:
+            errors.append("The route was generated from different inputs than those being "
+                          "validated — regenerate before upload.")
 
     checks["home_set"] = inp["home"] is not None
     if inp["home"] and _point_in_any_zone(inp["home"], zones):
         errors.append("The planning home lies inside a no-go zone.")
+
+    if not checks.get("home_set"):
+        warnings.append("No planning home is set.")
+    if not inp["approach_waypoints"]:
+        warnings.append("No explicit approach waypoints are defined.")
 
     return {"ok": not errors, "errors": errors, "warnings": warnings, "checks": checks}

@@ -91,10 +91,14 @@ class TestGeneration(unittest.TestCase):
 
     def test_dual_pass_creates_both_passes_and_segments(self):
         r = planning.generate_survey(
-            base_inputs(dual_pass=True, home=[12.9995, 56.6985], transit_waypoints=[[12.9998, 56.6988]]),
+            base_inputs(dual_pass=True, home=[12.9995, 56.6985],
+                        approach_waypoints=[[12.9998, 56.6988], [12.99995, 56.69885]],
+                        return_waypoints=[[12.9997, 56.6987], [12.9996, 56.6986]]),
             max_route_waypoints=500)
         kinds = [s["kind"] for s in r["segments"]]
-        for k in ("transit", "primary", "transition", "secondary", "return"):
+        for k in ("start_connector", "approach", "survey_entry_connector", "primary",
+                  "pass_transition", "secondary", "return_connector", "return_approach",
+                  "final_home_connector"):
             self.assertIn(k, kinds, f"dual-pass route missing the {k} segment")
         self.assertIsNotNone(r["metrics"]["secondary_angle_deg"])
 

@@ -1836,6 +1836,10 @@ def process_command_result(command_id, raw_status, result, reason, now, vehicle_
         _annotate_rtl_result(cmd)
         _annotate_mission_upload_result(cmd)
         _annotate_generic_verification(cmd)
+        # Follow a finalized-survey upload onto its immutable original mission record: a
+        # verified read-back marks the original mission VERIFIED; a failure records FAILED
+        # while preserving the record. No-op for uploads not created via /api/missions/finalize.
+        _sync_mission_record_status(cmd)
         _refresh_command_derived(cmd)
         # One normalized outcome drives severity + wording (SET_HOME/RTL/MISSION_UPLOAD and
         # any command Scout reports verified:false for).
@@ -2226,6 +2230,199 @@ def delete_draft(draft_id: str):
     except Exception as exc:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
     return {"ok": True, "deleted": draft_id}
+
+
+# ── Immutable original mission records (Plan finalization; future agent replanning) ───────
+# When a finalized survey is uploaded, the Operator MUST NOT lose the richer geometry it
+# flattened for the Pixhawk. The MISSION_UPLOAD command still carries ONLY the proven
+# mission-contract-v1 route (unchanged) — but alongside it we store ONE immutable original
+# mission record (revision 0) retaining the operator inputs, segmented purposes, navigable
+# geometry, no-go zones, the original execution order and the canonical route hash. This is
+# the substrate a Local Agent revision will later derive from; NONE of that replanning is
+# implemented here (see PART 6/7 of the task) — only the record and read-only APIs.
+#
+# In-memory, like the command queue / event log (resets on restart); durable storage is a
+# later item. The record's route_hash is the SAME canonical hash the upload command is
+# verified against (mission_contract.route_content_hash) — never a second identity.
+original_missions = {}            # {mission_id: record}
+mission_id_by_command = {}        # {upload_command_id: mission_id}
+active_original_by_vehicle = {}   # {vehicle_id: mission_id}  (latest finalized revision 0)
+
+# The command lifecycle → mission upload_status projection. QUEUED/SENT are both "queued"
+# from the mission's point of view; a verified read-back is the only VERIFIED.
+MISSION_UPLOAD_STATUSES = ("QUEUED", "ACCEPTED", "VERIFIED", "FAILED")
+
+
+def _mission_upload_status_for(cmd):
+    """Project a MISSION_UPLOAD command's current lifecycle onto the mission record's
+    upload_status. VERIFIED requires the read-back verification (_annotate_mission_upload_
+    result set mission_result:'verified'), never mere transport success."""
+    status = cmd.get("status")
+    if status in ("QUEUED", "SENT"):
+        return "QUEUED"
+    if status == "ACCEPTED":
+        return "ACCEPTED"
+    if status == "EXECUTED":
+        return "VERIFIED" if cmd.get("mission_result") == "verified" else "FAILED"
+    if status in ("REJECTED", "FAILED", "EXPIRED"):
+        return "FAILED"
+    return "QUEUED"
+
+
+def _sync_mission_record_status(cmd):
+    """Follow a linked MISSION_UPLOAD command's lifecycle onto its immutable mission record.
+    A failed upload keeps the record (upload_status FAILED, plan preserved); a verified
+    read-back marks the ORIGINAL mission VERIFIED. The record itself is never mutated beyond
+    its upload_status/verified_at — it is immutable geometry."""
+    if cmd.get("type") != "MISSION_UPLOAD":
+        return
+    mid = mission_id_by_command.get(cmd["id"])
+    rec = original_missions.get(mid) if mid else None
+    if rec is None:
+        return
+    new_status = _mission_upload_status_for(cmd)
+    rec["upload_status"] = new_status
+    if new_status == "VERIFIED" and not rec.get("verified_at"):
+        rec["verified_at"] = datetime.now(timezone.utc).isoformat()
+    if new_status == "FAILED":
+        rec["upload_failure_reason"] = cmd.get("reason")
+
+
+def _new_mission_record(vehicle_id, package, command):
+    """Build + store the immutable revision-0 original mission record for a finalized upload.
+    `package` is the operator-survey-plan-v1 generate output; `command` is the QUEUED
+    MISSION_UPLOAD record. The record's route_hash is the command's authoritative expected
+    hash (the two are the same route by construction)."""
+    now = datetime.now(timezone.utc).isoformat()
+    mission_id = "msn-" + uuid.uuid4().hex[:12]
+    params = command.get("params") or {}
+    rec = {
+        "mission_id": mission_id,
+        "mission_revision": 0,
+        "parent_revision_id": None,
+        "vehicle_id": vehicle_id,
+        "mission_package_version": package.get("mission_package_version", planning.MISSION_PACKAGE_VERSION),
+        "route_contract_version": MISSION_CONTRACT_VERSION,
+        # Authoritative canonical hash — the SAME one the upload read-back is verified against.
+        "route_hash": params.get("expected_route_content_hash"),
+        "input_revision": package.get("input_revision"),
+        "planning_inputs": package.get("planning_inputs") or {},
+        "navigable_geometry": package.get("navigable_boundary")
+                              or (package.get("planning_inputs") or {}).get("navigable_boundary"),
+        "no_go_zones": (package.get("planning_inputs") or {}).get("no_go_zones") or [],
+        "segments": package.get("segments") or [],
+        "original_execution_order": package.get("original_execution_order") or [],
+        "route_waypoints": params.get("waypoints") or package.get("route_waypoints") or [],
+        "metrics": package.get("metrics") or {},
+        "created_at": now,
+        "upload_command_id": command["id"],
+        "upload_status": "QUEUED",
+        "verified_at": None,
+        "upload_failure_reason": None,
+        "immutable": True,
+        # Reserved for later Local Agent revisions (documented flow; NOT implemented now):
+        # original revision 0 → Scout obstacle event → Local Agent revision 1 → revised flat
+        # route uploaded + verified → Operator stores revision 1 linked to this original.
+        "revision_reason": None,
+        "blocked_segments": None,
+        "derived_from_route_hash": None,
+    }
+    original_missions[mission_id] = rec
+    mission_id_by_command[command["id"]] = mission_id
+    active_original_by_vehicle[vehicle_id] = mission_id
+    return rec
+
+
+@app.post("/api/missions/finalize")
+async def finalize_mission(request: Request):
+    """Finalize a generated survey: store the immutable original mission record (revision 0)
+    AND create the verified MISSION_UPLOAD command, in one call. The command carries only the
+    proven mission-contract-v1 route (unchanged upload path); the record retains the richer
+    package so the geometry/segmentation survives flattening.
+
+    Body: { vehicle_id, mission_package (operator-survey-plan-v1 generate output), confirm }.
+    MISSION_UPLOAD is confirm-required (it overwrites the FC mission), so `confirm:true` is
+    required exactly as POST /api/commands demands. Returns { mission, command }."""
+    now = datetime.now(timezone.utc)
+    expire_commands(now)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad_request",
+                            "message": "Request body is not valid JSON."})
+
+    vid = parse_vehicle_id(body.get("vehicle_id"))
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": body.get("vehicle_id")})
+
+    package = body.get("mission_package") if isinstance(body.get("mission_package"), dict) else None
+    if not package or not isinstance(package.get("route_waypoints"), list):
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "invalid_mission_package",
+            "message": "mission_package with route_waypoints is required."})
+
+    if not bool(body.get("confirm")):
+        return JSONResponse(status_code=409, content={
+            "ok": False, "needs_confirmation": True, "type": "MISSION_UPLOAD",
+            "message": "MISSION_UPLOAD overwrites the mission on the flight controller and "
+                       "requires explicit confirmation. Resend with confirm:true."})
+
+    # Canonicalize through the SAME function POST /api/commands uses — one contract, one hash.
+    try:
+        params = canonical_mission_upload_params({
+            "contract_version": MISSION_CONTRACT_VERSION,
+            "waypoints": package.get("route_waypoints")})
+    except MissionContractError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "mission_contract_violation",
+            "contract_version": MISSION_CONTRACT_VERSION,
+            "message": "Mission does not satisfy " + MISSION_CONTRACT_VERSION + ".",
+            "errors": exc.errors})
+
+    # Defence-in-depth: the package's own route_hash (planning._route_hash) must match the
+    # authoritative one derived here — otherwise the package was altered after generation.
+    if package.get("route_hash") and package["route_hash"] != params["expected_route_content_hash"]:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "route_hash_mismatch",
+            "message": "The mission package route_hash does not match its route waypoints — "
+                       "regenerate the plan before finalizing."})
+
+    comm_state = comms_state_by_id.get(vid, "UNKNOWN")
+    cmd = make_command(vid=vid, ctype="MISSION_UPLOAD", params=params,
+                       created_by=body.get("created_by"), comm_state=comm_state, now=now,
+                       source="OPERATOR")
+    warnings = [RISK_WARNING["MISSION_UPLOAD"]]
+    if comm_state == "PARTITIONED":
+        warnings.append("Queued while communication is partitioned — delivery may be delayed.")
+    elif comm_state == "DISCONNECTED":
+        warnings.append("Queued while disconnected — will deliver on next contact.")
+    cmd["warning"] = " ".join(warnings)
+
+    rec = _new_mission_record(vid, package, cmd)
+    _command_event(cmd, severity="caution",
+                   message=f"Survey mission {rec['mission_id']} finalized and MISSION_UPLOAD "
+                           f"created ({comm_state})",
+                   source="operator-backend")
+    return {"ok": True, "mission": rec, "command": cmd}
+
+
+@app.get("/api/missions/original/{mission_id}")
+def get_original_mission(mission_id: str):
+    """The immutable original mission record (revision 0) for one mission id."""
+    rec = original_missions.get(str(mission_id))
+    if rec is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
+    return {"ok": True, "mission": rec}
+
+
+@app.get("/api/vehicles/{vehicle_id}/missions/active-original")
+def get_active_original_mission(vehicle_id: str):
+    """The most recently finalized original mission (revision 0) for a vehicle, or null."""
+    vid = parse_vehicle_id(vehicle_id)
+    mid = active_original_by_vehicle.get(vid)
+    rec = original_missions.get(mid) if mid else None
+    return {"ok": True, "vehicle_id": vid, "mission": rec}
 
 
 @app.get("/api/commands/pending/{vehicle_id}")
