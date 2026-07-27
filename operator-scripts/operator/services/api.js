@@ -257,6 +257,19 @@ export async function validatePlan(body) {
   return r.data || { ok: false, error: "no_response" };
 }
 
+/** Finalize a generated survey: store the immutable original mission record (revision 0)
+ *  AND create the verified MISSION_UPLOAD command in one call. body = lib/planning.js
+ *  finalizePayload(model) = { vehicle_id, mission_package, confirm }. The command still
+ *  carries only the proven mission-contract-v1 route; the record retains the richer package.
+ *  Returns { ok, status, data } where data = { mission, command }. */
+export function finalizeMission(body) { return postJSON("/api/missions/finalize", body); }
+
+/** The immutable original mission record (revision 0) for a mission id. */
+export function getOriginalMission(missionId) { return getJSON(`/api/missions/original/${missionId}`); }
+
+/** The most recently finalized original mission for a vehicle (or null). */
+export function getActiveOriginalMission(id) { return getJSON(`/api/vehicles/${id}/missions/active-original`); }
+
 /** List saved planning drafts (summaries). */
 export function listDrafts() { return getJSON("/api/planning/drafts"); }
 /** Load one draft in full. */

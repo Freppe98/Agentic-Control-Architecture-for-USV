@@ -27,19 +27,33 @@ import { hasPendingOfType } from "../lib/command.js";
 
 const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v0.01M11 12h1v4h1"/></svg>';
 
-// Distinct styles per geometry/segment kind — kept restrained so the map never becomes
-// visually overwhelming (a handful of hues + line styles, not a rainbow).
+// Distinct style per ORDERED segment kind — one hue family per phase so the route reads as a
+// sequence, never one ambiguous orange for approach + transition + return (the old defect):
+//   orange  = approach into the survey      green  = primary coverage
+//   grey    = primary→secondary transition   purple = secondary coverage
+//   amber   = return out of the survey
 const SEG_STYLE = {
-  primary:   { color: "#3ECF8E", weight: 3, opacity: 0.9 },
-  secondary: { color: "#A78BFA", weight: 3, opacity: 0.9, dashArray: "1 0" },
-  transit:   { color: "#F2A93B", weight: 2.4, opacity: 0.85, dashArray: "7 6" },
-  transition:{ color: "#8FA3B8", weight: 2, opacity: 0.7, dashArray: "3 5" },
-  return:    { color: "#F2A93B", weight: 2.4, opacity: 0.85, dashArray: "2 6" },
+  start_connector:        { color: "#F2A93B", weight: 2.2, opacity: 0.85, dashArray: "2 6" },
+  approach:               { color: "#F2A93B", weight: 2.6, opacity: 0.95, dashArray: "9 6" },
+  survey_entry_connector: { color: "#F2A93B", weight: 2.2, opacity: 0.95, dashArray: "2 5" },
+  primary:                { color: "#3ECF8E", weight: 3,   opacity: 0.95 },
+  pass_transition:        { color: "#C7D2DE", weight: 2,   opacity: 0.8, dashArray: "4 5" },
+  secondary:              { color: "#A78BFA", weight: 3,   opacity: 0.95 },
+  return_connector:       { color: "#F5C542", weight: 2.4, opacity: 0.9, dashArray: "7 6" },
+  return_approach:        { color: "#F5C542", weight: 2.6, opacity: 0.95, dashArray: "9 6" },
+  final_home_connector:   { color: "#F5C542", weight: 2.2, opacity: 0.9, dashArray: "2 6" },
 };
-const BOUNDARY_STYLE = { color: "#4C8DFF", weight: 2.2, opacity: 0.95, fill: false };
-const NAVIGABLE_STYLE = { color: "#3ECF8E", weight: 1, opacity: 0.5, dashArray: "4 5", fill: true, fillColor: "#3ECF8E", fillOpacity: 0.05 };
-const NOGO_STYLE = { color: "#E5484D", weight: 1.6, opacity: 0.9, fill: true, fillColor: "#E5484D", fillOpacity: 0.16 };
-const NOGO_SEL_STYLE = { ...NOGO_STYLE, weight: 2.4, dashArray: "5 4" };
+// Segment kinds that carry a direction the operator must read (approach/return order).
+const ARROW_KINDS = new Set(["approach", "return_approach", "start_connector",
+                             "survey_entry_connector", "return_connector", "final_home_connector"]);
+const BOUNDARY_STYLE = { color: "#4C8DFF", weight: 2.2, opacity: 0.95, fill: false, pane: "pl-boundary" };
+const NAVIGABLE_STYLE = { color: "#3ECF8E", weight: 1, opacity: 0.5, dashArray: "4 5", fill: true, fillColor: "#3ECF8E", fillOpacity: 0.05, pane: "pl-navigable" };
+// No-go zones keep an UNMISTAKABLE red fill+outline and live in their own pane ABOVE the
+// navigable fill, so route generation (which draws the translucent green navigable area) can
+// never grey them out — before or after generation. Selection thickens the outline but never
+// changes the red semantics.
+const NOGO_STYLE = { color: "#E5484D", weight: 1.8, opacity: 0.95, fill: true, fillColor: "#E5484D", fillOpacity: 0.22, pane: "pl-nogo" };
+const NOGO_SEL_STYLE = { ...NOGO_STYLE, weight: 2.6, dashArray: "5 4" };
 
 const WORKFLOW = [
   ["vehicle", "Vehicle"], ["area", "Survey Area"], ["restrictions", "Restrictions"],
@@ -51,9 +65,9 @@ export function Plan(root) {
   const L = window.L;
   let fleet = [];
   let model = P.emptyModel();
-  let mode = null;            // active drawing mode: null|'boundary'|'nogo'|'home'|'transit'
+  let mode = null;            // active drawing mode: null|'boundary'|'nogo'|'home'|'approach'|'return'
   let draftRing = [];         // in-progress polygon vertices ([lng,lat]) while drawing
-  let selected = null;        // { type:'boundary' } | { type:'nogo', id } | { type:'transit', index } | { type:'home' }
+  let selected = null;        // { type:'boundary'|'nogo'|'approach'|'return'|'home', id?/index? }
   const history = [];         // undo stack of prior models (drawing/edit actions)
   let drafts = [];            // saved-draft summaries
   let busyGen = false, busyVal = false;
@@ -83,9 +97,11 @@ export function Plan(root) {
            <div class="li"><span class="pl-sw boundary"></span>Survey boundary</div>
            <div class="li"><span class="pl-sw navigable"></span>Navigable (shoreline-offset)</div>
            <div class="li"><span class="pl-sw nogo"></span>No-go zone</div>
-           <div class="li"><span class="pl-sw transit"></span>Transit / return</div>
-           <div class="li"><span class="pl-sw primary"></span>Primary pass</div>
-           <div class="li"><span class="pl-sw secondary"></span>Secondary pass</div>
+           <div class="li"><span class="pl-sw approach"></span>Approach (A1→) &amp; entry</div>
+           <div class="li"><span class="pl-sw primary"></span>Primary coverage</div>
+           <div class="li"><span class="pl-sw transition"></span>Pass transition</div>
+           <div class="li"><span class="pl-sw secondary"></span>Secondary coverage</div>
+           <div class="li"><span class="pl-sw return"></span>Return (→R1) &amp; home connector</div>
            <div class="li"><span class="pl-sw home"></span>Planning home</div>
          </div>
        </div>
@@ -98,11 +114,20 @@ export function Plan(root) {
   const HOME_VIEW = [56.699893, 13.002148];
   const map = L.map("plan-map", { zoomControl: true, attributionControl: false }).setView(HOME_VIEW, 16);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20 }).addTo(map);
+
+  // Explicit stacking panes (task PART 3). The order guarantees the no-go RED fill/outline
+  // always sits ABOVE the translucent navigable fill — so generating the route can never
+  // grey a no-go zone out — while route lines and markers sit above the zones.
+  const PANES = [["pl-navigable", 410], ["pl-boundary", 420], ["pl-nogo", 430],
+                 ["pl-route", 450], ["pl-markers", 460], ["pl-handles", 470]];
+  PANES.forEach(([name, z]) => { map.createPane(name); map.getPane(name).style.zIndex = String(z); });
+
   map.on("click", onMapClick);
   map.on("dblclick", onMapDblClick);
   map.on("contextmenu", onMapRightClick);
 
-  // Layer groups, rebuilt on every render — simple and flicker-free at this scale.
+  // Layer groups, rebuilt on every render — simple and flicker-free at this scale. Each
+  // layer's SHAPES carry the matching `pane` so the z-order above is what actually renders.
   const layers = {
     boundary: L.layerGroup().addTo(map),
     navigable: L.layerGroup().addTo(map),
@@ -133,7 +158,8 @@ export function Plan(root) {
     const pt = fromLL(e.latlng);
     if (mode === "boundary" || mode === "nogo") { draftRing.push(pt); drawDraft(); renderTools(); }
     else if (mode === "home") { apply(P.setHome(model, pt)); mode = null; map.doubleClickZoom.enable(); }
-    else if (mode === "transit") { apply(P.setTransit(model, [...model.transit, pt])); }
+    else if (mode === "approach") { apply(P.setApproach(model, [...model.approach, pt])); }
+    else if (mode === "return") { apply(P.setReturns(model, [...model.returns, pt])); }
   }
   function onMapDblClick(e) { if (mode === "boundary" || mode === "nogo") finishShape(); }
   function onMapRightClick(e) {
@@ -157,14 +183,15 @@ export function Plan(root) {
     if (selected.type === "boundary") apply(P.setBoundary(model, null));
     else if (selected.type === "nogo") apply(P.removeNoGoZone(model, selected.id));
     else if (selected.type === "home") apply(P.setHome(model, null));
-    else if (selected.type === "transit") apply(P.setTransit(model, model.transit.filter((_, i) => i !== selected.index)));
+    else if (selected.type === "approach") apply(P.setApproach(model, model.approach.filter((_, i) => i !== selected.index)));
+    else if (selected.type === "return") apply(P.setReturns(model, model.returns.filter((_, i) => i !== selected.index)));
     selected = null; renderAll();
   }
   async function clearAll() {
     if (P.hasUnsavedWork(model) && !window.confirm(
-      "Clear the entire plan?\n\nThis removes the boundary, no-go zones, home, transit " +
-      "waypoints, the generated route and validation. It does NOT touch the mission stored " +
-      "on any vehicle and issues no command. This cannot be undone.")) return;
+      "Clear the entire plan?\n\nThis removes the boundary, no-go zones, home, approach and " +
+      "return waypoints, the generated route and validation. It does NOT touch the mission " +
+      "stored on any vehicle and issues no command. This cannot be undone.")) return;
     history.length = 0; selected = null; draftRing = []; mode = null;
     const keepVehicle = model.vehicleId;
     model = P.clearModel(); model.vehicleId = keepVehicle;
@@ -185,10 +212,41 @@ export function Plan(root) {
   function vertexHandle(ring, idx, onMove) {
     // A draggable vertex marker for polygon editing. Excludes the closing duplicate point.
     // A divIcon marker (not circleMarker, which isn't natively draggable) carries the handle.
-    const mk = L.marker(toLL(ring[idx]), { draggable: true, icon: L.divIcon({ className: "", html: '<div class="plan-vhandle"></div>', iconSize: [12, 12], iconAnchor: [6, 6] }) });
+    const mk = L.marker(toLL(ring[idx]), { draggable: true, pane: "pl-handles", icon: L.divIcon({ className: "", html: '<div class="plan-vhandle"></div>', iconSize: [12, 12], iconAnchor: [6, 6] }) });
     mk.on("drag", (e) => onMove(idx, fromLL(e.latlng), false));
     mk.on("dragend", (e) => onMove(idx, fromLL(e.latlng), true));
     return mk;
+  }
+
+  // Directional arrows along a leg the operator must read in order (screen-space angle,
+  // latitude-corrected so it stays right without a zoom listener). Decorative, non-interactive.
+  function drawArrows(coords, color) {
+    for (let i = 0; i < coords.length - 1; i++) {
+      const a = toLL(coords[i]), b = toLL(coords[i + 1]);
+      const latR = (a[0] * Math.PI) / 180;
+      const ang = (Math.atan2(-(b[0] - a[0]), (b[1] - a[1]) * Math.cos(latR)) * 180) / Math.PI;
+      const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      L.marker(mid, { interactive: false, pane: "pl-route", icon: L.divIcon({ className: "", html: `<div class="plan-arrow" style="color:${color};transform:rotate(${ang}deg)">➤</div>`, iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(layers.route);
+    }
+  }
+
+  // Render an ordered operator waypoint list (approach A1.., or return R1..): a dashed
+  // directional line through the points + numbered, selectable, draggable markers. Distinct
+  // labels (A vs R) so the two sets are never indistinguishable numbered dots.
+  function drawWaypointList(list, type, prefix, color) {
+    if (!list || !list.length) return;
+    const setter = type === "approach" ? P.setApproach : P.setReturns;
+    if (list.length > 1) {
+      L.polyline(list.map(toLL), { color, weight: 2, opacity: 0.75, dashArray: "8 6", pane: "pl-route" }).addTo(layers.markers);
+      drawArrows(list, color);
+    }
+    list.forEach((pt, i) => {
+      const sel = selected && selected.type === type && selected.index === i;
+      const mk = L.marker(toLL(pt), { draggable: true, pane: "pl-markers", icon: L.divIcon({ className: "", html: `<div class="plan-wp ${type}${sel ? " sel" : ""}">${prefix}${i + 1}</div>`, iconSize: [22, 18], iconAnchor: [11, 9] }) });
+      mk.on("click", (e) => { L.DomEvent.stop(e); selected = { type, index: i }; renderAll(); });
+      mk.on("dragend", (e) => { const pts = list.map((p) => [p[0], p[1]]); pts[i] = fromLL(e.latlng); apply(setter(model, pts)); });
+      mk.addTo(layers.markers);
+    });
   }
 
   function drawGeometry() {
@@ -225,27 +283,27 @@ export function Plan(root) {
       }
     });
 
-    // Generated route segments (distinct styles) + generated waypoint dots.
+    // Generated route segments (distinct styles per kind) + directional arrows on the
+    // approach/return/connector legs + generated waypoint dots.
     if (model.generated && Array.isArray(model.generated.segments)) {
       model.generated.segments.forEach((s) => {
         const style = SEG_STYLE[s.kind];
         if (style && s.coordinates.length > 1) {
-          L.polyline(s.coordinates.map(toLL), { ...style }).addTo(layers.route);
+          L.polyline(s.coordinates.map(toLL), { ...style, pane: "pl-route" }).addTo(layers.route);
+          if (ARROW_KINDS.has(s.kind)) drawArrows(s.coordinates, style.color);
         }
       });
       (model.generated.route_waypoints || []).forEach((w, i) => {
-        L.circleMarker([w.latitude, w.longitude], { radius: 2.6, color: "#0C141C", weight: 0.6, fillColor: "#DCE3EC", fillOpacity: 0.9 })
+        L.circleMarker([w.latitude, w.longitude], { radius: 2.6, color: "#0C141C", weight: 0.6, fillColor: "#DCE3EC", fillOpacity: 0.9, pane: "pl-markers" })
           .bindTooltip(`WP ${i + 1}`, { sticky: true }).addTo(layers.markers);
       });
     }
 
-    // Transit waypoints (ordered, distinct from coverage waypoints).
-    model.transit.forEach((pt, i) => {
-      const sel = selected && selected.type === "transit" && selected.index === i;
-      L.marker(toLL(pt), { icon: L.divIcon({ className: "", html: `<div class="plan-transit-wp${sel ? " sel" : ""}">${i + 1}</div>`, iconSize: [18, 18], iconAnchor: [9, 9] }) })
-        .on("click", (e) => { L.DomEvent.stop(e); selected = { type: "transit", index: i }; renderAll(); })
-        .addTo(layers.markers);
-    });
+    // Approach waypoints A1, A2, … (ordered route INTO the survey) + their directional line
+    // even before a route is generated, so the click order is always visually obvious.
+    drawWaypointList(model.approach, "approach", "A", "#F2A93B");
+    // Return waypoints R1, R2, … (ordered route OUT toward home).
+    drawWaypointList(model.returns, "return", "R", "#F5C542");
 
     // Planning home marker (distinct from vehicle Home / RTL point — this is planning only).
     if (model.home) {
@@ -286,7 +344,10 @@ export function Plan(root) {
     const vehOpts = fleet.map((v) => `<option value="${v.id}" ${v.id === model.vehicleId ? "selected" : ""}>${v.name || "USV-" + v.id} · ${commState(v)}</option>`).join("");
     const drawing = (mode === "boundary" || mode === "nogo");
     const zoneList = model.noGoZones.map((z) => `<div class="plan-item ${selected && selected.type === "nogo" && selected.id === z.id ? "sel" : ""}" data-zone="${z.id}"><span>${z.id}</span><button class="plan-x" data-rmzone="${z.id}" title="Remove zone">✕</button></div>`).join("") || `<div class="plan-empty">No no-go zones</div>`;
-    const transitList = model.transit.map((_, i) => `<div class="plan-item ${selected && selected.type === "transit" && selected.index === i ? "sel" : ""}" data-transit="${i}"><span>WP ${i + 1}</span><span class="plan-item-btns"><button data-tup="${i}" title="Move up" ${i === 0 ? "disabled" : ""}>▲</button><button data-tdn="${i}" title="Move down" ${i === model.transit.length - 1 ? "disabled" : ""}>▼</button><button class="plan-x" data-rmtransit="${i}" title="Remove">✕</button></span></div>`).join("") || `<div class="plan-empty">No transit waypoints</div>`;
+    const wpRow = (kind, i, n, prefix) => `<div class="plan-item ${selected && selected.type === kind && selected.index === i ? "sel" : ""}" data-wp="${kind}:${i}"><span>${prefix}${i + 1}</span><span class="plan-item-btns"><button data-wpup="${kind}:${i}" title="Move up" ${i === 0 ? "disabled" : ""}>▲</button><button data-wpdn="${kind}:${i}" title="Move down" ${i === n - 1 ? "disabled" : ""}>▼</button><button class="plan-x" data-wprm="${kind}:${i}" title="Remove">✕</button></span></div>`;
+    const approachList = model.approach.map((_, i) => wpRow("approach", i, model.approach.length, "A")).join("") || `<div class="plan-empty">No approach waypoints</div>`;
+    const returnList = model.returns.map((_, i) => wpRow("return", i, model.returns.length, "R")).join("") || `<div class="plan-empty">No return waypoints</div>`;
+    const startOpts = P.ROUTE_START_MODES.map((m) => `<option value="${m}" ${model.routeStartMode === m ? "selected" : ""}>${P.ROUTE_START_LABEL[m]}</option>`).join("");
 
     document.getElementById("plan-tools").innerHTML = `
       <div class="plan-sec"><span class="lbl">Workflow</span></div>
@@ -307,12 +368,29 @@ export function Plan(root) {
       ${drawing && mode === "nogo" ? `<div class="plan-draw-hint">Click to add vertices (${draftRing.length}). Double-click or Finish to close.<div class="plan-btnrow"><button id="pl-finish" ${P.ringIsValid(draftRing) ? "" : "disabled"}>Finish</button><button id="pl-cancel">Cancel</button></div></div>` : ""}
       <div class="plan-list">${zoneList}</div>
 
-      <div class="plan-sec"><span class="lbl">Home &amp; transit</span></div>
+      <div class="plan-sec"><span class="lbl">Planning home</span></div>
       <div class="plan-btnrow">
         <button class="plan-tool ${mode === "home" ? "on" : ""}" id="pl-home">${model.home ? "Move home" : "Set home"}</button>
-        <button class="plan-tool ${mode === "transit" ? "on" : ""}" id="pl-transit">Add transit WP</button>
       </div>
-      <div class="plan-list">${transitList}</div>
+      <div class="plan-note plan-note-sm">${infoIcon}<span>Planning Home is route-planning geometry only. It does <b>not</b> change the Pixhawk HOME_POSITION or the RTL home.</span></div>
+      <div class="plan-field"><label class="plan-fl" for="pl-start">Start route from</label><select id="pl-start" ${model.home ? "" : "disabled title='Set a planning home to start there'"}>${startOpts}</select></div>
+
+      <div class="plan-sec"><span class="lbl">Approach waypoints</span></div>
+      <div class="plan-help">Approach waypoints define the operator-approved route into the survey area before coverage begins. They are visited in numbered order (A1 → A2 → survey entry).</div>
+      <div class="plan-btnrow">
+        <button class="plan-tool ${mode === "approach" ? "on" : ""}" id="pl-approach">Add approach WP</button>
+        <button class="plan-tool" id="pl-approach-clear" ${model.approach.length ? "" : "disabled"}>Clear</button>
+      </div>
+      <div class="plan-list">${approachList}</div>
+
+      <div class="plan-sec"><span class="lbl">Return waypoints</span></div>
+      <div class="plan-help">Return waypoints define the route out of the survey back toward planning home (last coverage point → R1 → R2 → home). Optional.</div>
+      <div class="plan-btnrow">
+        <button class="plan-tool ${mode === "return" ? "on" : ""}" id="pl-return">Add return WP</button>
+        <button class="plan-tool" id="pl-return-rev" ${model.approach.length ? "" : "disabled"} title="Copy the approach waypoints in reverse into the return list (stays editable)">Use reversed approach</button>
+        <button class="plan-tool" id="pl-return-clear" ${model.returns.length ? "" : "disabled"}>Clear</button>
+      </div>
+      <div class="plan-list">${returnList}</div>
 
       <div class="plan-sec"><span class="lbl">Edit</span></div>
       <div class="plan-btnrow">
@@ -328,24 +406,34 @@ export function Plan(root) {
     bind("pl-del-boundary", () => apply(P.setBoundary(model, null)));
     bind("pl-draw-nogo", () => { if (P.canAddZone(model)) setMode("nogo"); });
     bind("pl-home", () => setMode("home"));
-    bind("pl-transit", () => setMode("transit"));
+    bind("pl-approach", () => setMode("approach"));
+    bind("pl-return", () => setMode("return"));
+    bind("pl-approach-clear", () => { apply(P.setApproach(model, [])); if (selected && selected.type === "approach") selected = null; renderAll(); });
+    bind("pl-return-clear", () => { apply(P.setReturns(model, [])); if (selected && selected.type === "return") selected = null; renderAll(); });
+    bind("pl-return-rev", () => { apply(P.reversedApproach(model)); showToast("Return list set to the reversed approach — still editable.", "ok"); });
     bind("pl-finish", finishShape);
     bind("pl-cancel", cancelDraw);
     bind("pl-undo", undo);
     bind("pl-delsel", deleteSelected);
     bind("pl-clear", clearAll);
+    const startSel = document.getElementById("pl-start");
+    if (startSel) startSel.onchange = () => apply(P.setRouteStart(model, startSel.value), false);
     document.querySelectorAll("[data-rmzone]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); apply(P.removeNoGoZone(model, b.dataset.rmzone)); if (selected && selected.id === b.dataset.rmzone) selected = null; renderAll(); });
     document.querySelectorAll("[data-zone]").forEach((el) => el.onclick = () => { selected = { type: "nogo", id: el.dataset.zone }; renderAll(); });
-    document.querySelectorAll("[data-rmtransit]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); apply(P.setTransit(model, model.transit.filter((_, i) => i !== +b.dataset.rmtransit))); selected = null; renderAll(); });
-    document.querySelectorAll("[data-tup]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); reorderTransit(+b.dataset.tup, -1); });
-    document.querySelectorAll("[data-tdn]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); reorderTransit(+b.dataset.tdn, +1); });
+    document.querySelectorAll("[data-wp]").forEach((el) => el.onclick = () => { const [k, i] = el.dataset.wp.split(":"); selected = { type: k, index: +i }; renderAll(); });
+    document.querySelectorAll("[data-wprm]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const [k, i] = b.dataset.wprm.split(":"); removeWp(k, +i); });
+    document.querySelectorAll("[data-wpup]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const [k, i] = b.dataset.wpup.split(":"); reorderWp(k, +i, -1); });
+    document.querySelectorAll("[data-wpdn]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const [k, i] = b.dataset.wpdn.split(":"); reorderWp(k, +i, +1); });
   }
   function bind(id, fn) { const e = document.getElementById(id); if (e) e.onclick = fn; }
-  function reorderTransit(i, dir) {
-    const t = [...model.transit]; const j = i + dir;
+  function wpListOf(kind) { return kind === "approach" ? model.approach : model.returns; }
+  function setWpList(kind, pts) { return kind === "approach" ? P.setApproach(model, pts) : P.setReturns(model, pts); }
+  function removeWp(kind, i) { apply(setWpList(kind, wpListOf(kind).filter((_, j) => j !== i))); selected = null; renderAll(); }
+  function reorderWp(kind, i, dir) {
+    const t = [...wpListOf(kind)]; const j = i + dir;
     if (j < 0 || j >= t.length) return;
     [t[i], t[j]] = [t[j], t[i]];
-    apply(P.setTransit(model, t));
+    apply(setWpList(kind, t));
   }
   function stepDone(k) {
     switch (k) {
@@ -431,9 +519,11 @@ export function Plan(root) {
       ["Pass mode", m.dual_pass ? "Dual pass" : "One pass"],
       ["Primary angle", `${m.primary_angle_deg}°`],
       ["Secondary angle", m.dual_pass ? `${m.secondary_angle_deg}°` : "—"],
+      ["Route start", P.ROUTE_START_LABEL[m.route_start_mode] || "—"],
+      ["Approach / return WPs", `${m.approach_waypoint_count ?? 0} / ${m.return_waypoint_count ?? 0}`],
       ["Total route length", fmtLen(m.total_length_m)],
       ["Coverage length", fmtLen(m.coverage_length_m)],
-      ["Transit / return length", fmtLen(m.transit_length_m)],
+      ["Approach / return length", fmtLen(m.transit_length_m)],
       ["Waypoints", `${m.waypoint_count}${model.generated.max_route_waypoints ? ` / ${model.generated.max_route_waypoints}` : ""}`],
       ["Estimated duration", m.estimated_duration_s != null ? `${fmtDur(m.estimated_duration_s)} (est.${m.survey_speed_is_default ? ", default speed" : ""})` : noTelem("no speed")],
       ["Generated", model.generated.generated_at ? new Date(model.generated.generated_at).toLocaleTimeString([], { hour12: false }) : "—"],
@@ -511,21 +601,25 @@ export function Plan(root) {
   async function doUpload() {
     if (!P.canUpload(model)) return;
     if (!hasControl()) { showToast("Take OPERATOR control on the Map or Vehicle page before uploading.", "warn"); return; }
-    const params = P.uploadParamsFromModel(model);
-    if (!params) { showToast("The generated route could not be prepared for upload.", "warn"); return; }
+    const payload = P.finalizePayload(model);
+    if (!payload) { showToast("The generated route could not be prepared for upload.", "warn"); return; }
     const v = fleet.find((x) => x.id === model.vehicleId);
     const vname = v ? (v.name || "USV-" + v.id) : "the vehicle";
     const n = model.generated.metrics.waypoint_count;
     if (!window.confirm(
       `Finish & upload this survey to ${vname}?\n\n` +
       `${n} route waypoints (Scout adds Home at seq 0 → ${n + 1} Pixhawk items).\n\n` +
-      `This OVERWRITES the mission stored on the flight controller and is confirmed only by ` +
-      `read-back verification. It does NOT start the mission.`)) return;
-    model = { ...model, upload: { phase: "uploading", cmdId: null, error: null, at: Date.now(), result: null } };
+      `An immutable original mission record (revision 0) is stored, then the mission is ` +
+      `uploaded through the verified path. This OVERWRITES the mission on the flight ` +
+      `controller and is confirmed only by read-back verification. It does NOT start the mission.`)) return;
+    model = { ...model, upload: { phase: "uploading", cmdId: null, missionId: null, revision: 0, error: null, at: Date.now(), result: null } };
     renderAll();
-    const res = await api.uploadMission(model.vehicleId, params);
+    // Finalize: store the immutable original mission record (revision 0) AND create the
+    // unchanged, read-back-verified MISSION_UPLOAD command in one call.
+    const res = await api.finalizeMission(payload);
     if (res.ok && res.data && res.data.command) {
-      model = { ...model, upload: { ...model.upload, cmdId: res.data.command.id } };
+      const rec = res.data.mission || {};
+      model = { ...model, upload: { ...model.upload, cmdId: res.data.command.id, missionId: rec.mission_id, revision: rec.mission_revision != null ? rec.mission_revision : 0 } };
     } else {
       const d = res.data || {};
       const err = Array.isArray(d.errors) && d.errors.length ? d.errors.join(" ") : (d.message || d.error || "Upload was not accepted by the operator backend.");
@@ -544,6 +638,8 @@ export function Plan(root) {
         cmdId: cmd.id, hash: (cmd.params && cmd.params.expected_route_content_hash) || null,
         waypoints: (cmd.params && cmd.params.expected_route_waypoint_count) || model.generated.metrics.waypoint_count,
         vehicleId: model.vehicleId,
+        missionId: model.upload.missionId || null,
+        revision: model.upload.revision != null ? model.upload.revision : 0,
       } } };
       renderAll();
     } else if (stg.state === "failed") {
@@ -562,7 +658,8 @@ export function Plan(root) {
     if (u.phase === "error") return `<span class="pl-upl bad">Upload failed — ${esc(u.error || "not verified")}. Plan preserved.</span>`;
     if (u.phase === "uploaded" && u.result) {
       const h = u.result.hash ? String(u.result.hash).replace(/^sha256:/, "").slice(0, 12) : "—";
-      return `<span class="pl-upl ok">Uploaded &amp; verified · ${u.result.waypoints} wp · hash ${h} · <a href="#/map" class="pl-link">Open on Map</a></span>`;
+      const mid = u.result.missionId ? `${esc(u.result.missionId)} · rev ${u.result.revision} · ` : "";
+      return `<span class="pl-upl ok">Uploaded &amp; verified · ${mid}${u.result.waypoints} wp · hash ${h} · <a href="#/map" class="pl-link">Open on Map</a></span>`;
     }
     return "";
   }

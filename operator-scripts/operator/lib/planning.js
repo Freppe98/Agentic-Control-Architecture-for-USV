@@ -47,15 +47,24 @@ export function emptyModel() {
     boundary: null,                // closed ring [[lng,lat],...] or null
     noGoZones: [],                 // [{ id, ring }]
     home: null,                    // [lng,lat] or null
-    transit: [],                   // [[lng,lat],...]
+    approach: [],                  // [[lng,lat],...] operator approach waypoints (A1,A2,...)
+    returns: [],                   // [[lng,lat],...] operator return waypoints (R1,R2,...)
+    routeStartMode: "planning_home",  // "planning_home" | "first_approach"
     params: defaultParams(),
-    generated: null,               // backend generate result + { revision }
+    generated: null,               // backend generate result (operator-survey-plan-v1 package)
     generatedRevision: null,       // inputRevision at the moment of generation
     validation: null,              // backend validate result
     upload: { phase: "idle", cmdId: null, error: null, at: 0, result: null },
     _zoneSeq: 0,
   };
 }
+
+/** Route-start modes offered by the page. Planning home is the prototype default. */
+export const ROUTE_START_MODES = ["planning_home", "first_approach"];
+export const ROUTE_START_LABEL = {
+  planning_home: "Planning home",
+  first_approach: "First approach waypoint",
+};
 
 function num(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -129,7 +138,9 @@ export function planningInputs(model) {
     survey_speed_mps: num(p.survey_speed_mps),
     no_go_zones: model.noGoZones.map((z) => z.ring),
     home: model.home,
-    transit_waypoints: model.transit,
+    route_start_mode: model.routeStartMode || "planning_home",
+    approach_waypoints: model.approach || [],
+    return_waypoints: model.returns || [],
   };
 }
 
@@ -144,7 +155,9 @@ export function inputRevision(model) {
     b: ring(i.boundary),
     z: (i.no_go_zones || []).map(ring),
     h: i.home ? [round7(i.home[0]), round7(i.home[1])] : null,
-    t: ring(i.transit_waypoints),
+    ap: ring(i.approach_waypoints),
+    rt: ring(i.return_waypoints),
+    m: i.route_start_mode,
     c: i.shoreline_clearance_m,
     s: i.lane_spacing_m,
     a: i.primary_angle_deg,
@@ -227,7 +240,20 @@ export function setBoundary(model, ring) {
   return invalidateValidation({ ...model, boundary: closeRing(ring) });
 }
 export function setHome(model, pt) { return invalidateValidation({ ...model, home: pt }); }
-export function setTransit(model, pts) { return invalidateValidation({ ...model, transit: pts || [] }); }
+/** Approach waypoints — the operator-approved route INTO the survey (A1, A2, ...). Any edit
+ *  invalidates a generated route (via isOutdated), exactly like a geometry change. */
+export function setApproach(model, pts) { return invalidateValidation({ ...model, approach: pts || [] }); }
+/** Return waypoints — the operator-approved route OUT of the survey toward home (R1, R2, ...). */
+export function setReturns(model, pts) { return invalidateValidation({ ...model, returns: pts || [] }); }
+export function setRouteStart(model, mode) {
+  return invalidateValidation({ ...model, routeStartMode: ROUTE_START_MODES.includes(mode) ? mode : "planning_home" });
+}
+/** Copy the approach waypoints into the return list in REVERSE order (A3→A2→A1 becomes the
+ *  return route). Deliberately explicit — the backend never auto-reverses; the operator asks
+ *  for this convenience and the result stays fully editable. */
+export function reversedApproach(model) {
+  return setReturns(model, [...(model.approach || [])].reverse().map((p) => [p[0], p[1]]));
+}
 export function setParam(model, key, value) {
   return invalidateValidation({ ...model, params: { ...model.params, [key]: value } });
 }
@@ -248,7 +274,8 @@ export function clearModel() { return emptyModel(); }
 /** True when Clear should ask for confirmation — any geometry or generated data exists. */
 export function hasUnsavedWork(model) {
   return hasBoundary(model) || model.noGoZones.length > 0 || model.home != null
-         || model.transit.length > 0 || !!model.generated;
+         || (model.approach && model.approach.length > 0)
+         || (model.returns && model.returns.length > 0) || !!model.generated;
 }
 
 // ── drafts ───────────────────────────────────────────────────────────────────────────────
@@ -265,7 +292,9 @@ export function toDraft(model, name) {
       boundary: model.boundary,
       no_go_zones: model.noGoZones,
       home: model.home,
-      transit: model.transit,
+      approach: model.approach,
+      returns: model.returns,
+      route_start_mode: model.routeStartMode,
       params: model.params,
       generated: model.generated,
       generated_revision: model.generatedRevision,
@@ -285,13 +314,19 @@ export function fromDraft(draft) {
     const m = /(\d+)$/.exec(z && z.id ? String(z.id) : "");
     if (m) maxSeq = Math.max(maxSeq, +m[1]);
   }
+  // MIGRATION: old drafts stored `transit`; load it as the approach list so a saved plan
+  // never breaks. The new `approach`/`returns` fields win when present.
+  const approach = Array.isArray(d.approach) ? d.approach
+                 : (Array.isArray(d.transit) ? d.transit : []);
   return {
     ...emptyModel(),
     vehicleId: draft && draft.vehicle_id != null ? draft.vehicle_id : null,
     boundary: d.boundary || null,
     noGoZones: zones,
     home: d.home || null,
-    transit: Array.isArray(d.transit) ? d.transit : [],
+    approach,
+    returns: Array.isArray(d.returns) ? d.returns : [],
+    routeStartMode: ROUTE_START_MODES.includes(d.route_start_mode) ? d.route_start_mode : "planning_home",
     params: { ...defaultParams(), ...(d.params || {}) },
     generated: d.generated || null,
     generatedRevision: d.generated_revision || null,
@@ -313,6 +348,28 @@ export function uploadParamsFromModel(model) {
     waypoints: model.generated.route_waypoints,
   });
   return parsed.ok ? missionUploadParams(parsed) : null;
+}
+
+/** The body for POST /api/missions/finalize: the FULL generated operator-survey-plan-v1
+ *  package plus the target vehicle. Finalize stores the immutable original mission record
+ *  (segments, planning inputs, navigable geometry, execution order) AND creates the
+ *  unchanged MISSION_UPLOAD command in one call — so the Operator no longer loses the
+ *  geometry after flattening it for the Pixhawk. Returns null when there is no route. */
+export function finalizePayload(model) {
+  if (!hasRoute(model) || model.vehicleId == null) return null;
+  return { vehicle_id: model.vehicleId, mission_package: model.generated, confirm: true };
+}
+
+/** The mission identity to show after a successful finalized upload. */
+export function missionIdentity(model) {
+  const g = model.generated || {};
+  const m = model.upload && model.upload.result ? model.upload.result : {};
+  return {
+    missionId: m.missionId || null,
+    revision: m.revision != null ? m.revision : 0,
+    hash: m.hash || g.route_hash || null,
+    waypoints: (g.metrics && g.metrics.waypoint_count) || (g.route_waypoints || []).length,
+  };
 }
 
 /** Approximate planar area (m²) of a lng/lat ring, for the LIVE left-panel readout before a
