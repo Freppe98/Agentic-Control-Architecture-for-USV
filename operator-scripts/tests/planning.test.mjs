@@ -10,8 +10,14 @@
 // existing mission-contract upload params (no second framework).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { NAV } from "../operator/lib/ui.js";
 import * as P from "../operator/lib/planning.js";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PLAN_SRC = readFileSync(join(HERE, "..", "operator", "pages", "Plan.js"), "utf-8");
 
 // A small square boundary near the project home (GeoJSON [lng,lat], closed).
 const RING = [[13.000, 56.699], [13.004, 56.699], [13.004, 56.7005], [13.000, 56.7005], [13.000, 56.699]];
@@ -154,7 +160,8 @@ test("Clear resets everything; hasUnsavedWork reflects real content", () => {
 test("a draft preserves geometry, params, route and revisions", () => {
   let m = P.setParam(P.setBoundary(P.emptyModel(), RING), "lane_spacing_m", 25);
   m = P.setHome(m, [12.999, 56.698]);
-  m = P.setTransit(m, [[12.9995, 56.6985]]);
+  m = P.setApproach(m, [[12.9995, 56.6985]]);
+  m = P.setReturns(m, [[12.9996, 56.6986]]);
   m = P.addNoGoZone(m, ZONE);
   m = { ...m, vehicleId: 2 };
   m = P.applyGenerated(m, fakeGenerated(m));
@@ -164,7 +171,8 @@ test("a draft preserves geometry, params, route and revisions", () => {
   assert.equal(back.noGoZones.length, 1);
   assert.equal(back.noGoZones[0].id, "ngz-1");
   assert.deepEqual(back.home, m.home);
-  assert.deepEqual(back.transit, m.transit);
+  assert.deepEqual(back.approach, m.approach);
+  assert.deepEqual(back.returns, m.returns);
   assert.equal(back.params.lane_spacing_m, 25);
   assert.equal(back.vehicleId, 2);
   assert.equal(P.isOutdated(back), false, "restored route is current, not outdated");
@@ -185,4 +193,93 @@ test("a generated route becomes mission-contract-v1 upload params (route only)",
     assert.ok(!("seq" in w) && !("command" in w) && !("altitude" in w), "route-only waypoint");
   }
   assert.equal(P.uploadParamsFromModel(P.emptyModel()), null, "no route → no params");
+});
+
+// ── Approach / Return waypoints (renamed from Transit) ─────────────────────────────────
+test("approach and return are separate ordered lists that keep insertion order", () => {
+  let m = P.emptyModel();
+  m = P.setApproach(m, [[13.0, 56.699], [13.001, 56.6992], [13.002, 56.6994]]);
+  m = P.setReturns(m, [[13.003, 56.700], [13.0035, 56.7002]]);
+  assert.deepEqual(m.approach.map((p) => p[0]), [13.0, 13.001, 13.002], "approach A1→A2→A3 order");
+  assert.deepEqual(m.returns.map((p) => p[0]), [13.003, 13.0035], "return R1→R2 order");
+  const inp = P.planningInputs(m);
+  assert.deepEqual(inp.approach_waypoints, m.approach);
+  assert.deepEqual(inp.return_waypoints, m.returns);
+});
+
+test("'Use reversed approach' copies the approach list in reverse, editable and separate", () => {
+  let m = P.setApproach(P.emptyModel(), [[13.0, 56.699], [13.001, 56.6992], [13.002, 56.6994]]);
+  m = P.reversedApproach(m);
+  assert.deepEqual(m.returns.map((p) => p[0]), [13.002, 13.001, 13.0], "returns are A3→A2→A1");
+  assert.notEqual(m.returns, m.approach, "return list is a distinct array (editable)");
+  // Editing the return list afterwards does not touch the approach list.
+  const edited = P.setReturns(m, [...m.returns, [13.004, 56.6996]]);
+  assert.equal(edited.approach.length, 3, "approach unchanged after editing returns");
+});
+
+test("approach/return edits invalidate a generated route (outdated)", () => {
+  let m = P.setParam(P.setBoundary(P.emptyModel(), RING), "lane_spacing_m", 25);
+  m = P.applyGenerated(m, fakeGenerated(m));
+  assert.equal(P.isOutdated(m), false);
+  const afterApproach = P.setApproach(m, [[12.9995, 56.6985]]);
+  assert.equal(P.isOutdated(afterApproach), true, "adding an approach WP outdates the route");
+  const afterReturn = P.setReturns(m, [[12.9996, 56.6986]]);
+  assert.equal(P.isOutdated(afterReturn), true, "adding a return WP outdates the route");
+  const afterStart = P.setRouteStart(m, "first_approach");
+  assert.equal(P.isOutdated(afterStart), true, "changing route-start mode outdates the route");
+});
+
+test("route-start mode defaults to planning_home and only accepts known modes", () => {
+  const m = P.emptyModel();
+  assert.equal(m.routeStartMode, "planning_home");
+  assert.equal(P.setRouteStart(m, "first_approach").routeStartMode, "first_approach");
+  assert.equal(P.setRouteStart(m, "bogus").routeStartMode, "planning_home", "unknown → default");
+});
+
+test("a draft with the OLD transit field still loads (migration to approach)", () => {
+  const legacy = { vehicle_id: 2, plan: { boundary: RING, transit: [[12.9995, 56.6985]], params: { lane_spacing_m: 25 } } };
+  const m = P.fromDraft(legacy);
+  assert.deepEqual(m.approach, [[12.9995, 56.6985]], "old `transit` loads as approach");
+  assert.deepEqual(m.returns, []);
+});
+
+// ── finalize payload + mission identity ────────────────────────────────────────────────
+test("finalizePayload carries the full package + vehicle; null without a route/vehicle", () => {
+  let m = P.setParam(P.setBoundary(P.emptyModel(), RING), "lane_spacing_m", 25);
+  m = P.applyGenerated(m, fakeGenerated(m));
+  assert.equal(P.finalizePayload(m), null, "no vehicle → no payload");
+  m = { ...m, vehicleId: 2 };
+  const body = P.finalizePayload(m);
+  assert.equal(body.vehicle_id, 2);
+  assert.equal(body.confirm, true);
+  assert.equal(body.mission_package, m.generated, "sends the whole generated package");
+});
+
+// ── static contract checks on the Plan page source (DOM-free) ──────────────────────────
+test("Plan page controls use Approach/Return wording, not the old Transit", () => {
+  assert.match(PLAN_SRC, /Add approach WP/, "Approach control present");
+  assert.match(PLAN_SRC, /Add return WP/, "Return control present");
+  assert.match(PLAN_SRC, /Use reversed approach/, "reversed-approach convenience present");
+  assert.ok(!/Add transit WP/.test(PLAN_SRC), "old 'Add transit WP' control removed");
+  assert.ok(!/setTransit/.test(PLAN_SRC), "no reference to the removed setTransit");
+});
+
+test("Plan page puts no-go zones in a dedicated pane above the navigable fill", () => {
+  assert.match(PLAN_SRC, /pl-nogo/, "no-go pane assigned");
+  assert.match(PLAN_SRC, /pl-navigable/, "navigable pane assigned");
+  // The no-go pane z-index must be higher than the navigable pane's (red stays on top).
+  const zOf = (name) => {
+    const m = PLAN_SRC.match(new RegExp(`\\["${name}",\\s*(\\d+)\\]`));
+    return m ? Number(m[1]) : null;
+  };
+  assert.ok(zOf("pl-nogo") > zOf("pl-navigable"), "no-go pane sits above navigable pane");
+  assert.ok(zOf("pl-route") > zOf("pl-nogo"), "route lines sit above no-go zones");
+});
+
+test("Plan page defines a distinct style for every ordered segment kind", () => {
+  for (const kind of ["start_connector", "approach", "survey_entry_connector", "primary",
+                      "pass_transition", "secondary", "return_connector", "return_approach",
+                      "final_home_connector"]) {
+    assert.match(PLAN_SRC, new RegExp(`${kind}:`), `SEG_STYLE has ${kind}`);
+  }
 });

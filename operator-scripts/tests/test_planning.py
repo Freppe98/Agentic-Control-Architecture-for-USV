@@ -241,5 +241,224 @@ class TestUploadPath(unittest.TestCase):
         self.assertEqual(res.json()["error"], "mission_contract_violation")
 
 
+# A U-shaped (concave) boundary with a notch bitten out of the top edge — the shape that
+# reproduced the observed "connector leaves the polygon" failure. Horizontal scan lines get
+# split by the notch, so the lane-to-lane connectors must be routed around it.
+CONCAVE = [[13.000, 56.699], [13.004, 56.699], [13.004, 56.7005], [13.0025, 56.7005],
+           [13.0025, 56.6997], [13.0015, 56.6997], [13.0015, 56.7005], [13.000, 56.7005]]
+
+
+@requires_geometry
+class TestSegmentIntegrity(unittest.TestCase):
+    """Ordered-segment invariants (task PART 5 / PART 9 cases 1–4, 11, 13)."""
+
+    def _dual(self):
+        inp = base_inputs(dual_pass=True, home=[12.9995, 56.6985],
+                          approach_waypoints=[[12.9998, 56.6988], [12.99995, 56.69885]],
+                          return_waypoints=[[12.9997, 56.6987], [12.9996, 56.6986]],
+                          no_go_zones=[ZONE])
+        return inp, planning.generate_survey(inp, max_route_waypoints=500)
+
+    def test_approach_points_in_exact_execution_order(self):
+        inp, r = self._dual()
+        order = [(round(o["longitude"], 6), round(o["latitude"], 6))
+                 for o in r["original_execution_order"]]
+        idxs = [order.index((round(p[0], 6), round(p[1], 6))) for p in inp["approach_waypoints"]]
+        self.assertEqual(idxs, sorted(idxs), "approach WPs must appear in numbered order")
+
+    def test_return_points_in_exact_execution_order(self):
+        inp, r = self._dual()
+        order = [(round(o["longitude"], 6), round(o["latitude"], 6))
+                 for o in r["original_execution_order"]]
+        idxs = [order.index((round(p[0], 6), round(p[1], 6))) for p in inp["return_waypoints"]]
+        self.assertEqual(idxs, sorted(idxs), "return WPs must appear in numbered order")
+
+    def test_segment_flattening_equals_route_waypoints(self):
+        _, r = self._dual()
+        flat, _order = planning._flatten_segments(
+            [dict(s) for s in r["segments"]])  # re-flatten a copy
+        flat_wp = planning._route_waypoints(planning._dedup(flat))
+        self.assertEqual([(w["latitude"], w["longitude"]) for w in flat_wp],
+                         [(w["latitude"], w["longitude"]) for w in r["route_waypoints"]])
+
+    def test_no_invisible_jump_between_adjacent_segments(self):
+        _, r = self._dual()
+        segs = r["segments"]
+        for a, b in zip(segs, segs[1:]):
+            end, start = a["coordinates"][-1], b["coordinates"][0]
+            self.assertTrue(planning._close(end, start),
+                            f"invisible jump between {a['kind']} and {b['kind']}")
+
+    def test_pass_transition_is_safe(self):
+        from shapely.geometry import LineString
+        from shapely.ops import transform
+        inp, r = self._dual()
+        grid = planning._NavGrid(inp["boundary"], inp["shoreline_clearance_m"],
+                                 inp["no_go_zones"], step_m=inp["lane_spacing_m"])
+        for s in r["segments"]:
+            if s["kind"] == "pass_transition":
+                lp = transform(grid.to_proj.transform,
+                               LineString([(p[0], p[1]) for p in s["coordinates"]]))
+                self.assertTrue(grid._seg_covered(lp), "pass transition left the navigable area")
+
+    def test_no_go_zones_remain_in_finalized_package(self):
+        inp, r = self._dual()
+        pkg_zones = r["planning_inputs"]["no_go_zones"]
+        self.assertEqual(len(pkg_zones), 1, "no-go zones dropped from package")
+        # The package retains the zone (stored as a closed ring); every input vertex is kept.
+        for pt in ZONE:
+            self.assertIn(pt, pkg_zones[0])
+
+
+@requires_geometry
+class TestSafeConnector(unittest.TestCase):
+    """The shared safe-connector (task PART 4 / PART 9 cases 5–9)."""
+
+    def _grid(self, boundary=BOUNDARY, clearance=10, zones=None, step=15):
+        return planning._NavGrid(boundary, clearance, zones or [], step_m=step)
+
+    def test_direct_connector_accepted_when_fully_safe(self):
+        g = self._grid()
+        cx, cy = 13.002, 56.69975   # near the lake centre — a short interior segment
+        path = g.safe_connector([cx, cy], [cx + 0.0002, cy], require_inside=True)
+        self.assertEqual(len(path), 2, "a fully-safe segment is accepted as the direct line")
+
+    def test_direct_connector_rejected_outside_concave_polygon(self):
+        g = self._grid(boundary=CONCAVE, clearance=3, step=8)
+        # A chord across the mouth of the U passes through the notch (outside navigable).
+        self.assertFalse(g.segment_is_safe([13.0012, 56.7003], [13.0028, 56.7003],
+                                           require_inside=True))
+
+    def test_astar_connector_stays_inside_navigable(self):
+        from shapely.geometry import Point
+        from shapely.ops import transform
+        g = self._grid(boundary=CONCAVE, clearance=3, step=8)
+        path = g.safe_connector([13.0012, 56.7003], [13.0028, 56.7003], require_inside=True)
+        self.assertGreater(len(path), 2, "an unsafe direct segment must be re-routed")
+        # Every INTERIOR vertex of the routed path lies inside the navigable region.
+        for lng, lat in path[1:-1]:
+            p = transform(g.to_proj.transform, Point(lng, lat))
+            self.assertTrue(g.navigable.buffer(planning.COVER_TOL_M).contains(p))
+
+    def test_connector_avoids_no_go_zone(self):
+        from shapely.geometry import LineString
+        from shapely.ops import transform
+        g = self._grid(zones=[ZONE], step=8)
+        # Straight line from just west to just east of the zone would cross it.
+        a, b = [13.0016, 56.69975], [13.0024, 56.69975]
+        path = g.safe_connector(a, b, require_inside=True)
+        lp = transform(g.to_proj.transform, LineString([(p[0], p[1]) for p in path]))
+        self.assertTrue(g._seg_clears_nogo(lp), "connector crossed the no-go interior")
+
+    def test_no_safe_connector_raises(self):
+        # A no-go wall splits the lake; a connector across the two halves cannot be routed.
+        WALL = [[13.0019, 56.6980], [13.0021, 56.6980], [13.0021, 56.7010], [13.0019, 56.7010]]
+        g = self._grid(clearance=2, zones=[WALL], step=6)
+        with self.assertRaises(planning.ConnectorError):
+            g.safe_connector([13.0010, 56.69975], [13.0030, 56.69975], require_inside=True)
+
+
+@requires_geometry
+class TestConcaveRegression(unittest.TestCase):
+    """Acceptance fixture (task PART 9): for a concave polygon EVERY generated coverage /
+    inside segment is contained in the navigable geometry and outside no-go interiors."""
+
+    def test_concave_polygon_produces_no_outside_connectors(self):
+        from shapely.geometry import LineString
+        from shapely.ops import transform
+        inp = {"boundary": CONCAVE, "shoreline_clearance_m": 3, "lane_spacing_m": 12,
+               "primary_angle_deg": 0, "home": [12.9995, 56.6985], "no_go_zones": [ZONE]}
+        r = planning.generate_survey(inp, max_route_waypoints=800)
+        grid = planning._NavGrid(CONCAVE, 3, [ZONE], step_m=12)
+        for s in r["segments"]:
+            if s["kind"] in planning._INSIDE_KINDS:
+                lp = transform(grid.to_proj.transform,
+                               LineString([(p[0], p[1]) for p in s["coordinates"]]))
+                out = lp.difference(grid.navigable.buffer(planning.COVER_TOL_M))
+                self.assertTrue(out.is_empty or out.length < 1.0,
+                                f"{s['kind']} leaves the navigable region by {out.length:.1f} m")
+                self.assertTrue(grid._seg_clears_nogo(lp),
+                                f"{s['kind']} crosses a no-go interior")
+        v = planning.validate_plan({**inp, "segments": r["segments"],
+                                    "route_waypoints": r["route_waypoints"],
+                                    "route_hash": r["route_hash"]}, max_route_waypoints=800)
+        self.assertTrue(v["ok"], v["errors"])
+
+    def test_disconnected_navigable_geometry_is_rejected(self):
+        WALL = [[13.0019, 56.6980], [13.0021, 56.6980], [13.0021, 56.7010], [13.0019, 56.7010]]
+        with self.assertRaises(planning.DisconnectedNavigableError):
+            planning.generate_survey(
+                {"boundary": BOUNDARY, "shoreline_clearance_m": 2, "lane_spacing_m": 15,
+                 "primary_angle_deg": 0, "no_go_zones": [WALL]}, max_route_waypoints=500)
+
+
+@requires_geometry
+class TestMissionRecord(unittest.TestCase):
+    """Immutable original mission record + finalize/verify lifecycle (task PART 6 / PART 9
+    cases 14–17)."""
+
+    def setUp(self):
+        self.client = TestClient(main.app)
+        main.commands.clear(); main.commands_by_id.clear()
+        main.original_missions.clear(); main.mission_id_by_command.clear()
+        main.active_original_by_vehicle.clear()
+        main.comms_state_by_id[SCOUT_VID] = "CONNECTED"
+
+    def _finalize(self):
+        pkg = planning.generate_survey(
+            base_inputs(home=[12.9995, 56.6985], approach_waypoints=[[12.9998, 56.6988]]),
+            max_route_waypoints=200)
+        res = self.client.post("/api/missions/finalize",
+                               json={"vehicle_id": SCOUT_VID, "mission_package": pkg, "confirm": True})
+        return pkg, res
+
+    def test_finalize_creates_immutable_original_revision_0(self):
+        pkg, res = self._finalize()
+        self.assertEqual(res.status_code, 200)
+        rec = res.json()["mission"]
+        self.assertEqual(rec["mission_revision"], 0)
+        self.assertIsNone(rec["parent_revision_id"])
+        self.assertTrue(rec["immutable"])
+        self.assertEqual(rec["upload_status"], "QUEUED")
+        self.assertTrue(rec["segments"] and rec["original_execution_order"])
+        # read-only GETs
+        mid = rec["mission_id"]
+        self.assertEqual(self.client.get(f"/api/missions/original/{mid}").status_code, 200)
+        active = self.client.get(f"/api/vehicles/{SCOUT_VID}/missions/active-original").json()
+        self.assertEqual(active["mission"]["mission_id"], mid)
+
+    def test_route_hash_matches_mission_contract_canonicalization(self):
+        pkg, res = self._finalize()
+        rec = res.json()["mission"]
+        cmd = res.json()["command"]
+        independent = mission_contract.route_content_hash(pkg["route_waypoints"])
+        self.assertEqual(rec["route_hash"], independent)
+        self.assertEqual(rec["route_hash"], cmd["params"]["expected_route_content_hash"])
+
+    def test_verified_command_updates_stored_record(self):
+        pkg, res = self._finalize()
+        mid, cid = res.json()["mission"]["mission_id"], res.json()["command"]["id"]
+        exp = res.json()["command"]["params"]
+        self.client.post("/agent/command_result", json={
+            "command_id": cid, "status": "EXECUTED", "result": {
+                "accepted": True, "uploaded": True, "verified": True,
+                "observed_route_waypoint_count": exp["expected_route_waypoint_count"],
+                "observed_pixhawk_item_count": exp["expected_pixhawk_item_count"],
+                "observed_route_content_hash": exp["expected_route_content_hash"]}})
+        rec = main.original_missions[mid]
+        self.assertEqual(rec["upload_status"], "VERIFIED")
+        self.assertIsNotNone(rec["verified_at"])
+
+    def test_failed_upload_preserves_record_with_failure_status(self):
+        pkg, res = self._finalize()
+        mid, cid = res.json()["mission"]["mission_id"], res.json()["command"]["id"]
+        self.client.post("/agent/command_result", json={
+            "command_id": cid, "status": "FAILED", "reason": "link lost mid-transfer"})
+        rec = main.original_missions[mid]
+        self.assertIn(mid, main.original_missions, "record preserved on failure")
+        self.assertEqual(rec["upload_status"], "FAILED")
+        self.assertTrue(rec["segments"], "plan geometry preserved on failure")
+
+
 if __name__ == "__main__":
     unittest.main()
