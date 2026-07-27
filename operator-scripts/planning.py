@@ -732,7 +732,12 @@ JOIN_TOL_DEG = 1e-7
 # still flies straight segments between items. See PART 5/PART 13 of the route-quality task.
 CLEANUP_MIN_SPACING_M = 1.0    # consecutive points closer than this collapse to one
 CLEANUP_COLLINEAR_DEG = 2.0    # a middle point whose turn is under this is redundant
-BACKTRACK_ANGLE_DEG = 160.0    # turn sharper than this is counted as a backtracking event
+# An "immediate backtrack" (the task's A→B→A artifact) is a near-reversal that RETURNS to
+# essentially where it came from — the route point after the reversal lands within
+# BACKTRACK_RETURN_M of the point before it. This deliberately does NOT count a legitimate
+# coverage U-turn between lanes, whose return point is offset by the (far larger) lane spacing.
+BACKTRACK_ANGLE_DEG = 160.0
+BACKTRACK_RETURN_M = 3.0
 
 # Provenance for the finalized package (PART 11): names the exact, reproducible algorithm at
 # each pipeline stage so the thesis run is explainable. Not a version the upload contract reads.
@@ -1276,6 +1281,40 @@ def _lane_runs_proj(proj_pts, reversal_deg=135.0):
     return runs
 
 
+def _fragment_summaries(proj_pts, deg_pts, runs, pass_kind):
+    """Per-lane-run coverage-fragment metadata (PART 3): the sweep coordinate (perpendicular
+    offset along the sweep axis, so rows sort monotonically), along-run length, endpoints and
+    point count. row_index ranks fragments by sweep coordinate — when the EXECUTION order (the
+    list order here) matches the row_index order, coverage advances monotonically through the
+    sweep with no cross-row scramble, which is what the ordering tests assert."""
+    if not runs:
+        return []
+    s0, e0 = runs[0]
+    dx, dy = proj_pts[e0][0] - proj_pts[s0][0], proj_pts[e0][1] - proj_pts[s0][1]
+    mag = math.hypot(dx, dy)
+    nx, ny = (-dy / mag, dx / mag) if mag > TOLERANCE else (0.0, 1.0)  # unit sweep axis
+    out = []
+    for fi, (s, e) in enumerate(runs):
+        seg = proj_pts[s:e + 1]
+        length = sum(math.hypot(seg[k + 1][0] - seg[k][0], seg[k + 1][1] - seg[k][1])
+                     for k in range(len(seg) - 1))
+        cx = sum(p[0] for p in seg) / len(seg)
+        cy = sum(p[1] for p in seg) / len(seg)
+        out.append({"pass_kind": pass_kind, "fragment_index": fi,
+                    "sweep_coordinate": cx * nx + cy * ny,
+                    "point_count": e - s + 1, "length_m": round(length, 2),
+                    "start": [round(deg_pts[s][0], 7), round(deg_pts[s][1], 7)],
+                    "end": [round(deg_pts[e][0], 7), round(deg_pts[e][1], 7)]})
+    # Normalise the sweep coordinate to metres from the first row (the raw UTM projection is a
+    # ~3.5M-magnitude northing that obscures the relative row spacing the metric is about).
+    base = min(f["sweep_coordinate"] for f in out)
+    for f in out:
+        f["sweep_coordinate"] = round(f["sweep_coordinate"] - base, 2)
+    for rank, i in enumerate(sorted(range(len(out)), key=lambda i: out[i]["sweep_coordinate"])):
+        out[i]["row_index"] = rank
+    return out
+
+
 def _route_quality(proj_pts, coverage_runs):
     """Objective, inspectable route-quality diagnostics from the FINAL projected route (PART 7):
     backtracking events (single-vertex near-reversals that a clean boustrophedon never needs),
@@ -1291,7 +1330,10 @@ def _route_quality(proj_pts, coverage_runs):
             min_leg = d
     for i in range(1, len(proj_pts) - 1):
         if _turn_angle_deg(proj_pts[i - 1], proj_pts[i], proj_pts[i + 1]) >= BACKTRACK_ANGLE_DEG:
-            backtracks += 1
+            ax, ay = proj_pts[i - 1]
+            cx, cy = proj_pts[i + 1]
+            if math.hypot(cx - ax, cy - ay) < BACKTRACK_RETURN_M:  # returns to ~origin: a spike
+                backtracks += 1
 
     # Fragment reorders: project each lane run's centroid onto the axis perpendicular to the
     # first run's direction (the sweep axis) and count consecutive runs that move BACKWARD.
@@ -1720,12 +1762,14 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     full_q = _route_quality(route_proj, [])
     coverage_fragment_count = 0
     fragment_reorders = 0
+    coverage_fragments = []
     for s in segments:
         if s["kind"] in _COVERAGE_KINDS:
             pp = [grid.to_proj.transform(c[0], c[1]) for c in s["coordinates"]]
             runs = _lane_runs_proj(pp)
             coverage_fragment_count += len(runs)
             fragment_reorders += _route_quality(pp, runs)["fragment_reorders"]
+            coverage_fragments.extend(_fragment_summaries(pp, s["coordinates"], runs, s["kind"]))
     final_seg_pts = sum(s.get("final_point_count", len(s["coordinates"])) for s in segments)
     los_removed = grid.raw_connector_pts - grid.final_connector_pts
     seg_removed = raw_segment_pts[0] - final_seg_pts
@@ -1743,6 +1787,7 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "backtracking_events": full_q["backtracking_events"],
         "minimum_segment_length_m": full_q["minimum_segment_length_m"],
         "cleanup_applied": True,
+        "coverage_fragments": coverage_fragments,
     }
     metrics["route_quality"] = route_quality
 
