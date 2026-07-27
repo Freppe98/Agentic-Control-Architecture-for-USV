@@ -7,16 +7,21 @@ Frontend-only; no Scout changes, no mission-contract-v1 changes, no new dependen
 ## Added (new modules)
 - `operator/lib/selection.js` — the ONE shared "which USV is selected" store (localStorage,
   keyed by numeric USV id). Map writes it on select; Plan adopts it at load and on change.
-- `operator/lib/mission-refresh.js` — pure policy: `missionIdentity()` (strongest stable id:
-  route_content_hash → full_mission_hash → hash → count/current_seq) + a per-USV
-  `createMissionRefreshTracker()` deciding when to re-download the full mission, and whether
-  the geometry actually changed. `MISSION_WRITE_COMMANDS` = {UPLOAD, CLEAR, REPLAN}.
+- `operator/lib/mission-refresh.js` — pure policy. `missionIdentity()` = GEOMETRY id only
+  (route_content_hash → full_mission_hash → hash → item count; current_seq EXCLUDED);
+  `missionProgress()` = current_seq. `createMissionRefreshTracker()` decides when to re-download
+  and returns `{ geometryChanged, progressChanged }` per read so unchanged geometry is not
+  redrawn while an advanced current_seq still updates the active waypoint/progress.
+  `MISSION_WRITE_COMMANDS` = {UPLOAD, CLEAR, REPLAN}; `missionWriteNeedsRefetch(outcome, result)`
+  gates refetch on a SUCCESSFUL/verified write (or an explicit uncertain/partial-state flag).
 - `operator/lib/map-view.js` — pure initial-view picker (`pickInitialView`), coordinate
   validation (`isValidLatLng`, `isNullIsland`, `freshVehiclePosition`, `bestFleetPosition`),
   and Plan-viewport persistence.
 - `operator/services/selected-refresh.js` — one DI'd refresh controller: immediate fetch on
   select, interval fallback, generation-token late-response rejection, overlap guard,
-  visibility pause.
+  visibility pause. In-flight ownership is per `{ id, token }` slot (NOT a global boolean): a
+  request may only clear the slot it acquired, so a superseded USV-A completion can never clear
+  the newer USV-B slot or let a second B request overlap.
 
 ## Changed
 - `operator/services/api.js` — `poll()` gained a backward-compatible `opts.pauseWhenHidden`
@@ -39,8 +44,9 @@ Frontend-only; no Scout changes, no mission-contract-v1 changes, no new dependen
 
 ## Full-mission refetch triggers
 1. Vehicle selected (immediate).
-2. A MISSION_UPLOAD / MISSION_CLEAR / MISSION_REPLAN command reaches a terminal state (once
-   per command id).
+2. A MISSION_UPLOAD / MISSION_CLEAR / MISSION_REPLAN command **succeeds** (verified/executed),
+   evaluated once per command id. An ordinary rejected/failed write does NOT refetch (the
+   on-vehicle mission is unchanged) unless its result explicitly flags uncertain/partial state.
 3. Fleet feed reports a changed mission-revision signal for the selected USV — **dormant**:
    the backend does not surface `active_revision_id`/`active_route_hash`/`mission_changed_at`
    yet (see API limitation below); the comparison is wired and will activate when it does.
@@ -54,15 +60,17 @@ contact ≤ 120 s. Render is never blocked on geolocation; recentre only upgrade
 stronger source and stops once the operator pans/zooms.
 
 ## Tests (node:test, all green)
-- `tests/selection.test.mjs` (6) — normalization, notify-on-change, persistence, private-mode.
-- `tests/mission-refresh.test.mjs` (12) — identity precedence, force/fallback/revision triggers,
-  in-flight suppression, per-USV keying, change reporting.
-- `tests/map-view.test.mjs` (12) — validation, freshness, priority order, viewport round-trip.
-- `tests/selected-refresh.test.mjs` (11) — immediate fetch, late-response rejection, no overlap,
-  repeated refresh, fallback caching, command trigger, unchanged identity, stale-retention,
-  hidden-tab pause, stop.
-- `tests/poll-visibility.test.mjs` (2) — pauseWhenHidden pause/resume + back-compat.
-- Baselines: frontend `npm test` → 271 pass (was 230). Backend `python -m unittest` → 346 pass.
+- `tests/selection.test.mjs` — normalization, notify-on-change, persistence, private-mode.
+- `tests/mission-refresh.test.mjs` — geometry-id precedence (current_seq excluded), geometry-vs-
+  progress change reporting, force/fallback/revision triggers, in-flight suppression, per-USV
+  keying, `missionWriteNeedsRefetch` success-vs-failure (+ uncertain/partial override).
+- `tests/map-view.test.mjs` — validation, freshness, priority order, viewport round-trip.
+- `tests/selected-refresh.test.mjs` — immediate fetch, late-response rejection, no overlap,
+  token/vehicle in-flight ownership (A finishes mid-B must not clear B or start a 2nd B; resumes
+  after B), progress delivered when geometry unchanged, fallback caching, command trigger,
+  stale-retention, hidden-tab pause, stop.
+- `tests/poll-visibility.test.mjs` — pauseWhenHidden pause/resume + back-compat.
+- Baselines: frontend `npm test` → 277 pass (was 230). Backend `python -m unittest` → 346 pass.
 
 ## Manual verification steps
 1. `/app#/map`: select a USV → position/telemetry update live (~2 s) and the Pixhawk mission

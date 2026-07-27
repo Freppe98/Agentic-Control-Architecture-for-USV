@@ -34,16 +34,25 @@ export function createSelectedRefresh({
 } = {}) {
   let activeId = null;
   let token = 0;              // bumped on every select — the generation guard
-  let stateInFlight = false;
-  let missionInFlight = false;
+  // In-flight OWNERSHIP slots. Each is null or { id, token } identifying the request that
+  // currently holds it. A global boolean was wrong: select() reset it so a NEW vehicle could
+  // fetch immediately, but then the OLD vehicle's request could finish and clear the flag the
+  // new request now owned — letting a second overlapping request start. So a request may only
+  // clear the slot it originally acquired (same id AND selection token), and the overlap guard
+  // only blocks a second request for the SAME owner. A superseded request neither blocks nor
+  // clears the newer selection's slot.
+  let stateSlot = null;
+  let missionSlot = null;
   let timer = null;
   let stopped = false;
 
   const isStale = (id, myToken) => stopped || myToken !== token || id !== activeId;
+  const owns = (slot, id, myToken) => slot != null && slot.id === id && slot.token === myToken;
 
   async function runState(id, myToken) {
-    if (!fetchState || stateInFlight) return;      // overlap guard
-    stateInFlight = true;
+    if (!fetchState) return;
+    if (owns(stateSlot, id, myToken)) return;      // overlap guard — same owner already running
+    stateSlot = { id, token: myToken };
     try {
       const data = await fetchState(id);
       if (isStale(id, myToken)) return;            // late response from an old selection
@@ -51,42 +60,42 @@ export function createSelectedRefresh({
     } catch (err) {
       if (!isStale(id, myToken) && onError) onError("state", id, err);
     } finally {
-      stateInFlight = false;
+      if (owns(stateSlot, id, myToken)) stateSlot = null;  // only clear the slot WE acquired
     }
   }
 
   async function runMission(id, myToken, reason, revisionSignal) {
-    const decision = tracker.shouldFetch(id, { reason, revisionSignal, now: now(), inFlight: missionInFlight });
+    const inFlight = owns(missionSlot, id, myToken);
+    const decision = tracker.shouldFetch(id, { reason, revisionSignal, now: now(), inFlight });
     if (!decision.fetch) return decision;
-    missionInFlight = true;
+    missionSlot = { id, token: myToken };
     try {
       const mission = await fetchMission(id);
       if (isStale(id, myToken)) return decision;   // dropped — selection moved on
       if (mission && mission.reachable) {
-        const changed = tracker.noteFetched(id, mission, now());
+        const meta = tracker.noteFetched(id, mission, now());
         if (reason === "revision") tracker.noteRevisionSignal(id, revisionSignal);
-        if (onMission) onMission(id, mission, changed);
+        if (onMission) onMission(id, mission, meta);
       } else {
         // Unreachable/empty: never cache it (keeps the last-known mission) — let the page
         // surface a quiet stale note without wiping the overlay.
-        if (onMission) onMission(id, mission, false);
+        if (onMission) onMission(id, mission, { geometryChanged: false, progressChanged: false });
       }
     } catch (err) {
       if (!isStale(id, myToken) && onError) onError("mission", id, err);
     } finally {
-      missionInFlight = false;
+      if (owns(missionSlot, id, myToken)) missionSlot = null;  // only clear the slot WE acquired
     }
     return decision;
   }
 
-  // Select a vehicle: reset the in-flight flags (any pending request belongs to the old
-  // selection and will be dropped by the token guard) and fire an immediate state + mission
-  // read. Passing null clears the active selection without fetching.
+  // Select a vehicle: bump the generation token (so any pending request for the old selection
+  // is dropped by the guard) and fire an immediate state + mission read. The in-flight slots
+  // are NOT reset — a superseded request cannot clear the new selection's slot because the
+  // owns() check requires a matching token. Passing null clears the active selection.
   function select(id) {
     activeId = id;
     token += 1;
-    stateInFlight = false;
-    missionInFlight = false;
     if (id == null) return;
     const myToken = token;
     runState(id, myToken);
@@ -121,6 +130,10 @@ export function createSelectedRefresh({
   return {
     select, refreshMission, tick, start, stop, tracker,
     // introspection for tests
-    _state: () => ({ activeId, token, stateInFlight, missionInFlight, stopped }),
+    _state: () => ({
+      activeId, token, stopped,
+      stateInFlight: stateSlot != null, missionInFlight: missionSlot != null,
+      stateSlot: stateSlot && { ...stateSlot }, missionSlot: missionSlot && { ...missionSlot },
+    }),
   };
 }

@@ -18,7 +18,7 @@ import { commandVerification, hasPendingOfType, commandStages } from "../lib/com
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
 import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
-import { MISSION_WRITE_COMMANDS } from "../lib/mission-refresh.js";
+import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
 
 const HOME = [56.699893, 13.002148];
 
@@ -146,11 +146,14 @@ export function Map(root) {
   // the USV-B overlay.
   const refreshController = createSelectedRefresh({
     fetchMission: (id) => api.getPixhawkMission(id),
-    onMission: (id, res, changed) => {
+    onMission: (id, res, meta) => {
       applyMissionRead(id, res);
       if (id === selId) {
+        // Progress text (current WP / %) always refreshes; the map overlay is rebuilt only
+        // when the GEOMETRY changed OR execution PROGRESS (current_seq) moved — unchanged
+        // geometry at the same progress is never needlessly redrawn.
         renderPxm(); renderDock();
-        if (changed && pxmState(id).shown) drawMissionOverlay(id);
+        if ((meta.geometryChanged || meta.progressChanged) && pxmState(id).shown) drawMissionOverlay(id);
       }
     },
     onError: (kind, id, err) => {
@@ -800,10 +803,12 @@ export function Map(root) {
     }).catch(() => { if (id === selId) { cmds = []; renderInspector(); } });
   }
 
-  // A mission-writing command (upload / clear / replan) that has reached a terminal state
-  // means the mission stored on the vehicle may have just changed — read it back once so the
-  // overlay reflects ground truth. Each command id is reacted to only once (missionWriteHandled)
-  // so a settled command in history never re-triggers a download on the 3 s command poll.
+  // A mission-writing command (upload / clear / replan) that has reached a terminal state MAY
+  // mean the mission stored on the vehicle changed. Re-read ground truth only when the write
+  // actually SUCCEEDED (verified/executed) — or when a failed write explicitly reports an
+  // uncertain/partial on-vehicle state (missionWriteNeedsRefetch). An ordinary rejected/failed
+  // upload leaves the mission unchanged, so it does not force a download. Each command id is
+  // evaluated once (missionWriteHandled) so a settled command never re-triggers on the 3 s poll.
   function detectMissionWrites(id) {
     let fire = false;
     cmds.forEach((c) => {
@@ -811,7 +816,8 @@ export function Map(root) {
       if (!CMD_TERMINAL_M.has(c.status)) return;
       if (missionWriteHandled.has(c.id)) return;
       missionWriteHandled.add(c.id);
-      fire = true;
+      const v = commandVerification(c);
+      if (missionWriteNeedsRefetch(v.outcome, c.result)) fire = true;
     });
     if (fire) refreshController.refreshMission(id, "command");
   }

@@ -98,17 +98,68 @@ test("a command trigger forces a mission re-fetch", async () => {
   assert.equal(count, 2);
 });
 
-test("onMission reports identity change: true first, false on unchanged", async () => {
+test("onMission reports geometryChanged: true first, false on unchanged", async () => {
   const onM = [];
   const mission = REACHABLE({ route_content_hash: "abc" });
   const c = createSelectedRefresh({
     ...base,
     fetchMission: () => Promise.resolve(mission),
-    onMission: (id, m, changed) => onM.push(changed),
+    onMission: (id, m, meta) => onM.push(meta.geometryChanged),
   });
   c.select(1); await flush();                    // first → changed
   c.refreshMission(1, "manual"); await flush();  // same identity → unchanged
   assert.deepEqual(onM, [true, false]);
+});
+
+test("a new current_seq is delivered even when geometry is unchanged", async () => {
+  const events = [];
+  let call = 0;
+  const reads = [
+    { reachable: true, route_content_hash: "abc", current_seq: 1 },
+    { reachable: true, route_content_hash: "abc", current_seq: 2 }, // same geometry, advanced
+  ];
+  const c = createSelectedRefresh({
+    ...base,
+    fetchMission: () => Promise.resolve(reads[call++]),
+    onMission: (id, m, meta) => events.push({ seq: m.current_seq, meta }),
+  });
+  c.select(1); await flush();                    // read #0
+  c.refreshMission(1, "manual"); await flush();  // read #1: same route_content_hash, new seq
+  assert.equal(events[1].meta.geometryChanged, false, "geometry (route_content_hash) unchanged");
+  assert.equal(events[1].meta.progressChanged, true, "current_seq advanced");
+  assert.equal(events[1].seq, 2, "new current_seq delivered to the progress consumer");
+});
+
+test("in-flight ownership is token/vehicle-specific: no cross-clear, no overlap, resumes after", async () => {
+  const calls = []; // each fetch: { id, resolve }
+  const c = createSelectedRefresh({
+    ...base,
+    fetchMission: (id) => new Promise((resolve) => calls.push({ id, resolve })),
+    onMission: () => {},
+  });
+  // 1. a mission request is pending for USV A (=1)
+  c.select(1);
+  assert.deepEqual([calls.length, calls[0].id], [1, 1]);
+  assert.equal(c._state().missionSlot.id, 1);
+  // 2-3. selection changes to USV B (=2); B's mission request begins
+  c.select(2);
+  assert.deepEqual([calls.length, calls[1].id], [2, 2]);
+  const slotB = c._state().missionSlot;
+  assert.equal(slotB.id, 2);
+  // 4-5. A finishes while B is still pending → must NOT clear B's ownership
+  calls[0].resolve(REACHABLE({ count: 1 }));
+  await flush();
+  assert.deepEqual(c._state().missionSlot, slotB, "A's completion left B's slot intact");
+  // 6. a timer tick or a command trigger must not start a second B request while B is pending
+  c.tick(); await flush();
+  c.refreshMission(2, "command"); await flush();
+  assert.equal(calls.length, 2, "no second B request while B is in flight");
+  // 7. once B finishes, a later valid trigger may start another request
+  calls[1].resolve(REACHABLE({ count: 2 }));
+  await flush();
+  assert.equal(c._state().missionSlot, null, "B slot cleared after B completed");
+  c.refreshMission(2, "command"); await flush();
+  assert.equal(calls.length, 3, "a fresh trigger after B finished starts a new request");
 });
 
 test("an unreachable read is delivered but never cached (keeps last-known)", async () => {

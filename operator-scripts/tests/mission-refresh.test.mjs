@@ -3,24 +3,45 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  missionIdentity, createMissionRefreshTracker, MISSION_WRITE_COMMANDS,
+  missionIdentity, missionProgress, createMissionRefreshTracker,
+  MISSION_WRITE_COMMANDS, MISSION_WRITE_SUCCESS, missionWriteNeedsRefetch,
 } from "../operator/lib/mission-refresh.js";
 
-// ---- identity precedence ----
+// ---- identity precedence (GEOMETRY only — current_seq excluded) ----
 test("missionIdentity prefers route_content_hash, then full/mission hash, then count", () => {
   assert.equal(missionIdentity({ route_content_hash: "a", full_mission_hash: "b", hash: "c", count: 4 }), "rch:a");
   assert.equal(missionIdentity({ full_mission_hash: "b", hash: "c", count: 4 }), "fmh:b");
   assert.equal(missionIdentity({ hash: "c", count: 4 }), "h:c");
-  assert.equal(missionIdentity({ count: 4, current_seq: 2 }), "c:4/s:2");
-  assert.equal(missionIdentity({ pixhawk_item_count: 5 }), "c:5/s:-");
+  assert.equal(missionIdentity({ count: 4 }), "c:4");
+  assert.equal(missionIdentity({ pixhawk_item_count: 5 }), "c:5");
 });
 test("missionIdentity is null when nothing usable is present", () => {
   assert.equal(missionIdentity(null), null);
   assert.equal(missionIdentity({}), null);
   assert.equal(missionIdentity({ reachable: false }), null);
 });
-test("progress (current_seq) changes the count-based identity", () => {
-  assert.notEqual(missionIdentity({ count: 4, current_seq: 1 }), missionIdentity({ count: 4, current_seq: 2 }));
+test("geometry identity ignores current_seq; progress is a separate signal", () => {
+  // Same geometry, different progress → identical identity, different progress.
+  assert.equal(missionIdentity({ count: 4, current_seq: 1 }), missionIdentity({ count: 4, current_seq: 2 }));
+  assert.equal(missionProgress({ current_seq: 2 }), 2);
+  assert.equal(missionProgress({ count: 4 }), null);
+  assert.equal(missionProgress(null), null);
+});
+
+// ---- geometry vs progress change reporting ----
+test("unchanged geometry with a new current_seq → geometryChanged false, progressChanged true", () => {
+  const t = createMissionRefreshTracker();
+  t.noteFetched(2, { route_content_hash: "abc", current_seq: 1 });
+  const meta = t.noteFetched(2, { route_content_hash: "abc", current_seq: 2 });
+  assert.equal(meta.geometryChanged, false, "geometry (route_content_hash) unchanged");
+  assert.equal(meta.progressChanged, true, "current_seq advanced");
+  assert.equal(t.progressOf(2), 2, "new progress recorded");
+});
+test("identical geometry AND progress → nothing changed", () => {
+  const t = createMissionRefreshTracker();
+  t.noteFetched(2, { route_content_hash: "abc", current_seq: 3 });
+  const meta = t.noteFetched(2, { route_content_hash: "abc", current_seq: 3 });
+  assert.deepEqual(meta, { geometryChanged: false, progressChanged: false });
 });
 
 // ---- forced triggers ----
@@ -55,12 +76,12 @@ test("revision stays dormant without a signal, fires on change, not on repeat", 
   assert.equal(t.shouldFetch(2, { reason: "revision", revisionSignal: "r3" }).fetch, true);
 });
 
-// ---- identity change reporting ----
-test("noteFetched reports whether the identity changed", () => {
+// ---- geometry change reporting ----
+test("noteFetched reports geometryChanged: true first, false unchanged, true on change", () => {
   const t = createMissionRefreshTracker();
-  assert.equal(t.noteFetched(2, { route_content_hash: "a" }), true);   // first
-  assert.equal(t.noteFetched(2, { route_content_hash: "a" }), false);  // unchanged
-  assert.equal(t.noteFetched(2, { route_content_hash: "b" }), true);   // changed
+  assert.equal(t.noteFetched(2, { route_content_hash: "a" }).geometryChanged, true);   // first
+  assert.equal(t.noteFetched(2, { route_content_hash: "a" }).geometryChanged, false);  // unchanged
+  assert.equal(t.noteFetched(2, { route_content_hash: "b" }).geometryChanged, true);   // changed
 });
 test("tracking is keyed per vehicle", () => {
   const t = createMissionRefreshTracker();
@@ -74,4 +95,19 @@ test("MISSION_WRITE_COMMANDS covers upload / clear / replan", () => {
   assert.ok(MISSION_WRITE_COMMANDS.has("MISSION_CLEAR"));
   assert.ok(MISSION_WRITE_COMMANDS.has("MISSION_REPLAN"));
   assert.equal(MISSION_WRITE_COMMANDS.has("RTL"), false);
+});
+
+// ---- mission-write refetch policy ----
+test("missionWriteNeedsRefetch: refetch on success, not on ordinary failure", () => {
+  assert.equal(missionWriteNeedsRefetch("VERIFIED", null), true);
+  assert.equal(missionWriteNeedsRefetch("EXECUTED", null), true);
+  assert.equal(missionWriteNeedsRefetch("FAILED", null), false);
+  assert.equal(missionWriteNeedsRefetch("REJECTED", { error: "denied" }), false);
+  assert.equal(missionWriteNeedsRefetch("EXPIRED", null), false);
+});
+test("missionWriteNeedsRefetch: a failure that flags uncertain/partial state DOES refetch", () => {
+  assert.equal(missionWriteNeedsRefetch("FAILED", { partial: true }), true);
+  assert.equal(missionWriteNeedsRefetch("FAILED", { vehicle_state_uncertain: true }), true);
+  assert.equal(missionWriteNeedsRefetch("REJECTED", { mission_state_uncertain: true }), true);
+  assert.ok(MISSION_WRITE_SUCCESS.has("VERIFIED"));
 });
