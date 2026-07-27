@@ -3,6 +3,23 @@
 Run the operator station from any computer and point Scout at it. Nothing about the
 operator PC is hardcoded — the vehicle is told where to post at runtime.
 
+## 0. Install dependencies (reproducible)
+
+The Plan page's survey generation needs the geometry stack (shapely / pyproj / numpy),
+so install from the pinned manifest rather than relying on packages already on the box:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+Without them the station still runs, but the Plan page's `/api/planning/*` and
+`/api/missions/finalize` geometry answer an honest **503 planning_unavailable** instead
+of a route. Confirm the stack is present:
+
+```powershell
+python -c "import shapely, pyproj, numpy; print('planning deps OK')"
+```
+
 ## 1. Start the backend on the operator PC
 
 ```powershell

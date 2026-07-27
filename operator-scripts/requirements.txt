@@ -1,15 +1,25 @@
 # Operator Station backend dependencies.
 #
+# Reproducible install (do NOT rely on packages happening to be on the workstation):
+#     python -m pip install -r requirements.txt
+#
 # The core station runs on FastAPI + requests + the Python stdlib. Survey planning (the Plan
 # page, planning.py) adds the geometry stack — shapely/pyproj/numpy — used to port Scout's
-# tested lawnmower + return-path generators. These are OPTIONAL at runtime: planning.py guards
-# their import and the /api/planning endpoints degrade to an honest 503 when they are absent,
-# so the rest of the backend still runs without them.
-fastapi
-uvicorn
-requests
+# tested lawnmower + return-path generators AND to compute the shared safe-connector grid A*.
+# These are OPTIONAL at runtime: planning.py guards their import and the /api/planning
+# endpoints (and /api/missions/finalize's package geometry) degrade to an honest 503 when
+# they are absent, so the rest of the backend still runs without them.
+fastapi>=0.110
+uvicorn>=0.29
+requests>=2.31
 
-# Survey planning (Plan page) — required only for route generation/validation.
-shapely
-pyproj
-numpy
+# Survey planning (Plan page) — required for route generation/validation/safe connectors.
+# Pinned to the versions this branch was developed and tested against; newer releases of the
+# geometry stack occasionally change buffer/UTM edge behaviour, which would move generated
+# routes (and their content hashes).
+shapely>=2.0,<3
+pyproj>=3.6,<4
+numpy>=1.26,<3
+
+# TestClient dependency for the backend unittest suite (fastapi.testclient).
+httpx>=0.27

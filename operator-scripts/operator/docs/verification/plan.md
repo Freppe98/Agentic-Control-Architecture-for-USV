@@ -98,11 +98,89 @@ is set — no return route was generated" and "Duration is an estimate only" not
     `planning_drafts/`). **Clear** asks for confirmation when there is work to lose, resets the
     page, and issues no vehicle command.
 
+## Route corrections (feature/operator-plan-route-corrections)
+
+### Approach vs Return semantics
+- **Approach waypoints (A1, A2, …)** — the operator-approved route *into* the survey, visited
+  in numbered order *before* coverage: `planning home → A1 → A2 → survey entry`. They are NOT
+  points visited before returning home.
+- **Return waypoints (R1, R2, …)** — a *separate* optional route *out* of the survey toward
+  home: `last coverage point → safe return connector → R1 → R2 → planning home`. The backend
+  never auto-reverses the approach; **Use reversed approach** copies `A3→A2→A1` into the
+  return list as an editable starting point.
+- Migration: old drafts/callers using `transit`/`transit_waypoints` load transparently as
+  approach waypoints — no saved plan breaks.
+
+### Planning Home vs Pixhawk HOME_POSITION
+- **Planning Home** is route-planning geometry only. It is where the planned route starts
+  (`Start route from → Planning home | First approach waypoint`) and where the return route
+  ends. It does **not** change the Pixhawk `HOME_POSITION` or the RTL home — an upload never
+  moves Home (Scout owns Pixhawk seq 0 / Home; the operator never sends it).
+
+### Route segment kinds and colours
+`start_connector`, `approach` (orange dashed, A-markers, arrows), `survey_entry_connector`
+(orange dotted), `primary` (green solid), `pass_transition` (grey dashed), `secondary`
+(purple solid), `return_connector` (amber dashed), `return_approach` (amber dashed, R-markers),
+`final_home_connector` (amber dotted). One hue family per phase — never one orange for
+approach + transition + return. No-go zones keep an unmistakable **red** fill/outline in their
+own map pane *above* the navigable fill, so generating the route can never grey them out.
+
+### Connector policy (safe connectors)
+Every gap between coverage/operator sections is an **explicit connector segment**, so the flat
+Pixhawk route carries no invisible straight jump. One strategy: `planning.safe_connector`
+accepts the direct segment only when it stays inside the navigable (shoreline-offset) region
+and clears no-go interiors; otherwise it routes a **bounded deterministic 4-neighbour grid
+A\*** inside the navigable region (no diagonal shortcuts, no second planner). It repairs every
+unsafe coverage lane turn / no-go-split bridge / pass transition — the fix for the observed
+asymmetric-concave "connector leaves the polygon" defect. If no safe path exists, generation
+**errors** rather than emitting a bad connector. Generation requires **one connected
+navigable region**; a clearance/no-go split is rejected with a clear message.
+
+### Mission package + immutable original revision 0
+- Generation returns the **`operator-survey-plan-v1`** package: typed `segments` (with
+  execution-seq ranges), `original_execution_order`, `route_waypoints`, the canonical
+  `route_hash`, echoed `planning_inputs`, `navigable_boundary`, `metrics` and `warnings`.
+- **Finish & Upload** calls `POST /api/missions/finalize`, which stores ONE immutable original
+  mission record (`mission_revision: 0`, `immutable: true`) retaining that geometry AND creates
+  the unchanged, read-back-verified `MISSION_UPLOAD` command. The record's `route_hash` is the
+  **same** `mission_contract.route_content_hash` the upload is verified against. A verified
+  read-back marks the original mission `VERIFIED`; a failed upload keeps the record with
+  `upload_status: FAILED` and the plan intact. Read-only: `GET /api/missions/original/{id}`,
+  `GET /api/vehicles/{id}/missions/active-original`.
+
+### Browser verification procedure
+1. Start the backend (`./run_operator_backend.ps1`), open `http://127.0.0.1:8210/app/#/plan`.
+2. Select a vehicle; draw a **concave** boundary (a notch/bay); set clearance + lane spacing.
+3. Add a no-go zone inside it — confirm it is **red** before generation.
+4. Add 2–3 **approach** waypoints (see `A1→A2→…` with arrows), a **planning home**, and a
+   couple of **return** waypoints (try **Use reversed approach**).
+5. **Generate** — confirm: the no-go zone is **still red** (not greyed); the route shows all
+   nine segment kinds in their distinct colours; every coverage segment stays inside the green
+   navigable area even around the concavity; no straight jump crosses the notch.
+6. **Validate** — should pass; deliberately drag a return WP across the no-go interior and
+   re-generate/validate to see the exact offending segment reported and **Upload** stay blocked.
+7. Take OPERATOR control, **Finish & Upload** — the banner shows `mission id · rev 0 · N wp ·
+   hash …`; when Scout's read-back verifies, the original record flips to `VERIFIED`.
+8. Reload with an old draft using `transit` — it loads as approach waypoints (no break).
+
+### Deferred (Scout-side replanning — NOT implemented here)
+The immutable record reserves `mission_revision` / `parent_revision_id` / `revision_reason` /
+`blocked_segments` / `derived_from_route_hash` for the future flow: *original revision 0 →
+Scout obstacle event → Local Agent creates revision 1 → revised flat route uploaded and
+verified → Operator stores revision 1 linked to the original*. None of that execution — no
+graph search, no LOITER/replan/resume, no full-package delivery to Scout — is built in this
+task; only the record and read-only APIs the future work needs.
+
 ## Known limitations
 
 - Obstacle **execution** / Local-Agent replanning is out of scope (planning-time no-go
   avoidance only). Dual-pass intersections are exposed as planning metadata for the future
   graph-based replanner; no arbitrary diagonal connectors are added.
+- The safe-connector grid is bounded (`MAX_GRID_CELLS_PER_AXIS`); a navigable area too large
+  for the chosen lane spacing raises an excessive-resolution generation error rather than
+  running unbounded — increase lane spacing or shrink the survey.
+- The immutable mission record store is in-memory (resets on backend restart), like the
+  command queue and event log; durable storage is a later item.
 - Duration is an estimate from the (optional) survey speed; a default speed is used and
   labelled when none is given.
 - "Warn before navigating away" covers a real tab close/reload via `beforeunload`; in-app hash
