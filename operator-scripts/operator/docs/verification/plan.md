@@ -41,13 +41,19 @@ framework. Planning is operator-owned; the vehicle receives a finalized, validat
   (ok, no-go interior crossing → error, over-limit → error, no route → error), draft CRUD, and
   a generated route hashing with `mission_contract` and uploading via `POST /api/commands`
   (with the over-limit route refused).
+- Backend `tests/test_planning_quality.py` (unittest): the route-quality layer — line-of-sight
+  connector compression (collapses a safe staircase, is blocked by a concave boundary / a no-go
+  interior, deterministic), semantic cleanup (dedup / near-dup / collinear removal / genuine
+  corner + anchor + endpoint preservation / tiny-zigzag / unsafe-shortcut rejection), and three
+  asymmetric/concave regression fixtures (concave notch, multi-lobe, central obstacle) asserting
+  safety, validity, connector reduction, monotonic sweep ordering and byte-stable generation.
 - Frontend `tests/planning.test.mjs` (node:test): Plan in NAV between Fleet/Mission; boundary
   enables no-go zones; stable zone ids; every generation input marks the route outdated;
   secondary-angle default; validation + vehicle gate upload; outdated/invalid block upload;
   Clear resets + `hasUnsavedWork`; draft round-trip; generated route → mission-contract params.
 
 Run: `python -m unittest discover -s tests -p "test_*.py"` and `npm test`.
-Result at commit: **backend 306 OK, frontend 221 pass**.
+Result at commit: **backend 346 OK, frontend 230 pass**.
 
 ## Live browser verification (Playwright, against the real backend)
 
@@ -156,7 +162,9 @@ navigable region**; a clearance/no-go split is rejected with a clear message.
    couple of **return** waypoints (try **Use reversed approach**).
 5. **Generate** — confirm: the no-go zone is **still red** (not greyed); the route shows all
    nine segment kinds in their distinct colours; every coverage segment stays inside the green
-   navigable area even around the concavity; no straight jump crosses the notch.
+   navigable area even around the concavity; no straight jump crosses the notch. The connectors
+   around the notch are now a few **turn points**, not a dense staircase, and Route Summary
+   shows a **"Waypoints reduced: raw → final (−N redundant)"** row.
 6. **Validate** — should pass; deliberately drag a return WP across the no-go interior and
    re-generate/validate to see the exact offending segment reported and **Upload** stay blocked.
 7. Take OPERATOR control, **Finish & Upload** — the banner shows `mission id · rev 0 · N wp ·
@@ -171,8 +179,92 @@ verified → Operator stores revision 1 linked to the original*. None of that ex
 graph search, no LOITER/replan/resume, no full-package delivery to Scout — is built in this
 task; only the record and read-only APIs the future work needs.
 
+## Route quality (feature/operator-plan-route-quality)
+
+This is route **cleanup** — fewer, cleaner mission items — **not** continuous-curvature
+trajectory smoothing. The Pixhawk still flies **straight segments between mission items**; the
+work only removes waypoints the straight legs already pass through and collapses grid staircases
+to their genuine turn points. Every safety and upload invariant above is preserved.
+
+### Confirmed cause of the irregularity
+Measured, not assumed. On the asymmetric/concave fixtures the dominant problem was
+**unsimplified grid-A\* connectors**: `safe_connector` returned one waypoint per grid cell with
+only exact-duplicate removal, so a single straight-ish corridor became a **33–46-point
+staircase** (plus long collinear runs). Fragment **ordering was already coherent** — the ported
+boustrophedon + projection order is monotonic by sweep row (0–1 immediate backtracks measured),
+so it is retained, instrumented and asserted, **not** rewritten (a speculative rewrite of the
+fragile ported stitch could only risk coverage). Confirmed before any code changed.
+
+### Row-aware fragment ordering (retained + verified)
+Coverage advances **monotonically through the sweep rows**, alternating sweep direction, exactly
+as the ported generator produces. Each coverage sub-path is decomposed into **fragments** with
+metadata (`row_index`, `sweep_coordinate`, `length_m`, endpoints, point count) in
+`route_quality.coverage_fragments`, and `fragment_reorders` counts consecutive fragments that
+regress along the sweep axis. The regression tests assert `fragment_reorders == 0` and that
+execution order equals sweep-row order — i.e. no cross-row jumping.
+
+### Connector line-of-sight compression (`safe-line-of-sight-v1`)
+After A\* returns a safe grid path, `_compress_los` keeps `P0`, then from the current kept point
+takes the **furthest** later `Pj` whose direct `Pi→Pj` is safe **under the same predicate the
+connector was routed with**, and repeats. Because every retained hop is re-verified with
+`segment_is_safe`, the safe corridor is never widened. **Generic RDP is not trusted**: RDP
+minimises perpendicular error, which can cut a corner through unapproved water or a no-go
+interior; here every proposed shortcut is checked with the real geometric safety predicate, so a
+shortcut across a concave notch or a no-go zone is refused and the turn point kept.
+
+### Semantic cleanup + per-kind policy (`semantic-path-cleanup-v1`)
+`clean_path` runs, in order: exact-dedup → near-duplicate merge (< `CLEANUP_MIN_SPACING_M`) →
+safety-checked collinear removal (< `CLEANUP_COLLINEAR_DEG`, bypass re-verified) → for aggressive
+connector kinds a line-of-sight pass → collinear removal again. **Points never removed** (the
+semantic anchors): first/last of every segment, operator **approach**/**return** waypoints,
+survey entry, coverage fragment endpoints, and (by construction of the segmentation) every
+segment join and planning-home connector endpoint. Policy by kind: **aggressive** LOS for
+generated connectors (`start`/`survey_entry`/`pass_transition`/`return`/`final_home`);
+**moderate** for `approach`/`return_approach` (operator WPs preserved, only generated
+in-between points compressed); **conservative** for `primary`/`secondary` coverage (dedup +
+provably-collinear only, no broad shortcuts across lanes).
+
+### Objective route-quality metrics (`route_quality`)
+No vague score — every number is re-derivable: `raw`/`final`/`removed` waypoint counts,
+`raw`/`final` connector waypoint counts, connector length before/after, coverage fragment count,
+fragment reorders, backtracking events (a true `A→B→A` return-to-origin spike, **not** a
+legitimate lane U-turn), minimum segment length. The UI Route Summary shows only the compact
+**"Waypoints reduced: raw → final (−N redundant)"** row; the detail stays in the package/tests.
+The canonical mission-contract **hash is computed from the final simplified route** (unchanged
+calculator, unchanged upload protocol); `generation_algorithm` records the per-stage provenance.
+
+### Validation after cleanup (unchanged defence)
+`validate_plan` is not bypassed: it independently re-checks that the flattened segment route
+equals `route_waypoints`, no invisible jumps, coverage stays inside the navigable region,
+connectors clear no-go interiors, operator WPs remain in order, coordinates are finite, the hash
+recomputes from the final route, and the count is within the limit. A shortcut that would fail
+any of these is rejected locally by the safety predicate before it is ever emitted.
+
+### Measured before → after (three regression fixtures, min of 5 runs)
+| Fixture | Total wp | Connector wp | Connector length (m) | Gen time (ms) |
+|---|---|---|---|---|
+| concave notch | 94 → **64** | 36 → **6** | 506.4 → 505.7 | 17.8 → 20.8 |
+| multi-lobe (wide notch) | 118 → **66** | 37 → **12** (raw A\* 64) | 517.0 → 504.9 | 18.6 → 23.3 |
+| central obstacle | 116 → **83** | 36 → **6** | 506.4 → 505.7 | 27.5 → 31.4 |
+
+Connector **length is essentially unchanged** (LOS only cuts staircase corners while staying
+safe), coverage geometry is preserved (coverage length unchanged, validation passes), and
+generation stays **well under 35 ms** — the compression re-uses a cached safety predicate
+(`_safe_cache`) so the extra passes stay inside the bounded planning budget.
+
+### Deterministic / bounded
+Identical inputs produce a **byte-equivalent route and hash** (asserted per fixture). The grid
+size limit (`MAX_GRID_CELLS_PER_AXIS`) is unchanged; the safety predicate is memoised by
+normalised endpoint pair so the O(n²) compression re-checks nothing twice.
+
 ## Known limitations
 
+- Route quality is **cleanup, not smoothing**: the vehicle flies straight legs between items;
+  no splines/Dubins/curvature. A legitimate coverage U-turn in a narrow lobe is retained (it is
+  required by the geometry), not counted as a backtrack.
+- Fragment ordering is the ported monotonic sweep order — **not** a global TSP; a genuinely
+  multi-lobed shape that the ported coverage generator itself cannot cover validly is out of
+  scope (this is a coverage-generation limit, not a cleanup one).
 - Obstacle **execution** / Local-Agent replanning is out of scope (planning-time no-go
   avoidance only). Dual-pass intersections are exposed as planning metadata for the future
   graph-based replanner; no arbitrary diagonal connectors are added.
