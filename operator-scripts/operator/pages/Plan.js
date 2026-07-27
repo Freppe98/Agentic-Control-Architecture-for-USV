@@ -525,6 +525,12 @@ export function Plan(root) {
       ["Coverage length", fmtLen(m.coverage_length_m)],
       ["Approach / return length", fmtLen(m.transit_length_m)],
       ["Waypoints", `${m.waypoint_count}${model.generated.max_route_waypoints ? ` / ${model.generated.max_route_waypoints}` : ""}`],
+      // Compact route-cleanup diagnostic only (PART 10): raw → final and how many redundant
+      // points the safety-checked simplification removed. Detailed per-fragment metrics stay
+      // in the mission package/tests, not the operator UI.
+      ...(m.route_quality && m.route_quality.removed_waypoint_count > 0
+        ? [["Waypoints reduced", `${m.route_quality.raw_waypoint_count} → ${m.route_quality.final_waypoint_count} (−${m.route_quality.removed_waypoint_count} redundant)`]]
+        : []),
       ["Estimated duration", m.estimated_duration_s != null ? `${fmtDur(m.estimated_duration_s)} (est.${m.survey_speed_is_default ? ", default speed" : ""})` : noTelem("no speed")],
       ["Generated", model.generated.generated_at ? new Date(model.generated.generated_at).toLocaleTimeString([], { hour12: false }) : "—"],
     ];
