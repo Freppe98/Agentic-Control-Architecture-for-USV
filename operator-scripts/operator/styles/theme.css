@@ -955,6 +955,10 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .plan-banner .pl-upl { color:var(--text); }
 .plan-banner .pl-upl.ok { color:var(--connected); } .plan-banner .pl-upl.bad { color:var(--disconnected); }
 .plan-banner .pl-link { color:var(--accent-bright); }
+/* Dynamic-view controls (Center on USV / on me) — top-right map overlay. */
+.plan-viewctl { top:14px; right:14px; display:flex; gap:6px; padding:6px; z-index:600; }
+.plan-viewctl button { font-family:var(--font-mono); font-size:10px; letter-spacing:.03em; padding:5px 9px; border-radius:var(--r); background:var(--panel-2); border:1px solid var(--line-strong); color:var(--text); cursor:pointer; }
+.plan-viewctl button:hover { border-color:var(--accent-bright); color:var(--accent-bright); }
 .plan-legend .pl-sw { display:inline-block; width:16px; height:0; border-top-width:3px; border-top-style:solid; margin-right:8px; vertical-align:middle; }
 .plan-legend .li { display:flex; align-items:center; font-size:10.5px; color:var(--text); }
 .pl-sw.boundary { border-top-color:#4C8DFF; }

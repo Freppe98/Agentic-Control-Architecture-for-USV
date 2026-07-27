@@ -24,6 +24,9 @@ import { commState, noTelem } from "../lib/ui.js";
 import * as P from "../lib/planning.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
+import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
+import { pickInitialView, getSavedViewport, setSavedViewport, isValidLatLng, isNullIsland,
+         TOFTASJON, DEFAULT_ZOOM, VIEW_RANK } from "../lib/map-view.js";
 
 const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v0.01M11 12h1v4h1"/></svg>';
 
@@ -65,6 +68,11 @@ export function Plan(root) {
   const L = window.L;
   let fleet = [];
   let model = P.emptyModel();
+  // Adopt the shared cross-page selection so a vehicle picked on the Map page is already
+  // selected here (and the initial view can centre on it). Reuses the one selection model
+  // rather than a Plan-private one.
+  const sharedSel = getSelectedVehicleId();
+  if (sharedSel != null) model = { ...model, vehicleId: sharedSel };
   let mode = null;            // active drawing mode: null|'boundary'|'nogo'|'home'|'approach'|'return'
   let draftRing = [];         // in-progress polygon vertices ([lng,lat]) while drawing
   let selected = null;        // { type:'boundary'|'nogo'|'approach'|'return'|'home', id?/index? }
@@ -106,14 +114,40 @@ export function Plan(root) {
          </div>
        </div>
        <div class="ov toast" id="plan-toast"></div>
+       <div class="ov plan-viewctl" id="plan-viewctl">
+         <button id="pl-center-usv" title="Centre the map on the selected USV's position">Center on USV</button>
+         <button id="pl-center-op" title="Centre the map on your device location (asks permission)">Center on me</button>
+       </div>
        <div class="plan-actionbar" id="plan-actions"></div>
      </div>
      <aside class="inspector plan-inspector" id="plan-inspector"></aside>`;
 
   // ---- Leaflet ----
-  const HOME_VIEW = [56.699893, 13.002148];
-  const map = L.map("plan-map", { zoomControl: true, attributionControl: false }).setView(HOME_VIEW, 16);
+  // Dynamic initial view (task 2). Render IMMEDIATELY at the best synchronous source (a saved
+  // Plan viewport, else the Toftasjön fallback); fresh USV positions and browser geolocation
+  // arrive asynchronously and upgrade the view via recenterIfBetter() — without ever blocking
+  // first paint. `viewRank` is the priority of the source currently centred on (lower =
+  // stronger); a new source only recentres if it is STRICTLY stronger AND the operator has
+  // not manually panned/zoomed. All coordinates stay WGS84 — this only moves the camera.
+  let viewRank = Infinity;
+  let userInteracted = false;   // operator panned/zoomed → stop automatic recentering
+  let programmaticMove = false; // guard so our own setView is not mistaken for interaction
+  let geo = null;               // resolved browser geolocation { lat, lng }, once granted
+  let geoRequested = false;
+
+  const init0 = pickInitialView({ saved: getSavedViewport(), fallback: TOFTASJON });
+  viewRank = init0.rank;
+  const map = L.map("plan-map", { zoomControl: true, attributionControl: false }).setView(init0.center, init0.zoom);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20 }).addTo(map);
+
+  // Interaction tracking + viewport persistence. The initial setView above ran BEFORE these
+  // handlers were attached, so it does not count as interaction or persist a fallback view.
+  map.on("movestart", () => { if (!programmaticMove) userInteracted = true; });
+  map.on("moveend", () => {
+    const wasProgrammatic = programmaticMove;
+    programmaticMove = false;
+    if (!wasProgrammatic) { const c = map.getCenter(); setSavedViewport([c.lat, c.lng], map.getZoom()); }
+  });
 
   // Explicit stacking panes (task PART 3). The order guarantees the no-go RED fill/outline
   // always sits ABOVE the translucent navigable fill — so generating the route can never
@@ -401,7 +435,15 @@ export function Plan(root) {
 
     // wire
     const veh = document.getElementById("plan-veh");
-    if (veh) veh.onchange = () => { const id = veh.value ? +veh.value : null; model = { ...model, vehicleId: id }; selectVehicleSideEffects(id); renderAll(); };
+    if (veh) veh.onchange = () => {
+      const id = veh.value ? +veh.value : null;
+      model = { ...model, vehicleId: id };
+      setSelectedVehicleId(id);          // keep the shared cross-page selection in sync
+      selectVehicleSideEffects(id);
+      userInteracted = false;            // choosing a vehicle re-engages follow…
+      centerOnSelected({ explicit: false }); // …and centres on it when it has a valid position
+      renderAll();
+    };
     bind("pl-draw-boundary", () => setMode("boundary"));
     bind("pl-del-boundary", () => apply(P.setBoundary(model, null)));
     bind("pl-draw-nogo", () => { if (P.canAddZone(model)) setMode("nogo"); });
@@ -724,12 +766,84 @@ export function Plan(root) {
   function fmtLen(m) { if (m == null) return "—"; return m >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${Math.round(m)} m`; }
   function fmtDur(s) { if (s == null) return "—"; const h = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = Math.round(s % 60); return h ? `${h}h ${mm}m` : mm ? `${mm}m ${ss}s` : `${ss}s`; }
 
+  // ═══════════════ INITIAL VIEW: dynamic centering ═══════════════
+  // Recenter to the strongest currently-available source, but only when it is STRICTLY
+  // stronger than the source we are already on and the operator has not taken manual control
+  // of the camera. Async arrivals (first fleet payload, geolocation) call this; a later even
+  // stronger source (a fresh USV over a geolocation fix) can still upgrade it.
+  function recenterIfBetter() {
+    if (userInteracted) return;
+    const selected = model.vehicleId != null ? fleet.find((v) => v.id === model.vehicleId) : null;
+    const view = pickInitialView({
+      selected, fleet, selectedId: model.vehicleId, geo,
+      saved: getSavedViewport(), fallback: TOFTASJON,
+    });
+    if (view.rank < viewRank) {
+      programmaticMove = true;
+      map.setView(view.center, view.zoom, { animate: false });
+      viewRank = view.rank;
+    }
+  }
+
+  // Explicit / selection-driven centre on the selected USV. Validates the coordinate
+  // (rejecting invalid + Null Island) before moving; `explicit` toasts on a missing position
+  // and animates. Bypasses the strict-rank guard so switching between two USVs (both rank 1)
+  // still recentres, and so an explicit button press works even after manual panning.
+  function centerOnSelected({ explicit } = {}) {
+    const v = model.vehicleId != null ? fleet.find((x) => x.id === model.vehicleId) : null;
+    if (!v || !isValidLatLng(v.lat, v.lng) || isNullIsland(v.lat, v.lng)) {
+      if (explicit) showToast("No valid position for the selected USV yet.", "warn");
+      return false;
+    }
+    programmaticMove = true;
+    map.setView([v.lat, v.lng], DEFAULT_ZOOM, { animate: !!explicit });
+    viewRank = VIEW_RANK.selected;
+    return true;
+  }
+
+  // Browser geolocation (task priority 3). Non-blocking; on success stores `geo` and either
+  // runs the caller's callback or recenters if it is now the best source. Silent on denial —
+  // other sources remain, and an automatic request never nags.
+  function requestGeolocation(onOk, onErr) {
+    if (typeof navigator === "undefined" || !navigator.geolocation) { if (onErr) onErr(); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const g = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        if (!isValidLatLng(g.lat, g.lng) || isNullIsland(g.lat, g.lng)) { if (onErr) onErr(); return; }
+        geo = g;
+        if (onOk) onOk(g); else recenterIfBetter();
+      },
+      () => { if (onErr) onErr(); },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 60000 }
+    );
+  }
+
+  // Only request geolocation when no fresh USV already gives us a better view — so we do not
+  // prompt the operator for location the common case where the fleet supplies the centre.
+  function maybeRequestGeo() {
+    if (geoRequested || userInteracted) return;
+    if (viewRank <= VIEW_RANK.fleet) return;   // already centred on a USV
+    geoRequested = true;
+    requestGeolocation();
+  }
+
+  function centerOnOperator() {
+    requestGeolocation(
+      (g) => { programmaticMove = true; map.setView([g.lat, g.lng], DEFAULT_ZOOM, { animate: true }); viewRank = VIEW_RANK.geolocation; },
+      () => showToast("Could not get your location (permission denied or unavailable).", "warn")
+    );
+  }
+
   // ═══════════════ fleet poll + lifecycle ═══════════════
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
     // Refresh the vehicle <select> label + upload lifecycle without disturbing drawing.
     renderTools();
     if (model.vehicleId != null) { syncUploadFromCommands(); }
+    // Upgrade the initial view now that positions are available, then (if still needed)
+    // fall back to geolocation.
+    recenterIfBetter();
+    maybeRequestGeo();
     updateRibbon({ counts: counts() });
     updateFeed();
   }
@@ -741,13 +855,23 @@ export function Plan(root) {
     updateRibbon({ feed: ageS <= 4 ? { cls: "ok", label: "LIVE" } : ageS <= 12 ? { cls: "warn", label: `DELAYED ${Math.round(ageS)}s` } : { cls: "bad", label: `UNREACHABLE ${Math.round(ageS)}s` } });
   }
 
+  // Static map view-control buttons (wired once — not part of the re-rendered panels).
+  bind("pl-center-usv", () => centerOnSelected({ explicit: true }));
+  bind("pl-center-op", centerOnOperator);
+
   api.getCommandCapabilities().then((c) => { capabilities = c; }).catch(() => {});
   loadDrafts();
-  const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeed, "fleet");
+  // Load the adopted vehicle's command/authority context so an upload can proceed without
+  // re-selecting it in the dropdown.
+  if (model.vehicleId != null) selectVehicleSideEffects(model.vehicleId);
+  const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeed, "fleet", { pauseWhenHidden: true });
   const cmdTimer = setInterval(() => loadCommands(model.vehicleId), 3000);
   const authTimer = setInterval(() => loadAuthority(model.vehicleId), 4000);
   const clockId = setInterval(() => { updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }); }, 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
+  // Safety net: if the fleet never loads (backend down) a fresh USV view never arrives, so
+  // still offer geolocation as a better-than-fallback source after a short delay.
+  const geoTimer = setTimeout(maybeRequestGeo, 2500);
 
   // Warn before navigating away with unsaved planning changes (hash router → beforeunload
   // covers a real tab close/reload; the in-app nav is a hash change the operator initiates).
@@ -760,6 +884,7 @@ export function Plan(root) {
 
   return function cleanup() {
     stopFleet(); clearInterval(cmdTimer); clearInterval(authTimer); clearInterval(clockId);
+    clearTimeout(geoTimer);
     window.removeEventListener("beforeunload", beforeUnload);
     if (toastTimer) clearTimeout(toastTimer);
     map.remove();

@@ -16,6 +16,9 @@ import { AVAIL, availSlot } from "../lib/availability.js";
 import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
 import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
+import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
+import { createSelectedRefresh } from "../services/selected-refresh.js";
+import { MISSION_WRITE_COMMANDS } from "../lib/mission-refresh.js";
 
 const HOME = [56.699893, 13.002148];
 
@@ -107,6 +110,67 @@ export function Map(root) {
   // sendCommand's finally; the queue-derived hasPendingOfType keeps the button disabled
   // afterwards until the outstanding command reaches a terminal state.
   const sending = new Set();
+  // Mission-write commands (upload/clear/replan) whose completion we have already reacted
+  // to with a mission refetch — so a settled command sitting in history does not re-trigger
+  // a download on every command-queue poll. Keyed by command id.
+  const missionWriteHandled = new Set();
+  // Rate-limited quiet logging for automatic-refresh failures — an auto refresh must never
+  // spam the console/operator (task F). At most one log per kind per window.
+  const lastQuietLog = {};
+  function logQuiet(kind, err) {
+    const t = Date.now();
+    if (lastQuietLog[kind] && t - lastQuietLog[kind] < 15000) return;
+    lastQuietLog[kind] = t;
+    console.warn(`[map] auto-refresh ${kind} failed:`, err && err.message ? err.message : err);
+  }
+
+  // Apply a Pixhawk mission read-back into the per-vehicle cache. A reachable read replaces
+  // the displayed mission; an unreachable one only sets a note so the last-known mission is
+  // preserved (never wiped) — the same honesty rule the manual Fetch used.
+  function applyMissionRead(id, res) {
+    const s = pxmState(id);
+    if (res && res.reachable) {
+      s.mission = res; s.fetchedAt = Date.now();
+      s.note = res.available === false ? "no-api" : (res.partial ? "partial" : null);
+    } else {
+      s.note = (res && res.available === false) ? "no-api" : "unreachable";
+    }
+  }
+
+  // ONE shared controller drives the selected vehicle's automatic mission refresh: an
+  // immediate read on selection, a slow fallback safety refresh, and the command/revision
+  // triggers below. Lightweight live state (position/battery/comms/authority) stays on the
+  // existing 2 s fleet + authority/command polls — the full mission is deliberately NOT
+  // pulled on every heartbeat. The controller drops any read that resolves after the
+  // operator has moved to another USV (token guard), so a late USV-A reply never overwrites
+  // the USV-B overlay.
+  const refreshController = createSelectedRefresh({
+    fetchMission: (id) => api.getPixhawkMission(id),
+    onMission: (id, res, changed) => {
+      applyMissionRead(id, res);
+      if (id === selId) {
+        renderPxm(); renderDock();
+        if (changed && pxmState(id).shown) drawMissionOverlay(id);
+      }
+    },
+    onError: (kind, id, err) => {
+      if (kind === "mission" && id === selId) { pxmState(id).note = "error"; renderPxm(); }
+      logQuiet(kind, err);
+    },
+    intervalMs: 5000,          // cadence at which the fallback deadline is checked
+    missionFallbackMs: 20000,  // full mission re-read at most this often absent a real trigger
+  });
+
+  // The mission-revision signal for a vehicle, read off the fleet payload IF the backend
+  // surfaces one (active_revision_id / active_route_hash / mission_changed_at — see main.py's
+  // fleet-payload extension point). None exists today, so this returns undefined and the
+  // "revision" trigger stays dormant until Scout/the backend reports it — no fabricated signal.
+  function missionRevisionSignal(v) {
+    if (!v) return undefined;
+    const md = v.mission_data || {};
+    return md.active_revision_id ?? md.active_route_hash ?? md.mission_changed_at
+      ?? v.active_revision_id ?? v.route_hash ?? undefined;
+  }
 
   root.className = "app has-dock";
   root.innerHTML =
@@ -246,23 +310,24 @@ export function Map(root) {
   // Fetch the mission stored on the vehicle's Pixhawk (a live Scout proxy). A reachable
   // reply replaces the displayed mission; an unreachable one (or a thrown 404) only sets
   // a note so the last-known mission is preserved. Never called by Show/Hide.
+  // Manual Fetch — an explicit operator recovery/diagnostic action. Deliberately INDEPENDENT
+  // of the automatic controller (it bypasses the overlap guard so it always works, even mid
+  // auto-refresh) and shows the loading spinner + a clear error, unlike the quiet auto path.
+  // It still updates the shared mission tracker so the fallback timer treats the read as
+  // fresh and does not immediately duplicate it.
   async function fetchPixhawkMission(id) {
     if (id == null) return;
     const s = pxmState(id);
     s.loading = true; renderPxm();
     try {
       const res = await api.getPixhawkMission(id);
-      if (res && res.reachable) {
-        s.mission = res; s.fetchedAt = Date.now();
-        s.note = res.available === false ? "no-api" : (res.partial ? "partial" : null);
-      } else {
-        s.note = (res && res.available === false) ? "no-api" : "unreachable";
-      }
+      applyMissionRead(id, res);
+      if (res && res.reachable) refreshController.tracker.noteFetched(id, res);
     } catch (e) {
       s.note = "error";
     } finally {
       s.loading = false;
-      if (id === selId) { renderPxm(); if (s.shown) drawMissionOverlay(id); }
+      if (id === selId) { renderPxm(); renderDock(); if (s.shown) drawMissionOverlay(id); }
     }
   }
 
@@ -729,9 +794,26 @@ export function Map(root) {
       if (id === selId) {
         cmds = (d && d.commands) || [];
         syncSetHomeFromCommands();
+        detectMissionWrites(id);
         renderInspector(); renderPxm(); updateHomeMarker();
       }
     }).catch(() => { if (id === selId) { cmds = []; renderInspector(); } });
+  }
+
+  // A mission-writing command (upload / clear / replan) that has reached a terminal state
+  // means the mission stored on the vehicle may have just changed — read it back once so the
+  // overlay reflects ground truth. Each command id is reacted to only once (missionWriteHandled)
+  // so a settled command in history never re-triggers a download on the 3 s command poll.
+  function detectMissionWrites(id) {
+    let fire = false;
+    cmds.forEach((c) => {
+      if (!MISSION_WRITE_COMMANDS.has(c.type)) return;
+      if (!CMD_TERMINAL_M.has(c.status)) return;
+      if (missionWriteHandled.has(c.id)) return;
+      missionWriteHandled.add(c.id);
+      fire = true;
+    });
+    if (fire) refreshController.refreshMission(id, "command");
   }
 
   // Resolve the in-flight Set-Home command's queue lifecycle (QUEUED → SENT → EXECUTED/
@@ -1153,6 +1235,12 @@ export function Map(root) {
       selId = id; commsHist = null; loadCommsHistory(id);
       authCtl.reset(); loadAuthority(id);
       cmds = []; loadCommands(id);
+      // Share the selection so the Plan page (and any other page) follows the operator to
+      // this vehicle, and hand the id to the refresh controller — which immediately reads
+      // the latest telemetry-adjacent mission overlay and ignores any late reply from the
+      // vehicle we just switched away from.
+      setSelectedVehicleId(id);
+      refreshController.select(id);
       // Set-Home phase is per-vehicle — never carry a pending/failed flash (or a
       // tracked command id) across a switch.
       if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
@@ -1176,17 +1264,28 @@ export function Map(root) {
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
     if (selId == null && fleet.length) {
-      selId = defaultSelection();
-      loadCommsHistory(selId); loadAuthority(selId); loadCommands(selId);
+      // First fleet payload: adopt the shared selection if it still names a real vehicle,
+      // else fall back to a reporting vehicle. Routing through select() gives the controller
+      // the immediate mission read too.
+      select(resolveInitialSelection());
+    } else if (selId != null) {
+      // Mission-revision auto-refresh: when the fleet feed reports a changed mission-revision
+      // signal for the SELECTED vehicle, the controller refetches the full mission (and skips
+      // it when the signal is unchanged). Dormant until the backend surfaces such a field —
+      // see missionRevisionSignal / main.py's fleet-payload extension point.
+      const sig = missionRevisionSignal(fleet.find((x) => x.id === selId));
+      if (sig !== undefined) refreshController.refreshMission(selId, "revision", { revisionSignal: sig });
     }
-    // FUTURE EXTENSION POINT (mission-revision auto-refresh): every fleet poll lands here
-    // with the latest per-vehicle payload. When the backend starts surfacing a revision
-    // signal (active_revision_id / mission_changed_at — see main.py normalize_agent_message),
-    // detect a change for the SELECTED vehicle here and call fetchPixhawkMission(selId) — the
-    // existing, self-contained overlay refresh (it clears and redraws, never duplicates). No
-    // new transport is needed; deliberately NOT wired yet.
     updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
     updateRibbon({ counts: counts() });
+  }
+
+  // Prefer the shared cross-page selection when it still names a vehicle in the current
+  // fleet; otherwise pick a vehicle that is actually reporting.
+  function resolveInitialSelection() {
+    const shared = getSelectedVehicleId();
+    if (shared != null && fleet.some((v) => v.id === shared)) return shared;
+    return defaultSelection();
   }
   function onEnv(e) {
     env = e || {};
@@ -1214,8 +1313,17 @@ export function Map(root) {
   function updateFeedIndicator() { updateRibbon({ feed: feedIndicator() }); }
 
   // polling + clock
-  const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeedIndicator, "fleet");
-  const stopEnv = api.poll(api.getEnvironment, 10000, onEnv, () => {});
+  // The fleet feed is the lightweight selected-vehicle refresh (position/battery/comms/mode
+  // for the whole roster in one call). It pauses while the tab is hidden — a backgrounded
+  // operator tab stops polling the backend/Scout and resumes on the next visible tick.
+  const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeedIndicator, "fleet", { pauseWhenHidden: true });
+  const stopEnv = api.poll(api.getEnvironment, 10000, onEnv, () => {}, null, { pauseWhenHidden: true });
+  // Start the shared mission-refresh controller (fallback safety re-read + command/revision
+  // triggers; the immediate read fires from select()).
+  refreshController.start();
+  // Resume promptly when the tab is refocused rather than waiting for the next interval.
+  const onVisible = () => { if (!document.hidden) refreshController.tick(); };
+  document.addEventListener("visibilitychange", onVisible);
   timers.push(setInterval(() => loadCommsHistory(selId), 3000));  // refresh selected vehicle's comms log
   timers.push(setInterval(() => loadAuthority(selId), 2000));  // refresh selected vehicle's control authority
   timers.push(setInterval(() => loadCommands(selId), 3000));  // refresh selected vehicle's command lifecycle
@@ -1234,6 +1342,8 @@ export function Map(root) {
 
   return function cleanup() {
     stopFleet(); stopEnv(); clearInterval(clockId); timers.forEach(clearInterval);
+    refreshController.stop();
+    document.removeEventListener("visibilitychange", onVisible);
     if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
     authCtl.dispose();
     clearMissionOverlay();

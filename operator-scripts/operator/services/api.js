@@ -319,12 +319,20 @@ export function stopNetworkExperiment() { return delJSON("/api/experiment/networ
 
 /** Small polling helper so pages don't each reinvent setInterval + error handling.
  *  `key` is optional — pass one (e.g. "fleet") to make this feed's health readable
- *  via getFeedHealth() for an operator-facing freshness indicator. */
-export function poll(fn, ms, onData, onError, key) {
+ *  via getFeedHealth() for an operator-facing freshness indicator.
+ *
+ *  `opts.pauseWhenHidden` (default false): while the browser tab is hidden, skip the
+ *  network call for that cycle (the feed keeps its timer but does no work) and reschedule
+ *  a short recheck — so a backgrounded operator tab stops hammering the backend/Scout, and
+ *  resumes the instant it is foregrounded. `opts.isHidden` is injectable for tests. */
+export function poll(fn, ms, onData, onError, key, opts = {}) {
   let stopped = false;
+  const pauseWhenHidden = !!opts.pauseWhenHidden;
+  const isHidden = opts.isHidden || (() => typeof document !== "undefined" && document.hidden);
   if (key && !feedHealth.has(key)) feedHealth.set(key, { lastOkAt: null, lastErrAt: null, consecutiveErrors: 0 });
   async function tick() {
     if (stopped) return;
+    if (pauseWhenHidden && isHidden()) { setTimeout(tick, Math.min(ms, 1000)); return; }
     try {
       const data = await fn();
       if (key) { const h = feedHealth.get(key); h.lastOkAt = Date.now(); h.consecutiveErrors = 0; }
