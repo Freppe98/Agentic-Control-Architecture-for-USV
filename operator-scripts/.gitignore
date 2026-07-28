@@ -12,6 +12,10 @@ node_modules/
 # port/host); the committed template is .env.example
 .env
 
+# Runtime artifacts from hidden launcher
+.operator.pid
+logs/
+
 # Python bytecode / caches
 __pycache__/
 *.pyc

@@ -71,6 +71,31 @@ http://localhost:8210/app
 
 The run script also prints the computer’s network addresses so the Operator Station can be reached from other devices.
 
+#### Everyday use (after installation)
+
+If the installer created Desktop icons, use them to launch and stop the backend:
+- **Operator Station** icon: starts the backend silently in the background and opens the browser to the dashboard.
+- **Stop Operator Station** icon: cleanly shuts down the backend.
+
+The desktop icons are optional — `.\run_operator_backend.ps1` remains available if you prefer to run the backend in a visible foreground window (useful for monitoring live logs).
+
+To recreate the desktop icons after updating the scripts, run:
+
+```powershell
+.\install_operator.ps1 -CreateShortcut
+```
+
+#### Updating the Operator Station
+
+After `git pull`:
+
+- **Frontend changes** (`operator/` HTML/CSS/JS) appear immediately on the next browser refresh (no server restart needed).
+- **Backend changes** (`main.py`, `mission_contract.py`, `planning.py`, or `requirements.txt`) require stopping and restarting the server:
+  1. Click **Stop Operator Station** (or Ctrl+C if running in foreground).
+  2. Run `git pull`.
+  3. If `requirements.txt` changed, run `.\install_operator.ps1` to update dependencies.
+  4. Click **Operator Station** to restart (or `.\run_operator_backend.ps1` if running in foreground).
+
 ### Reinstalling Dependencies
 
 After pulling dependency changes, rerun:

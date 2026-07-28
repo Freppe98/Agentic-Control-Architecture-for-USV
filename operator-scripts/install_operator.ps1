@@ -25,7 +25,9 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$CreateShortcut,
+    [switch]$SkipShortcut
 )
 
 # 'Continue', not 'Stop': the installer drives native commands (python, pip, npm, the
@@ -216,12 +218,67 @@ if ($SkipTests) {
     Write-Ok "frontend tests passed"
 }
 
+# --- 8. Desktop shortcuts (optional) -----------------------------------------------
+Write-Step "Desktop shortcuts"
+
+$ShouldCreateShortcuts = $CreateShortcut
+
+if (-not $ShouldCreateShortcuts -and -not $SkipShortcut) {
+    # Interactive prompt: default Yes on empty input.
+    try {
+        $response = Read-Host "    Create 'Operator Station' / 'Stop Operator Station' icons on the Desktop? [Y/n]"
+        if ($response -eq '' -or $response -match '^y|Y') {
+            $ShouldCreateShortcuts = $true
+        }
+    } catch {
+        # Read-Host throws when no console is attached (e.g., test suite invokes us via subprocess).
+        # Treat this as a skip so headless/CI invocations don't hang.
+        Write-Info "No interactive console (skipping shortcut creation; re-run with -CreateShortcut to create them)."
+        $ShouldCreateShortcuts = $false
+    }
+}
+
+if ($ShouldCreateShortcuts) {
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $desktop = [Environment]::GetFolderPath('Desktop')
+
+        # Start Operator Station.lnk
+        $startLink = $shell.CreateShortcut((Join-Path $desktop "Operator Station.lnk"))
+        $startVbs = Join-Path $Root "Start Operator Station.vbs"
+        $startLink.TargetPath = $startVbs
+        $startLink.WorkingDirectory = $Root
+        $startLink.Description = "Start the Operator Station backend and open the dashboard"
+        $startLink.Save()
+
+        # Stop Operator Station.lnk
+        $stopLink = $shell.CreateShortcut((Join-Path $desktop "Stop Operator Station.lnk"))
+        $stopVbs = Join-Path $Root "Stop Operator Station.vbs"
+        $stopLink.TargetPath = $stopVbs
+        $stopLink.WorkingDirectory = $Root
+        $stopLink.Description = "Stop the Operator Station backend"
+        $stopLink.Save()
+
+        Write-Ok "Desktop shortcuts created at: $desktop"
+    } catch {
+        Write-Warn "Failed to create desktop shortcuts: $_"
+        Write-Info "You can create them manually later by running: .\install_operator.ps1 -CreateShortcut"
+    }
+} else {
+    Write-Info "Shortcuts skipped. To create them later, run:  .\install_operator.ps1 -CreateShortcut"
+}
+
 # --- done --------------------------------------------------------------------------
 Write-Host ""
 Write-Host "Install complete." -ForegroundColor Green
-Write-Host "Launch the Operator Station with:" -ForegroundColor White
-Write-Host ""
-Write-Host "    .\run_operator_backend.ps1" -ForegroundColor Cyan
-Write-Host ""
-Write-Info "Then open the UI at  http://127.0.0.1:8210/app/"
+Write-Host "Next steps:" -ForegroundColor White
+if ($ShouldCreateShortcuts) {
+    Write-Host "  1. Use the 'Operator Station' icon on your Desktop to launch the backend" -ForegroundColor DarkGray
+} else {
+    Write-Host "  1. Run this command to create Desktop icons:" -ForegroundColor DarkGray
+    Write-Host "     .\install_operator.ps1 -CreateShortcut" -ForegroundColor Cyan
+    Write-Host "     Or launch manually with:" -ForegroundColor DarkGray
+}
+Write-Host "  2. Or use the command:  .\run_operator_backend.ps1" -ForegroundColor Cyan
+Write-Host "  3. Open the UI at:  http://127.0.0.1:8210/app/" -ForegroundColor Cyan
 exit 0

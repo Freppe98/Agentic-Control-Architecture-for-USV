@@ -19,6 +19,8 @@ from pathlib import Path
 OP_DIR = Path(__file__).resolve().parent.parent
 INSTALL_PS1 = OP_DIR / "install_operator.ps1"
 RUN_PS1 = OP_DIR / "run_operator_backend.ps1"
+START_HIDDEN_PS1 = OP_DIR / "start_operator_hidden.ps1"
+STOP_HIDDEN_PS1 = OP_DIR / "stop_operator_hidden.ps1"
 REQUIREMENTS = OP_DIR / "requirements.txt"
 ENV_EXAMPLE = OP_DIR / ".env.example"
 GITIGNORE = OP_DIR / ".gitignore"
@@ -55,7 +57,7 @@ class PowerShellSyntaxTests(unittest.TestCase):
             "$env:PS_TARGET, [ref]$null, [ref]$errs) | Out-Null; "
             "if ($errs) { $errs | ForEach-Object { $_.Message }; exit 1 } else { exit 0 }"
         )
-        for script in (INSTALL_PS1, RUN_PS1):
+        for script in (INSTALL_PS1, RUN_PS1, START_HIDDEN_PS1, STOP_HIDDEN_PS1):
             with self.subTest(script=script.name):
                 rc, out, err = _run_powershell(parse, env={"PS_TARGET": str(script)})
                 self.assertEqual(rc, 0, f"{script.name} has PowerShell parse errors:\n{out}\n{err}")
@@ -86,6 +88,18 @@ class InstallerContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = INSTALL_PS1.read_text(encoding="utf-8")
+
+    def test_has_shortcut_switches(self):
+        # -CreateShortcut and -SkipShortcut must be present for scriptable control.
+        self.assertRegex(self.text, r"\[switch\]\s*\$CreateShortcut")
+        self.assertRegex(self.text, r"\[switch\]\s*\$SkipShortcut")
+
+    def test_interactive_shortcut_prompt_with_safety(self):
+        # The shortcut step must have an interactive prompt (Read-Host) wrapped in
+        # try/catch so non-interactive/CI invocations don't hang.
+        self.assertIn("Read-Host", self.text)
+        self.assertIn("try", self.text)
+        self.assertIn("catch", self.text)
 
     def test_uses_psscriptroot(self):
         self.assertIn("$PSScriptRoot", self.text)
@@ -222,7 +236,7 @@ class GitignoreTests(unittest.TestCase):
             for ln in GITIGNORE.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.strip().startswith("#")
         }
-        for required in (".venv/", "node_modules/", ".env", "__pycache__/", "*.pyc", ".pytest_cache/"):
+        for required in (".venv/", "node_modules/", ".env", "__pycache__/", "*.pyc", ".pytest_cache/", ".operator.pid", "logs/"):
             self.assertIn(required, entries, f"{required} missing from .gitignore")
 
 
@@ -249,6 +263,28 @@ class VenvImportTests(unittest.TestCase):
                     "fastapi", "uvicorn", "requests", "httpx"):
             with self.subTest(module=mod):
                 importlib.import_module(mod)
+
+
+class HiddenLauncherScriptTests(unittest.TestCase):
+    """Static guarantees about start_operator_hidden.ps1 and stop_operator_hidden.ps1."""
+
+    def test_start_hidden_script_has_required_functions(self):
+        text = START_HIDDEN_PS1.read_text(encoding="utf-8")
+        # Must have helpers for MessageBox and server-ready tests.
+        self.assertIn("Show-MessageBox", text)
+        self.assertIn("Test-ServerReady", text)
+        # Must guard the venv.
+        self.assertIn(".venv\\Scripts\\python.exe", text)
+        # Must use .operator.pid for the PID file.
+        self.assertIn(".operator.pid", text)
+
+    def test_stop_hidden_script_has_required_functions(self):
+        text = STOP_HIDDEN_PS1.read_text(encoding="utf-8")
+        # Must have MessageBox helper.
+        self.assertIn("Show-MessageBox", text)
+        # Must read and kill using the PID file.
+        self.assertIn(".operator.pid", text)
+        self.assertIn("taskkill", text)
 
 
 if __name__ == "__main__":
