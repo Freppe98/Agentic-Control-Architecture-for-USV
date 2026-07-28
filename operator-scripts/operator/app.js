@@ -13,6 +13,7 @@ import { Pilot } from "./pages/Pilot.js";
 import { Terminal } from "./pages/Terminal.js";
 import { Experiment } from "./pages/Experiment.js";
 import { Stub } from "./pages/Stub.js";
+import { mountTour, openTour, tourSeen } from "./lib/tour.js";
 
 const routes = { map: Map, fleet: Fleet, plan: Plan, vehicle: Vehicle, mission: Mission, autonomy: Agent, events: Events, experiment: Experiment, config: Config, pilot: Pilot, terminal: Terminal };
 const root = document.getElementById("app");
@@ -30,5 +31,20 @@ function navFrom(target) { return target.closest && target.closest(".nav[data-ro
 document.addEventListener("click", (e) => { const n = navFrom(e.target); if (n) location.hash = "#/" + n.dataset.route; });
 document.addEventListener("keydown", (e) => { if (e.key === "Enter") { const n = navFrom(e.target); if (n) location.hash = "#/" + n.dataset.route; } });
 
+// guide button (bottom of the rail) → the tour overlay, not a route. It lives inside
+// #app, which every page rebuilds, so this is delegated like the nav handlers above.
+function helpFrom(target) { return target.closest && target.closest("[data-tour-open]"); }
+document.addEventListener("click", (e) => { if (helpFrom(e.target)) openTour(0); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  if (helpFrom(e.target)) { e.preventDefault(); openTour(0); }
+});
+
 window.addEventListener("hashchange", render);
 render();
+
+// The overlay lives on <body>, outside #app, so a page re-render never wipes it.
+mountTour();
+// First run only: auto-open once, then remembered in this browser (lib/tour.js).
+// Delayed so the first page has laid out and the spotlight anchors to a real rect.
+if (!tourSeen()) setTimeout(() => openTour(0), 700);

@@ -1,6 +1,10 @@
-// Ribbon(opts) — global top bar: mission scope, status, search, fleet summary,
+// Ribbon(opts) — global top bar: mission scope, status, search, guide, fleet summary,
 // bell, mission clock. Dynamic bits carry ids so the page updates them in place
 // (updateRibbon) rather than re-rendering the whole bar every second.
+//
+// The Guide button opens the guided tour (lib/tour.js). It sits here rather than in
+// the nav rail so it never eats vertical space the frozen NAV list needs, and it
+// carries data-tour-open — app.js delegates off that, since it is not a route.
 //
 // NOTE (backend mismatch): a named "mission scope" and mission status are not in
 // the backend yet (no mission registry). We show an honest live-fleet label and
@@ -31,6 +35,12 @@ export function Ribbon({ missionLabel = "Live fleet", missionStatusKnown = false
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
         <span>Search vehicles, pages, systems…</span>
       </div>
+    </div>
+    <div class="rib-seg">
+      <button class="rib-help" data-tour-open type="button" title="Open the guided introduction to this station">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.4 9.2a2.7 2.7 0 0 1 5.2.9c0 1.8-2.6 2.2-2.6 4"/><path d="M12 17.2h.01"/></svg>
+        <span>Guide</span>
+      </button>
     </div>
     <div class="rib-seg">
       <div class="fleet-sum">
