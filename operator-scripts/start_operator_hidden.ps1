@@ -76,22 +76,37 @@ Please run the installer first:
 # --- 3. Start the backend in a hidden child process ----
 $RunScript = Join-Path $PSScriptRoot 'run_operator_backend.ps1'
 $LogDir = Join-Path $PSScriptRoot 'logs'
-$LogFile = Join-Path $LogDir 'operator.log'
+# Start-Process rejects the same path for both streams, so stdout and stderr go to
+# separate files. uvicorn logs to stderr, so operator.err.log is the interesting one.
+$OutLogFile = Join-Path $LogDir 'operator.log'
+$ErrLogFile = Join-Path $LogDir 'operator.err.log'
 $PidFile = Join-Path $PSScriptRoot '.operator.pid'
 
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
-$proc = Start-Process powershell.exe `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunScript) `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $LogFile `
-    -RedirectStandardError $LogFile `
-    -PassThru
+try {
+    $proc = Start-Process powershell.exe `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$RunScript`"") `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $OutLogFile `
+        -RedirectStandardError $ErrLogFile `
+        -PassThru `
+        -ErrorAction Stop
+} catch {
+    $proc = $null
+    $startError = $_.Exception.Message
+}
 
 if ($null -eq $proc -or $proc.Id -le 0) {
-    Show-MessageBox "Startup Failed" "Could not start the Operator Station backend. Check $LogFile for details."
+    Show-MessageBox "Startup Failed" @"
+Could not start the Operator Station backend.
+
+$startError
+
+Logs: $LogDir
+"@
     exit 1
 }
 
@@ -116,6 +131,7 @@ Show-MessageBox "Startup Timeout" @"
 The Operator Station backend did not become ready within 20 seconds.
 
 Check the logs:
-  $LogFile
+  $ErrLogFile
+  $OutLogFile
 "@
 exit 1

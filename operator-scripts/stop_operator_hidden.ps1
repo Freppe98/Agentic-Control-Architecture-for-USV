@@ -32,12 +32,13 @@ if (-not $pidContent -or -not ($pidContent -match '^\d+$')) {
     exit 1
 }
 
-$pid = [int]$pidContent
+# Note: NOT $pid - that's a read-only PowerShell automatic variable.
+$BackendPid = [int]$pidContent
 
 # --- Check if the process is still alive ----
-$proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+$proc = Get-Process -Id $BackendPid -ErrorAction SilentlyContinue
 if ($null -eq $proc) {
-    Show-MessageBox "Already Stopped" "The Operator Station backend is not running (process $pid not found)."
+    Show-MessageBox "Already Stopped" "The Operator Station backend is not running (process $BackendPid not found)."
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
     exit 0
 }
@@ -45,7 +46,7 @@ if ($null -eq $proc) {
 # --- Kill the process tree ----
 # /T kills the tree (this powershell.exe and its child python.exe);
 # /F forces termination (equivalent to -Force in PowerShell).
-taskkill /PID $pid /T /F 2>&1 | Out-Null
+taskkill /PID $BackendPid /T /F 2>&1 | Out-Null
 
 # Wait a moment for the kill to complete.
 Start-Sleep -Milliseconds 500

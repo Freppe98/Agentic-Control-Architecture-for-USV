@@ -242,6 +242,7 @@ if ($ShouldCreateShortcuts) {
     try {
         $shell = New-Object -ComObject WScript.Shell
         $desktop = [Environment]::GetFolderPath('Desktop')
+        $IconFile = Join-Path $Root "assets\operator_station.ico"
 
         # Start Operator Station.lnk
         $startLink = $shell.CreateShortcut((Join-Path $desktop "Operator Station.lnk"))
@@ -249,6 +250,7 @@ if ($ShouldCreateShortcuts) {
         $startLink.TargetPath = $startVbs
         $startLink.WorkingDirectory = $Root
         $startLink.Description = "Start the Operator Station backend and open the dashboard"
+        if (Test-Path $IconFile) { $startLink.IconLocation = "$IconFile,0" }
         $startLink.Save()
 
         # Stop Operator Station.lnk
@@ -257,6 +259,7 @@ if ($ShouldCreateShortcuts) {
         $stopLink.TargetPath = $stopVbs
         $stopLink.WorkingDirectory = $Root
         $stopLink.Description = "Stop the Operator Station backend"
+        if (Test-Path $IconFile) { $stopLink.IconLocation = "$IconFile,0" }
         $stopLink.Save()
 
         Write-Ok "Desktop shortcuts created at: $desktop"
