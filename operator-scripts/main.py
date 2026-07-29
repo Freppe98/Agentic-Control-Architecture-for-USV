@@ -32,8 +32,11 @@ STALE_AFTER_SECONDS = 8
 PARTITIONED_AFTER_SECONDS = 15
 DISCONNECTED_AFTER_SECONDS = 30
 
-latest_agent_status = {}
-latest_agent_received_at = None
+# Per-vehicle latest status (NOT a single shared "most recent overall" — with more than
+# one vehicle reporting, whichever posted last would silently overwrite every other
+# vehicle's live view on every request). Keyed by vehicle id, same as last_seen_by_id etc.
+latest_agent_status_by_id = {}       # {vehicle_id: raw incoming message}
+latest_agent_received_at_by_id = {}  # {vehicle_id: iso timestamp string}
 
 # Newest accepted message send-time per vehicle (epoch seconds). Enforces monotonic
 # current-state updates: a replayed/buffered packet whose own timestamp is older than
@@ -79,6 +82,7 @@ last_authority_by_id = {}        # {vehicle_id: last event-recorded effective au
 # only vehicles with a real, reachable Scout Flask instance belong here.
 SCOUT_API_BASE = {
     2: "http://10.0.2.10:8080",  # Scout — motherpi Flask API
+    3: "http://10.0.3.10:8080",  # SAR-001 — same Flask API, over its own VPN peer
 }
 
 
@@ -138,7 +142,7 @@ FLEET_TEMPLATE = [
     },
     {
         "id": 3,
-        "name": "USV-3",
+        "name": "SAR-001",
         "online": False,
         "status": "UNKNOWN",
         "battery": None,
@@ -365,7 +369,7 @@ def normalize_agent_message(message: dict) -> dict:
         t = datetime.fromisoformat(iso_time)
         return (datetime.now(timezone.utc) - t).total_seconds()
 
-    age = age_seconds(latest_agent_received_at)
+    age = age_seconds(latest_agent_received_at_by_id.get(usv_id))
     if age is None:
         online = False
         comm_state = "UNKNOWN"
@@ -453,7 +457,7 @@ def normalize_agent_message(message: dict) -> dict:
         },
         "telemetry": telemetry,
         "raw": message,
-        "last_seen": latest_agent_received_at,
+        "last_seen": latest_agent_received_at_by_id.get(usv_id),
     }
 
 
@@ -3054,7 +3058,7 @@ def vehicle_commands(vehicle_id: str):
 
 @app.post("/agent/status")
 async def receive_agent_status(request: Request):
-    global latest_agent_status, latest_agent_received_at
+    global latest_agent_status_by_id, latest_agent_received_at_by_id
 
     incoming = await request.json()
     now = datetime.now(timezone.utc)
@@ -3068,7 +3072,7 @@ async def receive_agent_status(request: Request):
     stale = msg_ts is not None and prev_ts is not None and msg_ts < prev_ts
 
     if not stale:
-        latest_agent_status = incoming
+        latest_agent_status_by_id[vid] = incoming
         if msg_ts is not None:
             latest_msg_ts_by_id[vid] = msg_ts
         name = extract_name(incoming)
@@ -3096,7 +3100,7 @@ async def receive_agent_status(request: Request):
     # reaches us (even a replayed one) proves the operator link is carrying data now,
     # so refresh last-seen / received-at and log CONNECTED. Buffered events are still
     # ingested as history (deduped) regardless of the snapshot guard.
-    latest_agent_received_at = now.isoformat()
+    latest_agent_received_at_by_id[vid] = now.isoformat()
     last_seen_by_id[vid] = now
     record_comms_state(vid, "CONNECTED", now, 0.0)
     ingest_payload_events(vid, incoming, now)
@@ -3117,15 +3121,17 @@ async def receive_agent_status(request: Request):
         "ok": True,
         "message": "status received",
         "stale": stale,
-        "received_at": latest_agent_received_at,
+        "received_at": latest_agent_received_at_by_id.get(vid),
     }
 
 
 @app.get("/agent/status")
 def get_agent_status():
+    """Raw latest envelope per vehicle (debug / Messages page) — not a single shared
+    "most recent overall" value, since that would only ever show one vehicle at a time."""
     return {
-        "latest_status": latest_agent_status,
-        "received_at": latest_agent_received_at,
+        "latest_status_by_id": latest_agent_status_by_id,
+        "received_at_by_id": latest_agent_received_at_by_id,
     }
 
 
@@ -3133,8 +3139,13 @@ def get_agent_status():
 def fleet_status():
     fleet = [dict(usv) for usv in FLEET_TEMPLATE]
 
-    if latest_agent_status:
-        live_usv = normalize_agent_message(latest_agent_status)
+    # Overlay EVERY vehicle that has ever reported — not just whichever one posted most
+    # recently. With more than one vehicle live, using a single "latest overall" message
+    # here meant only one vehicle's real status was ever visible at a time; every other
+    # vehicle silently fell back to the static template regardless of it actually being
+    # connected and reporting fine.
+    for raw_message in latest_agent_status_by_id.values():
+        live_usv = normalize_agent_message(raw_message)
 
         replaced = False
         for i, usv in enumerate(fleet):

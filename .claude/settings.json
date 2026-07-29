@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://127.0.0.1:8210/api/fleet/status)",
+      "Bash(python -c ' *)",
+      "Bash(curl -s http://127.0.0.1:8210/agent/status)"
+    ]
+  }
+}
