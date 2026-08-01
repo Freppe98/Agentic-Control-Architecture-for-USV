@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-SCOUT_VID = 2  # the only vehicle with a Scout API base configured (SCOUT_API_BASE)
+SCOUT_VID = 2  # Scout's canonical id; its route lives in VEHICLE_API_BASE (SAR-001 is 3)
 
 # A fully successful Scout Set Home result, per the real contract.
 SUCCESS_RESULT = {

@@ -22,7 +22,7 @@ only the form, and the page never imports `lib/authority.js` / `lib/home.js` or 
   without a DOM.
 - **Real (backend, done — Stage 1):** `GET/POST/DELETE /api/experiment/network` are now
   implemented in `main.py` as a thin proxy to Scout's experiment controller
-  (`{SCOUT_API_BASE[vid]}/agent/experiment/network`), the same configurable per-vehicle map
+  (`{VEHICLE_API_BASE[vid]}/agent/experiment/network`), the same configurable per-vehicle map
   `control_authority` / `pixhawk_mission` use. The browser never runs `tc`/firewall/shell — it
   posts a structured profile and the backend forwards a normalized request to Scout, returning
   ONLY Scout-confirmed state. See "Backend orchestration (Stage 1)" below. Pinned by
@@ -37,12 +37,21 @@ only the form, and the page never imports `lib/authority.js` / `lib/home.js` or 
 
 Implemented in `main.py` (search `Network-impairment experiment (Stage 1)`).
 
-- **Vehicle → Scout URL resolution.** `scout_api_base(vid)` → `SCOUT_API_BASE[vid]`. For Scout
-  (vehicle **2**) that is `http://10.0.2.10:8080`, so requests go to
-  `http://10.0.2.10:8080/agent/experiment/network`. No address is hard-coded in the frontend.
-  The no-id `GET`/`DELETE` the browser issues resolve to the **last-targeted** vehicle (a `POST`
-  or `DELETE` sets it; default is the single configured Scout vehicle). `GET`/`DELETE` also
-  accept an explicit `?vehicle_id=`.
+- **Vehicle → vehicle-local URL resolution.** `vehicle_api_base(vid)` → `VEHICLE_API_BASE[vid]`,
+  looked up by **canonical id**, so `3` / `"3"` / `"usv-3"` / `"USV-3"` / `"SAR-001"` all resolve
+  to one entry. For Scout (vehicle **2**) that is `http://10.0.2.10:8080` and for SAR-001
+  (vehicle **3**) `http://10.0.3.10:8080`, so requests go to `{base}/agent/experiment/network`.
+  No address is hard-coded in the frontend.
+  `GET`/`DELETE` accept an explicit `?vehicle_id=` in any of those spellings; the **no-id**
+  `GET`/`DELETE` the browser issues resolve to the **last-targeted** vehicle (a `POST` or
+  `DELETE` sets it; before any of those, the first configured route — Scout). A `vehicle_id`
+  that IS supplied but names no vehicle is answered `available:false` and **never** falls back
+  to the default: with two routable USVs, silently redirecting would impair the wrong vehicle.
+- **Known limitation.** `Experiment.js` sends `vehicle_id` on `POST` (from its fleet dropdown)
+  but not on `GET`/`DELETE`, so polling and **Stop** follow the last-targeted vehicle rather
+  than the dropdown. Harmless while only one experiment runs at a time, but pressing Stop
+  before ever applying targets the default vehicle — pass `?vehicle_id=` explicitly if that
+  matters. Not changed here (this pass adds routing, and impairment commands were not exercised).
 - **experiment_id is backend-owned.** Every accepted `POST` generates a fresh UUID and injects
   it into the forwarded payload; the browser neither sends nor owns one.
 - **Never optimistic.** `active` in every response comes from Scout's own confirmed flag. A

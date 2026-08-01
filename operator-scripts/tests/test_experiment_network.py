@@ -3,12 +3,12 @@
 Run from operator-scripts/:  python -m unittest tests.test_experiment_network  (no pytest).
 
 The Operator backend is a THIN PROXY to Scout's experiment controller
-(GET/POST/DELETE {SCOUT_API_BASE[vid]}/agent/experiment/network). These tests mock every
+(GET/POST/DELETE {VEHICLE_API_BASE[vid]}/agent/experiment/network). These tests mock every
 Scout HTTP call by swapping `main.requests` for a recording fake — NOTHING here runs tc or
 touches real networking. They pin the contract the frontend depends on:
 
   • a valid Stage-1 request is normalized and forwarded, with a BACKEND-generated experiment_id;
-  • vehicle_id maps to the correct Scout base URL (the SCOUT_API_BASE map, not a hard-coded addr);
+  • vehicle_id maps to the correct Scout base URL (the VEHICLE_API_BASE map, not a hard-coded addr);
   • Scout-confirmed active state passes through, and the backend NEVER fabricates active=true;
   • unsupported direction / bandwidth / duplication / reordering / full_disconnect are rejected
     in Stage 1 with a clear 400 (never a generic 500);
@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-SCOUT_VID = 2  # the only vehicle with a Scout API base configured (SCOUT_API_BASE)
+SCOUT_VID = 2  # Scout's canonical id; its route lives in VEHICLE_API_BASE (SAR-001 is 3)
 
 
 class FakeResp:
@@ -115,11 +115,11 @@ class TestApply(ExperimentTestBase):
         self.scout.post_resp = scout_active()
         r = self.client.post("/api/experiment/network", json=VALID_BODY)
         self.assertEqual(r.status_code, 200)
-        # exactly one POST, to the correct Scout base URL derived from SCOUT_API_BASE
+        # exactly one POST, to the correct Scout base URL derived from VEHICLE_API_BASE
         posts = [c for c in self.scout.calls if c[0] == "POST"]
         self.assertEqual(len(posts), 1)
         method, url, kw = posts[0]
-        self.assertEqual(url, f"{main.SCOUT_API_BASE[SCOUT_VID]}/agent/experiment/network")
+        self.assertEqual(url, f"{main.VEHICLE_API_BASE[SCOUT_VID]}/agent/experiment/network")
         sent = kw["json"]
         # backend generated a UUID experiment_id; the browser sent none
         self.assertIn("experiment_id", sent)
@@ -135,7 +135,7 @@ class TestApply(ExperimentTestBase):
         self.scout.post_resp = scout_active()
         self.client.post("/api/experiment/network", json=VALID_BODY)
         url = [c for c in self.scout.calls if c[0] == "POST"][0][1]
-        self.assertTrue(url.startswith(main.SCOUT_API_BASE[SCOUT_VID]))
+        self.assertTrue(url.startswith(main.VEHICLE_API_BASE[SCOUT_VID]))
         self.assertIn(":8080", url)  # Scout Flask default port
 
     def test_scout_confirmed_active_passes_through(self):
@@ -298,7 +298,7 @@ class TestDelete(ExperimentTestBase):
         self.assertIn("stopped_manually", self.actions())
         # the DELETE went to the right Scout URL
         dels = [c for c in self.scout.calls if c[0] == "DELETE"]
-        self.assertEqual(dels[0][1], f"{main.SCOUT_API_BASE[SCOUT_VID]}/agent/experiment/network")
+        self.assertEqual(dels[0][1], f"{main.VEHICLE_API_BASE[SCOUT_VID]}/agent/experiment/network")
 
     def test_repeated_delete_is_harmless(self):
         self.scout.delete_resp = FakeResp({"active": False})

@@ -259,14 +259,64 @@ A vehicle that reports an id not in the file is still accepted and appears as a 
 fleet member (slug `usv-4`, or e.g. `probe-alpha` for a non-numeric id). Configure it when you
 want a stable display name before first contact, or a callsign alias.
 
+That gives **monitoring only.** A registry entry is enough for live telemetry because the
+vehicle *pushes* it to us (`POST /agent/status`), which needs no address at all. It grants no
+outbound reach: control authority, Pixhawk mission read-back and experiment control require a
+second, independent thing — a **verified** route in `VEHICLE_API_BASE` (`main.py`). Do not
+claim a vehicle is commandable merely because it appears in `vehicles.json`.
+
+### The two maps, side by side
+
+| | `vehicles.json` / `REGISTRY` | `VEHICLE_API_BASE` (`main.py`) |
+|---|---|---|
+| Answers | *who exists*, how their packets resolve, what operators call them | *where we reach them* for vehicle-local API calls |
+| Direction | inbound — the vehicle **pushes** telemetry to us | outbound — this station **pulls from / posts to** the vehicle |
+| Needs an address | no | yes, a real **verified** one |
+| Enables | fleet presence, selection, telemetry, comms state, the command **queue** | control authority read/write, Pixhawk mission read-back, experiment control |
+| Missing entry means | vehicle is unknown / not pre-registered | endpoints answer an honest `available:false` (a supported state) |
+
+Both halves are needed for a fully functional vehicle. Keys are canonical ids, so `3`, `"3"`,
+`"usv-3"`, `"USV-3"` and the configured alias `"SAR-001"` all resolve to the same row; the
+display name is never a routing or storage key.
+
+### Verified routes
+
+| Vehicle | Canonical id | Route | Status |
+|---|---|---|---|
+| Scout | `2` | `http://10.0.2.10:8080` | verified over WireGuard |
+| SAR-001 | `3` | `http://10.0.3.10:8080` | verified over WireGuard from both ends |
+| USV-1 | `1` | — | registered, monitored, no address |
+
+**Port note — 8090 is a trap, not a clean error.** `8080` is the vehicle's Gunicorn/Flask API
+(behind `docker-proxy`) and is the only port this map may name. `8090` on the same host is the
+Python **Local Agent diagnostics** server. Probed live on SAR during this pass:
+
+| Route on `10.0.3.10` | `:8080` (Flask API) | `:8090` (diagnostics) |
+|---|---|---|
+| `/agent/pixhawk_mission` | `200` | `200` — full, correct-looking mission |
+| `/agent/control_authority` | `200` | `404` |
+| `/agent/experiment/network` | `200` | `404` |
+| `/agent/state` | `200` | `404` |
+
+A row pointed at `8090` would therefore render a healthy Mission/Map page while control
+authority and experiment control silently failed — worse than an obviously dead address.
+
+Never add a **guessed** address. An absent route degrades honestly (`available:false`); a wrong
+one sends authority and mission traffic to whatever host actually holds that IP. Routing is
+pinned by `tests/test_vehicle_api_routing.py`, including that an unknown vehicle resolves to no
+base and never falls back to Scout.
+
 ## Limitations
 
 - All state remains in-memory and resets on backend restart (unchanged; same as the event log
   and comms history). The registry is the only part that survives a restart.
-- `SCOUT_API_BASE` / `DASHBOARDS` / `SSH_TARGETS` are still hardcoded per-vehicle maps for the
+- `VEHICLE_API_BASE` / `DASHBOARDS` / `SSH_TARGETS` are still hardcoded per-vehicle maps for the
   vehicle-local Flask API, dashboard and terminal — a vehicle added via `vehicles.json` appears
-  in the fleet but has no live authority/dashboard proxy until it is added there too. Keyed by
-  canonical id, so the spelling is consistent.
+  in the fleet but has no live authority/mission/experiment proxy until it is added there too.
+  Keyed by canonical id, so the spelling is consistent. **Adding a USV therefore takes both
+  halves: a registry identity AND a verified API route.** `VEHICLE_API_BASE` now carries two
+  verified routes (Scout `10.0.2.10:8080`, SAR-001 `10.0.3.10:8080`); `DASHBOARDS` and
+  `SSH_TARGETS` still list Scout only.
 - The SAR Local Agent is not in this repository; its exact payload spelling was not captured
   live. The operator boundary accepts every spelling listed above and logs the resolved
   canonical id per packet, so the live contract is verifiable from `[STATUS]` lines.

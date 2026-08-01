@@ -156,11 +156,11 @@ last_authority_by_id = {}        # {vehicle_id: last event-recorded effective au
 # Separate from flight mode, and deliberately NOT part of the command queue below —
 # it is vehicle state owned by the Scout Flask service (motherpi/services/flask),
 # not an operator-issued mission command. The operator backend holds no authority
-# state of its own; every read/write is a live, synchronous proxy to Scout's own
+# state of its own; every read/write is a live, synchronous proxy to the vehicle's own
 # GET/POST /agent/control_authority (see set_control_authority / get_control_authority
-# further down). SCOUT_API_BASE is the same "no Configuration API yet" hardcoded
+# further down). VEHICLE_API_BASE is the same "no Configuration API yet" hardcoded
 # per-vehicle map already used by Pilot.js's DASHBOARDS / Terminal.js's SSH_TARGETS —
-# only vehicles with a real, reachable Scout Flask instance belong here.
+# only vehicles with a real, reachable vehicle-local Flask instance belong here.
 #
 # THIS IS NOT THE VEHICLE REGISTRY, and the two must not be conflated:
 #
@@ -169,26 +169,45 @@ last_authority_by_id = {}        # {vehicle_id: last event-recorded effective au
 #       is tracked, sorted, selectable, and shows live telemetry, because telemetry is
 #       something the vehicle PUSHES to us (POST /agent/status). No address needed.
 #
-#   SCOUT_API_BASE (below)   — OUTBOUND COMMAND & API ROUTING. Where this station PULLs
+#   VEHICLE_API_BASE (below)  — OUTBOUND COMMAND & API ROUTING. Where this station PULLs
 #       from / POSTs to on the vehicle's own network: control authority, Pixhawk mission
 #       reads, network-impairment experiment control. Needs a real, verified address.
 #
-# A registry entry with no SCOUT_API_BASE row is a normal, supported state: the vehicle
+# The two are independent, and BOTH are required for a fully functional vehicle: a
+# registry entry alone gives monitoring only. Appearing in vehicles.json therefore does
+# NOT make a vehicle commandable — a future USV needs a registry identity AND a verified
+# row here before control authority, Pixhawk mission reads or experiment control work.
+#
+# A registry entry with no VEHICLE_API_BASE row is a normal, supported state: the vehicle
 # is monitored, and the vehicle-local endpoints answer 200 available:false rather than
 # failing — see get_control_authority / get_pixhawk_mission. Adding a GUESSED address is
 # strictly worse than omitting one: an absent entry degrades honestly, while a wrong one
 # sends authority and command traffic to whatever host actually holds that IP.
-SCOUT_API_BASE = {
-    2: "http://10.0.2.10:8080",  # Scout — motherpi Flask API
-    # usv-3 / SAR-001 is in the registry (monitored) but has NO verified Flask address
-    # yet. Add it here only once the address is confirmed against the real vehicle.
+#
+# NOTE ON PORTS: 8080 is the vehicle's Flask API (Gunicorn, behind docker-proxy) — the
+# ONLY port this map may name. Port 8090 on the same host is the Python Local Agent's
+# DIAGNOSTICS server, and it is a trap rather than a clean error: probed live on SAR it
+# answers /agent/pixhawk_mission with a full, correct-looking mission, but 404s on
+# /agent/control_authority, /agent/experiment/network and /agent/state. A row pointed at
+# 8090 would therefore look healthy on the Mission/Map pages while control authority and
+# experiment control silently failed — worse than an obviously dead address. Always 8080.
+#
+# Vehicle telemetry does not travel over this map at all: the Local Agent PUSHES it to the
+# operator via POST /agent/status (see receive_agent_status). That push path needs no entry
+# here, which is why a vehicle can be fully monitored with no route configured.
+VEHICLE_API_BASE = {
+    2: "http://10.0.2.10:8080",  # Scout   — motherpi Flask API, over WireGuard
+    3: "http://10.0.3.10:8080",  # SAR-001 — verified over WireGuard (wg0 10.0.3.10/16)
 }
 
 
-def scout_api_base(vid):
+def vehicle_api_base(vid):
     """Base URL for a vehicle's own Flask API, looked up by CANONICAL id so any accepted
-    spelling ('2', 2, 'usv-2') resolves to the same entry."""
-    return SCOUT_API_BASE.get(canonical_id(vid))
+    spelling (3, '3', 'usv-3', 'USV-3', 'SAR-001') resolves to the same entry.
+
+    Returns None for a vehicle with no configured route — callers must render that as an
+    honest available:false and must NEVER substitute another vehicle's base URL."""
+    return VEHICLE_API_BASE.get(canonical_id(vid))
 
 # --- Persistent event log (BACKEND_ROADMAP #2; Operator-backend-owned) ---
 # One server-side, append-only record that replaces the frontend's flatten-from-
@@ -2828,7 +2847,7 @@ async def agent_command_result(request: Request):
 # Take Control / Release Control in the Operator UI. Deliberately bypasses the
 # QUEUED→SENT→EXECUTED command lifecycle entirely: control authority is vehicle
 # state owned by Scout's own Flask service (motherpi/services/flask), reachable at
-# SCOUT_API_BASE. The operator backend holds no authority state of its own — every
+# VEHICLE_API_BASE. The operator backend holds no authority state of its own — every
 # call here is a live, synchronous round-trip to Scout; a network failure surfaces
 # as an honest reachable:false, never a guessed or cached value.
 #
@@ -2909,7 +2928,7 @@ async def set_control_authority(vehicle: str, request: Request):
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
 
-    base = scout_api_base(vid)
+    base = vehicle_api_base(vid)
     if base is None:
         return JSONResponse(status_code=409, content={
             "ok": False, "available": False, "vehicle_id": vid,
@@ -2966,7 +2985,7 @@ def get_control_authority(vehicle: str):
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
 
-    base = scout_api_base(vid)
+    base = vehicle_api_base(vid)
     if base is None:
         return {
             "ok": True, "vehicle_id": vid, "available": False, "reachable": False,
@@ -2981,7 +3000,7 @@ def get_control_authority(vehicle: str):
 # (MISSION_REQUEST_LIST/MISSION_ITEM_INT over MAVLink, performed on Scout). Same
 # proxy pattern as control_authority: the operator backend holds NO mission state of
 # its own — every fetch is a live, synchronous round-trip to Scout's own Flask API
-# (SCOUT_API_BASE). A network failure surfaces as an honest reachable:false with an
+# (VEHICLE_API_BASE). A network failure surfaces as an honest reachable:false with an
 # empty waypoint list, never a fabricated or cached mission. This is deliberately a
 # separate axis from the operator command queue and from `mission_state` progress:
 # it is what the flight controller actually holds, for testing/verification. The card
@@ -3125,7 +3144,7 @@ def pixhawk_mission(vehicle_id: str):
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle_id})
 
-    base = scout_api_base(vid)
+    base = vehicle_api_base(vid)
     if base is None:
         return {
             "ok": True, "vehicle_id": vid, "available": False, "reachable": False,
@@ -3594,7 +3613,7 @@ def environment():
 
 # --- Network-impairment experiment (Stage 1) — Operator→Scout orchestration proxy ---
 # A thin proxy to Scout's experiment controller (GET/POST/DELETE {base}/agent/experiment/
-# network), resolved through the SAME SCOUT_API_BASE map as control_authority / pixhawk_
+# network), resolved through the SAME VEHICLE_API_BASE map as control_authority / pixhawk_
 # mission — never a hard-coded address, and never one the browser owns. The Operator backend:
 #   • validates the frontend profile against STAGE-1 CAPABILITIES before forwarding, so an
 #     unsupported field fails HERE with a clear 400 instead of a Scout 500;
@@ -3635,13 +3654,27 @@ MAX_EXPERIMENT_HISTORY = 1000
 # history — the established persistence pattern in this process, not a new database.
 experiment_history = []          # [ {timestamp, experiment_id, vehicle_id, action, direction,
                                  #    profile, duration_s, result, detail} ]
-# The no-id GET the frontend issues resolves to the last vehicle a POST/DELETE targeted;
-# defaults to the single configured Scout vehicle.
-_last_experiment_vehicle_id = next(iter(SCOUT_API_BASE), 2)
+# The no-id GET/DELETE the frontend issues resolves to the last vehicle a POST/DELETE
+# targeted; before any POST it defaults to the first configured route (Scout). This is the
+# ONE place an absent id picks a vehicle, and it applies only when the caller named none —
+# an id that IS supplied but names no vehicle is rejected, never silently redirected here.
+_last_experiment_vehicle_id = next(iter(VEHICLE_API_BASE), 2)
 # Per-vehicle tracking so GET can (a) size its own latency-aware read timeout from the known
 # active profile and (b) record confirmed_active / expired_automatically exactly once per
 # experiment_id as Scout's polled state transitions.
 _experiment_tracked = {}         # {vid: {experiment_id, active, direction, profile, recorded:set}}
+
+
+def _experiment_vehicle_id(raw):
+    """Canonical target vehicle for an experiment call, in any accepted spelling.
+
+    Returns the canonical id, or the sentinel -1 when the caller SUPPLIED an id that names
+    no vehicle this station knows. Only a genuinely absent id (None / "") falls back to the
+    last-targeted vehicle: with more than one routable USV configured, quietly resolving an
+    unrecognised id to a default would point an impairment command at the wrong vehicle."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return _last_experiment_vehicle_id
+    return parse_vehicle_id(raw)
 
 
 def _experiment_read_timeout(latency_ms=0, jitter_ms=0):
@@ -3815,13 +3848,13 @@ def _observe_experiment_state(vid, state):
 
 
 @app.get("/api/experiment/network")
-def get_network_experiment(vehicle_id: Optional[int] = None):
+def get_network_experiment(vehicle_id: Optional[str] = None):
     """Confirmed Scout experiment state for the selected/last-targeted vehicle, in the stable
     schema. Never 500s: an unreachable Scout is a deliberate, handled unavailable response so
     the frontend's 2 s poll renders an honest "Unavailable" (its convention for a failed
     experiment GET) rather than a fabricated inactive/active state."""
-    vid = vehicle_id if vehicle_id is not None else _last_experiment_vehicle_id
-    base = scout_api_base(vid)
+    vid = _experiment_vehicle_id(vehicle_id)
+    base = vehicle_api_base(vid)
     if base is None:
         return JSONResponse(status_code=200, content=_stable_experiment_state(
             vid, status="unavailable", active=False, available=False,
@@ -3859,17 +3892,16 @@ async def apply_network_experiment(request: Request):
     if not isinstance(body, dict):
         body = {}
 
+    # Any accepted spelling (3, "3", "usv-3", "SAR-001") resolves to the same canonical
+    # vehicle. A supplied id that names no vehicle is the -1 sentinel and falls through to
+    # the no-route 409 below — it must never quietly become the last-targeted USV, which
+    # would apply an impairment profile to a vehicle the operator did not choose.
     raw_vid = body.get("vehicle_id")
     if isinstance(raw_vid, bool):
         raw_vid = None
-    if isinstance(raw_vid, (int, float)):
-        vid = int(raw_vid)
-    elif isinstance(raw_vid, str) and raw_vid.strip().isdigit():
-        vid = int(raw_vid)
-    else:
-        vid = _last_experiment_vehicle_id
+    vid = _experiment_vehicle_id(raw_vid)
 
-    base = scout_api_base(vid)
+    base = vehicle_api_base(vid)
     if base is None:
         return JSONResponse(status_code=409, content=_stable_experiment_state(
             vid, status="unavailable", active=False, available=False,
@@ -3947,13 +3979,13 @@ async def apply_network_experiment(request: Request):
 
 
 @app.delete("/api/experiment/network")
-def stop_network_experiment(vehicle_id: Optional[int] = None):
+def stop_network_experiment(vehicle_id: Optional[str] = None):
     """Stop / clear the active impairment. Idempotent and safe when nothing is active. Proxies
     to Scout and returns Scout-confirmed state — never an optimistic inactive before Scout
     confirms it. A confirmed stop is recorded as a manual stop in experiment history."""
     global _last_experiment_vehicle_id
-    vid = vehicle_id if vehicle_id is not None else _last_experiment_vehicle_id
-    base = scout_api_base(vid)
+    vid = _experiment_vehicle_id(vehicle_id)
+    base = vehicle_api_base(vid)
     if base is None:
         return JSONResponse(status_code=409, content=_stable_experiment_state(
             vid, status="unavailable", active=False, available=False,

@@ -162,10 +162,10 @@ Operator UI → Operator Backend (GET/POST /api/control_authority/{vehicle})
 Operator Backend → Scout Flask (GET/POST /agent/control_authority) — new direct REST call, live proxy, no queue
 Local Agent (Scripts/) → Scout Flask (GET /agent/control_authority) — reads and obeys directly
 ```
-The operator backend holds **no authority state of its own** — every `/api/control_authority/{vehicle}` call is a synchronous `requests` round-trip to Scout Flask at `SCOUT_API_BASE[vehicle]` (`main.py`, same hardcoded "no Configuration API yet" per-vehicle map already used by `Pilot.js`'s `DASHBOARDS` / `Terminal.js`'s `SSH_TARGETS` — currently just `{2: "http://10.0.2.10:8080"}`). A network failure surfaces as an honest `502`, never a cached or guessed value — nothing here fabricates state the way the command queue above is careful not to fabricate execution.
+The operator backend holds **no authority state of its own** — every `/api/control_authority/{vehicle}` call is a synchronous `requests` round-trip to Scout Flask at `VEHICLE_API_BASE[vehicle]` (`main.py`, same hardcoded "no Configuration API yet" per-vehicle map already used by `Pilot.js`'s `DASHBOARDS` / `Terminal.js`'s `SSH_TARGETS` — `{2: "http://10.0.2.10:8080"` (Scout)`, 3: "http://10.0.3.10:8080"` (SAR-001, verified over WireGuard)`}`). A network failure surfaces as an honest `502`, never a cached or guessed value — nothing here fabricates state the way the command queue above is careful not to fabricate execution.
 
 **Added** (`main.py`)
-- `SCOUT_API_BASE` + `scout_api_base(vid)`.
+- `VEHICLE_API_BASE` + `vehicle_api_base(vid)`.
 - `POST /api/control_authority/{vehicle}` — body `{"authority": "LOCAL_AGENT"|"OPERATOR"}`. Validates the value, looks up the vehicle's Scout Flask base (`404` if unmapped), forwards to `POST {base}/agent/control_authority`, returns Scout's response verbatim. `502` on any `requests.RequestException`.
 - `GET /api/control_authority/{vehicle}` — same lookup, forwards to `GET {base}/agent/control_authority`, returns Scout's response verbatim.
 
@@ -182,7 +182,7 @@ The operator backend holds **no authority state of its own** — every `/api/con
 **Verified** (fresh instance on :8211, live via curl, no fabricated results)
 - ✓ command queue regression: `POST /api/commands` with `type:"SET_MODE_AUTO"` still queues normally; `COMMAND_TYPES` no longer contains `SET_CONTROL_AUTHORITY`
 - ✓ `GET /api/control_authority/2` with no mock Scout listening → `502 Scout control-authority API unreachable`
-- ✓ `GET /api/control_authority/1` (no `SCOUT_API_BASE` entry) → `404 no Scout API configured for this vehicle`
+- ✓ `GET /api/control_authority/1` (registered vehicle, no `VEHICLE_API_BASE` entry) → `200 available:false` (an id that names no vehicle at all is the `404` case). Superseded once `usv-1` joined the registry; re-verified in `tests/test_vehicle_api_routing.py`.
 - ✓ `POST /api/control_authority/2` with an invalid `authority` value → `400 invalid authority` (no request made to Scout)
 - ✓ full round-trip against a local mock of Scout's `/agent/control_authority` (GET + POST, same contract Scout Flask is expected to implement): `GET /api/control_authority/2` → proxies through and returns the mock's `{"authority":"OPERATOR"}`; `POST {"authority":"LOCAL_AGENT"}` → proxies through, mock state flips, next `GET` reads `LOCAL_AGENT` back
 - ✓ `Scripts/control_authority.py`'s `ControlAuthority.poll()` run directly against the same mock: `OPERATOR` → poll → `LOCAL_AGENT`, and a fail-safe check against an unreachable host leaves `authority` unchanged
@@ -218,7 +218,7 @@ The operator backend holds **no authority state of its own** — every `/api/con
    - success: `{"command_id":"…","status":"executed","result":{"accepted":true,"verified":true,"observed_mode":"RTL","previous_mode":"MANUAL"}}` → `rtl_result:"confirmed"`.
    - not entered: `…"result":{"accepted":true,"verified":false,"observed_mode":"MANUAL"}` → `rtl_result:"failed"`, `reason:"Pixhawk remained in MANUAL"`.
    - legacy: `…"result":{"status":"Returning home"}` → `rtl_result:"failed"` (never confirmed).
-3. **Compare with Scout ground truth:** `GET {SCOUT_API_BASE[2]}/agent/state` (Scout's own reported flight mode) — the operator's `observed_mode`/verdict must agree with Scout's live mode.
+3. **Compare with Scout ground truth:** `GET {VEHICLE_API_BASE[2]}/agent/state` (Scout's own reported flight mode) — the operator's `observed_mode`/verdict must agree with Scout's live mode.
 4. **Compare with Mission Planner:** the Pixhawk mode indicator (bottom-left flight-mode box) must read `RTL` for a `confirmed` RTL, and the pre-RTL mode for any `failed` one. A green `confirmed` with Mission Planner **not** in RTL is the exact regression this change forbids — report it.
 5. **LOITER duplicate guard:** press LOITER on the Map inspector; while it is `QUEUED`/`SENT` the button is disabled (dashed, "already sent — awaiting the vehicle's result"). On `REJECTED` it re-enables and shows the reason.
 
