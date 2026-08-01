@@ -16,7 +16,7 @@ import { AVAIL, availSlot } from "../lib/availability.js";
 import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
 import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
-import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
+import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
 import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
 import { missionShowable, nextVisibility, toggleVisibility, toggleButton } from "../lib/mission-visibility.js";
@@ -279,7 +279,7 @@ export function Map(root) {
   function renderDock() {
     const list = document.getElementById("veh-list");
     list.innerHTML = vehicleRows(fleet, selId);
-    list.querySelectorAll(".vrow").forEach((el) => (el.onclick = () => select(+el.dataset.id)));
+    list.querySelectorAll(".vrow").forEach((el) => (el.onclick = () => select(canonicalVehicleId(el.dataset.id))));
 
     // Mission progress for the SELECTED vehicle — real waypoint counts + remaining
     // distance/ETA from the Pixhawk mission readback (lib/mission.js), the same numbers

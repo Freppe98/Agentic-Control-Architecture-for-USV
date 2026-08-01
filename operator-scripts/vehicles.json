@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Vehicle registry — the Operator Station's canonical vehicle identity, data-driven.",
+    "Loaded by vehicle_registry.load_registry() at startup (override the path with the",
+    "OPERATOR_VEHICLE_REGISTRY environment variable). Adding a USV means adding an entry",
+    "here and restarting the backend — no code change anywhere in the station.",
+    "",
+    "  key          canonical id, written as the slug 'usv-<n>' (the numeric id is derived",
+    "               from it, or declared explicitly with 'id')",
+    "  display_name what operators see. NEVER an identity: a vehicle may change it, and no",
+    "               state, cache, command or selection is ever keyed by it",
+    "  aliases      every other spelling THIS vehicle may use for itself in a status packet",
+    "               (callsigns, hull names, bare numbers). Explicit only — the station never",
+    "               guesses an alias, because a guess could merge two different vehicles.",
+    "               The key, its slug and its bare number are always aliases of themselves.",
+    "",
+    "An alias claimed by two vehicles is a hard startup error, not a silent last-one-wins."
+  ],
+  "usv-1": {
+    "id": 1,
+    "display_name": "USV-1",
+    "aliases": []
+  },
+  "usv-2": {
+    "id": 2,
+    "display_name": "Scout",
+    "aliases": ["Scout"]
+  },
+  "usv-3": {
+    "id": 3,
+    "display_name": "SAR-001",
+    "aliases": ["SAR-001", "SAR001", "SAR"]
+  }
+}

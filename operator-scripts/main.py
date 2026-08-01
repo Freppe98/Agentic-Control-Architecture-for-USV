@@ -15,6 +15,7 @@ import uuid
 
 import mission_contract
 import planning
+import vehicle_registry
 
 
 @asynccontextmanager
@@ -32,13 +33,96 @@ STALE_AFTER_SECONDS = 8
 PARTITIONED_AFTER_SECONDS = 15
 DISCONNECTED_AFTER_SECONDS = 30
 
-latest_agent_status = {}
-latest_agent_received_at = None
+# --- Canonical vehicle identity (see vehicle_registry.py) --------------------------
+# ONE explicit id policy for the whole station: every per-USV store, command, mission
+# cache, URL and selection is keyed by the canonical id this registry returns, and the
+# display name ("Scout", "SAR-001") is a separate field that is never an identity key.
+REGISTRY = vehicle_registry.load_registry()
+
+
+def canonical_id(raw):
+    """THE canonical-vehicle-id function (int, slug string, or None). Use it everywhere
+    a vehicle identity enters the backend — packet, URL, query or request body. Returns
+    None for a value that names no vehicle; callers must NOT substitute a default
+    vehicle, because that is exactly how SAR's packets used to land on Scout's record."""
+    return REGISTRY.canonical_id(raw)
+
+
+def vehicle_slug(cid) -> str:
+    """Stable string form of a canonical id ("usv-2") for URLs, log lines and payloads."""
+    return REGISTRY.slug(cid)
+
+
+# --- Per-USV authoritative current state -------------------------------------------
+# THE fix for multi-USV state isolation. There is deliberately no single "latest status"
+# object any more: whichever vehicle posted most recently used to become the only fully
+# populated row in GET /api/fleet/status, so two live USVs made every page alternate
+# between one complete vehicle and one UNKNOWN placeholder every couple of seconds.
+#
+# Every USV now owns one independent record keyed by its canonical id. A packet from
+# vehicle A updates exactly A's entry — never B's telemetry, name, health, mission,
+# authority, freshness or the operator's selection. The fleet endpoint is assembled from
+# ALL records every time, so a vehicle that did not report this poll simply keeps its own
+# last-known values and ages on its OWN clock.
+#
+#   current_vehicle_state = { canonical_id: {
+#       "canonical_id":      2,                      # identity key (int or slug string)
+#       "slug":              "usv-2",                # stable string form
+#       "display_name":      "Scout",                # per-USV, stable, never an id
+#       "raw_latest":        {...},                  # last ACCEPTED envelope, verbatim
+#       "received_at":       datetime,               # per-USV arrival time (freshness)
+#       "message_timestamp": 1712345678.9,           # per-USV monotonic guard
+#       "last_known_telemetry": {...},               # same dict object as the store below
+#       "last_known_agent":     {...},               #   ''
+#       "packets": 12, "rejected": 0,                # bounded per-USV diagnostics
+#   } }
+current_vehicle_state = {}
+
+
+def vehicle_record(cid, *, create=True):
+    """The one authoritative record for a vehicle, created on first contact.
+
+    `last_known_telemetry` / `last_known_agent` intentionally hold the SAME dict objects
+    as the per-vehicle stores below, so the record is a view over them rather than a
+    second copy that could drift out of sync."""
+    rec = current_vehicle_state.get(cid)
+    if rec is None:
+        if not create:
+            return None
+        rec = {
+            "canonical_id": cid,
+            "slug": vehicle_slug(cid),
+            "display_name": REGISTRY.default_display_name(cid),
+            "raw_latest": None,
+            "received_at": None,
+            "message_timestamp": None,
+            "last_known_telemetry": last_known_telemetry.setdefault(cid, {}),
+            "last_known_agent": last_known_agent.setdefault(cid, {}),
+            "packets": 0,
+            "rejected": 0,
+        }
+        current_vehicle_state[cid] = rec
+    return rec
+
+
+def fleet_vehicle_ids():
+    """Every vehicle the fleet endpoint reports, in a STABLE order: configured vehicles
+    first (declaration order), then discovered ones in first-contact order. Stability
+    matters because nothing may select or identify a vehicle by list position."""
+    ids = [cid for cid in REGISTRY.configured_ids()]
+    seen = set(ids)
+    for cid in current_vehicle_state:            # dicts preserve insertion order
+        if cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+    return ids
+
 
 # Newest accepted message send-time per vehicle (epoch seconds). Enforces monotonic
-# current-state updates: a replayed/buffered packet whose own timestamp is older than
-# what we've already accepted must not overwrite the current fleet snapshot. The
-# operator backend owns current state; store-and-forward replay is history, not "now".
+# current-state updates PER USV: a replayed/buffered Scout packet older than the newest
+# Scout packet must not overwrite Scout's current state — but it says nothing about SAR,
+# whose packets are guarded only against SAR's own newest timestamp. Interleaved arrivals
+# from several vehicles are normal and must never block each other.
 latest_msg_ts_by_id = {}   # {vehicle_id: float epoch seconds}
 
 # --- Operator-side comms-state transition log (see SYSTEM_INFORMATION_MODEL.md) ---
@@ -82,8 +166,10 @@ SCOUT_API_BASE = {
 }
 
 
-def scout_api_base(vid: int):
-    return SCOUT_API_BASE.get(vid)
+def scout_api_base(vid):
+    """Base URL for a vehicle's own Flask API, looked up by CANONICAL id so any accepted
+    spelling ('2', 2, 'usv-2') resolves to the same entry."""
+    return SCOUT_API_BASE.get(canonical_id(vid))
 
 # --- Persistent event log (BACKEND_ROADMAP #2; Operator-backend-owned) ---
 # One server-side, append-only record that replaces the frontend's flatten-from-
@@ -97,18 +183,29 @@ MAX_EVENTS = 5000
 event_log = []             # [ {id, ts, severity, type, source, vehicle_id, vehicle, message, acknowledged} ]
 _event_seq = 0             # monotonic event id (supports later replay / since-id)
 _ingested_event_keys = set()  # fingerprints of forwarded vehicle events already stored
-# vehicle_names {vehicle_id: display name} is seeded from FLEET_TEMPLATE (defined below)
+# vehicle_names {canonical_id: display name} is seeded from the registry (defined below)
 
 
-FLEET_TEMPLATE = [
-    {
-        "id": 1,
-        "name": "USV-1",
+def never_contacted_row(cid):
+    """The fleet row for a CONFIGURED vehicle that has not reported yet.
+
+    Replaces the old hardcoded FLEET_TEMPLATE list. That list was half of the alternation
+    bug: a live vehicle's row was overwritten by this static template the moment ANOTHER
+    vehicle posted, which is why the same vehicle appeared as a complete "SAR-001" one
+    second and an empty "USV-3" the next. A template row is now used ONLY for a vehicle
+    that has genuinely never made contact — live data always updates that same canonical
+    record instead of replacing it with, or adding, a second row."""
+    return {
+        "id": cid,
+        "vehicle_id": vehicle_slug(cid),
+        "name": name_of(cid),
         "online": False,
         "status": "UNKNOWN",
         "battery": None,
         "comms": "No data",
         "comm_state": "UNKNOWN",
+        "last_seen_age_s": None,
+        "last_seen": None,
         "heading": None,
         "speed": None,
         "mission": "Unknown",
@@ -118,44 +215,27 @@ FLEET_TEMPLATE = [
         "lng": None,
         "agent": {},
         "telemetry": {},
-    },
-    {
-        "id": 2,
-        "name": "Scout",
-        "online": False,
-        "status": "UNKNOWN",
-        "battery": None,
-        "comms": "No data",
-        "comm_state": "UNKNOWN",
-        "heading": None,
-        "speed": None,
-        "mission": "Unknown",
-        "coverage": None,
-        "lat": None,
-        "lng": None,
-        "agent": {},
-        "telemetry": {},
-    },
-    {
-        "id": 3,
-        "name": "USV-3",
-        "online": False,
-        "status": "UNKNOWN",
-        "battery": None,
-        "comms": "No data",
-        "comm_state": "UNKNOWN",
-        "heading": None,
-        "speed": None,
-        "mission": "Unknown",
-        "coverage": None,
-        "lat": None,
-        "lng": None,
-        "agent": {},
-        "telemetry": {},
-    },
-]
+        # The SAME field set a contacted vehicle's row carries, empty rather than absent, so
+        # no consumer has to branch on "has this vehicle ever reported?" — a missing key and
+        # a null value are very different things to a UI that reads them.
+        "home": home_block(cid, {}, {}),
+        "mission_data": {},
+        "communication": {},
+        "health": {},
+        "mavlink": mavlink_evidence({}),
+        "measurements": {},
+        "events": [],
+        "agent_status": {},
+        "mission_upload": None,
+        "fleet_info": {},
+        "raw": None,
+        "contacted": False,
+    }
 
-vehicle_names = {usv["id"]: usv["name"] for usv in FLEET_TEMPLATE}
+
+# Per-vehicle display names. Seeded from the registry (stable, configured) and updated
+# ONLY by that vehicle's own packets — a name reported by one USV can never rename another.
+vehicle_names = {cid: REGISTRY.default_display_name(cid) for cid in REGISTRY.configured_ids()}
 
 
 def _first_present(*vals):
@@ -309,14 +389,21 @@ def home_block(vid: int, payload: dict, telemetry: dict):
     }
 
 
-def normalize_agent_message(message: dict) -> dict:
-    """
+def normalize_agent_message(message: dict, cid=None, received_at=None) -> dict:
+    """Normalize ONE vehicle's last accepted packet into its fleet row.
+
     Accepts both:
     1. Envelope format:
        {"message_type": "...", "source": "...", "payload": {...}}
 
     2. Direct payload format:
        {"usv_id": ..., "comm_state": ..., "telemetry": {...}}
+
+    `cid` / `received_at` are that vehicle's OWN canonical id and arrival time. They used
+    to be read from a single global `latest_agent_received_at`, which meant every vehicle's
+    comm-state was derived from whenever ANY vehicle last posted: a silent USV looked
+    CONNECTED because a different one was alive, and a live USV could not age on its own
+    clock. Freshness is per-USV and nothing else.
     """
     if "payload" in message and isinstance(message["payload"], dict):
         payload = message["payload"]
@@ -334,11 +421,10 @@ def normalize_agent_message(message: dict) -> dict:
     events = payload.get("events", []) or []
     agent_reasoning = payload.get("agent", {}) or {}
 
-    usv_id_raw = payload.get("usv_id", payload.get("id", 2))
-    try:
-        usv_id = int(str(usv_id_raw).replace("usv-", ""))
-    except Exception:
-        usv_id = 2
+    # Identity comes from the caller (the per-USV record this packet was stored under), so
+    # one packet can only ever describe one vehicle. Re-deriving it here is a fallback for
+    # direct callers/tests; it never silently defaults to another vehicle.
+    usv_id = cid if cid is not None else extract_usv_id(message)
 
     comm_state = payload.get("comm_state", "UNKNOWN")
 
@@ -359,13 +445,16 @@ def normalize_agent_message(message: dict) -> dict:
     lat = telemetry.get("lat") or payload.get("lat") or lk.get("lat")
     lng = telemetry.get("lng") or payload.get("lng") or lk.get("lng")
 
-    def age_seconds(iso_time):
-        if not iso_time:
+    def age_seconds(when):
+        if not when:
             return None
-        t = datetime.fromisoformat(iso_time)
+        t = when if isinstance(when, datetime) else datetime.fromisoformat(when)
         return (datetime.now(timezone.utc) - t).total_seconds()
 
-    age = age_seconds(latest_agent_received_at)
+    # THIS vehicle's own arrival time — never the fleet-wide "someone posted" timestamp.
+    if received_at is None:
+        received_at = last_seen_by_id.get(usv_id)
+    age = age_seconds(received_at)
     if age is None:
         online = False
         comm_state = "UNKNOWN"
@@ -401,7 +490,14 @@ def normalize_agent_message(message: dict) -> dict:
 
     return {
         "id": usv_id,
-        "name": payload.get("name") or name_of(usv_id),
+        # Stable string form of the SAME canonical identity ("usv-2"). Published so any
+        # consumer can key on an id that is safe in a URL; it is not a second identity.
+        "vehicle_id": vehicle_slug(usv_id),
+        # Per-USV display name. Read from name_of() — the sticky per-vehicle name this
+        # vehicle itself last reported (or its configured one) — so it cannot flip between
+        # a configured placeholder and a live callsign depending on who posted last.
+        "name": name_of(usv_id),
+        "contacted": True,
         "online": online,
         "status": mission.get("mission_state", payload.get("mission_state", "UNKNOWN")),
         "battery": battery if battery != -1 else None,
@@ -453,20 +549,38 @@ def normalize_agent_message(message: dict) -> dict:
         },
         "telemetry": telemetry,
         "raw": message,
-        "last_seen": latest_agent_received_at,
+        # This vehicle's own last contact — not "when the fleet last heard from anyone".
+        "last_seen": received_at.isoformat() if isinstance(received_at, datetime) else received_at,
     }
 
 
-def extract_usv_id(message: dict) -> int:
-    """Vehicle id from either envelope or direct-payload form (mirrors normalize)."""
-    payload = message.get("payload", message) if isinstance(message, dict) else {}
-    if not isinstance(payload, dict):
-        payload = {}
-    raw = payload.get("usv_id", payload.get("id", 2))
-    try:
-        return int(str(raw).replace("usv-", ""))
-    except Exception:
-        return 2
+# Identity fields a status packet may carry, in priority order. Scout's Local Agent sends
+# payload.usv_id = 2 with envelope source "usv-2"; another vehicle may send "3", "usv-3",
+# "USV-3" or its callsign. Every spelling is folded to ONE canonical id by the registry.
+# `name` is deliberately absent: a display name is not an identity, and resolving by it
+# would let a renamed vehicle jump records. The envelope `source` is the last resort — it
+# is the only identity a payload-less/degraded envelope carries.
+_PACKET_ID_KEYS = ("usv_id", "vehicle_id", "id", "usvId", "vehicleId")
+
+
+def extract_usv_id(message: dict):
+    """Canonical vehicle id of a status message, or None when it identifies no vehicle.
+
+    Returning None (instead of the old silent `2` fallback) is the point: an unidentified
+    packet must be rejected, never merged into whichever vehicle happens to be first in
+    the registry."""
+    if not isinstance(message, dict):
+        return None
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else message
+    for key in _PACKET_ID_KEYS:
+        cid = canonical_id(payload.get(key))
+        if cid is not None:
+            return cid
+    for key in _PACKET_ID_KEYS:
+        cid = canonical_id(message.get(key))
+        if cid is not None:
+            return cid
+    return canonical_id(message.get("source") or payload.get("source"))
 
 
 def extract_name(message: dict):
@@ -474,15 +588,22 @@ def extract_name(message: dict):
     payload = message.get("payload", message) if isinstance(message, dict) else {}
     if not isinstance(payload, dict):
         payload = {}
-    return payload.get("name")
+    return payload.get("name") or payload.get("vehicle_name")
 
 
-def parse_vehicle_id(raw) -> int:
-    """Vehicle id from a path/query value in either '2' or 'usv-2' form (or -1)."""
-    try:
-        return int(str(raw).lower().replace("usv-", ""))
-    except (TypeError, ValueError):
+def parse_vehicle_id(raw):
+    """Canonical vehicle id from a path/query/body value in ANY accepted spelling —
+    '2', 2, 'usv-2', 'USV-2' or a configured alias — or -1 when it names no vehicle the
+    station knows.
+
+    Deliberately resolves only to EXISTING vehicles (configured, or already in contact):
+    a URL, query string or request body must never bring a vehicle into existence. A uuid
+    or typo therefore still parses to the -1 sentinel the routes 404 on, exactly as before.
+    Vehicles are discovered in one place only — an identified status packet."""
+    cid = canonical_id(raw)
+    if cid is None or not (REGISTRY.is_configured(cid) or cid in current_vehicle_state):
         return -1
+    return cid
 
 
 def extract_message_ts(message: dict):
@@ -509,8 +630,10 @@ def extract_message_ts(message: dict):
         return None
 
 
-def name_of(vid: int) -> str:
-    return vehicle_names.get(vid, f"USV-{vid}")
+def name_of(vid) -> str:
+    """This vehicle's display name: the last name IT reported, else its configured name,
+    else a readable fallback. Per-USV and sticky — no other vehicle's packet can change it."""
+    return vehicle_names.get(vid) or REGISTRY.default_display_name(vid)
 
 
 def derive_comm_state(age_s):
@@ -537,7 +660,7 @@ def record_comms_state(vid: int, state: str, ts: datetime, age_s):
         "since_last_seen_s": round(age_s, 1) if age_s is not None else None,
     }
     comms_history_by_id.setdefault(vid, []).append(entry)
-    print(f"[COMMS] USV-{vid}: {prev} -> {state}")
+    print(f"[COMMS] {vehicle_slug(vid)}: {prev} -> {state}")
     _emit_comms_event(vid, prev, state, ts)
     return entry
 
@@ -744,7 +867,7 @@ def ingest_payload_events(vid, message, now):
             continue
         _ingested_event_keys.add(key)
         etype = (ev.get("type") if isinstance(ev, dict) else None) or "vehicle"
-        source = (ev.get("source") if isinstance(ev, dict) else None) or f"usv-{vid}"
+        source = (ev.get("source") if isinstance(ev, dict) else None) or vehicle_slug(vid)
         # Known typed events (e.g. local_agent comm notifications) get a clean
         # severity+message; everything else keeps the generic derivation.
         typed = normalize_typed_event(ev)
@@ -800,7 +923,7 @@ def record_agent_changes(vid, payload, now):
                 if reason:
                     msg = f"{msg} — {reason}"
                 _append_event(severity="info", message=msg, etype="agent",
-                              source=f"usv-{vid}", vehicle_id=vid, vehicle=name,
+                              source=vehicle_slug(vid), vehicle_id=vid, vehicle=name,
                               ts=now.isoformat())
 
     if isinstance(mission, dict) and mission:
@@ -811,7 +934,7 @@ def record_agent_changes(vid, payload, now):
             if prev_m is not None:
                 _append_event(severity="info",
                               message=f"Mission state: {prev_m} → {mstate}",
-                              etype="mission", source=f"usv-{vid}",
+                              etype="mission", source=vehicle_slug(vid),
                               vehicle_id=vid, vehicle=name, ts=now.isoformat())
 
 
@@ -952,8 +1075,8 @@ orphaned_command_results = {}
 
 
 def known_vehicle_ids():
-    """Vehicle ids the backend recognises (template + any that have reported)."""
-    return set(vehicle_names) | {u["id"] for u in FLEET_TEMPLATE}
+    """Canonical ids the backend recognises: configured vehicles + any that have reported."""
+    return set(fleet_vehicle_ids())
 
 
 def _command_event(cmd, *, severity, message, source):
@@ -1759,12 +1882,11 @@ def _archive_orphaned_result(command_id, status, reason, vehicle_id, now):
     ONCE, so a retry storm never floods the event log."""
     key = str(command_id)
     rec = orphaned_command_results.get(key)
-    vid = None
-    if vehicle_id is not None:
-        try:
-            vid = int(str(vehicle_id).lower().replace("usv-", ""))
-        except (TypeError, ValueError):
-            vid = None
+    # Known-vehicles-only (parse_vehicle_id semantics): an orphan result naming a vehicle
+    # the station has never heard of records no vehicle rather than inventing one.
+    vid = parse_vehicle_id(vehicle_id) if vehicle_id is not None else None
+    if vid == -1:
+        vid = None
     if rec is None:
         orphaned_command_results[key] = {
             "command_id": key, "first_seen": now.isoformat(), "last_seen": now.isoformat(),
@@ -1774,7 +1896,7 @@ def _archive_orphaned_result(command_id, status, reason, vehicle_id, now):
         # command that no longer exists, NOT a failure of any command the operator is watching.
         _append_event(
             severity="info", etype="command",
-            source=(f"usv-{vid}" if vid is not None else "operator-backend"),
+            source=(vehicle_slug(vid) if vid is not None else "operator-backend"),
             vehicle_id=vid, vehicle=(name_of(vid) if vid is not None else None),
             message=(f"Orphaned command result archived — reported {status or 'result'} for "
                      f"unknown command {key} (no current command; not applied)"),
@@ -1857,7 +1979,7 @@ def process_command_result(command_id, raw_status, result, reason, now, vehicle_
                else f"Command {cmd['type']} {new_status.lower()}")
         if cmd.get("reason"):
             msg = f"{msg} — {cmd['reason']}"
-        _command_event(cmd, severity=sev, message=msg, source=f"usv-{cmd['vehicle_id']}")
+        _command_event(cmd, severity=sev, message=msg, source=vehicle_slug(cmd["vehicle_id"]))
     return {"command_id": command_id, "found": True, "applied": applied,
             "status": new_status, "command": cmd}
 
@@ -2525,7 +2647,9 @@ async def agent_commands(usv_id: str = ""):
         # to do" forever — that is exactly the failure mode this endpoint was added for.
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "usv_id": usv_id,
-            "known": sorted(known_vehicle_ids())})
+            # Canonical slugs: one stable, sortable spelling regardless of how each
+            # vehicle's id is typed internally.
+            "known": sorted(vehicle_slug(c) for c in known_vehicle_ids())})
 
     delivered = []
     for cmd in commands:
@@ -3054,26 +3178,50 @@ def vehicle_commands(vehicle_id: str):
 
 @app.post("/agent/status")
 async def receive_agent_status(request: Request):
-    global latest_agent_status, latest_agent_received_at
-
     incoming = await request.json()
     now = datetime.now(timezone.utc)
     vid = extract_usv_id(incoming)
 
-    # Monotonic current-state guard (backend owns "now"): if this packet's own send
-    # time is older than the newest we've already accepted for this vehicle, it is a
-    # replayed/buffered snapshot — do NOT let it overwrite the current fleet state.
+    # An unidentified packet is REJECTED, not merged. Previously an unparseable identity
+    # (e.g. a callsign like "SAR-001") fell back to id 2 — Scout — so a second vehicle's
+    # telemetry, name and health silently overwrote Scout's record. Better a visible,
+    # actionable rejection than cross-vehicle contamination.
+    if vid is None:
+        global _unidentified_log_at
+        if (_unidentified_log_at is None
+                or (now - _unidentified_log_at).total_seconds() >= STATUS_HEARTBEAT_SECONDS):
+            _unidentified_log_at = now
+            print("[STATUS] accepted=false reason=unidentified_vehicle — packet carries no "
+                  f"resolvable identity (expected one of {', '.join(_PACKET_ID_KEYS)} or "
+                  "`source`); further identical rejections suppressed")
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "unidentified vehicle",
+            "detail": "status packets must carry a vehicle identity in one of "
+                      f"{list(_PACKET_ID_KEYS)} or the envelope `source`",
+        })
+
+    rec = vehicle_record(vid)
+
+    # Monotonic current-state guard, PER VEHICLE (backend owns "now"): if this packet's own
+    # send time is older than the newest we have already accepted FOR THIS VEHICLE, it is a
+    # replayed/buffered snapshot and must not overwrite this vehicle's current state. It is
+    # compared only against this vehicle's own newest timestamp — Scout's clock never gates
+    # SAR's packets, and interleaved arrivals from any number of USVs never block each other.
     msg_ts = extract_message_ts(incoming)
     prev_ts = latest_msg_ts_by_id.get(vid)
     stale = msg_ts is not None and prev_ts is not None and msg_ts < prev_ts
+    reject_reason = "stale_timestamp" if stale else None
 
     if not stale:
-        latest_agent_status = incoming
+        # Everything below writes to exactly ONE vehicle's record, keyed by canonical id.
+        rec["raw_latest"] = incoming
+        rec["message_timestamp"] = msg_ts if msg_ts is not None else rec.get("message_timestamp")
         if msg_ts is not None:
             latest_msg_ts_by_id[vid] = msg_ts
         name = extract_name(incoming)
         if name:
-            vehicle_names[vid] = name
+            vehicle_names[vid] = str(name)
+            rec["display_name"] = str(name)
         # Carry forward real telemetry values so a later degraded (telemetry-less)
         # packet renders last-known instead of a fabricated position.
         payload = incoming.get("payload", incoming) if isinstance(incoming, dict) else {}
@@ -3085,66 +3233,223 @@ async def receive_agent_status(request: Request):
             # and let it flip a valid 97% to "—" on the next poll.
             lk.update({k: v for k, v in tel.items()
                        if v is not None and not (k == "battery" and v == -1)})
+            rec["last_known_telemetry"] = lk
         # Same carry-forward for the agent reasoning group (payload.agent.*), and record
         # any agent-decision / mission-state CHANGE as a first-class event (deduped).
         agent_block = payload.get("agent") if isinstance(payload, dict) else None
         if isinstance(agent_block, dict) and agent_block:
             last_known_agent[vid] = dict(agent_block)
+            rec["last_known_agent"] = last_known_agent[vid]
         record_agent_changes(vid, payload, now)
+        rec["packets"] = rec.get("packets", 0) + 1
+        # The STREAK ends on recovery, but `last_reject` is deliberately NOT cleared: an
+        # episode is usually investigated after it has already recovered, and evidence that
+        # deletes itself on recovery is evidence you never get to read.
+        recovered_after = rec.get("reject_streak", 0)
+        rec["reject_streak"] = 0
+    else:
+        recovered_after = 0
+        rec["rejected"] = rec.get("rejected", 0) + 1
+        rec["reject_streak"] = rec.get("reject_streak", 0) + 1
+        # Evidence for the rejection, kept on the record (and on GET /agent/status). `delta_s`
+        # is the size of the backward step in the vehicle's OWN clock — the number that tells
+        # a replayed store-and-forward packet (small negative) apart from a time base that
+        # restarted (large negative, packet_ts near zero) or a poisoned high-water mark
+        # (accepted_ts far ahead of wall clock).
+        rec["last_reject"] = {
+            "reason": reject_reason,
+            "at": now.isoformat(),
+            "accepted_ts": prev_ts,
+            "packet_ts": msg_ts,
+            "delta_s": round(msg_ts - prev_ts, 3),
+            "streak": rec["reject_streak"],
+        }
 
     # Arrival-age reachability is about *arrival*, not payload age: any packet that
     # reaches us (even a replayed one) proves the operator link is carrying data now,
-    # so refresh last-seen / received-at and log CONNECTED. Buffered events are still
-    # ingested as history (deduped) regardless of the snapshot guard.
-    latest_agent_received_at = now.isoformat()
+    # so refresh THIS vehicle's last-seen and log CONNECTED for it alone. Buffered events
+    # are still ingested as history (deduped) regardless of the snapshot guard.
+    rec["received_at"] = now
     last_seen_by_id[vid] = now
     record_comms_state(vid, "CONNECTED", now, 0.0)
     ingest_payload_events(vid, incoming, now)
 
-    # One compact line per status packet — never the raw payload. The full envelope
-    # (agent reasoning, watch_conditions, decision_inputs, health, measurements, …) is
-    # already available live in the Operator Station UI; dumping it here on every ~1 Hz
-    # packet just buries the terminal in noise that makes a real problem harder to spot.
-    # Real state CHANGES still get their own line elsewhere ([COMMS] transitions,
-    # [EVENT] agent/mission changes) — this is only a liveness confirmation.
+    # One compact line per meaningful CHANGE — never the raw payload, and never once per
+    # ~1 Hz packet (see status_log_decision / _status_signature above). The full envelope
+    # is already available live in the Operator Station UI; dumping it here just buries the
+    # terminal in noise that makes a real problem harder to spot. Real state changes still
+    # get their own line elsewhere ([COMMS] transitions, [EVENT] agent/mission changes).
+    # The line names the CANONICAL id and the reported source, so multi-USV routing — and a
+    # vehicle whose packets start being rejected — is inspectable at a glance.
     log_payload = incoming.get("payload", incoming) if isinstance(incoming, dict) else {}
-    log_comm = log_payload.get("comm_state", "UNKNOWN") if isinstance(log_payload, dict) else "UNKNOWN"
-    log_mission = log_payload.get("mission", {}) if isinstance(log_payload, dict) else {}
-    log_mission_state = log_mission.get("mission_state", "—") if isinstance(log_mission, dict) else "—"
-    print(f"[STATUS] USV-{vid}{' (stale/replayed)' if stale else ''}: comm={log_comm} mission={log_mission_state}")
+    if not isinstance(log_payload, dict):
+        log_payload = {}
+    log_source = (incoming.get("source") if isinstance(incoming, dict) else None) or name_of(vid)
+    signature = _status_signature(log_payload, accepted=not stale, reason=reject_reason,
+                                  source=log_source)
+    should_log, why = status_log_decision(vid, signature, now)
+    if should_log:
+        line = (f"[STATUS] canonical_id={vehicle_slug(vid)} source={log_source} "
+                f"accepted={str(not stale).lower()}")
+        if stale:
+            # Enough evidence to diagnose WHY without a second run: the vehicle's own clock
+            # values, not just the verdict. A backward step (negative delta) distinguishes a
+            # replayed/buffered packet from a Local Agent whose time base restarted.
+            line += (f" reason={reject_reason} prev_ts={prev_ts!r} msg_ts={msg_ts!r}"
+                     f" delta_s={round(msg_ts - prev_ts, 3)}")
+        elif recovered_after:
+            # Closes the episode in the log: how many packets that vehicle lost, so a
+            # rejection streak is visible end-to-end without reading every line.
+            line += f" recovered_after={recovered_after}"
+        log_mission = log_payload.get("mission") if isinstance(log_payload.get("mission"), dict) else {}
+        line += (f" comm={log_payload.get('comm_state', 'UNKNOWN')}"
+                 f" mission={log_mission.get('mission_state', '—')} ({why})")
+        print(line)
 
     return {
         "ok": True,
         "message": "status received",
         "stale": stale,
-        "received_at": latest_agent_received_at,
+        "reason": reject_reason,
+        "vehicle_id": vehicle_slug(vid),
+        "received_at": now.isoformat(),
     }
 
 
 @app.get("/agent/status")
 def get_agent_status():
+    """The last accepted packet per vehicle. `latest_status`/`received_at` keep the old
+    single-vehicle shape for existing callers (most recently contacted vehicle), while
+    `vehicles` exposes the real per-USV truth — there is no global "latest" state any more."""
+    per_vehicle = {}
+    newest = None
+    for cid, rec in current_vehicle_state.items():
+        per_vehicle[vehicle_slug(cid)] = {
+            "vehicle_id": vehicle_slug(cid),
+            "id": cid,
+            "name": name_of(cid),
+            "latest_status": rec.get("raw_latest"),
+            "received_at": rec["received_at"].isoformat() if rec.get("received_at") else None,
+            "message_timestamp": rec.get("message_timestamp"),
+            # Per-USV ingest counters + the most recent rejection's evidence. This is how a
+            # "vehicle X was accepted=false for a while" episode is diagnosed after the fact:
+            # `last_reject.delta_s` is how far that vehicle's own clock went backwards.
+            "accepted_packets": rec.get("packets", 0),
+            "rejected_packets": rec.get("rejected", 0),
+            "reject_streak": rec.get("reject_streak", 0),   # 0 = currently accepting
+            "last_reject": rec.get("last_reject"),          # survives recovery, for post-hoc use
+        }
+        if rec.get("received_at") and (newest is None or rec["received_at"] > newest[1]):
+            newest = (cid, rec["received_at"])
+    latest = current_vehicle_state.get(newest[0]) if newest else None
     return {
-        "latest_status": latest_agent_status,
-        "received_at": latest_agent_received_at,
+        "latest_status": latest.get("raw_latest") if latest else {},
+        "received_at": newest[1].isoformat() if newest else None,
+        "vehicles": per_vehicle,
     }
+
+
+# --- Bounded status diagnostics ----------------------------------------------------
+# Multi-USV routing has to be inspectable, but two vehicles posting at ~1 Hz means ~120
+# lines a minute if every packet logs — the real transitions ([COMMS], [EVENT], a packet
+# starting to be rejected) drown in it. So [STATUS] is CHANGE-DRIVEN and per-vehicle:
+# a line is printed on first contact, whenever this vehicle's status signature changes
+# (accepted↔rejected, a new rejection reason, comm-state, mission state, mode, armed, or
+# the source string that resolved to this canonical id), and otherwise at most once per
+# STATUS_HEARTBEAT_SECONDS as a liveness confirmation. Steady-state traffic is silent;
+# a repeated identical rejection prints once, not once per packet.
+#
+# Dedup state is strictly per canonical id, so a chatty vehicle can never suppress or
+# trigger another vehicle's line.
+STATUS_HEARTBEAT_SECONDS = 60
+
+_status_log_state = {}   # {canonical_id: {"signature": tuple, "at": datetime}}
+
+
+def status_log_decision(cid, signature, now):
+    """(should_log, why) for one vehicle's status line. Pure apart from the per-vehicle
+    dedup state it updates on a decision to log. `why` is "first-contact" | "change" |
+    "heartbeat" and is only meaningful when should_log is True."""
+    prev = _status_log_state.get(cid)
+    if prev is None:
+        _status_log_state[cid] = {"signature": signature, "at": now}
+        return True, "first-contact"
+    if signature != prev["signature"]:
+        prev["signature"] = signature
+        prev["at"] = now
+        return True, "change"
+    if (now - prev["at"]).total_seconds() >= STATUS_HEARTBEAT_SECONDS:
+        prev["at"] = now
+        return True, "heartbeat"
+    return False, None
+
+
+def _status_signature(payload, *, accepted, reason, source):
+    """The facts a [STATUS] line reports. Two packets with the same signature say nothing
+    new, so only the first of them is printed. Deliberately excludes continuously varying
+    telemetry (battery, position, heading) — those are the UI's job, not the log's."""
+    tel = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
+    mission = payload.get("mission") if isinstance(payload.get("mission"), dict) else {}
+    return (
+        accepted,
+        reason,
+        payload.get("comm_state", "UNKNOWN"),
+        mission.get("mission_state"),
+        tel.get("mode"),
+        tel.get("armed"),
+        source,          # a changed source string means identity resolution changed
+    )
+
+
+# Unidentified packets carry no vehicle to key dedup state by, so they get their own
+# rate limit — a misconfigured agent retrying at 1 Hz must not flood the terminal.
+_unidentified_log_at = None
+
+
+# Bounded fleet diagnostics: one line only when the fleet's shape actually changes
+# (vehicle count or per-state counts), never once per 2 s poll. Enough to see "both USVs
+# are present and connected" without flooding the terminal.
+_last_fleet_summary = None
+
+
+def _log_fleet_summary(fleet):
+    global _last_fleet_summary
+    counts = {"CONNECTED": 0, "PARTITIONED": 0, "DISCONNECTED": 0, "UNKNOWN": 0}
+    for v in fleet:
+        counts[v.get("comm_state", "UNKNOWN")] = counts.get(v.get("comm_state", "UNKNOWN"), 0) + 1
+    summary = (len(fleet), tuple(sorted(counts.items())))
+    if summary == _last_fleet_summary:
+        return
+    _last_fleet_summary = summary
+    print(f"[FLEET] vehicles={len(fleet)} connected={counts['CONNECTED']} "
+          f"partitioned={counts['PARTITIONED']} disconnected={counts['DISCONNECTED']} "
+          f"unknown={counts['UNKNOWN']}")
 
 
 @app.get("/api/fleet/status")
 def fleet_status():
-    fleet = [dict(usv) for usv in FLEET_TEMPLATE]
+    """Every known vehicle, every time — each row normalized INDEPENDENTLY from that
+    vehicle's own record and its own last-contact time.
 
-    if latest_agent_status:
-        live_usv = normalize_agent_message(latest_agent_status)
-
-        replaced = False
-        for i, usv in enumerate(fleet):
-            if usv["id"] == live_usv["id"]:
-                fleet[i] = live_usv
-                replaced = True
-
-        if not replaced:
-            fleet.append(live_usv)
-
+    This endpoint used to build a static template list and splice in the single most
+    recently received packet, so exactly one vehicle could be populated at a time and the
+    others reverted to UNKNOWN placeholders whenever someone else posted. Now nothing about
+    vehicle A's row is a function of vehicle B: a vehicle that did not report during this
+    poll keeps its last-known values and ages on its own clock (CONNECTED → PARTITIONED →
+    DISCONNECTED), and no vehicle ever disappears because another one reported."""
+    fleet = []
+    for cid in fleet_vehicle_ids():
+        rec = current_vehicle_state.get(cid)
+        if rec is None or rec.get("raw_latest") is None:
+            # Configured but never contacted (or contacted with nothing storable yet).
+            row = never_contacted_row(cid)
+            if rec is not None and rec.get("received_at") is not None:
+                row["last_seen"] = rec["received_at"].isoformat()
+            fleet.append(row)
+            continue
+        fleet.append(normalize_agent_message(
+            rec["raw_latest"], cid=cid, received_at=rec.get("received_at")))
+    _log_fleet_summary(fleet)
     return fleet
 
 

@@ -200,7 +200,7 @@ class TestAgentCommandDelivery(AgentCommandsBase):
         self.assertEqual(main.commands_by_id[cid]["status"], "EXPIRED")
 
     def test_only_the_addressed_vehicle_s_commands_are_delivered(self):
-        other = next(u["id"] for u in main.FLEET_TEMPLATE if u["id"] != SCOUT_VID)
+        other = next(c for c in main.REGISTRY.configured_ids() if c != SCOUT_VID)
         mine = self.queue("SET_HOME", vid=SCOUT_VID)
         self.queue("SET_MODE_LOITER", params={}, vid=other)
         cmds = self.poll("usv-2").json()["commands"]

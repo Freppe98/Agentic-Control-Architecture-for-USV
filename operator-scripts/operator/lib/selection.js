@@ -10,6 +10,11 @@
 // on what a vehicle actually is. Multiple USVs and multiple operator stations are
 // preserved: this is per-station state, and the value is only ever a USV id.
 //
+// The stored value is a CANONICAL vehicle id and nothing else — never a display name,
+// never a fleet-array index. That matters with several live USVs: a vehicle renaming
+// itself (USV-3 → SAR-001), the fleet list reordering, or the selected vehicle going
+// stale must not move the operator's selection. Only an explicit selection changes it.
+//
 // No DOM beyond localStorage; the subscribe mechanism is a plain observer set so it is
 // unit-testable (tests/selection.test.mjs) with an injected storage.
 
@@ -40,13 +45,34 @@ function persist() {
   try { if (storage) storage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* private mode — in-memory only */ }
 }
 
-// Accept a numeric id or a numeric string; anything else (null/NaN/object) → null. Ids
-// are kept as numbers because the fleet payload keys vehicles by numeric id.
-function normalizeId(v) {
-  if (v == null) return null;
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : null;
+// Canonical vehicle id — the frontend mirror of the backend's one identity policy
+// (operator-scripts/vehicle_registry.py). Every spelling of the SAME vehicle folds to one
+// value, so a number and a string can never be two selections of one USV:
+//
+//   2, "2", "usv-2", "USV-2"  → 2                (numeric identity, what the fleet rows use)
+//   "sar-001", "SAR_001"      → "sar-001"        (a vehicle with no numeric identity)
+//   null / "" / {}            → null             (names no vehicle)
+//
+// A display name is NOT an identity and is deliberately not resolvable here: the operator
+// station must never key selection or per-USV state by a name a vehicle can change.
+export function canonicalVehicleId(v) {
+  if (v == null || typeof v === "boolean") return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v !== "string") return null;
+  const token = v.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!token) return null;
+  if (/^\d+$/.test(token)) return Number(token);
+  const m = /^usv-(\d+)$/.exec(token);
+  return m ? Number(m[1]) : token;
 }
+
+/** True when two id spellings name the same vehicle. Use instead of a bare `===` on ids. */
+export function sameVehicle(a, b) {
+  const x = canonicalVehicleId(a);
+  return x !== null && x === canonicalVehicleId(b);
+}
+
+function normalizeId(v) { return canonicalVehicleId(v); }
 
 /** The currently selected USV id (number), or null if none. */
 export function getSelectedVehicleId() { return state.id; }

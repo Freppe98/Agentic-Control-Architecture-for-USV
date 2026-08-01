@@ -28,6 +28,7 @@ import { homeStatus, fmtDistance } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
 import { parseMission, missionUploadParams, missionUploadStage, missionUploadCompare, missionClearOutcome, missionOperationState, missionEvidence, missionErrorText, missionErrorOf, MISSION_TOO_LARGE, UPLOAD_STAGES, READBACK_PENDING, READBACK_AVAILABLE, READBACK_UNAVAILABLE } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
+import { canonicalVehicleId } from "../lib/selection.js";
 
 const TABS = [["overview", "Overview"], ["upload", "Upload"], ["replay", "Replay"], ["statistics", "Statistics"], ["export", "Export"]];
 const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v0.01M11 12h1v4h1"/></svg>';
@@ -759,7 +760,7 @@ export function Mission(root) {
 
   function renderDock() {
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
-    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => selectVehicle(+el.dataset.id)));
+    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => selectVehicle(canonicalVehicleId(el.dataset.id))));
   }
 
   function counts() {
