@@ -23,11 +23,19 @@ test("starts empty with no backing value", () => {
   assert.equal(getSelectedAt(), null);
 });
 
-test("normalizes numeric strings and rejects garbage", () => {
+// Multi-USV note: a canonical vehicle id is no longer necessarily numeric. A vehicle with
+// no numeric identity is keyed by its slug, so a non-numeric string is a legitimate id and
+// is kept verbatim — only values that name NO vehicle (null/undefined/blank/objects) clear
+// the selection. Every spelling of one vehicle still folds to a single stored value.
+test("normalizes every spelling of an id and rejects non-ids", () => {
   _setStorageForTest(fakeStorage());
   assert.equal(setSelectedVehicleId("3"), 3);
   assert.equal(getSelectedVehicleId(), 3);
-  assert.equal(setSelectedVehicleId("not-a-number"), null);
+  assert.equal(setSelectedVehicleId("usv-2"), 2);
+  assert.equal(setSelectedVehicleId("USV-2"), 2, "same vehicle — no change");
+  assert.equal(setSelectedVehicleId("sar-001"), "sar-001", "a non-numeric canonical id");
+  assert.equal(setSelectedVehicleId({}), null);
+  assert.equal(setSelectedVehicleId("   "), null);
   assert.equal(getSelectedVehicleId(), null);
 });
 

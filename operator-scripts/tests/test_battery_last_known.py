@@ -20,8 +20,7 @@ def _pkt(tel, ts):
 class TestBatteryLastKnown(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
-        main.latest_agent_status_by_id.clear()
-        main.latest_agent_received_at_by_id.clear()
+        main.current_vehicle_state.clear()
         main.last_known_telemetry.clear()
         main.latest_msg_ts_by_id.clear()
         main.last_seen_by_id.clear()

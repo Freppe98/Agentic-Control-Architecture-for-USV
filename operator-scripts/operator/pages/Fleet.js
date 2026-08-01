@@ -9,13 +9,23 @@ import { Ribbon, updateRibbon } from "../components/Ribbon.js";
 import { CommsPill } from "../components/CommsPill.js";
 import { BatteryBar } from "../components/BatteryBar.js";
 import { Table } from "../components/Table.js";
-import { HealthBadge, deriveHealth, healthRank } from "../components/HealthBadge.js";
+import { HealthBadge, deriveHealth } from "../components/HealthBadge.js";
 import { commState, cls, fmtAge, statusDot, noTelem } from "../lib/ui.js";
-
-const commRank = { connected: 0, partitioned: 1, disconnected: 2, unknown: 3 };
+import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId, subscribeSelection }
+  from "../lib/selection.js";
+import { DEFAULT_SORT, sortFleet, nextSort } from "../lib/fleet-sort.js";
 
 export function Fleet(root) {
-  let fleet = [], selId = null, sort = { key: "age", dir: -1 };
+  // Selection is the SHARED canonical one, not a page-local id: this page used to keep its
+  // own `selId` and seed it from fleet[0] — a selection derived from list position, which
+  // silently moved whenever the fleet order or membership changed. Highlighting here now
+  // means the same thing as on Map/Vehicle, and follows the operator across pages.
+  //
+  // The default sort was `{ key: "age", dir: -1 }` — last contact, recomputed every 2 s poll.
+  // With two USVs reporting at slightly different moments their ages crossed and the rows
+  // swapped on their own. Default is now canonical-id order (lib/fleet-sort.js), which no
+  // amount of traffic can change; an operator-chosen sort still stays active until changed.
+  let fleet = [], selId = getSelectedVehicleId(), sort = DEFAULT_SORT;
 
   root.className = "app no-dock";
   root.innerHTML =
@@ -44,31 +54,21 @@ export function Fleet(root) {
     { key: "cov", label: "Coverage", align: "num", sortable: true, render: coverageCell },
   ];
 
-  function sorted() {
-    const arr = [...fleet];
-    const k = sort.key;
-    arr.sort((a, b) => {
-      let x, y;
-      if (k === "name") { x = a.id; y = b.id; }
-      else if (k === "comm") { x = commRank[commState(a)]; y = commRank[commState(b)]; }
-      else if (k === "age") { x = a.last_seen_age_s ?? -1; y = b.last_seen_age_s ?? -1; }
-      else if (k === "health") { const ha = deriveHealth(a), hb = deriveHealth(b); x = ha ? healthRank[ha.sev] : -1; y = hb ? healthRank[hb.sev] : -1; }
-      else if (k === "batt") { x = a.battery ?? -1; y = b.battery ?? -1; }
-      else if (k === "cov") { x = a.coverage ?? -1; y = b.coverage ?? -1; }
-      else { x = 0; y = 0; }
-      return (x - y) * sort.dir;
-    });
-    return arr;
-  }
-
   function renderTable() {
-    document.getElementById("tw").innerHTML = Table(columns, sorted(), { selectedId: selId, sort });
+    // sortFleet returns a COPY — `fleet` stays in the order the backend sent it, because the
+    // rollup, the counts and (on other pages) the telemetry cache read the same records.
+    document.getElementById("tw").innerHTML =
+      Table(columns, sortFleet(fleet, sort), { selectedId: selId, sort });
     document.querySelectorAll("#tw th[data-sort-key]").forEach((th) => (th.onclick = () => {
-      const key = th.dataset.sortKey;
-      if (sort.key === key) sort.dir *= -1; else sort = { key, dir: key === "name" ? 1 : -1 };
+      sort = nextSort(sort, th.dataset.sortKey);
       renderTable();
     }));
-    document.querySelectorAll("#tw tbody tr").forEach((tr) => (tr.onclick = () => { selId = +tr.dataset.id; renderTable(); }));
+    document.querySelectorAll("#tw tbody tr").forEach((tr) => (tr.onclick = () => {
+      // canonicalVehicleId, not `+id`: a vehicle whose canonical id is a string (one with
+      // no numeric identity) must stay selectable, and `+"sar-001"` is NaN.
+      selId = setSelectedVehicleId(canonicalVehicleId(tr.dataset.id));
+      renderTable();
+    }));
   }
 
   function counts() {
@@ -92,16 +92,20 @@ export function Fleet(root) {
   }
 
   function onFleet(data) {
+    // A fleet poll replaces the roster but NEVER the selection: no auto-select of the
+    // first row, the newest row, or the most recently connected vehicle. An unselected
+    // roster simply renders unselected until the operator picks a vehicle.
     fleet = Array.isArray(data) ? data : [];
-    if (selId == null && fleet.length) selId = fleet[0].id;
     document.getElementById("fcount").textContent = `${fleet.length} vehicles`;
     renderRollup(); renderTable();
     updateRibbon({ counts: counts() });
   }
 
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
+  // Follow a selection made on another page (Map/Vehicle) without re-deriving one here.
+  const unsubscribe = subscribeSelection((id) => { selId = id; if (fleet.length) renderTable(); });
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); };
+  return function cleanup() { stopFleet(); unsubscribe(); clearInterval(clockId); };
 }

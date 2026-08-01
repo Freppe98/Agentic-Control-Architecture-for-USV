@@ -26,6 +26,8 @@ import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { isSafetyHold, SAFETY_HOLD_TITLE, homeStatus, commandGate, commandGateCtx } from "../lib/home.js";
 import { classifyMissionWaypoints, missionCounts } from "../lib/mission.js";
 import { commandVerification, commandSource, commandStages } from "../lib/command.js";
+import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId, subscribeSelection }
+  from "../lib/selection.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
@@ -94,7 +96,10 @@ function commandRow(cm) {
 const lockSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
 
 export function Vehicle(root) {
-  let fleet = [], selId = null, cmds = [];
+  // The SHARED canonical selection (lib/selection.js), not a page-local one: this page
+  // used to keep its own id, so opening it could land on a different vehicle than the one
+  // the operator had selected on the Map. All pages now agree on one canonical selected id.
+  let fleet = [], selId = getSelectedVehicleId(), cmds = [];
   const pxm = {};  // per-vehicle Pixhawk mission cache — same contract as Map.js/Mission.js
 
   // Control authority — a dedicated read (GET /api/control_authority/{id}, a live
@@ -138,8 +143,9 @@ export function Vehicle(root) {
     finally { s.loading = false; if (id === selId) renderDetail(); }
   }
   function selectVehicle(id) {
+    id = canonicalVehicleId(id);
     if (id !== selId) {
-      selId = id; authCtl.reset(); loadAuthority(id);
+      selId = id; setSelectedVehicleId(id); authCtl.reset(); loadAuthority(id);
       cmds = []; refreshCommands();
       // Auto-fetch once per vehicle per page visit (this page's whole purpose is
       // showing vehicle state) — Refresh stays a deliberate action for re-fetches,
@@ -208,7 +214,7 @@ export function Vehicle(root) {
     }).join("");
     const mx = document.getElementById("mxwrap");
     mx.innerHTML = `<table class="mx"><thead>${head}</thead><tbody>${body}</tbody></table>`;
-    mx.querySelectorAll("tbody tr").forEach((tr) => (tr.onclick = () => { selectVehicle(+tr.dataset.id); renderMatrix(); renderDetail(); }));
+    mx.querySelectorAll("tbody tr").forEach((tr) => (tr.onclick = () => { selectVehicle(tr.dataset.id); renderMatrix(); renderDetail(); }));
   }
 
   // ---- detail ----
@@ -534,23 +540,28 @@ export function Vehicle(root) {
 
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
-    // Open on a vehicle that is actually reporting rather than a placeholder template row.
+    // FIRST payload only: open on a vehicle that is actually reporting rather than a
+    // never-contacted row. Every later poll leaves the selection alone — with several live
+    // USVs, re-deriving "the reporting one" each poll would drag the operator between
+    // vehicles as they take turns reporting, and a stale selection must stay selected.
     if (selId == null && fleet.length) {
       selectVehicle((fleet.find((x) => x.online) || fleet.find((x) => x.lat != null) || fleet[0]).id);
     }
     document.getElementById("vcount").textContent = `${fleet.length} vehicles`;
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
-    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selectVehicle(+el.dataset.id); onFleet(fleet); }));
+    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { selectVehicle(el.dataset.id); onFleet(fleet); }));
     renderMatrix(); renderDetail();
     updateRibbon({ counts: counts() });
   }
 
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeedIndicator, "fleet");
+  // Follow a selection made on another page without re-deriving one here.
+  const unsubscribe = subscribeSelection((id) => { if (id !== selId) selectVehicle(id); });
   const authorityId = setInterval(() => loadAuthority(selId), 2000);  // refresh selected vehicle's control authority
   const commandsId = setInterval(() => refreshCommands(), 3000);  // refresh selected vehicle's command queue
   const clockId = setInterval(() => { updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }); updateFeedIndicator(); }, 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
   updateFeedIndicator();
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(commandsId); authCtl.dispose(); };
+  return function cleanup() { stopFleet(); unsubscribe(); clearInterval(clockId); clearInterval(authorityId); clearInterval(commandsId); authCtl.dispose(); };
 }

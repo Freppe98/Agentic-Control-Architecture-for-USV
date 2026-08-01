@@ -22,6 +22,7 @@ import { vehicleRows } from "../components/VehicleDock.js";
 import { commState, cls, fmtAge } from "../lib/ui.js";
 import { AVAIL, availSlot, availTag } from "../lib/availability.js";
 import { createAuthorityController } from "../lib/authority.js";
+import { canonicalVehicleId } from "../lib/selection.js";
 
 const clockSvg =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
@@ -411,7 +412,7 @@ export function Agent(root) {
       loadAuthority(selId);
     }
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
-    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { select(+el.dataset.id); onFleet(fleet); }));
+    document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { select(canonicalVehicleId(el.dataset.id)); onFleet(fleet); }));
     renderDetail();
     updateRibbon({ counts: counts() });
   }

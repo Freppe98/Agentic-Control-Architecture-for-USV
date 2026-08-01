@@ -16,9 +16,10 @@ import * as api from "../services/api.js";
 import { NavRail } from "../components/NavRail.js";
 import { Ribbon, updateRibbon } from "../components/Ribbon.js";
 import { commState } from "../lib/ui.js";
+import { canonicalVehicleId } from "../lib/selection.js";
 
-// Small local vehicle→dashboard map (per the task: no Configuration API). Keyed by
-// the vehicle id used everywhere else (FLEET_TEMPLATE / fleet status). Only vehicles
+// Small local vehicle→dashboard map (per the task: no Configuration API). Keyed by the
+// CANONICAL vehicle id used everywhere else (vehicle registry / fleet status). Only vehicles
 // with a real, reachable local dashboard belong here — we do not fabricate one for
 // hulls that don't serve a web UI.
 const DASHBOARDS = {
@@ -114,7 +115,7 @@ export function Pilot(root) {
         `<button class="pilot-chip${id === selId ? " on" : ""}" data-id="${id}">${nameOf(id)}</button>`
       ).join("");
       veh.querySelectorAll(".pilot-chip").forEach((b) => (b.onclick = () => {
-        selId = +b.dataset.id; renderTarget(); mountFrame();
+        selId = canonicalVehicleId(b.dataset.id); renderTarget(); mountFrame();
       }));
     }
   }

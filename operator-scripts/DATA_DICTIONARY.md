@@ -4,6 +4,18 @@ Single source of truth for every data field the operator station consumes. Field
 
 Backend today (`main.py`): `GET /api/fleet/status` returns a list of normalized vehicles (see `normalize_agent_message`). `POST /agent/status` ingests the latest agent message; `GET /api/environment` returns weather. Comms state is derived from time-since-last-contact against the thresholds in `main.py` (`STALE_AFTER_SECONDS=8`, `PARTITIONED_AFTER_SECONDS=15`, `DISCONNECTED_AFTER_SECONDS=30`).
 
+### Multi-USV identity and per-vehicle current state
+
+Several USVs post to the same endpoint, so **identity and isolation are part of the data contract**:
+
+- **Canonical vehicle id** — one id policy for the whole station, in `vehicle_registry.py` with the deployed configuration in `vehicles.json`. `canonical_id()` folds every spelling a vehicle may use for itself (`3`, `"3"`, `"usv-3"`, `"USV-3"`, and declared aliases such as the callsign `"SAR-001"`) to ONE value; its stable string form is the slug `usv-3`, published on every fleet row as `vehicle_id`. Aliases are declared by a human, never inferred, and an alias claimed by two vehicles is a startup error.
+- **Display name is not an identity.** `name` is per-vehicle and sticky (the name that vehicle last reported, else its configured one). No state, cache, command, URL or selection is keyed by it — a vehicle renaming itself (`USV-3` → `SAR-001`) must not create, merge or move a record.
+- **One record per USV.** `current_vehicle_state[canonical_id]` holds that vehicle's last accepted packet, its own `received_at`, its own monotonic `message_timestamp`, and its own last-known telemetry/agent groups. A packet from vehicle A updates exactly A: it can never overwrite B's telemetry, name, health, mission, authority or freshness, and never changes the operator's selection.
+- **Freshness is per USV.** `comm_state` / `last_seen_age_s` come from that vehicle's own last contact. One vehicle reporting neither refreshes nor ages another; a silent vehicle keeps its last-known values and transitions CONNECTED → PARTITIONED → DISCONNECTED on its own clock.
+- **Packet ordering is per USV.** The monotonic replay guard compares a packet only against the newest timestamp from the SAME vehicle. Interleaved arrivals (Scout, SAR, Scout, SAR) are normal traffic and never block each other.
+- **The fleet response is complete every time.** Every configured vehicle exists from startup with `comm_state: UNKNOWN` and `contacted: false`; live data updates that same canonical record instead of adding a second row. No vehicle disappears, or reverts to a placeholder, because another vehicle reported.
+- **Adding a USV is configuration, not code** — one entry in `vehicles.json`, then restart. See `operator/docs/verification/multi-usv-isolation.md`.
+
 Legend — **Freq**: how often the value changes/should refresh. **Opt**: optional / may be absent.
 
 ## Data Availability States (first-class)

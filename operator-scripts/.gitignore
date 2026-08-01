@@ -16,6 +16,10 @@ node_modules/
 .operator.pid
 logs/
 
+# Survey draft store written at runtime by the Plan page (PLANNING_DRAFTS_DIR in main.py).
+# Operator-local mission state, not source — each station keeps its own.
+planning_drafts/
+
 # Python bytecode / caches
 __pycache__/
 *.pyc
