@@ -317,6 +317,75 @@ export function applyNetworkExperiment(body) { return postJSON("/api/experiment/
 /** Remove the active impairment immediately. Returns { ok, status, data }. */
 export function stopNetworkExperiment() { return delJSON("/api/experiment/network"); }
 
+// --- Replanning supervisory API (Scout Local Agent /agent/replan/*, port 8090) ----------
+// The Operator Station is a THIN PROXY over Scout's replanning controller (see main.py
+// scout_replan.py). Every method below is per-vehicle and hits the SELECTED vehicle's Local
+// Agent only. Reads never fabricate state; writes carry the three-state outcome model:
+//   outcome "accepted"    — Scout stored/applied it (HTTP 200)
+//   outcome "rejected"    — Scout refused it (400, or 409 transaction_active) — reason preserved
+//   outcome "unknown"     — no verdict reached us (HTTP 202) — reconcile with a GET, never retry
+//   outcome "unavailable" — a read failed (503) — honest "unavailable", not a guess
+//   outcome "unsupported" — an older Scout 404s the route (200, supported:false)
+// getJSON throws on non-2xx, so reads that may answer 503/202 use the non-throwing helpers.
+
+async function getReplan(path) {
+  const res = await fetch(BASE + path, { headers: { Accept: "application/json" } });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* empty */ }
+  return data || { ok: false, reachable: false, outcome: "unavailable" };
+}
+async function patchJSON(path, body) {
+  const res = await fetch(BASE + path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* empty */ }
+  return { ok: res.ok, status: res.status, data };
+}
+
+/** Scout's canonical replanning status object (decision, FSM, energy, revision, package,
+ *  geometry, transitions). Read-only; answers supported:false for an older Scout. */
+export function getReplanStatus(id) { return getReplan(`/api/vehicles/${id}/replan/status`); }
+
+/** Combined MISSION READY / REPLANNING READY summary (backend-computed, never fabricated). */
+export function getReplanReadiness(id) { return getReplan(`/api/vehicles/${id}/replan/readiness`); }
+
+/** Resolved replanning config with the source of each value (default/environment/runtime). */
+export function getReplanConfig(id) { return getReplan(`/api/vehicles/${id}/replan/config`); }
+/** Patch runtime config (Scout's patchable fields only). Returns { ok, status, data }; a 409
+ *  is TRANSACTION_ACTIVE (data.transaction_active), NOT a generic network failure. */
+export function patchReplanConfig(id, patch) { return patchJSON(`/api/vehicles/${id}/replan/config`, patch); }
+
+/** The planning package Scout currently stores (single slot) — for reconciliation. */
+export function getReplanPackage(id) { return getReplan(`/api/vehicles/${id}/replan/planning-package`); }
+/** Build the approved package from the vehicle's active original mission and PUT it to Scout.
+ *  body: { mission_id? }. Returns { ok, status, data }; watch data.outcome (accepted/rejected/
+ *  unknown). An "unknown" (202) is reconciled by a later getReplanPackage(), never re-PUT. */
+export function putReplanPackage(id, body = {}) { return putJSON(`/api/vehicles/${id}/replan/planning-package`, body); }
+/** Clear Scout's stored planning package. Idempotent. */
+export function deleteReplanPackage(id) { return delJSON(`/api/vehicles/${id}/replan/planning-package`); }
+
+/** Scout's accepted energy-replanning injection state (always SIMULATED, auto-expiring). */
+export function getReplanExperiment(id) { return getReplan(`/api/vehicles/${id}/replan/experiment`); }
+/** Apply ONE explicit energy-replanning injection. body: { force_safe_return?, energy_margin_percent?,
+ *  battery_percent?, duration_s? }. target_vehicle is forced server-side to the selected vehicle.
+ *  Never call this during polling. Returns { ok, status, data }. */
+export function putReplanExperiment(id, body) { return putJSON(`/api/vehicles/${id}/replan/experiment`, body); }
+/** Clear Scout's energy-replanning injection. Idempotent. */
+export function deleteReplanExperiment(id) { return delJSON(`/api/vehicles/${id}/replan/experiment`); }
+
+/** Rearm Scout's replanning controller from a terminal state. Issues NO vehicle command and
+ *  does NOT change vehicle mode or the Pixhawk mission. 409 while a transaction is active. */
+export function resetReplanController(id) { return postJSON(`/api/vehicles/${id}/replan/reset`, {}); }
+
+/** The write operation trace (planning-package / config / experiment / reset), reconnect-safe:
+ *  accepted / rejected / unknown outcomes, newest last. Optionally filtered to one vehicle. */
+export function getReplanOperations(id) {
+  return getJSON(`/api/replan/operations${id != null ? `?vehicle_id=${id}` : ""}`);
+}
+
 /** Small polling helper so pages don't each reinvent setInterval + error handling.
  *  `key` is optional — pass one (e.g. "fleet") to make this feed's health readable
  *  via getFeedHealth() for an operator-facing freshness indicator.

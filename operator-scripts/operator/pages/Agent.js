@@ -23,6 +23,7 @@ import { commState, cls, fmtAge } from "../lib/ui.js";
 import { AVAIL, availSlot, availTag } from "../lib/availability.js";
 import { createAuthorityController } from "../lib/authority.js";
 import { canonicalVehicleId } from "../lib/selection.js";
+import * as replan from "../lib/replan.js";
 
 const clockSvg =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
@@ -63,6 +64,12 @@ const pill = (label, tint) => `<span class="pill ${tint}">${label}</span>`;
 export function Agent(root) {
   let fleet = [], selId = null, events = [];
 
+  // Replanning supervisory state, per SELECTED vehicle only (isolation: switching vehicles
+  // clears it, so no Scout's replan state can leak onto another's panel). All read-only from
+  // Scout except explicit operator writes; `replanMsg` holds the last write's outcome pill.
+  let replanStatus = null, replanReadiness = null, replanConfig = null, replanExperiment = null;
+  let replanMsg = null, replanBusy = false, replanForVid = null;
+
   const authCtl = createAuthorityController(() => renderDetail());
   function loadAuthority(id) {
     if (id == null) return;
@@ -74,6 +81,41 @@ export function Agent(root) {
   }
   function loadEvents() {
     api.getEventLog().then((list) => { events = Array.isArray(list) ? list : []; renderDetail(); }).catch(() => {});
+  }
+
+  // Poll Scout's replanning state for the SELECTED vehicle. READS ONLY — a poll never writes,
+  // so reconnect/poll can never resend a package/config/injection. Results are tagged with the
+  // vehicle they were fetched for and dropped if the selection changed meanwhile (isolation).
+  function loadReplan(id) {
+    if (id == null) { replanStatus = replanReadiness = replanConfig = replanExperiment = null; return; }
+    const forId = id;
+    Promise.allSettled([
+      api.getReplanStatus(id), api.getReplanReadiness(id),
+      api.getReplanConfig(id), api.getReplanExperiment(id),
+    ]).then(([st, rd, cf, ex]) => {
+      if (forId !== selId) return;                 // selection moved — discard stale fetch
+      replanStatus = st.status === "fulfilled" ? st.value : null;
+      replanReadiness = rd.status === "fulfilled" ? rd.value : null;
+      replanConfig = cf.status === "fulfilled" ? cf.value : null;
+      replanExperiment = ex.status === "fulfilled" ? ex.value : null;
+      replanForVid = forId;
+      renderDetail();
+    });
+  }
+
+  // One explicit supervisory WRITE, then reconcile with a fresh read. `busy` disables the
+  // controls; the outcome pill shows accepted / rejected / unknown (unknown is NOT a failure —
+  // the following read reconciles Scout's actual state). Writes only ever fire from here.
+  function replanWrite(label, fn) {
+    if (replanBusy || selId == null) return;
+    const id = selId;
+    replanBusy = true; replanMsg = { label, outcome: "pending" }; renderDetail();
+    Promise.resolve(fn(id)).then((r) => {
+      const data = (r && r.data) || r || {};
+      const outcome = data.outcome || (r && r.ok ? "accepted" : "rejected");
+      replanMsg = { label, outcome, code: data.scout_error_code, error: data.error };
+    }).catch((e) => { replanMsg = { label, outcome: "unavailable", error: String(e) }; })
+      .finally(() => { replanBusy = false; loadReplan(id); });
   }
 
   root.className = "app dock-main";
@@ -223,9 +265,232 @@ export function Agent(root) {
       ${banner}
       <div class="subgrid two">${situationCard}${decisionCard}</div>
       <div class="subgrid two">${watchCard}${policyCard}</div>
+      ${replanSection(v, { connected, stale })}
       <div class="subgrid two">${transitionsCard}${inputsCard}</div>
       ${timelineCard}`;
+    wireReplan();
   }
+
+  // ================= Replanning supervisory view (Scout Local Agent /agent/replan/*) =======
+  // Seven concepts kept DISTINCT (task Section 4): communication (above), Pixhawk mode, control
+  // authority (above), replanning FSM state, decision, mission revision, planning-package
+  // readiness. Everything here is Scout's word, normalized by lib/replan.js; the frontend
+  // never generates an alternate transition or a competing decision.
+  const rp = (label, tint) => `<span class="pill ${tint}">${label}</span>`;
+  const val = (v) => (v === null || v === undefined || v === "" ? `<span class="txt-u">—</span>` : String(v));
+  const shortHash = (h) => (h ? String(h).replace(/^sha256:/, "").slice(0, 12) + "…" : "—");
+  const OUTCOME_TINT = { accepted: "c", rejected: "d", unknown: "p", unavailable: "u", unsupported: "u", pending: "p" };
+
+  function replanSection(v, { connected, stale }) {
+    // Isolation guard: only render replan state actually fetched for THIS vehicle.
+    const forThis = replanForVid != null && v && replanForVid === v.id;
+    const S = forThis ? replan.normalizeReplanStatus(replanStatus) : replan.normalizeReplanStatus(null);
+    const rd = forThis && replanReadiness ? replanReadiness : null;
+    const cfg = forThis && replanConfig ? replanConfig : null;
+    const exp = forThis && replanExperiment ? replanExperiment : null;
+
+    if (replanStatus && replanStatus.supported === false) {
+      return `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Replanning (Scout Local Agent)</span></div>
+        ${gapBody("Replanning not supported by this Scout version.")}`;
+    }
+
+    return `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Replanning (Scout Local Agent)</span>
+        <span class="tag">safe-return lifecycle — decision, FSM, mission revision &amp; package shown verbatim from Scout ${S.decision.simulated ? rp("SIMULATED", "p") : ""}</span>
+        ${replanMsg ? `<span style="margin-left:8px">${rp(replanMsg.label + ": " + replan.outcomeLabel(replanMsg.outcome) + (replanMsg.code ? " (" + replanMsg.code + ")" : ""), OUTCOME_TINT[replanMsg.outcome] || "u")}</span>` : ""}
+      </div>
+      <div class="subgrid two">${readinessCard(rd)}${decisionReplanCard(S)}</div>
+      <div class="subgrid two">${transactionCard(S)}${missionRevisionCard(S)}</div>
+      <div class="subgrid two">${execConfigCard(cfg, S, rd, exp, av2(v, stale))}${experimentCard(exp, v)}</div>
+      ${transitionsReplanCard(S)}`;
+  }
+
+  function av2(v, stale) {
+    const view = authCtl.view();
+    return { authorityKnown: !stale && view.reachable !== false && view.value != null, value: stale ? null : view.value };
+  }
+
+  function readinessCard(rd) {
+    if (!rd) return card("Mission / Replanning readiness", availTag(AVAIL.GAP), "idle",
+      gapBody("Scout replanning readiness unavailable."), true);
+    const vm = rd.vehicle_mission || {}, pk = rd.planning_package || {};
+    const badge = (ok, on, off) => rp(ok ? on : off, ok ? "c" : "d");
+    const lims = Array.isArray(rd.limitations) ? rd.limitations : [];
+    return card("Mission / Replanning readiness",
+      `${badge(rd.mission_ready, "MISSION READY", "MISSION NOT READY")} ${badge(rd.replanning_ready, "REPLANNING READY", "NOT READY")}`,
+      rd.replanning_ready ? "ok" : rd.mission_ready ? "caution" : "idle",
+      `<div class="metrics">
+         ${row("Vehicle mission", `${vm.mission_id ? `<span class="mono">${vm.mission_id}</span>` : "—"}`)}
+         ${row("Pixhawk verified", badge(vm.pixhawk_verified, "VERIFIED", "NOT VERIFIED"))}
+         ${row("Readback hash match", vm.readback_reachable ? badge(vm.readback_hash_match, "MATCH", "NO MATCH") : rp("readback unreachable", "u"))}
+         ${row("Home valid", badge(vm.home_valid, "VALID" + (vm.home_source ? " · " + vm.home_source : ""), "INVALID"))}
+         ${row("Package stored", badge(pk.stored, "STORED", "NOT STORED"))}
+         ${row("Package consistency", pk.consistency ? rp(pk.consistency.replace("PLANNING_PACKAGE_", ""), pk.consistent ? "c" : "d") : rp("unknown", "u"))}
+         ${row("Mission id / hash match", `${badge(pk.mission_id_match, "ID", "ID?")} ${pk.hash_comparison_available ? badge(pk.hash_match, "HASH", "HASH✗") : rp("hash n/a", "u")}`)}
+         ${row("Boundary supplied", badge(vm.boundary_supplied, "YES", "NO"))}
+         ${row("Connector proven safe", pk.connector_proven_safe == null ? rp("unknown", "u") : badge(pk.connector_proven_safe, "PROVEN", "NOT PROVEN"))}
+       </div>
+       ${lims.length ? `<div class="reason-note">${warnSvg}<span>Limitations: ${lims.map((l) => l).join(" · ")}</span></div>` : ""}
+       <div style="padding:9px 13px;display:flex;gap:8px;flex-wrap:wrap">
+         <button class="btn" id="rp-pkg-put" ${replanBusy ? "disabled" : ""}>Upload approved planning package</button>
+         <button class="btn ghost" id="rp-pkg-del" ${replanBusy ? "disabled" : ""}>Clear package</button>
+       </div>`, true);
+  }
+
+  function decisionReplanCard(S) {
+    const d = S.decision;
+    if (!S.present) return card("Replanning decision", availTag(AVAIL.GAP), "idle",
+      gapBody("Scout is not reporting a replanning decision."), false);
+    const eng = d.energy && typeof d.energy === "object"
+      ? Object.entries(d.energy).map(([k, x]) => `${k}=${x}`).join(", ") : val(d.energy);
+    return card("Replanning decision", d.simulated ? rp("SIMULATED INPUT", "p") : availTag(AVAIL.LIVE), d.simulated ? "caution" : "ok",
+      `<div class="metrics">
+         ${row("Decision", `<b>${val(d.decision)}</b>`)}
+         ${row("Reason codes", d.reasonCodes.length ? d.reasonCodes.map((c) => rp(c, "u")).join(" ") : "—")}
+         ${row("Reason", val(d.reason))}
+         ${row("Snapshot id", `<span class="mono">${val(d.snapshotId)}</span>`)}
+         ${row("Energy calculation", eng)}
+         ${row("Trigger persistence", val(d.persistence))}
+         ${row("Real battery", d.realBattery == null ? "—" : d.realBattery + "%")}
+         ${row("Simulated battery / margin", d.simulated ? rp("simulated — see experiment", "p") : "—")}
+       </div>`, false);
+  }
+
+  function transactionCard(S) {
+    const t = S.transaction;
+    if (!S.present) return card("Replanning transaction", availTag(AVAIL.GAP), "idle",
+      gapBody("No replanning transaction reported."), false);
+    const cond = t.active ? rp("ACTIVE", "p") : t.terminal ? rp("TERMINAL", "d") : rp(String(t.fsmState || "IDLE"), "c");
+    return card("Replanning transaction", cond, t.terminal ? "caution" : t.active ? "caution" : "ok",
+      `<div class="metrics">
+         ${row("FSM state", `<b>${val(t.fsmState)}</b>`)}
+         ${row("Current step", val(t.currentStep))}
+         ${row("Transition id", `<span class="mono">${val(t.transitionId)}</span>`)}
+         ${row("Revision", val(t.revision))}
+         ${row("Strategy", val(t.strategy))}
+         ${row("Retry count", val(t.retryCount))}
+         ${row("Cooldown", t.cooldownS == null ? "—" : t.cooldownS + "s")}
+         ${row("Authority", val(t.authority))}
+         ${row("Authority-blocked recommendation", val(t.authorityBlockedRecommendation))}
+         ${row("Fallback", val(t.fallback))}
+         ${row("Last error", t.lastError ? `<span class="txt-d">${t.lastError}</span>` : "—")}
+       </div>
+       <div style="padding:9px 13px">
+         <button class="btn ghost" id="rp-reset" ${replanBusy || t.active ? "disabled" : ""} title="Rearms the Local Agent controller — issues NO vehicle command, does not change mode or the Pixhawk mission">Rearm replanning controller</button>
+         ${t.active ? `<span class="cond" style="margin-left:8px">reset is refused while a transaction is active</span>` : ""}
+       </div>`, false);
+  }
+
+  function missionRevisionCard(S) {
+    const m = S.missionRevision;
+    if (!S.present) return card("Mission revision", availTag(AVAIL.GAP), "idle",
+      gapBody("No mission revision reported."), false);
+    return card("Mission revision", val(m.revision === null ? "—" : "rev " + m.revision), "ok",
+      `<div class="metrics">
+         ${row("Original hash", `<span class="mono">${shortHash(m.originalHash)}</span>`)}
+         ${row("Revised hash", `<span class="mono">${shortHash(m.revisedHash)}</span>`)}
+         ${row("Preserved waypoints", val(m.preservedCount))}
+         ${row("Removed waypoints", val(m.removedCount))}
+         ${row("Inserted waypoints", val(m.insertedCount))}
+         ${row("Revised waypoints", val(m.revisedCount))}
+         ${row("Validation result", val(m.validationResult))}
+         ${row("Upload result", val(m.uploadResult))}
+         ${row("Readback result", val(m.readbackResult))}
+       </div>`, false);
+  }
+
+  function execConfigCard(cfg, S, rd, exp, auth) {
+    const scout = cfg && cfg.scout ? cfg.scout : null;
+    if (!scout) return card("Execution configuration", availTag(AVAIL.GAP), "idle",
+      gapBody("Scout replanning config unavailable."), false);
+    const stage = replan.executionStage(scout);
+    const injectionActive = !!(exp && exp.scout && (exp.scout.active || exp.scout.source === "SIMULATED"));
+    const blockers = replan.realExecutionBlockers({
+      injectionActive, transactionActive: S.transaction.active,
+      packageConsistent: !!(rd && rd.planning_package && rd.planning_package.consistent),
+      homeValid: !!(rd && rd.vehicle_mission && rd.vehicle_mission.home_valid),
+      authorityKnown: auth.authorityKnown,
+    });
+    const stageBadge = stage === replan.STAGE.REAL ? rp("REAL EXECUTION", "d")
+      : stage === replan.STAGE.DRY_RUN ? rp("DRY-RUN", "p") : rp("DISABLED", "u");
+    const src = (k) => (scout.sources && scout.sources[k]) ? `<span class="cond">${scout.sources[k]}</span>` : "";
+    return card("Execution configuration", stageBadge, stage === replan.STAGE.REAL ? "caution" : "ok",
+      `<div class="metrics">
+         ${row("Autonomous execution", `${scout.autonomous_execution_enabled ? "ENABLED" : "DISABLED"} ${src("autonomous_execution_enabled")}`)}
+         ${row("Dry run", `${scout.dry_run ? "TRUE" : "FALSE"} ${src("dry_run")}`)}
+         ${row("RTL fallback", `${scout.rtl_fallback_enabled ? "ENABLED" : "DISABLED (default)"} ${src("rtl_fallback_enabled")}`)}
+         ${row("Critical battery", val(scout.critical_battery_percent) + "%")}
+         ${row("Reserve margin", val(scout.reserve_margin_percent) + "%")}
+       </div>
+       <div style="padding:9px 13px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+         <button class="btn ghost" id="rp-stage-disabled" ${replanBusy ? "disabled" : ""}>Disable</button>
+         <button class="btn" id="rp-stage-dry" ${replanBusy ? "disabled" : ""}>Enable dry-run</button>
+         <button class="btn" id="rp-stage-real" ${replanBusy || blockers.length ? "disabled" : ""} title="${blockers.join(" · ")}">Enable real execution</button>
+       </div>
+       ${blockers.length ? `<div class="reason-note">${warnSvg}<span>Real execution blocked: ${blockers.join(" · ")}</span></div>`
+         : `<div class="reason-note">${gapSvg}<span>Real execution requires: clear experiment, no active transaction, consistent package, valid Home, explicit confirm. Runtime overrides disappear when Scout restarts.</span></div>`}`, false);
+  }
+
+  function experimentCard(exp, v) {
+    const scout = exp && exp.scout ? exp.scout : null;
+    const active = !!(scout && (scout.active || scout.source === "SIMULATED"));
+    const realBattery = num(v && v.battery);
+    return card("Energy replanning experiment", active ? rp("SIMULATED · ACTIVE", "p") : rp("inactive", "u"), active ? "caution" : "idle",
+      `<div class="metrics">
+         ${row("Real battery (telemetry)", realBattery == null ? "—" : realBattery + "%")}
+         ${row("Injection state", active ? rp("SIMULATED", "p") : "none")}
+         ${row("Created", val(scout && (scout.created_at || scout.created)))}
+         ${row("Expires", val(scout && (scout.expires_at || scout.expiry)))}
+         ${row("Overrides", scout && scout.overrides ? Object.entries(scout.overrides).map(([k, x]) => `${k}=${x}`).join(", ") : (active ? "(applied)" : "—"))}
+       </div>
+       <div style="padding:8px 13px;display:grid;grid-template-columns:1fr 1fr;gap:6px 10px">
+         <label class="cond" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="rp-exp-force"> Force safe return</label>
+         <label class="cond">Battery % <input type="number" id="rp-exp-batt" min="0" max="100" style="width:60px"></label>
+         <label class="cond">Energy margin % <input type="number" id="rp-exp-margin" style="width:60px"></label>
+         <label class="cond">Duration s <input type="number" id="rp-exp-dur" min="1" max="3600" style="width:70px" placeholder="300"></label>
+       </div>
+       <div style="padding:4px 13px 11px;display:flex;gap:8px">
+         <button class="btn" id="rp-exp-apply" ${replanBusy ? "disabled" : ""}>Apply injection</button>
+         <button class="btn ghost" id="rp-exp-clear" ${replanBusy ? "disabled" : ""}>Clear</button>
+       </div>
+       <div class="reason-note">${gapSvg}<span>Always SIMULATED — real telemetry is never overwritten. Clear the injection and rearm the controller before enabling real execution.</span></div>`, false);
+  }
+
+  function transitionsReplanCard(S) {
+    if (!S.present || !S.transitions.length) return card("Recent replanning transitions", "", "idle",
+      `<div style="padding:10px 13px"><span class="cond">${S.present ? "No transitions reported." : "Scout not reporting transitions."}</span></div>`, true);
+    return card("Recent replanning transitions", `${S.transitions.length}`, "idle",
+      `<div class="rlist" style="padding:8px 13px">
+         ${S.transitions.slice(-12).map((tr) => `<div class="ritem">
+            <span class="cond mono">${fmtTime(tr.timestamp)}</span>
+            <span class="rtx"><b>${val(tr.from)}</b> → <b>${val(tr.to)}</b>${tr.reason ? " · " + tr.reason : ""}</span>
+            <span class="rav mono">${tr.transitionId || ""}</span>
+            ${tr.simulated ? rp("SIM", "p") : ""}
+          </div>`).join("")}
+       </div>`, true);
+  }
+
+  function wireReplan() {
+    const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
+    on("rp-pkg-put", () => replanWrite("Package upload", (id) => api.putReplanPackage(id, {})));
+    on("rp-pkg-del", () => replanWrite("Package clear", (id) => api.deleteReplanPackage(id)));
+    on("rp-reset", () => replanWrite("Controller rearm", (id) => api.resetReplanController(id)));
+    on("rp-stage-disabled", () => replanWrite("Config: disable", (id) => api.patchReplanConfig(id, replan.stagePatch(replan.STAGE.DISABLED))));
+    on("rp-stage-dry", () => replanWrite("Config: dry-run", (id) => api.patchReplanConfig(id, replan.stagePatch(replan.STAGE.DRY_RUN))));
+    on("rp-stage-real", () => {
+      if (!window.confirm("Enable REAL execution? Scout may command the vehicle (LOITER/AUTO/RTL). Confirm the experiment is cleared and no transaction is active.")) return;
+      replanWrite("Config: real execution", (id) => api.patchReplanConfig(id, replan.stagePatch(replan.STAGE.REAL)));
+    });
+    on("rp-exp-apply", () => {
+      const payload = replan.injectionPayload({
+        forceSafeReturn: document.getElementById("rp-exp-force") && document.getElementById("rp-exp-force").checked,
+        batteryPercent: fieldVal("rp-exp-batt"), energyMarginPercent: fieldVal("rp-exp-margin"), durationS: fieldVal("rp-exp-dur"),
+      });
+      if (!replan.injectionHasOverride(payload)) { replanMsg = { label: "Injection", outcome: "rejected", error: "at least one override required" }; renderDetail(); return; }
+      replanWrite("Injection apply", (id) => api.putReplanExperiment(id, payload));
+    });
+    on("rp-exp-clear", () => replanWrite("Injection clear", (id) => api.deleteReplanExperiment(id)));
+  }
+  function fieldVal(id) { const el = document.getElementById(id); return el && el.value !== "" ? el.value : null; }
 
   // Reason bullets: prefer the agent's own decision_reasons (verbatim). If Scout sent
   // only the legacy single string, split it into lines. If it sent nothing, fall back to
@@ -402,7 +667,11 @@ export function Agent(root) {
     if (id === selId) return;
     selId = id;
     authCtl.reset();
+    // Isolation: clear the previous vehicle's replan panels immediately, then load this one's.
+    replanStatus = replanReadiness = replanConfig = replanExperiment = null;
+    replanMsg = null; replanForVid = null;
     loadAuthority(id);
+    loadReplan(id);
   }
 
   function onFleet(data) {
@@ -410,6 +679,7 @@ export function Agent(root) {
     if (selId == null && fleet.length) {
       selId = (fleet.find((v) => v.online) || fleet.find((v) => v.lat != null) || fleet[0]).id;
       loadAuthority(selId);
+      loadReplan(selId);
     }
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
     document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { select(canonicalVehicleId(el.dataset.id)); onFleet(fleet); }));
@@ -420,11 +690,15 @@ export function Agent(root) {
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, () => {});
   const authorityId = setInterval(() => loadAuthority(selId), 2000);
   const eventsId = setInterval(loadEvents, 3000);
+  // Replan status/readiness/config/experiment poll for the SELECTED vehicle. Reads only —
+  // never a write — so this poll can never resend a supervisory operation. Skipped while a
+  // write is in flight so a reconciling read does not race the write's own follow-up read.
+  const replanId = setInterval(() => { if (!replanBusy) loadReplan(selId); }, 2500);
   loadEvents();
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(eventsId); authCtl.dispose(); };
+  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(eventsId); clearInterval(replanId); authCtl.dispose(); };
 }
 
 function titleCase(s) {

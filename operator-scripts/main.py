@@ -15,6 +15,8 @@ import uuid
 
 import mission_contract
 import planning
+import replan_package
+import scout_replan
 import vehicle_registry
 
 
@@ -208,6 +210,48 @@ def vehicle_api_base(vid):
     Returns None for a vehicle with no configured route — callers must render that as an
     honest available:false and must NEVER substitute another vehicle's base URL."""
     return VEHICLE_API_BASE.get(canonical_id(vid))
+
+
+# --- Local Agent replanning API (port 8090) — a SEPARATE routing surface from Flask (8080) ---
+# The replanning lifecycle (planning package, energy decision, FSM, experiment injection,
+# runtime config, reset) lives on the Python Local Agent's HTTP server on port 8090, NOT the
+# Flask API on 8080 (VEHICLE_API_BASE above). The two are deliberately distinct: Flask 8080
+# answers control authority / Pixhawk-mission reads / network-impairment; the Local Agent 8090
+# owns everything under /agent/replan/*. A vehicle needs BOTH addresses to be fully driveable,
+# and an absent entry here degrades honestly (replanning routes answer supported/reachable:false)
+# rather than being guessed onto another host. Same canonical-id lookup, same isolation rule as
+# vehicle_api_base — one vehicle's base URL is NEVER substituted for another's.
+LOCAL_AGENT_API_BASE = {
+    2: "http://10.0.2.10:8090",  # Scout   — Local Agent replanning server, over WireGuard
+    3: "http://10.0.3.10:8090",  # SAR-001 — Local Agent replanning server, over WireGuard
+}
+
+
+def local_agent_base(vid):
+    """Base URL for a vehicle's Local Agent replanning API (port 8090), by CANONICAL id.
+    Returns None for a vehicle with no configured route — callers render supported:false."""
+    return LOCAL_AGENT_API_BASE.get(canonical_id(vid))
+
+
+# Scout's own patchable runtime-config fields (task Section 5). The operator forwards ONLY
+# these; an unknown key is dropped rather than passed through to a Scout that would reject the
+# whole PATCH. Scout remains the validator of ranges/bounds — the operator does not re-validate.
+REPLAN_PATCHABLE_FIELDS = frozenset({
+    "autonomous_execution_enabled", "dry_run", "rtl_fallback_enabled",
+    "critical_battery_percent", "reserve_margin_percent", "usable_range_m",
+    "energy_persistence_count", "max_transaction_retries", "cooldown_s",
+})
+
+# Scout's energy-replanning experiment-injection override fields (task Section 6). At least one
+# must be supplied; `target_vehicle` is set by the backend to the selected vehicle, never taken
+# from the browser, so an injection can only ever target the Scout the operator selected.
+REPLAN_EXPERIMENT_FIELDS = frozenset({
+    "force_safe_return", "energy_margin_percent", "battery_percent", "duration_s",
+})
+
+# Scout's package-consistency verdicts (task handoff). Only CONSISTENT clears replanning
+# readiness; the rest are surfaced verbatim so the operator sees WHY Scout fails closed.
+PACKAGE_CONSISTENT = "PLANNING_PACKAGE_CONSISTENT"
 
 # --- Persistent event log (BACKEND_ROADMAP #2; Operator-backend-owned) ---
 # One server-side, append-only record that replaces the frontend's flatten-from-
@@ -4039,6 +4083,440 @@ def get_experiment_history(limit: int = 200):
     now = datetime.now(timezone.utc)
     items = experiment_history[-limit:] if limit and limit > 0 else list(experiment_history)
     return {"history": items, "count": len(experiment_history), "generated_at": now.isoformat()}
+
+
+# ── Replanning supervisory API (Scout Local Agent /agent/replan/*, port 8090) ─────────
+# The Operator Station is a THIN PROXY over Scout's replanning controller (see scout_replan.py
+# for the outcome model, replan_package.py for planning-package construction). It constructs
+# the approved planning package, issues explicit supervisory operations, and presents Scout's
+# status accurately — it recreates NONE of Scout's FSM, energy decision or execution state.
+#
+# Every WRITE is recorded in an in-memory operation log (accepted / rejected / unknown), so an
+# operation whose HTTP response was lost is preserved as UNKNOWN and reconciled by a later GET
+# rather than silently retried. Writes only ever happen on an explicit operator route call —
+# never during polling — so reconnect/poll can never resend a package/config/injection.
+MAX_REPLAN_OPERATIONS = 2000
+replan_operations = []   # [ {seq, vehicle_id, vehicle, operation, requested_at, http_status,
+                         #    outcome, scout_error_code, mission_id, transition_id, ...} ]
+_replan_op_seq = 0
+
+
+def _scout_field(result, *names):
+    """First present value among `names` in a scout_replan result's Scout body (or None)."""
+    body = result.get("scout") if isinstance(result, dict) else None
+    if not isinstance(body, dict):
+        return None
+    for n in names:
+        if body.get(n) is not None:
+            return body.get(n)
+    return None
+
+
+def _record_replan_operation(vid, result, *, mission_id=None):
+    """Append one write to the operation trace: operation type, target USV, requested-at,
+    response status, accepted/rejected/unknown outcome, Scout error code, and the mission /
+    transition id where Scout supplies one. Read-only reconnaissance (GETs) is not logged —
+    only writes, which are the operations reconnect must never duplicate."""
+    global _replan_op_seq
+    _replan_op_seq += 1
+    entry = {
+        "seq": _replan_op_seq,
+        "vehicle_id": vehicle_slug(vid),
+        "vehicle": name_of(vid),
+        "operation": result.get("operation"),
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "http_status": result.get("http_status"),
+        "outcome": result.get("outcome"),
+        "scout_error_code": result.get("scout_error_code"),
+        "mission_id": mission_id or _scout_field(result, "mission_id"),
+        "transition_id": _scout_field(result, "transition_id"),
+        "revision": _scout_field(result, "revision"),
+        "supported": result.get("supported", True),
+        "simulated": bool(_scout_field(result, "simulated") or
+                          (_scout_field(result, "source") == "SIMULATED")),
+    }
+    replan_operations.append(entry)
+    if len(replan_operations) > MAX_REPLAN_OPERATIONS:
+        del replan_operations[:len(replan_operations) - MAX_REPLAN_OPERATIONS]
+    # Surface accepted/rejected writes and every unknown outcome on the operator event log too.
+    sev = ("warning" if entry["outcome"] == scout_replan.OUTCOME_UNKNOWN
+           else "caution" if entry["outcome"] == scout_replan.OUTCOME_REJECTED else "info")
+    _append_event(severity=sev, etype="replan-operation", source="operator-backend",
+                  vehicle_id=vid, vehicle=name_of(vid),
+                  message=f"Replan {entry['operation']} -> {entry['outcome']}"
+                          + (f" ({entry['scout_error_code']})" if entry["scout_error_code"] else ""),
+                  detail=entry)
+    return entry
+
+
+def _compute_replan_readiness(vid, base):
+    """The combined readiness summary (task Section 3). Keeps the Vehicle mission and the Scout
+    planning package as two DISTINCT operations, never letting a successful Pixhawk upload hide
+    a package failure, and reports limitations separately. Returns a JSON-able dict."""
+    now = datetime.now(timezone.utc)
+
+    # A. Vehicle mission — the immutable revision-0 record + a live Pixhawk readback.
+    mission_id = active_original_by_vehicle.get(vid)
+    rec = original_missions.get(mission_id) if mission_id else None
+    flask_base = vehicle_api_base(vid)
+    readback = _scout_mission_read(vid, flask_base, now) if flask_base else None
+
+    record_hash = rec.get("route_hash") if rec else None
+    upload_status = rec.get("upload_status") if rec else None
+    readback_hash = readback.get("route_content_hash") if isinstance(readback, dict) else None
+    pixhawk_verified = bool(rec and upload_status == "VERIFIED")
+    readback_hash_match = bool(record_hash and readback_hash and record_hash == readback_hash)
+    home, home_source = _current_home_for_package(vid, rec) if rec else (None, None)
+    home_valid = home is not None
+    boundary_supplied = bool(rec and (rec.get("navigable_geometry")
+                             or (rec.get("planning_inputs") or {}).get("navigable_boundary")))
+
+    vehicle_mission = {
+        "mission_id": mission_id, "record_present": rec is not None,
+        "route_hash": record_hash, "upload_status": upload_status,
+        "pixhawk_verified": pixhawk_verified,
+        "readback_reachable": bool(readback and readback.get("reachable")),
+        "readback_hash": readback_hash, "readback_hash_match": readback_hash_match,
+        "home_valid": home_valid, "home_source": home_source,
+        "boundary_supplied": boundary_supplied,
+    }
+
+    # B. Scout planning package — live status + package pull (never fabricated).
+    status = scout_replan.get_status(base)
+    pkg = scout_replan.get_planning_package(base)
+    scout_reachable = bool(status.get("reachable") and status.get("supported"))
+    consistency = (_scout_field(status, "package_consistency")
+                   or _scout_field(pkg, "consistency", "package_consistency"))
+    geometry = (_scout_field(status, "geometry_validation")
+                or _scout_field(pkg, "geometry_validation") or {})
+    if not isinstance(geometry, dict):
+        geometry = {}
+    package_mission_id = _scout_field(pkg, "mission_id") or _scout_field(status, "mission_id")
+    package_hash = (_scout_field(pkg, "route_content_hash")
+                    or _scout_field(status, "route_content_hash"))
+    stored_flag = _scout_field(pkg, "stored")
+    package_stored = (bool(stored_flag) if stored_flag is not None
+                      else bool(package_mission_id or package_hash))
+    package_usable = consistency not in ("PLANNING_PACKAGE_MISSING", "PLANNING_PACKAGE_UNUSABLE", None) \
+        or (package_stored and consistency is None and scout_reachable)
+    consistency_ok = consistency == PACKAGE_CONSISTENT
+    mission_id_match = bool(package_mission_id and mission_id and package_mission_id == mission_id)
+    hash_available = bool(package_hash)
+    hash_match = bool(record_hash and package_hash and record_hash == package_hash)
+    hash_mismatch = bool(record_hash and package_hash and record_hash != package_hash)
+
+    planning_package = {
+        "scout_reachable": scout_reachable,
+        "scout_supported": bool(status.get("supported")),
+        "stored": package_stored, "usable": package_usable,
+        "mission_id": package_mission_id, "mission_id_match": mission_id_match,
+        "route_hash": package_hash, "hash_match": hash_match, "hash_mismatch": hash_mismatch,
+        "hash_comparison_available": hash_available,
+        "consistency": consistency, "consistent": consistency_ok,
+        "route_count": _scout_field(pkg, "route_waypoint_count", "route_count"),
+        "boundary_available": geometry.get("boundary_available"),
+        "boundary_checked": geometry.get("boundary_checked"),
+        "no_go_available": geometry.get("no_go_available"),
+        "no_go_checked": geometry.get("no_go_checked"),
+        "connector_proven_safe": geometry.get("connector_proven_safe"),
+        "shoreline_clearance_available": geometry.get("shoreline_clearance_available"),
+    }
+
+    # Limitations — reported SEPARATELY from readiness, never as a silent pass.
+    limitations = []
+    if not boundary_supplied:
+        limitations.append("Navigable boundary absent — connector cannot be proven safe")
+    if geometry.get("connector_proven_safe") is False:
+        limitations.append("Scout could not prove the current-position connector safe")
+    if hash_mismatch:
+        limitations.append("Package route hash does NOT match the approved route — replanning blocked")
+    if not hash_available and scout_reachable:
+        limitations.append("Scout did not report a package route hash — hash comparison unavailable")
+    limitations.append("shoreline_clearance_m is scalar metadata, not geometry Scout can "
+                       "run an onboard clearance check against")
+    for lim in (geometry.get("limitations") or []):
+        if isinstance(lim, str) and lim not in limitations:
+            limitations.append(lim)
+
+    mission_ready = bool(pixhawk_verified and home_valid)
+    replanning_ready = bool(
+        mission_ready and package_stored and package_usable and consistency_ok
+        and mission_id_match and boundary_supplied and not hash_mismatch)
+
+    return {
+        "ok": True, "vehicle_id": vehicle_slug(vid), "generated_at": now.isoformat(),
+        "mission_ready": mission_ready, "replanning_ready": replanning_ready,
+        "vehicle_mission": vehicle_mission, "planning_package": planning_package,
+        "limitations": limitations,
+    }
+
+
+def _replan_target(vehicle_id):
+    """(vid, base) for a replanning route, or a JSONResponse to return directly.
+
+    Three honest cases, mirroring the Pixhawk/authority proxies:
+      unknown vehicle id            → 404 (no such vehicle)
+      known, no Local Agent route   → 200 supported:false (nothing to talk to here)
+      known, Local Agent configured → (vid, base) for the live proxy."""
+    vid = parse_vehicle_id(vehicle_id)
+    if vid not in known_vehicle_ids():
+        return None, JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle_id})
+    base = local_agent_base(vid)
+    if base is None:
+        return None, JSONResponse(status_code=200, content={
+            "ok": False, "supported": False, "reachable": False,
+            "vehicle_id": vehicle_slug(vid), "outcome": "unsupported",
+            "error": "No Scout Local Agent replanning API configured for this vehicle"})
+    return (vid, base), None
+
+
+def _replan_status_code(result):
+    """The honest HTTP status for a scout_replan outcome — non-500 for every handled case so
+    the frontend poll never sees a console error for an unreachable/older Scout."""
+    outcome = result.get("outcome")
+    if outcome == scout_replan.OUTCOME_UNSUPPORTED:
+        return 200          # older Scout — a handled, honest "not supported", not an error
+    if outcome == scout_replan.OUTCOME_UNAVAILABLE:
+        return 503          # reachable:false read — the frontend's honest "unavailable"
+    if outcome == scout_replan.OUTCOME_UNKNOWN:
+        return 202          # accepted-but-unconfirmed: reconcile with a GET (never a failure)
+    if outcome == scout_replan.OUTCOME_REJECTED:
+        return 409 if result.get("transaction_active") else 400
+    return 200
+
+
+def _replan_response(vid, result):
+    """Normalize a scout_replan result into the operator response envelope (adds vehicle_id
+    and keeps Scout's body under `scout`), at the honest HTTP status for its outcome."""
+    result = dict(result)
+    result["vehicle_id"] = vehicle_slug(vid)
+    return JSONResponse(status_code=_replan_status_code(result), content=result)
+
+
+def _current_home_for_package(vid, record):
+    """(home, source) for a planning package: Scout's live verified Home if it is reporting one,
+    else the plan's own planning_home from the record. None when neither yields a valid fix —
+    a package is never built with a fabricated Home."""
+    lk = last_known_agent.get(vid)
+    hs = lk.get("home_status") if isinstance(lk, dict) else None
+    if isinstance(hs, dict):
+        home = replan_package.normalize_home(hs.get("home_position") or hs)
+        if home:
+            return home, "verified_home"
+    ph = (record.get("planning_inputs") or {}).get("planning_home")
+    home = replan_package.normalize_home(ph)
+    if home:
+        return home, "planning_home"
+    return None, None
+
+
+@app.get("/api/vehicles/{vehicle_id}/replan/status")
+def replan_status(vehicle_id: str):
+    """Scout's canonical replanning status object (the same one carried under agent.replan in
+    the normal status push), pulled live from the Local Agent. Read-only; never fabricated."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    return _replan_response(vid, scout_replan.get_status(base))
+
+
+@app.get("/api/vehicles/{vehicle_id}/replan/config")
+def replan_get_config(vehicle_id: str):
+    """Resolved replanning config with the source of each value (default/environment/runtime)."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    return _replan_response(vid, scout_replan.get_config(base))
+
+
+@app.patch("/api/vehicles/{vehicle_id}/replan/config")
+async def replan_patch_config(vehicle_id: str, request: Request):
+    """Patch runtime config (Scout's patchable fields only). A 409 TRANSACTION_ACTIVE is
+    surfaced as a distinct rejection, never a generic network failure. Recorded as a write."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    patch = {k: v for k, v in (body or {}).items() if k in REPLAN_PATCHABLE_FIELDS}
+    if not patch:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "vehicle_id": vehicle_slug(vid), "error": "no patchable fields supplied",
+            "patchable_fields": sorted(REPLAN_PATCHABLE_FIELDS)})
+    result = scout_replan.patch_config(base, patch)
+    _record_replan_operation(vid, result)
+    return _replan_response(vid, result)
+
+
+@app.get("/api/vehicles/{vehicle_id}/replan/planning-package")
+def replan_get_package(vehicle_id: str):
+    """The planning package currently stored on Scout (single slot), for reconciliation."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    return _replan_response(vid, scout_replan.get_planning_package(base))
+
+
+@app.put("/api/vehicles/{vehicle_id}/replan/planning-package")
+async def replan_put_package(vehicle_id: str, request: Request):
+    """Construct the approved planning package from a stored immutable mission record and PUT it
+    to Scout. Body: { mission_id? } — defaults to the vehicle's active original mission. The
+    route bytes are the record's Pixhawk route (hash-invariant); Scout re-validates and returns
+    package consistency. Idempotent: the same PUT replaces Scout's single slot, never adds one."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mission_id = (body or {}).get("mission_id") or active_original_by_vehicle.get(vid)
+    rec = original_missions.get(mission_id) if mission_id else None
+    if rec is None:
+        return JSONResponse(status_code=404, content={
+            "ok": False, "vehicle_id": vehicle_slug(vid),
+            "error": "no mission record to package",
+            "detail": "Finalize a survey mission for this vehicle first (revision 0 record)."})
+    if rec.get("vehicle_id") != vid:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "vehicle_id": vehicle_slug(vid), "error": "mission belongs to another vehicle",
+            "mission_vehicle_id": vehicle_slug(rec.get("vehicle_id"))})
+    home, home_source = _current_home_for_package(vid, rec)
+    try:
+        package, meta = replan_package.build_package(
+            rec, home, usv_id=vehicle_slug(vid))
+    except replan_package.PackageError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "vehicle_id": vehicle_slug(vid),
+            "error": "planning_package_unbuildable", "message": str(exc)})
+    result = scout_replan.put_planning_package(base, package)
+    _record_replan_operation(vid, result, mission_id=mission_id)
+    # The honest outcome envelope, plus the operator-side package metadata (what was sent:
+    # hash, labels, limitations) so the UI shows it alongside Scout's verdict.
+    envelope = dict(result)
+    envelope["vehicle_id"] = vehicle_slug(vid)
+    envelope["operator_package"] = {
+        "mission_id": mission_id, "home_source": home_source,
+        "route_content_hash": meta["route_content_hash"],
+        "waypoint_count": meta["waypoint_count"],
+        "segment_label_counts": meta["segment_label_counts"],
+        "boundary_supplied": meta["boundary_supplied"],
+        "no_go_supplied": meta["no_go_supplied"],
+        "limitations": meta["limitations"],
+    }
+    return JSONResponse(status_code=_replan_status_code(result), content=envelope)
+
+
+@app.delete("/api/vehicles/{vehicle_id}/replan/planning-package")
+def replan_delete_package(vehicle_id: str):
+    """Clear Scout's stored planning package. Idempotent — safe when nothing is stored."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    result = scout_replan.delete_planning_package(base)
+    _record_replan_operation(vid, result)
+    return _replan_response(vid, result)
+
+
+@app.get("/api/vehicles/{vehicle_id}/replan/experiment")
+def replan_get_experiment(vehicle_id: str):
+    """Scout's accepted energy-replanning injection state (always SIMULATED, auto-expiring)."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    return _replan_response(vid, scout_replan.get_experiment(base))
+
+
+@app.put("/api/vehicles/{vehicle_id}/replan/experiment")
+async def replan_put_experiment(vehicle_id: str, request: Request):
+    """Apply ONE explicit energy-replanning injection (force_safe_return / energy_margin_percent
+    / battery_percent / duration_s). target_vehicle is forced to the path vehicle — an injection
+    can only ever target the selected Scout. At least one override is required. Recorded as a
+    write; the frontend must never resend this during polling."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    overrides = {k: (body or {}).get(k) for k in REPLAN_EXPERIMENT_FIELDS
+                 if (body or {}).get(k) is not None}
+    if not overrides:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "vehicle_id": vehicle_slug(vid),
+            "error": "at least one override is required",
+            "fields": sorted(REPLAN_EXPERIMENT_FIELDS)})
+    overrides["target_vehicle"] = vehicle_slug(vid)   # isolation: never another vehicle
+    result = scout_replan.put_experiment(base, overrides)
+    _record_replan_operation(vid, result)
+    return _replan_response(vid, result)
+
+
+@app.delete("/api/vehicles/{vehicle_id}/replan/experiment")
+def replan_delete_experiment(vehicle_id: str):
+    """Clear Scout's energy-replanning injection. Idempotent — safe when nothing is active."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    result = scout_replan.delete_experiment(base)
+    _record_replan_operation(vid, result)
+    return _replan_response(vid, result)
+
+
+@app.post("/api/vehicles/{vehicle_id}/replan/reset")
+def replan_reset(vehicle_id: str):
+    """Rearm Scout's replanning controller from a terminal state (rearms transaction state,
+    clears the energy debounce). Issues NO vehicle command, does NOT change vehicle mode, does
+    NOT clear/restore any Pixhawk mission. Rejected (409) while a transaction is active."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    result = scout_replan.post_reset(base)
+    _record_replan_operation(vid, result)
+    return _replan_response(vid, result)
+
+
+@app.get("/api/vehicles/{vehicle_id}/replan/readiness")
+def replan_readiness(vehicle_id: str):
+    """The combined MISSION READY / REPLANNING READY summary (task Section 3). Distinguishes the
+    Vehicle mission (Pixhawk upload + verified readback) from the Scout planning package (stored,
+    consistent, geometry). Never hides a package failure behind a successful Pixhawk upload, and
+    lists limitations (absent boundary, connector not proven safe, shoreline metadata only, hash
+    comparison unavailable) separately. Read-only."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    return _compute_replan_readiness(vid, base)
+
+
+@app.get("/api/replan/operations")
+def replan_operation_trace(vehicle_id: Optional[str] = None, limit: int = 200):
+    """The write operation trace (planning-package / config / experiment / reset), newest last.
+    Optionally filtered to one vehicle. This is the reconnect-safe record of accepted / rejected
+    / unknown supervisory writes — the frontend renders it rather than re-deriving events."""
+    items = replan_operations
+    if vehicle_id is not None:
+        vid = parse_vehicle_id(vehicle_id)
+        items = [o for o in items if o["vehicle_id"] == vehicle_slug(vid)]
+    if limit and limit > 0:
+        items = items[-limit:]
+    return {"ok": True, "operations": items, "count": len(replan_operations),
+            "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/", include_in_schema=False)
