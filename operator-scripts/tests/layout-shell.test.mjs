@@ -224,6 +224,39 @@ test("the nav rail scrolls rather than clipping navigation", () => {
   assert.match(rule(".nav .tip"), /position:\s*fixed/);
 });
 
+test("every scroll region shares one scrollbar design, declared once", () => {
+  for (const v of ["--scrollbar-size", "--scrollbar-track", "--scrollbar-thumb", "--scrollbar-thumb-hover"]) {
+    assert.match(vars, new RegExp(`${v}\\s*:`), `${v} must be a token in variables.css`);
+  }
+  // scoped to the station's own roots, so the browser window's outer scrollbar is untouched
+  const bar = RULES.filter((r) => /::-webkit-scrollbar\b/.test(r.sel));
+  assert.ok(bar.length, "the shared ::-webkit-scrollbar rule is missing");
+  bar.forEach((r) => assert.match(r.sel, /#app|\.modal-ov|\.tour-root/,
+    `unscoped scrollbar rule "${r.sel}" would restyle the browser window's own scrollbar`));
+  // compact, and never invisible
+  const size = Number(vars.match(/--scrollbar-size\s*:\s*(\d+)px/)[1]);
+  assert.ok(size >= 4 && size <= 8, `--scrollbar-size ${size}px should be 4–8px`);
+  assert.doesNotMatch(css, /scrollbar-width:\s*none/, "scrollbars must never be hidden outright");
+  assert.doesNotMatch(vars, /--scrollbar-thumb\s*:\s*(transparent|rgba\([^)]*,\s*0\s*\))/,
+    "a transparent thumb is a hidden scrollbar");
+});
+
+test("no element sets scrollbar-width without scrollbar-color", () => {
+  // REGRESSION. In Blink, specifying EITHER standard scrollbar property switches the
+  // element to the standard rendering path and disables every ::-webkit-scrollbar rule for
+  // it. A bare `scrollbar-width:thin` on .rail therefore threw away the app's dark
+  // scrollbar and rendered the bright OS default — while every panel that set nothing kept
+  // the dark one, which is why it looked like a one-off bug rather than a CSS rule.
+  const offenders = RULES
+    .filter((r) => /scrollbar-width\s*:/.test(r.body) && !/scrollbar-color\s*:/.test(r.body))
+    .map((r) => r.sel);
+  assert.deepEqual(offenders, [],
+    `these set scrollbar-width with no scrollbar-color, which disables ::-webkit-scrollbar in Blink: ${offenders.join(", ")}`);
+  // and the standard properties must stay behind the guard that keeps Blink out of them
+  assert.match(css, /@supports \(scrollbar-color: red blue\) and \(not selector\(::-webkit-scrollbar\)\)/,
+    "the standard scrollbar properties must be fenced off from engines that have ::-webkit-scrollbar");
+});
+
 test("operator-facing messages wrap instead of truncating", () => {
   for (const sel of [".plan-banner", ".toast", ".pl-upload-hint", ".fp-err", ".plan-vlist"]) {
     assert.match(rule(sel), /overflow-wrap:\s*anywhere|white-space:\s*normal/,

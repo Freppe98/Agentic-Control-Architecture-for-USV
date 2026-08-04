@@ -23,10 +23,58 @@ button { font:inherit; }
 a { color:inherit; }
 .mono { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
 .lbl { font-family:var(--font-mono); font-size:var(--fs-micro); letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
-::-webkit-scrollbar { width:9px; height:9px; }
-::-webkit-scrollbar-thumb { background:var(--line-strong); border-radius:5px; border:2px solid transparent; background-clip:padding-box; }
-::-webkit-scrollbar-thumb:hover { background:rgba(132,152,172,.35); background-clip:padding-box; }
-::-webkit-scrollbar-track { background:transparent; }
+/* ---------- scrollbars ----------
+   ONE design for every intentional scroll region, declared once here rather than per page.
+   Scoped to the operator station's own roots (#app plus the two overlays that mount on
+   <body>: the confirmation modal and the guided tour), so the browser window's own outer
+   scrollbar keeps its native behaviour.
+
+   The two engines are addressed SEPARATELY and that is not redundancy — it is the actual
+   bug this replaces. In Blink, specifying `scrollbar-width` or `scrollbar-color` on an
+   element switches it to the standard scrollbar rendering path and DISABLES every
+   ::-webkit-scrollbar rule for it. The nav rail carried a bare `scrollbar-width:thin`
+   alongside its own ::-webkit-scrollbar styling: the pseudo-elements were silently
+   dropped and the rail rendered the bright OS-default scrollbar, while every other panel
+   — which set no standard property — kept the dark one. Hence: pseudo-elements only for
+   the engines that have them (exact 6px), standard properties only for the engines that
+   do not (Firefox), and never both on the same element. */
+#app::-webkit-scrollbar, #app ::-webkit-scrollbar,
+.modal-ov::-webkit-scrollbar, .modal-ov ::-webkit-scrollbar,
+.tour-root::-webkit-scrollbar, .tour-root ::-webkit-scrollbar {
+  width:var(--scrollbar-size); height:var(--scrollbar-size);
+}
+#app::-webkit-scrollbar-track, #app ::-webkit-scrollbar-track,
+.modal-ov::-webkit-scrollbar-track, .modal-ov ::-webkit-scrollbar-track,
+.tour-root::-webkit-scrollbar-track, .tour-root ::-webkit-scrollbar-track {
+  background:var(--scrollbar-track);
+}
+#app::-webkit-scrollbar-thumb, #app ::-webkit-scrollbar-thumb,
+.modal-ov::-webkit-scrollbar-thumb, .modal-ov ::-webkit-scrollbar-thumb,
+.tour-root::-webkit-scrollbar-thumb, .tour-root ::-webkit-scrollbar-thumb {
+  background:var(--scrollbar-thumb); border-radius:var(--r-pill);
+  border:1px solid transparent; background-clip:padding-box;
+}
+#app::-webkit-scrollbar-thumb:hover, #app ::-webkit-scrollbar-thumb:hover,
+.modal-ov::-webkit-scrollbar-thumb:hover, .modal-ov ::-webkit-scrollbar-thumb:hover,
+.tour-root::-webkit-scrollbar-thumb:hover, .tour-root ::-webkit-scrollbar-thumb:hover {
+  background:var(--scrollbar-thumb-hover); background-clip:padding-box;
+}
+/* where a pane scrolls both ways, the corner must not be a bright square */
+#app::-webkit-scrollbar-corner, #app ::-webkit-scrollbar-corner,
+.modal-ov::-webkit-scrollbar-corner, .modal-ov ::-webkit-scrollbar-corner,
+.tour-root::-webkit-scrollbar-corner, .tour-root ::-webkit-scrollbar-corner {
+  background:transparent;
+}
+/* Engines without ::-webkit-scrollbar (Firefox) get the standard properties instead. The
+   `not selector(::-webkit-scrollbar)` guard is what keeps Blink out of this block — if it
+   applied there it would undo everything above. Width is the engine's `thin` rather than
+   an exact px: the standard property has no length form. */
+@supports (scrollbar-color: red blue) and (not selector(::-webkit-scrollbar)) {
+  #app, #app *, .modal-ov, .modal-ov *, .tour-root, .tour-root * {
+    scrollbar-width:thin;
+    scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track);
+  }
+}
 :focus-visible { outline:2px solid var(--accent); outline-offset:1px; border-radius:2px; }
 
 /* ---------- app shell ----------
@@ -118,10 +166,9 @@ a { color:inherit; }
   display:flex; flex-direction:column; align-items:center;
   padding:var(--sp-3) 0; gap:var(--nav-gap);
   min-height:0; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain;
-  scrollbar-width:thin;
 }
-.rail::-webkit-scrollbar { width:4px; }
-.rail::-webkit-scrollbar-thumb { border:0; border-radius:2px; background:var(--line-strong); }
+/* (no scrollbar declarations here — the rail uses the one shared design at the top of this
+   file. Its own `scrollbar-width:thin` was what disabled that design in Blink.) */
 .nav { flex:none; position:relative; width:var(--nav-size); height:var(--nav-size); border-radius:var(--r); display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:pointer; transition:color var(--t-base), background var(--t-base); }
 .nav svg { width:var(--nav-icon); height:var(--nav-icon); }
 .nav:hover { color:var(--text); background:var(--raise); }
@@ -737,7 +784,7 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 /* ---------- mission (tabs + overview) ---------- */
 /* the tab strip scrolls horizontally rather than dropping tabs when the content column
    narrows — a mission tab must stay reachable at 1366 */
-.mtabs { flex:none; display:flex; gap:4px; padding:0 var(--panel-pad); border-bottom:1px solid var(--line); background:var(--panel); overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; }
+.mtabs { flex:none; display:flex; gap:4px; padding:0 var(--panel-pad); border-bottom:1px solid var(--line); background:var(--panel); overflow-x:auto; overflow-y:hidden; }
 .mtab { flex:none; position:relative; background:transparent; border:none; color:var(--muted); font-size:12.5px; font-weight:600; padding:11px 12px 12px; cursor:pointer; transition:color var(--t-base); white-space:nowrap; }
 .mtab:hover:not(.locked) { color:var(--text); }
 .mtab.on { color:var(--accent); }

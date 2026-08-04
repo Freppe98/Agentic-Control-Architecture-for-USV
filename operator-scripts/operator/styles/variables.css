@@ -48,6 +48,15 @@
   /* ---- radii ---- */
   --r:5px; --r-sm:3px; --r-pill:999px;
 
+  /* ---- scrollbars ----
+     One design for every intentional scroll region in the station. Compact enough not to
+     eat a narrow panel (the nav rail is only ~58px wide), visible enough to read as an
+     affordance against the dark surfaces — never hidden, never transparent. */
+  --scrollbar-size:6px;
+  --scrollbar-track:rgba(255,255,255,.025);
+  --scrollbar-thumb:rgba(132,152,172,.34);
+  --scrollbar-thumb-hover:rgba(154,176,198,.56);
+
   /* ---- shadows ---- */
   --shadow-1:0 2px 10px rgba(0,0,0,.3);
   --shadow-2:0 4px 12px rgba(0,0,0,.4);
