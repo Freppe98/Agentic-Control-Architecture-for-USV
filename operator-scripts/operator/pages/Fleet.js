@@ -45,7 +45,9 @@ export function Fleet(root) {
       : `<span class="batt-inline"><span class="bar"><i style="width:${v.coverage}%;background:var(--accent)"></i></span><span class="bpc">${v.coverage}%</span></span>`;
 
   const columns = [
-    { key: "name", label: "Vehicle", sortable: true, render: (v) => `<span class="vname">${statusDot(v)}<b>${v.name || "USV-" + v.id}</b></span>` },
+    // name truncates at 26ch (theme.css) so one long name cannot widen the table past the
+    // viewport; title keeps the full value inspectable
+    { key: "name", label: "Vehicle", sortable: true, render: (v) => { const n = v.name || "USV-" + v.id; return `<span class="vname">${statusDot(v)}<b title="${n}">${n}</b></span>`; } },
     { key: "comm", label: "Comms", sortable: true, render: (v) => CommsPill(v) },
     { key: "age", label: "Last Contact", align: "num", sortable: true, render: (v) => `<span class="mono txt-${cls(v)}">${fmtAge(v.last_seen_age_s)}</span>` },
     { key: "health", label: "Health", sortable: true, render: (v) => HealthBadge(v) },

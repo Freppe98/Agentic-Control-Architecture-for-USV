@@ -27,6 +27,7 @@ import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
 import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
 import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
+import { attachMapLayout } from "../lib/map-layout.js";
 import { pickInitialView, getSavedViewport, setSavedViewport, isValidLatLng, isNullIsland,
          TOFTASJON, DEFAULT_ZOOM, VIEW_RANK } from "../lib/map-view.js";
 
@@ -108,6 +109,7 @@ export function Plan(root) {
        <div class="dock-foot">${infoIcon}<span>Planning is operator-owned. The vehicle receives a finalized, validated mission through the existing verified upload path — nothing here starts a mission.</span></div>
      </div>
      <div class="map-wrap">
+       <div class="map-stage" id="plan-map-stage">
        <div id="plan-map"></div>
        <div class="ov plan-banner" id="plan-banner"></div>
        <div class="ov legend plan-legend" id="plan-legend">
@@ -129,6 +131,7 @@ export function Plan(root) {
          <button id="pl-center-usv" title="Centre the map on the selected USV's position">Center on USV</button>
          <button id="pl-center-op" title="Centre the map on your device location (asks permission)">Center on me</button>
        </div>
+       </div>
        <div class="plan-actionbar" id="plan-actions"></div>
      </div>
      <aside class="inspector plan-inspector" id="plan-inspector"></aside>`;
@@ -148,8 +151,27 @@ export function Plan(root) {
 
   const init0 = pickInitialView({ saved: getSavedViewport(), fallback: TOFTASJON });
   viewRank = init0.rank;
-  const map = L.map("plan-map", { zoomControl: true, attributionControl: false }).setView(init0.center, init0.zoom);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20 }).addTo(map);
+  // Zoom moves TOP-RIGHT, beneath the Center-on view controls (theme.css offsets it by
+  // the measured --map-tr-h). It used to sit top-left directly on top of the plan status
+  // banner, which is where the drawing instructions and every generation/validation error
+  // are printed — the two controls fought for the same 30x38 px on every viewport.
+  // trackResize:false — lib/map-layout.js is the SINGLE owner of resize for every map in
+  // the station. Leaflet's built-in window listener also calls invalidateSize, but with
+  // debounceMoveend, which parks a 200 ms timer that fires `moveend` on a map the router
+  // may already have removed (crash: "_leaflet_pos of undefined" in the moveend handler
+  // below). One owner, no dangling timer.
+  const map = L.map("plan-map", { zoomControl: false, attributionControl: true, trackResize: false })
+    .setView(init0.center, init0.zoom);
+  L.control.zoom({ position: "topright" }).addTo(map);
+  L.control.scale({ position: "bottomright", imperial: false }).addTo(map);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20, attribution: "© OpenStreetMap" }).addTo(map);
+  // Shared resize + corner-measurement contract (lib/map-layout.js). The banner is a
+  // top-left overlay, so the legend's max-height is derived from it and the two can never
+  // collide however long a validation message grows.
+  const detachMapLayout = attachMapLayout(map, document.getElementById("plan-map-stage"), {
+    topLeft: [document.getElementById("plan-banner")],
+    topRight: [document.getElementById("plan-viewctl")],
+  });
 
   // Interaction tracking + viewport persistence. The initial setView above ran BEFORE these
   // handlers were attached, so it does not count as interaction or persist a fallback view.
@@ -157,7 +179,9 @@ export function Plan(root) {
   map.on("moveend", () => {
     const wasProgrammatic = programmaticMove;
     programmaticMove = false;
-    if (!wasProgrammatic) { const c = map.getCenter(); setSavedViewport([c.lat, c.lng], map.getZoom()); }
+    // _mapPane is gone once the map has been removed; a late event must not persist a
+    // viewport (or throw) on a torn-down map.
+    if (!wasProgrammatic && map._mapPane) { const c = map.getCenter(); setSavedViewport([c.lat, c.lng], map.getZoom()); }
   });
 
   // Explicit stacking panes (task PART 3). The order guarantees the no-go RED fill/outline
@@ -819,10 +843,16 @@ export function Plan(root) {
     if (!fp) return `<div class="plan-empty">No fleet plan generated yet.</div>`;
     const s = fp.allocation_summary || {};
     const vrows = (fp.vehicles || []).map((vp) => {
-      const m = vp.metrics; const up = (fleetModel.upload.vehicles[String(vp.vehicle_id)] || {}).status || "—";
+      const u = fleetModel.upload.vehicles[String(vp.vehicle_id)] || {};
+      const m = vp.metrics; const up = u.status || "—";
       const iso = isolateVehicle && String(isolateVehicle) === String(vp.vehicle_id);
+      // Each vehicle owns its own result AND its own failure reason. One vehicle's long
+      // backend error is confined to that vehicle's card (it wraps, and the list scrolls),
+      // so it can never overflow the panel or hide the other vehicles' statuses.
+      const err = u.error ? `<div class="fp-err" title="${esc(String(u.error))}">${esc(String(u.error))}</div>` : "";
       return `<div class="fleet-sumcard ${iso ? "iso" : ""}" data-iso="${vp.vehicle_id}" style="border-left:3px solid ${vp.colour}">
-        <div class="fc-h"><span class="fc-sw" style="background:${vp.colour}"></span><b>${esc(vp.vehicle_name)}</b><span class="fc-id">${esc(String(vp.vehicle_id))}</span><span class="fp-up ${up.toLowerCase()}">${up}</span></div>
+        <div class="fc-h"><span class="fc-sw" style="background:${vp.colour}"></span><b title="${esc(vp.vehicle_name)}">${esc(vp.vehicle_name)}</b><span class="fc-id">${esc(String(vp.vehicle_id))}</span><span class="fp-up ${up.toLowerCase()}">${up}</span></div>
+        ${err}
         <div class="fleet-metgrid">
           <span>Lines</span><span>${m.assigned_survey_line_count}</span>
           <span>Waypoints</span><span>${m.waypoint_count}</span>
@@ -846,7 +876,7 @@ export function Plan(root) {
     const iso = `<div class="plan-btnrow"><button class="plan-tool ${isolateVehicle ? "" : "on"}" id="fleet-showall">Show all</button></div>`;
     const html = `<div class="fleet-legend">${(fp.vehicles || []).map((vp) => `<span class="fleet-leg" data-iso="${vp.vehicle_id}"><span class="fc-sw" style="background:${vp.colour}"></span>${esc(vp.vehicle_name)}</span>`).join("")}</div>
       ${iso}
-      ${vrows}
+      <div class="fleet-sumlist">${vrows}</div>
       <div class="plan-sumgrid">${frows.map(([k, val]) => `<div class="plan-srow"><span class="k">${k}</span><span class="v">${val}</span></div>`).join("")}</div>`;
     setTimeout(() => {
       document.querySelectorAll("[data-iso]").forEach((el) => el.onclick = () => { isolateVehicle = el.dataset.iso; renderAll(); });
@@ -1332,14 +1362,15 @@ export function Plan(root) {
   window.addEventListener("beforeunload", beforeUnload);
 
   renderAll();
-  // Leaflet needs a size recalc once the grid has laid out.
-  setTimeout(() => map.invalidateSize(), 60);
+  // (no setTimeout size recalc any more — attachMapLayout's ResizeObserver fires as soon
+  // as the grid gives the stage a real box, and keeps firing for every later change)
 
   return function cleanup() {
     stopFleet(); clearInterval(cmdTimer); clearInterval(authTimer); clearInterval(clockId);
     clearTimeout(geoTimer);
     window.removeEventListener("beforeunload", beforeUnload);
     if (toastTimer) clearTimeout(toastTimer);
+    detachMapLayout();
     map.remove();
   };
 }

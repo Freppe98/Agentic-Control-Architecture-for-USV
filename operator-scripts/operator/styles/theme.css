@@ -4,6 +4,16 @@
 /* ---------- reset / base ---------- */
 * { box-sizing:border-box; }
 html,body { height:100%; margin:0; overflow:hidden; }
+
+/* A flex COLUMN that scrolls must not also compress its children — flex-shrink defaults
+   to 1, so the browser happily squeezes each item to fit and then clips it inside its own
+   `overflow:hidden`, instead of scrolling. That is a silent content-loss bug (it cost the
+   Configuration page two of four threshold rows and two of three registry vehicles), so
+   the invariant is declared once here for every scrolling column in the app rather than
+   rediscovered per component. */
+.veh-list > *, .mprog > *, .pxm > *, .legend-body > *, .stub > *,
+.cfg > *, .mission-body > *, .fleet-picklist > *, .fleet-sumlist > *,
+.evbar > *, .plan-tools > * { flex-shrink:0; }
 body {
   background:var(--ground); color:var(--text);
   font-family:var(--font-ui); font-size:var(--fs-base); line-height:1.45;
@@ -19,20 +29,52 @@ a { color:inherit; }
 ::-webkit-scrollbar-track { background:transparent; }
 :focus-visible { outline:2px solid var(--accent); outline-offset:1px; border-radius:2px; }
 
-/* ---------- app shell ---------- */
-.app { height:100vh; width:100vw; display:grid; grid-template-rows:var(--ribbon-h) 1fr; }
-.app.has-dock { grid-template-columns:var(--rail-w) var(--dock-w) 1fr var(--inspector-w); }
-.app.no-dock  { grid-template-columns:var(--rail-w) 1fr; }
+/* ---------- app shell ----------
+   ONE owner of viewport height: .app is the only element measured against the viewport.
+   Row 1 is the ribbon, row 2 is everything else; every page lives inside row 2 and uses
+   height:100% of it, never 100vh of its own.
+   minmax(0,1fr) — NOT 1fr — is load-bearing. A bare `1fr` track keeps an implicit
+   `auto` (min-content) floor, so the tallest child in row 2 (the 13-item nav rail) used
+   to force the row to ~886px on every screen; the app then overflowed a 768px or 900px
+   viewport and `overflow:hidden` silently ate the bottom of the rail, both map legends,
+   the Plan action bar and the last two nav items. minmax(0,…) lets the row be genuinely
+   as tall as the viewport says, and the children scroll instead of the shell. */
+.app {
+  height:100vh; height:100dvh;   /* dvh so a collapsing browser toolbar cannot clip us */
+  width:100%;
+  display:grid;
+  grid-template-rows:var(--ribbon-h) minmax(0,1fr);
+  overflow:hidden;
+}
+/* Every shell child must be allowed to shrink below its content size, otherwise the
+   min-content floor comes back one level down. */
+.app > * { min-width:0; min-height:0; }
+.app.has-dock  { grid-template-columns:var(--rail-w) var(--dock-w) minmax(0,1fr) var(--inspector-w); }
+.app.no-dock   { grid-template-columns:var(--rail-w) minmax(0,1fr); }
+.app.dock-main { grid-template-columns:var(--rail-w) var(--dock-w) minmax(0,1fr); }
 
 /* ---------- ribbon ---------- */
-.ribbon { grid-column:1 / -1; display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line); }
-.rib-brand { display:flex; align-items:center; width:var(--rail-w); justify-content:center; border-right:1px solid var(--line); }
+.ribbon { grid-row:1; grid-column:1 / -1; display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line); min-width:0; overflow:hidden; }
+.rib-brand { flex:none; display:flex; align-items:center; width:var(--rail-w); justify-content:center; border-right:1px solid var(--line); }
 .rib-brand .mark { width:22px; height:22px; border:1.5px solid var(--accent); border-radius:50%; position:relative; }
 .rib-brand .mark::before,.rib-brand .mark::after { content:""; position:absolute; background:var(--accent); }
 .rib-brand .mark::before { left:50%; top:2px; bottom:2px; width:1.5px; transform:translateX(-50%); }
 .rib-brand .mark::after { top:50%; left:2px; right:2px; height:1.5px; transform:translateY(-50%); }
-.rib-seg { display:flex; align-items:center; padding:0 var(--sp-5); gap:12px; border-right:1px solid var(--line); }
-.rib-seg.grow { flex:1; }
+.rib-seg { flex:none; min-width:0; display:flex; align-items:center; padding:0 clamp(9px,.9vw,16px); gap:clamp(7px,.8vw,12px); border-right:1px solid var(--line); }
+.rib-seg.grow { flex:1 1 auto; min-width:0; }
+/* On a compact laptop the ribbon's own content is what would overflow, so the two
+   segments that carry no operational state give way first: the (decorative) search box
+   shrinks to nothing and the Guide label collapses to its icon. Nothing that reports
+   fleet or link state is ever hidden to save width. */
+@media (max-width:1450px) {
+  .rib-seg { padding:0 10px; }
+  .rib-seg.grow { flex:1 1 0; }
+  .search span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+}
+@media (max-width:1200px) {
+  .rib-seg.grow { display:none; }
+  .rib-help span { display:none; }
+}
 .mission-select { display:flex; align-items:center; gap:11px; background:transparent; border:1px solid var(--line-strong); border-radius:var(--r); padding:6px 11px; color:var(--text); cursor:pointer; transition:border-color var(--t-base), background var(--t-base), transform var(--t-fast); }
 .mission-select:hover { border-color:var(--accent); background:var(--accent-dim); }
 .mission-select:active { transform:translateY(1px); }
@@ -52,7 +94,7 @@ a { color:inherit; }
 .feedlink.warn { color:var(--caution); background:rgba(242,169,59,.12); }
 .feedlink.bad { color:var(--disconnected); background:rgba(229,72,77,.13); animation:feedlink-pulse 1.4s ease-in-out infinite; }
 @keyframes feedlink-pulse { 0%,100% { opacity:1; } 50% { opacity:.55; } }
-.search { display:flex; align-items:center; gap:9px; width:100%; max-width:340px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r); padding:7px 11px; color:var(--dim); cursor:text; transition:border-color var(--t-base); }
+.search { display:flex; align-items:center; gap:9px; width:100%; min-width:0; max-width:340px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r); padding:7px 11px; color:var(--dim); cursor:text; transition:border-color var(--t-base); }
 .search:hover,.search:focus { border-color:var(--line-strong); color:var(--muted); }
 .search svg { flex:none; }
 .fleet-sum { display:flex; align-items:center; gap:13px; }
@@ -64,18 +106,35 @@ a { color:inherit; }
 .clock { display:flex; flex-direction:column; align-items:flex-end; line-height:1.25; }
 .clock .t { font-family:var(--font-mono); font-size:var(--fs-lg); font-variant-numeric:tabular-nums; }
 
-/* ---------- nav rail ---------- */
-.rail { grid-row:2; grid-column:1; background:var(--panel-2); border-right:1px solid var(--line); display:flex; flex-direction:column; align-items:center; padding:11px 0; gap:5px; }
-.nav { position:relative; width:var(--nav-size); height:var(--nav-size); border-radius:var(--r); display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:pointer; transition:color var(--t-base), background var(--t-base); }
+/* ---------- nav rail ----------
+   The frozen NAV list is 13 fixed items. At the large-desktop --nav-size that needs
+   ~886px, which is taller than the body row on any 768px or 900px laptop — so the rail
+   both SHRINKS (height bands in variables.css) and, past that, SCROLLS. It must never
+   silently clip: an unreachable Terminal/Messages icon is lost navigation, not a
+   cosmetic issue. The scrollbar is deliberately narrow but visible, so the affordance
+   survives without eating the rail's width. */
+.rail {
+  grid-row:2; grid-column:1; background:var(--panel-2); border-right:1px solid var(--line);
+  display:flex; flex-direction:column; align-items:center;
+  padding:var(--sp-3) 0; gap:var(--nav-gap);
+  min-height:0; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain;
+  scrollbar-width:thin;
+}
+.rail::-webkit-scrollbar { width:4px; }
+.rail::-webkit-scrollbar-thumb { border:0; border-radius:2px; background:var(--line-strong); }
+.nav { flex:none; position:relative; width:var(--nav-size); height:var(--nav-size); border-radius:var(--r); display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:pointer; transition:color var(--t-base), background var(--t-base); }
 .nav svg { width:var(--nav-icon); height:var(--nav-icon); }
 .nav:hover { color:var(--text); background:var(--raise); }
 .nav:active { background:rgba(132,152,172,.14); }
 .nav.active { color:var(--accent); background:var(--accent-dim); }
 .nav.active::before { content:""; position:absolute; left:-9px; top:13px; bottom:13px; width:2px; background:var(--accent); border-radius:0 2px 2px 0; }
-/* tooltip clears the widened button (rail 78 − ~9px left margin − 60px button ≈ right edge 69) */
-.nav .tip { position:absolute; left:calc(var(--nav-size) + 12px); top:50%; transform:translateY(-50%); background:#020509; border:1px solid var(--line-strong); color:var(--text); padding:4px 9px; border-radius:var(--r-sm); font-size:var(--fs-sm); white-space:nowrap; opacity:0; pointer-events:none; transition:opacity var(--t-hover); z-index:40; box-shadow:var(--shadow-2); }
-.nav:hover .tip { opacity:1; }
-.rail .sep { width:34px; height:1px; background:var(--line); margin:9px 0; }
+/* The tooltip is position:FIXED, not absolute-inside-the-rail. The rail is a scroll
+   container now (overflow-y:auto forces overflow-x to a scroller too), so an inside
+   tooltip would be clipped at the rail's right edge. app.js positions it from the
+   button's rect on hover/focus and clamps it to the viewport. */
+.nav .tip { position:fixed; left:0; top:0; background:#020509; border:1px solid var(--line-strong); color:var(--text); padding:4px 9px; border-radius:var(--r-sm); font-size:var(--fs-sm); white-space:nowrap; opacity:0; pointer-events:none; transition:opacity var(--t-hover); z-index:var(--z-nav-tip); box-shadow:var(--shadow-2); }
+.nav:hover .tip, .nav:focus-visible .tip { opacity:1; }
+.rail .sep { flex:none; width:60%; height:1px; background:var(--line); margin:9px 0; }
 
 /* ---------- status primitives ---------- */
 .dot { width:8px; height:8px; border-radius:50%; flex:none; }
@@ -110,20 +169,22 @@ a { color:inherit; }
 .no-telem-box svg { width:14px; height:14px; flex:none; color:var(--dim); }
 
 /* ---------- left dock (roster + panels) ---------- */
-.dock { grid-row:2; grid-column:2; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
-.dock-h { display:flex; align-items:center; justify-content:space-between; padding:12px 14px 9px; }
-.veh-list { flex:1; overflow-y:auto; padding:0 10px 10px; display:flex; flex-direction:column; gap:5px; }
+.dock { grid-row:2; grid-column:2; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0; min-width:0; overflow:hidden; }
+.dock-h { flex:none; display:flex; align-items:center; justify-content:space-between; padding:12px 14px 9px; }
+/* the roster is the ONLY part of the dock that scrolls; the fixed cards below it keep
+   their space, so mission progress is never pushed out of the viewport */
+.veh-list { flex:1 1 auto; min-height:0; overflow-y:auto; padding:0 10px 10px; display:flex; flex-direction:column; gap:5px; }
 .vrow { display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:11px; padding:11px; border-radius:var(--r); cursor:pointer; border:1px solid transparent; background:var(--panel-2); transition:background var(--t-hover), border-color var(--t-hover), transform var(--t-fast); }
 .vrow:hover { background:var(--raise); } .vrow:active { transform:translateY(1px); }
 .vrow.sel { background:var(--accent-dim); border-color:rgba(76,141,255,.42); }
 .vrow .stat { align-self:start; margin-top:4px; }
 .vrow .body { min-width:0; display:flex; flex-direction:column; gap:2px; }
-.vrow .nm { font-family:var(--font-mono); font-size:14px; font-weight:600; }
-.vrow .act { font-size:12px; color:var(--text); }
-.vrow .sub { font-family:var(--font-mono); font-size:10.5px; color:var(--muted); border:none; background:transparent; border-radius:0; overflow:visible; }
+.vrow .nm { font-family:var(--font-mono); font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.vrow .act { font-size:12px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.vrow .sub { font-family:var(--font-mono); font-size:10.5px; color:var(--muted); border:none; background:transparent; border-radius:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .vrow .mid { display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
 .vrow .bt { font-family:var(--font-mono); font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
-.mprog { border-top:1px solid var(--line); padding:13px 14px 15px; background:var(--panel-2); display:flex; flex-direction:column; gap:11px; }
+.mprog { flex:0 1 auto; min-height:0; overflow-y:auto; border-top:1px solid var(--line); padding:13px 14px 15px; background:var(--panel-2); display:flex; flex-direction:column; gap:11px; }
 .mprog .row { display:flex; align-items:center; justify-content:space-between; }
 .mprog .top { display:flex; align-items:baseline; justify-content:space-between; }
 .mprog .pct { font-family:var(--font-mono); font-size:24px; line-height:1; }
@@ -132,7 +193,10 @@ a { color:inherit; }
 .mgrid .v { font-family:var(--font-mono); font-size:var(--fs-base); }
 
 /* ---------- Pixhawk mission card (left dock, between roster and mission progress) ---------- */
-.pxm { border-top:1px solid var(--line); padding:12px 14px 14px; background:var(--panel-2); display:flex; flex-direction:column; gap:9px; }
+/* Fixed-content cards below the roster: they keep their space (flex-basis auto) but may
+   shrink and scroll internally on a short laptop rather than pushing the roster — or
+   themselves — out of the dock. */
+.pxm { flex:0 1 auto; min-height:0; overflow-y:auto; border-top:1px solid var(--line); padding:12px 14px 14px; background:var(--panel-2); display:flex; flex-direction:column; gap:9px; }
 .pxm .pxm-h { display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .pxm-chip { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.04em; text-transform:uppercase; font-weight:600; padding:3px 8px; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel); color:var(--muted); white-space:nowrap; }
 .pxm-chip.ok { color:var(--connected); border-color:rgba(62,207,142,.3); background:rgba(62,207,142,.08); }
@@ -166,7 +230,7 @@ a { color:inherit; }
 /* mission overlay — small, discreet numbered waypoints that stay subordinate to the
    round comm-colored vehicle dot. Rounded-square so they never read as a vehicle. */
 .wp-marker { width:20px; height:20px; border-radius:5px; background:rgba(76,141,255,.82); color:#08101C; display:flex; align-items:center; justify-content:center; font-family:var(--font-mono); font-size:10px; font-weight:700; line-height:1; border:1.5px solid rgba(7,12,17,.85); box-shadow:0 1px 2px rgba(0,0,0,.5); transition:transform var(--t-fast), background var(--t-hover), box-shadow var(--t-hover); }
-.wp-marker:hover { background:rgba(76,141,255,1); transform:scale(1.18); box-shadow:0 0 0 3px rgba(76,141,255,.25), 0 1px 3px rgba(0,0,0,.55); z-index:20; }
+.wp-marker:hover { background:rgba(76,141,255,1); transform:scale(1.18); box-shadow:0 0 0 3px rgba(76,141,255,.25), 0 1px 3px rgba(0,0,0,.55); z-index:var(--z-marker-hover); }
 .wp-marker .wp-num { pointer-events:none; }
 /* current waypoint — stronger ring (gently pulsing so it's findable at a glance on a
    busy mission), not a bigger box (keeps the flow calm) */
@@ -180,7 +244,7 @@ a { color:inherit; }
 /* HOME / current-position item — distinct home glyph, never numbered into the route */
 .home-marker { width:22px; height:22px; border-radius:6px; background:rgba(18,24,31,.92); color:var(--muted); display:flex; align-items:center; justify-content:center; border:1.5px solid var(--muted); box-shadow:0 1px 3px rgba(0,0,0,.6); transition:transform var(--t-fast), color var(--t-hover), border-color var(--t-hover); }
 .home-marker svg { width:13px; height:13px; }
-.home-marker:hover { color:var(--text); border-color:var(--text); transform:scale(1.12); z-index:20; }
+.home-marker:hover { color:var(--text); border-color:var(--text); transform:scale(1.12); z-index:var(--z-marker-hover); }
 .home-marker.cur { border-color:var(--connected); color:var(--connected); box-shadow:0 0 0 2.5px rgba(62,207,142,.4), 0 1px 3px rgba(0,0,0,.6); }
 /* wide zoom: drop the numbers and shrink the markers to just readable dots (no layer
    rebuild — a single class on the map container). Current keeps its ring. */
@@ -200,28 +264,75 @@ a { color:inherit; }
 .wp-pop-row span:first-child { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }
 .wp-pop-row span:last-child { font-family:var(--font-mono); font-size:11.5px; color:var(--text); font-variant-numeric:tabular-nums; }
 
-/* ---------- map ---------- */
-.map-wrap { grid-row:2; grid-column:3; position:relative; overflow:hidden; background:#0C141C; }
-#map { position:absolute; inset:0; width:100%; height:100%; }
+/* ---------- map ----------
+   The map column is a two-row grid: the STAGE (map + its overlays) takes the flexible
+   row, any bottom action/progress bar takes an `auto` row of its own. The bars used to
+   be absolutely positioned over the map, which is what buried the legend and put the
+   Plan action bar outside the viewport. Giving them a real row means the map's bottom
+   edge is genuinely the bottom of the map — no reserved offsets, no overlap. A hidden
+   bar collapses the row to 0 and the stage simply gets the height back. */
+.map-wrap { grid-row:2; grid-column:3; display:grid; grid-template-rows:minmax(0,1fr) auto; min-width:0; min-height:0; overflow:hidden; background:#0C141C; }
+.map-stage { position:relative; min-width:0; min-height:0; overflow:hidden; }
+#map, #plan-map { position:absolute; inset:0; width:100%; height:100%; }
 .leaflet-container { background:#0C141C; }
-.ov { position:absolute; background:rgba(9,13,18,.84); border:1px solid var(--line); border-radius:var(--r); backdrop-filter:blur(3px); box-shadow:var(--shadow-1); z-index:500; }
-.wind { top:14px; right:14px; width:80px; text-align:center; padding:9px 6px 8px; }
+
+/* Leaflet control placement — one shared spacing system (--map-pad / --map-ov-gap),
+   never per-page pixel values. Corner ownership:
+     top-left      drawing + status instructions (.plan-banner)
+     top-right     our view controls (.wind, .plan-viewctl) with ZOOM beneath them
+     bottom-left   legend
+     bottom-right  attribution
+   --map-tr-h is measured from the live top-right overlay by lib/map-layout.js, so the
+   zoom control drops below whatever is actually there at this viewport. */
+.leaflet-left .leaflet-control { margin-left:var(--map-pad); }
+.leaflet-right .leaflet-control { margin-right:var(--map-pad); }
+.leaflet-top .leaflet-control { margin-top:var(--map-pad); }
+.leaflet-bottom .leaflet-control { margin-bottom:var(--map-pad); }
+.leaflet-top.leaflet-right { padding-top:calc(var(--map-tr-h) + var(--map-ov-gap)); }
+/* dark-theme Leaflet's own controls so they stay legible on the dark map and stop
+   reading as a foreign white widget dropped on the operator station */
+.leaflet-bar { border:1px solid var(--line-strong); box-shadow:var(--shadow-1); }
+.leaflet-bar a, .leaflet-bar a:hover { background:rgba(9,13,18,.88); color:var(--text); border-bottom-color:var(--line); width:28px; height:28px; line-height:28px; }
+.leaflet-bar a:hover { background:var(--raise); color:var(--accent-bright); }
+.leaflet-bar a.leaflet-disabled { background:rgba(9,13,18,.6); color:var(--dim); }
+/* Attribution is a licence obligation for the OSM tiles, so it is never truncated: it
+   wraps within a sane cap instead. */
+.leaflet-control-attribution { background:rgba(9,13,18,.78) !important; color:var(--muted); font-size:9.5px; line-height:1.5; padding:1px 6px; border:1px solid var(--line); border-radius:var(--r-sm); max-width:32ch; white-space:normal; }
+.leaflet-control-attribution a { color:var(--muted); }
+.leaflet-control-scale-line { background:rgba(9,13,18,.78); border-color:var(--line-strong); color:var(--muted); }
+
+/* Map overlays. z sits above .leaflet-control (800) and the corner containers (1000)
+   because these carry operator state — a status banner must never be painted under a
+   zoom button. Their corners are kept clear of each other by the rules below, not by
+   stacking order. */
+.ov { position:absolute; background:rgba(9,13,18,.84); border:1px solid var(--line); border-radius:var(--r); backdrop-filter:blur(3px); box-shadow:var(--shadow-1); z-index:var(--z-map-overlay); }
+.wind { top:var(--map-pad); right:var(--map-pad); width:80px; text-align:center; padding:9px 6px 8px; }
 .wind .arrow { font-size:26px; line-height:1; color:var(--accent); display:inline-block; }
 .wind .spd { font-family:var(--font-mono); font-size:var(--fs-base); margin-top:4px; }
 .wind .frm { font-size:9.5px; color:var(--muted); margin-top:1px; }
 
 /* map legend — identifies every marker type without requiring a click. Bottom-left,
-   collapsible so it never competes with the map itself once an operator knows it. */
-.legend { bottom:14px; left:14px; width:206px; padding:9px 11px 10px; font-size:11px; }
-.legend-h { display:flex; align-items:center; justify-content:space-between; margin-bottom:7px; }
-.legend-toggle { background:transparent; border:1px solid var(--line-strong); color:var(--muted); border-radius:4px; width:18px; height:18px; line-height:1; cursor:pointer; font-family:var(--font-mono); font-size:12px; padding:0; }
+   collapsible so it never competes with the map itself once an operator knows it.
+   It is bounded by the STAGE, not by a guessed pixel budget: max-height is the stage
+   height minus the padding and minus whatever the top-left overlay occupies, and the
+   body scrolls inside that. Since the bottom bars now own their own grid row, "bottom
+   of the stage" really is above them — the legend can no longer be buried. */
+.legend {
+  bottom:var(--map-pad); left:var(--map-pad); width:var(--legend-w);
+  max-height:calc(100% - var(--map-pad) * 2 - var(--map-tl-h) - var(--map-ov-gap));
+  display:flex; flex-direction:column; padding:9px 11px 10px; font-size:11px;
+}
+.legend-h { flex:none; display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
+.legend-toggle { flex:none; background:transparent; border:1px solid var(--line-strong); color:var(--muted); border-radius:4px; width:18px; height:18px; line-height:1; cursor:pointer; font-family:var(--font-mono); font-size:12px; padding:0; }
 .legend-toggle:hover { color:var(--text); border-color:var(--accent); }
-.legend-body { display:flex; flex-direction:column; gap:10px; }
+.legend-body { display:flex; flex-direction:column; gap:10px; min-height:0; overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
 .legend-body.collapsed { display:none; }
 .li-group { display:flex; flex-direction:column; gap:5px; padding-top:8px; border-top:1px solid var(--line); }
 .li-group:first-child { padding-top:0; border-top:none; }
-.li { display:flex; align-items:center; gap:8px; color:var(--muted); line-height:1.3; }
-.li-ic { width:14px; height:14px; flex:none; display:inline-block; }
+/* align-items:flex-start + wrapping label: a long entry wraps under itself with its
+   symbol still lined up on the first line, instead of stretching the legend wider */
+.li { display:flex; align-items:flex-start; gap:8px; color:var(--muted); line-height:1.3; overflow-wrap:anywhere; }
+.li-ic { width:14px; height:14px; flex:none; display:inline-block; margin-top:1px; }
 .li-ic.veh { border-radius:50%; background:var(--connected); box-shadow:0 0 0 1.5px #070C11 inset; }
 .li-ic.wp { border-radius:4px; background:rgba(76,141,255,.82); }
 .li-ic.wp.done { border-radius:50%; background:rgba(62,207,142,.35); }
@@ -235,12 +346,21 @@ a { color:inherit; }
 /* bottom-of-map mission-progress strip — 0-100% waypoint completion for the selected
    vehicle, on the map surface itself (not just a side-panel chip). Hidden entirely
    (see renderMissionBar) when no mission is loaded, never a fabricated 0%. */
-.mission-progress-bar { position:absolute; left:0; right:0; bottom:0; height:28px; background:rgba(9,13,18,.88); border-top:1px solid var(--line-strong); display:flex; align-items:center; z-index:500; overflow:hidden; }
+.mission-progress-bar { grid-row:2; position:relative; height:28px; background:var(--panel-2); border-top:1px solid var(--line-strong); display:flex; align-items:center; z-index:var(--z-page-bar); overflow:hidden; }
 .mpb-fill { position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg, rgba(62,207,142,.28), rgba(62,207,142,.4)); transition:width var(--t-slow); }
 .mpb-label { position:relative; margin:0 auto; font-family:var(--font-mono); font-size:11px; letter-spacing:.04em; color:var(--text); font-variant-numeric:tabular-nums; }
 
-/* transient command-result toast (replaces window.alert) */
-.toast { top:14px; left:50%; transform:translateX(-50%); max-width:440px; padding:10px 16px; font-size:12.5px; line-height:1.4; display:none; align-items:center; gap:8px; z-index:900; }
+/* transient command-result toast (replaces window.alert). Sits BELOW whatever the top
+   corners already hold, so a command result never lands on top of the status banner or
+   the view controls, and wraps rather than truncating a backend error. */
+.toast {
+  top:calc(var(--map-pad) + max(var(--map-tl-h), var(--map-tr-h)) + var(--map-ov-gap));
+  left:50%; transform:translateX(-50%);
+  max-width:min(440px, calc(100% - var(--map-pad) * 2));
+  max-height:calc(100% - var(--map-pad) * 3); overflow-y:auto;
+  padding:10px 16px; font-size:12.5px; line-height:1.4; display:none; align-items:center; gap:8px;
+  white-space:normal; overflow-wrap:anywhere; z-index:var(--z-map-toast);
+}
 .toast.warn { border-color:rgba(242,169,59,.5); color:var(--caution); }
 .toast.err { border-color:rgba(229,72,77,.5); color:var(--disconnected); }
 .usv-marker { position:relative; width:40px; height:40px; display:flex; align-items:center; justify-content:center; }
@@ -256,13 +376,16 @@ a { color:inherit; }
 .usv-marker .staledash { position:absolute; left:50%; top:50%; width:30px; height:30px; transform:translate(-50%,-50%); border-radius:50%; border:2px dashed currentColor; opacity:.75; }
 
 /* ---------- inspector ---------- */
-.inspector { grid-row:2; grid-column:4; background:var(--panel); border-left:1px solid var(--line); overflow-y:auto; overflow-x:hidden; }
+.inspector { grid-row:2; grid-column:4; background:var(--panel); border-left:1px solid var(--line); min-height:0; min-width:0; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain; }
 .isec { padding:var(--sp-4); border-bottom:1px solid var(--line); }
-.sec-title { display:flex; align-items:center; justify-content:space-between; margin-bottom:11px; }
+.sec-title { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px 10px; margin-bottom:11px; min-width:0; }
+.sec-title > * { min-width:0; }
 .idcard { background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); overflow:hidden; }
 .idcard .idtop { padding:12px 13px 11px; }
-.idrow { display:flex; align-items:center; justify-content:space-between; gap:10px; }
-.idname { font-family:var(--font-mono); font-size:var(--fs-xxl); font-weight:600; line-height:1; }
+.idrow { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; }
+/* long vehicle names truncate here (the full value is in the row's title) rather than
+   widening the inspector — the panel width is a layout invariant, the name is not */
+.idname { font-family:var(--font-mono); font-size:var(--fs-xxl); font-weight:600; line-height:1.1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .idassign { margin-top:11px; font-size:var(--fs-base); }
 .idbehav { margin-top:2px; font-size:12px; color:var(--muted); }
 .idcontact { display:flex; align-items:baseline; gap:9px; padding:11px 13px; border-top:1px solid var(--line); background:rgba(0,0,0,.12); }
@@ -270,8 +393,8 @@ a { color:inherit; }
 .idcontact .big { font-family:var(--font-mono); font-size:22px; line-height:1; font-variant-numeric:tabular-nums; }
 .idcontact .u { font-family:var(--font-mono); font-size:var(--fs-base); color:var(--muted); }
 .idcontact .cap { margin-left:auto; text-align:right; display:flex; flex-direction:column; gap:2px; }
-.tele { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
-.cell { background:var(--panel); padding:9px 11px; }
+.tele { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(118px,100%),1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.cell { background:var(--panel); padding:9px 11px; min-width:0; }
 .cell.full { grid-column:1 / -1; }
 .cell .k { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
 .cell .v { font-family:var(--font-mono); font-size:var(--fs-md); margin-top:3px; font-variant-numeric:tabular-nums; transition:color var(--t-slow); }
@@ -280,8 +403,8 @@ a { color:inherit; }
 .tele.stale .cell.batt .v { color:inherit; }
 .stale-note { display:flex; align-items:center; gap:7px; margin-top:10px; font-size:var(--fs-sm); color:var(--partitioned); }
 .stale-note svg { width:13px; height:13px; flex:none; }
-.qa { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-.qa button { display:flex; align-items:center; gap:9px; padding:10px 11px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); color:var(--text); font-size:12.5px; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); text-align:left; }
+.qa { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(128px,100%),1fr)); gap:8px; }
+.qa button { display:flex; align-items:center; gap:9px; padding:10px 11px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); color:var(--text); font-size:12.5px; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); text-align:left; min-width:0; }
 .qa button:hover:not(:disabled) { border-color:var(--accent); background:var(--accent-dim); }
 .qa button:active:not(:disabled) { transform:translateY(1px); }
 .qa button:disabled { opacity:.5; cursor:not-allowed; }
@@ -303,9 +426,12 @@ a { color:inherit; }
 .vbadge.accent { color:var(--accent-bright); border-color:rgba(76,141,255,.32); background:var(--accent-dim); }
 .vbadge.idle { color:var(--dim); background:transparent; }
 
-/* ---------- authority segmented indicator (RC / Operator / Local Agent) ---------- */
-.authseg { display:inline-flex; align-items:stretch; border:1px solid var(--line-strong); border-radius:var(--r-sm); overflow:hidden; }
-.authseg .aseg { padding:4px 8px; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--dim); background:var(--panel-2); border-right:1px solid var(--line); white-space:nowrap; }
+/* ---------- authority segmented indicator (RC / Operator / Local Agent) ----------
+   Who holds command authority is safety-critical, so LOCAL AGENT must never render as
+   "LOCAL AGE": the control wraps to a second line in a narrow inspector rather than
+   clipping its last segment. */
+.authseg { display:inline-flex; align-items:stretch; flex-wrap:wrap; max-width:100%; border:1px solid var(--line-strong); border-radius:var(--r-sm); overflow:hidden; }
+.authseg .aseg { flex:none; padding:4px 8px; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--dim); background:var(--panel-2); border-right:1px solid var(--line); white-space:nowrap; }
 .authseg .aseg:last-child { border-right:none; }
 .authseg .aseg.ready { color:var(--muted); }
 .authseg .aseg.on { color:var(--accent-bright); background:var(--accent-dim); font-weight:700; }
@@ -338,31 +464,36 @@ a { color:inherit; }
 .agent-last-action .v { display:flex; align-items:center; gap:8px; font-size:12px; }
 
 /* ---------- generic page toolbar ---------- */
-.toolbar { display:flex; align-items:center; gap:16px; padding:13px 20px; border-bottom:1px solid var(--line); }
+.toolbar { flex:none; display:flex; align-items:center; gap:clamp(8px,1vw,16px); flex-wrap:wrap; padding:clamp(9px,1vh,13px) var(--panel-pad); border-bottom:1px solid var(--line); }
 .toolbar h1 { margin:0; font-size:var(--fs-lg); font-weight:600; }
 
 /* ---------- migration stub ---------- */
-.stub { grid-row:2; grid-column:2 / -1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:40px; color:var(--muted); }
+.stub { grid-row:2; grid-column:2 / -1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:40px; color:var(--muted); }
 .stub .st-ic { width:44px; height:44px; color:var(--dim); }
 .stub h2 { margin:0; font-size:var(--fs-lg); color:var(--text); font-weight:600; }
 .stub p { margin:0; max-width:420px; line-height:1.55; font-size:var(--fs-base); }
 .stub a { color:var(--accent-bright); }
 
-/* ---------- no-dock page container ---------- */
-.page { grid-row:2; grid-column:2; display:flex; flex-direction:column; overflow:hidden; }
+/* ---------- no-dock page container ----------
+   A page is a column: fixed header rows, then exactly ONE flexible region that scrolls.
+   min-height:0 on the chain is what keeps that region inside the viewport instead of
+   letting it push the page taller than the shell. */
+.page { grid-row:2; grid-column:2; display:flex; flex-direction:column; min-height:0; min-width:0; overflow:hidden; }
 .toolbar .count { margin-left:2px; color:var(--muted); font-size:12px; }
 
 /* ---------- rollup tiles ---------- */
-.rollup { display:flex; gap:1px; background:var(--line); border-bottom:1px solid var(--line); }
-.rtile { flex:1; background:var(--panel); padding:12px 20px; display:flex; flex-direction:column; gap:6px; }
+.rollup { flex:none; display:flex; flex-wrap:wrap; gap:1px; background:var(--line); border-bottom:1px solid var(--line); }
+.rtile { flex:1 1 160px; min-width:0; background:var(--panel); padding:clamp(9px,1vh,12px) var(--panel-pad); display:flex; flex-direction:column; gap:6px; }
 .rtile .v { font-family:var(--font-mono); font-size:var(--fs-xl); font-variant-numeric:tabular-nums; display:flex; align-items:center; gap:12px; }
 .rtile .v .seg { display:flex; align-items:center; gap:5px; font-size:var(--fs-lg); }
 .rtile .sub { font-size:var(--fs-sm); color:var(--muted); border:none; background:transparent; border-radius:0; overflow:visible; }
 
-/* ---------- data table ---------- */
-.tablewrap { flex:1; overflow:auto; }
+/* ---------- data table ----------
+   A wide table scrolls HORIZONTALLY inside its own container; it must never widen the
+   application shell. The last column is reachable by scrolling, never clipped. */
+.tablewrap { flex:1 1 auto; min-height:0; min-width:0; overflow:auto; }
 table.dt { width:100%; border-collapse:collapse; }
-table.dt thead th { position:sticky; top:0; z-index:5; background:var(--panel); text-align:left; font-family:var(--font-mono); font-size:10px; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); font-weight:600; padding:9px 12px; border-bottom:1px solid var(--line-strong); white-space:nowrap; }
+table.dt thead th { position:sticky; top:0; z-index:var(--z-sticky-head); background:var(--panel); text-align:left; font-family:var(--font-mono); font-size:10px; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); font-weight:600; padding:9px 12px; border-bottom:1px solid var(--line-strong); white-space:nowrap; }
 table.dt th.sortable { cursor:pointer; user-select:none; transition:color var(--t-hover); }
 table.dt th.sortable:hover { color:var(--text); }
 table.dt th .ar { color:var(--accent); margin-left:3px; }
@@ -372,8 +503,10 @@ table.dt tbody tr { cursor:pointer; transition:background .08s; }
 table.dt tbody tr:hover td { background:var(--raise); }
 table.dt tbody tr.sel td { background:var(--accent-dim); }
 table.dt tbody tr.sel td:first-child { box-shadow:inset 2px 0 0 var(--accent); }
-.vname { display:flex; align-items:center; gap:10px; }
-.vname b { font-family:var(--font-mono); font-size:14px; font-weight:600; }
+/* A long vehicle name truncates rather than stretching the table past the viewport; the
+   full value stays available through the cell's title attribute (components/Table.js). */
+.vname { display:flex; align-items:center; gap:10px; min-width:0; }
+.vname b { font-family:var(--font-mono); font-size:14px; font-weight:600; max-width:26ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
 /* ---------- health badge (health axis) ---------- */
 .hb { display:inline-flex; align-items:center; gap:8px; font-family:var(--font-mono); font-size:11.5px; letter-spacing:.03em; }
@@ -384,27 +517,31 @@ table.dt tbody tr.sel td:first-child { box-shadow:inset 2px 0 0 var(--accent); }
 .hb.idle { color:var(--dim); } .hb.idle .hd { background:var(--dim); }
 
 /* ---------- dock-main pages (Vehicle) ---------- */
-.app.dock-main { grid-template-columns:var(--rail-w) var(--dock-w) 1fr; }
-.content-main { grid-row:2; grid-column:3; display:flex; flex-direction:column; overflow:hidden; }
-.vcontent { flex:1; overflow-y:auto; overflow-x:hidden; }
-.sect { padding:16px 20px 5px; display:flex; align-items:baseline; gap:10px; }
+.content-main { grid-row:2; grid-column:3; display:flex; flex-direction:column; min-height:0; min-width:0; overflow:hidden; }
+.vcontent { flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; }
+.sect { padding:16px var(--panel-pad) 5px; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
 .sect .tag { font-family:var(--font-mono); font-size:10px; color:var(--dim); }
-.dock-foot { border-top:1px solid var(--line); padding:11px 14px; background:var(--panel-2); font-size:10.5px; color:var(--dim); line-height:1.45; display:flex; gap:8px; }
+/* The dock's explanatory footer keeps its natural height up to a fraction of the
+   viewport, then scrolls internally — so it neither squeezes the roster above it nor
+   collapses to two unreadable lines on a 768px laptop. */
+.dock-foot { flex:0 0 auto; max-height:22vh; overflow-y:auto; border-top:1px solid var(--line); padding:11px 14px; background:var(--panel-2); font-size:10.5px; color:var(--dim); line-height:1.45; display:flex; gap:8px; }
 .dock-foot svg { width:14px; height:14px; flex:none; margin-top:1px; }
 
 /* ---------- systems matrix ---------- */
-.mxwrap { padding:4px 20px 8px; overflow-x:auto; }
+.mxwrap { padding:4px var(--panel-pad) 8px; overflow-x:auto; }
 table.mx { border-collapse:separate; border-spacing:0; width:100%; min-width:820px; }
 table.mx th, table.mx td { border-bottom:1px solid var(--line); }
-table.mx thead th { position:sticky; top:0; z-index:2; background:var(--panel); text-align:center; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); font-weight:600; padding:9px 8px; border-bottom:1px solid var(--line-strong); white-space:nowrap; }
+table.mx thead th { position:sticky; top:0; z-index:var(--z-sticky-head); background:var(--panel); text-align:center; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); font-weight:600; padding:9px 8px; border-bottom:1px solid var(--line-strong); white-space:nowrap; }
 table.mx thead th.veh { text-align:left; padding-left:12px; width:170px; }
 table.mx tbody tr { cursor:pointer; transition:background .08s; }
 table.mx tbody tr:hover td { background:var(--raise); }
 table.mx tbody tr.sel td { background:var(--accent-dim); }
 table.mx tbody tr.sel td.vcell { box-shadow:inset 2px 0 0 var(--accent); }
 table.mx td.vcell { padding:0 12px; height:48px; white-space:nowrap; }
-.vcell .vc-in { display:flex; align-items:center; gap:10px; }
-.vcell b { font-family:var(--font-mono); font-size:14px; font-weight:600; }
+.vcell .vc-in { display:flex; align-items:center; gap:10px; min-width:0; }
+/* the matrix's first column stays a predictable width so the subsystem columns keep
+   their share of the (horizontally scrollable) table; the full name is in the title */
+.vcell b { font-family:var(--font-mono); font-size:14px; font-weight:600; max-width:22ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-align:middle; }
 .mcell { display:inline-flex; flex-direction:column; align-items:center; gap:4px; min-width:58px; padding:6px 8px; border-radius:var(--r-sm); border:1px solid transparent; }
 .mcell .mdot { width:9px; height:9px; border-radius:50%; box-shadow:0 0 0 3px rgba(0,0,0,.22); }
@@ -415,9 +552,9 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .mcell.idle .mdot, .mcell.na .mdot { background:var(--dim); } .mcell.idle .mv, .mcell.na .mv { color:var(--dim); }
 
 /* ---------- vehicle detail ---------- */
-.detail { padding:6px 20px 40px; }
-.dhead { display:flex; align-items:center; gap:14px; padding:14px 16px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); margin-bottom:14px; flex-wrap:wrap; }
-.dhead .dname { font-family:var(--font-mono); font-size:22px; font-weight:600; line-height:1; }
+.detail { padding:6px var(--panel-pad) 40px; }
+.dhead { display:flex; align-items:center; gap:10px 14px; padding:14px 16px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); margin-bottom:14px; flex-wrap:wrap; }
+.dhead .dname { font-family:var(--font-mono); font-size:clamp(17px,1.4vw,22px); font-weight:600; line-height:1.1; min-width:0; overflow-wrap:anywhere; }
 .dhead .ovr { display:inline-flex; align-items:center; gap:8px; font-family:var(--font-mono); font-size:12px; padding:4px 11px; border-radius:var(--r); }
 .dhead .ovr .hd { width:9px; height:9px; border-radius:50%; }
 .ovr.ok { color:var(--ok); background:rgba(62,207,142,.1); } .ovr.ok .hd { background:var(--ok); }
@@ -426,9 +563,12 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .dhead .sp { flex:1; }
 .dhead .contact { text-align:right; display:flex; flex-direction:column; gap:2px; }
 .dhead .contact .big { font-family:var(--font-mono); font-size:20px; font-variant-numeric:tabular-nums; line-height:1; }
-.subgrid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-@media (max-width:1320px){ .subgrid { grid-template-columns:repeat(2,1fr); } }
-@media (max-width:980px){ .subgrid { grid-template-columns:1fr; } }
+/* Card grids are auto-fit, NOT a hard-coded column count behind a viewport media query.
+   These cards live inside .content-main, which is ~660px narrower than the viewport, so
+   a `@media (max-width:1320px)` rule was measuring the wrong box entirely and left
+   3-across cards ~180px wide on a 1366 laptop. auto-fit + a minmax floor reflows off the
+   space the cards actually have. */
+.subgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(var(--card-min),1fr)); gap:var(--page-gap); }
 .sub { background:var(--panel); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
 .sub.full { margin-bottom:12px; }
 .sub-head { display:flex; align-items:center; gap:10px; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel-2); }
@@ -440,10 +580,10 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .sub-head.warn .hd { background:var(--warn); } .sub-head.warn .cond { color:var(--warn); }
 .sub-head.idle .hd { background:var(--dim); } .sub-head.idle .cond { color:var(--dim); }
 .metrics { display:flex; flex-direction:column; }
-.mrow { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 13px; border-bottom:1px solid var(--line); }
+.mrow { display:flex; align-items:center; justify-content:space-between; gap:6px 12px; flex-wrap:wrap; padding:8px 13px; border-bottom:1px solid var(--line); }
 .mrow:last-child { border-bottom:none; }
-.mrow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
-.mrow .val { font-family:var(--font-mono); font-size:13px; font-variant-numeric:tabular-nums; color:var(--text); display:flex; align-items:center; gap:9px; }
+.mrow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); min-width:0; }
+.mrow .val { font-family:var(--font-mono); font-size:13px; font-variant-numeric:tabular-nums; color:var(--text); display:flex; align-items:center; gap:9px; min-width:0; overflow-wrap:anywhere; margin-left:auto; }
 .mrow .val .pcw { min-width:34px; text-align:right; }
 .metrics.stale .mrow .val { color:var(--dim); }
 .metrics.stale .mrow .val.keep { color:var(--text); }
@@ -457,16 +597,17 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .diag-btn:hover:not(:disabled) { border-color:var(--accent); background:var(--accent-dim); }
 .diag-btn:disabled { opacity:.6; cursor:default; }
 .diag-note { padding:9px 13px; font-size:11px; color:var(--muted); line-height:1.5; border-bottom:1px solid var(--line); }
-.diag-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); }
-@media (max-width:640px){ .diag-grid { grid-template-columns:1fr; } }
-.diag-item { background:var(--panel); padding:9px 13px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
-.diag-item .dk { font-family:var(--font-mono); font-size:11px; color:var(--muted); }
+.diag-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr)); gap:1px; background:var(--line); }
+.diag-item { background:var(--panel); padding:9px 13px; display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; }
+.diag-item .dk { font-family:var(--font-mono); font-size:11px; color:var(--muted); min-width:0; overflow-wrap:anywhere; }
 .dchip { display:inline-flex; align-items:center; gap:6px; font-family:var(--font-mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase; font-weight:600; white-space:nowrap; }
 .dchip .hd { width:7px; height:7px; border-radius:50%; flex:none; background:currentColor; }
 .dchip.ok { color:var(--ok); } .dchip.caution { color:var(--caution); } .dchip.warn { color:var(--warn); } .dchip.idle { color:var(--dim); }
 
 /* ---------- events log ---------- */
-.evbar { display:flex; gap:8px; padding:11px 20px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+/* Filter chips may wrap onto a second row, but the strip itself is capped so a long
+   filter set can never squeeze the log below a usable height. */
+.evbar { flex:0 1 auto; min-height:0; max-height:24vh; overflow-y:auto; display:flex; gap:8px; padding:11px var(--panel-pad); border-bottom:1px solid var(--line); flex-wrap:wrap; }
 .chip { display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border:1px solid var(--line-strong); border-radius:999px; background:var(--panel-2); color:var(--muted); font-size:12px; cursor:pointer; transition:color var(--t-hover), border-color var(--t-hover), background var(--t-hover); }
 .chip:hover { color:var(--text); }
 .chip.on { color:var(--text); border-color:var(--accent); background:var(--accent-dim); }
@@ -492,13 +633,18 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .ev-ack { padding:4px 12px; border:1px solid var(--line-strong); border-radius:6px; background:var(--panel-2); color:var(--text); font-family:var(--font-mono); font-size:11px; cursor:pointer; transition:border-color var(--t-hover), color var(--t-hover); }
 .ev-ack:hover { border-color:var(--accent); color:var(--accent); }
 .ev-ack.done { color:var(--muted); border-style:dashed; cursor:default; }
-.ev-note { display:flex; align-items:center; gap:8px; padding:11px 20px; color:var(--muted); font-size:11.5px; border-top:1px solid var(--line); line-height:1.45; }
+.ev-note { flex:none; display:flex; align-items:flex-start; gap:8px; padding:11px var(--panel-pad); color:var(--muted); font-size:11.5px; border-top:1px solid var(--line); line-height:1.45; }
 .ev-note svg { width:14px; height:14px; flex:none; color:var(--dim); }
 
 /* ---------- configuration ---------- */
-.cfg { flex:1; overflow-y:auto; overflow-x:hidden; padding:18px 20px 40px; display:flex; flex-direction:column; gap:16px; max-width:940px; }
-.cfg-card { background:var(--panel); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
-.cfg-h { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--panel-2); }
+.cfg { flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding:18px var(--panel-pad) 40px; display:flex; flex-direction:column; gap:var(--page-gap); max-width:940px; width:100%; }
+/* flex:none is load-bearing. .cfg is a flex COLUMN with overflow-y:auto, and flex items
+   default to flex-shrink:1 — so once the cards were taller than the viewport the browser
+   compressed each card instead of scrolling the column, and `overflow:hidden` on the card
+   silently ate the bottom of its own content (900px of settings rendered into a 377px
+   box). The cards must keep their natural height and let .cfg scroll. */
+.cfg-card { flex:none; background:var(--panel); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.cfg-h { display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:8px 14px; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--panel-2); }
 .cfg-h h2 { margin:0; font-size:var(--fs-md); font-weight:600; }
 .cfg-sub { margin:3px 0 0; font-size:var(--fs-sm); color:var(--muted); line-height:1.4; }
 .cfg-tag { flex:none; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.06em; text-transform:uppercase; font-weight:600; padding:4px 9px; border-radius:var(--r-sm); white-space:nowrap; }
@@ -513,7 +659,10 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 
 /* threshold timeline (comms axis) */
 .tl { display:flex; flex-direction:column; gap:14px; }
-.tl-track { position:relative; height:16px; border-radius:var(--r-sm); background:var(--panel-2); border:1px solid var(--line); overflow:hidden; margin-top:6px; }
+/* the wrapper reserves the space the tick labels sit in, above the clipped track */
+.tl-trackwrap { position:relative; margin-top:22px; }
+.tl-track { position:relative; height:16px; border-radius:var(--r-sm); background:var(--panel-2); border:1px solid var(--line); overflow:hidden; }
+.tl-ticks { position:absolute; inset:0; pointer-events:none; }
 .tl-seg { position:absolute; top:0; bottom:0; background:var(--c); opacity:.85; }
 .tl-seg.hatch { opacity:1; background:repeating-linear-gradient(-45deg, var(--c) 0 5px, rgba(0,0,0,.28) 5px 10px); }
 .tl-tick { position:absolute; top:-6px; bottom:-6px; width:0; border-left:1px solid var(--text); }
@@ -525,21 +674,25 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 
 /* read-only value rows */
 .cfg-ro-grid { display:flex; flex-direction:column; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
-.cfg-ro { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel); }
+.cfg-ro { display:flex; align-items:center; justify-content:space-between; gap:8px 14px; flex-wrap:wrap; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel); }
 .cfg-ro:last-child { border-bottom:none; }
-.cfg-ro-l { display:flex; flex-direction:column; gap:3px; }
-.cfg-ro-v { font-family:var(--font-mono); font-size:var(--fs-md); font-variant-numeric:tabular-nums; color:var(--text); }
+.cfg-ro-l { flex:1 1 200px; display:flex; flex-direction:column; gap:3px; min-width:0; }
+/* a URL or long identifier wraps in place rather than widening the card */
+.cfg-ro-v { font-family:var(--font-mono); font-size:var(--fs-md); font-variant-numeric:tabular-nums; color:var(--text); min-width:0; overflow-wrap:anywhere; }
 .cfg-ro-v small { font-size:var(--fs-sm); color:var(--muted); margin-left:1px; }
 
 /* form controls (Select / Toggle) */
 .cfg-form { display:flex; flex-direction:column; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
-.fld { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel); }
+/* Label left, control right — but the row WRAPS on a narrow panel so the control drops
+   under its label instead of squeezing it, and long help text can never push a control
+   outside the card. */
+.fld { display:flex; align-items:center; justify-content:space-between; gap:10px 16px; flex-wrap:wrap; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--panel); }
 .fld:last-child { border-bottom:none; }
-.fld-l { display:flex; flex-direction:column; gap:3px; min-width:0; }
-.fld-lbl { font-size:12.5px; font-weight:600; color:var(--text); }
-.fld-hint { font-size:var(--fs-sm); color:var(--muted); }
-.fld-c { flex:none; }
-.sel { font-family:var(--font-ui); font-size:12.5px; color:var(--text); background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:7px 10px; cursor:pointer; min-width:190px; transition:border-color var(--t-base); }
+.fld-l { flex:1 1 220px; display:flex; flex-direction:column; gap:3px; min-width:0; }
+.fld-lbl { font-size:12.5px; font-weight:600; color:var(--text); overflow-wrap:anywhere; }
+.fld-hint { font-size:var(--fs-sm); color:var(--muted); overflow-wrap:anywhere; }
+.fld-c { flex:0 0 auto; max-width:100%; }
+.sel { font-family:var(--font-ui); font-size:12.5px; color:var(--text); background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:7px 10px; cursor:pointer; width:100%; min-width:min(190px,100%); max-width:260px; transition:border-color var(--t-base); }
 .sel:hover { border-color:var(--accent); }
 .sel:disabled { opacity:.5; cursor:not-allowed; }
 .tgl { position:relative; width:40px; height:22px; border-radius:var(--r-pill); background:var(--panel-2); border:1px solid var(--line-strong); cursor:pointer; padding:0; transition:background var(--t-base), border-color var(--t-base); }
@@ -549,7 +702,7 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .tgl:disabled { opacity:.5; cursor:not-allowed; }
 
 /* preference actions + save feedback */
-.cfg-actions { display:flex; align-items:center; gap:14px; }
+.cfg-actions { display:flex; align-items:center; flex-wrap:wrap; gap:10px 14px; }
 .cfg-btn { font-family:var(--font-ui); font-size:12px; color:var(--text); background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:7px 13px; cursor:pointer; transition:border-color var(--t-base), background var(--t-base); }
 .cfg-btn:hover { border-color:var(--accent); background:var(--accent-dim); }
 .cfg-save { font-family:var(--font-mono); font-size:11px; color:var(--connected); opacity:0; transition:opacity var(--t-base); }
@@ -562,15 +715,17 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .cfg-tablewrap table.dt tbody tr:hover td { background:transparent; }
 
 /* ---------- mission (tabs + overview) ---------- */
-.mtabs { display:flex; gap:4px; padding:0 20px; border-bottom:1px solid var(--line); background:var(--panel); }
-.mtab { position:relative; background:transparent; border:none; color:var(--muted); font-size:12.5px; font-weight:600; padding:11px 12px 12px; cursor:pointer; transition:color var(--t-base); }
+/* the tab strip scrolls horizontally rather than dropping tabs when the content column
+   narrows — a mission tab must stay reachable at 1366 */
+.mtabs { flex:none; display:flex; gap:4px; padding:0 var(--panel-pad); border-bottom:1px solid var(--line); background:var(--panel); overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; }
+.mtab { flex:none; position:relative; background:transparent; border:none; color:var(--muted); font-size:12.5px; font-weight:600; padding:11px 12px 12px; cursor:pointer; transition:color var(--t-base); white-space:nowrap; }
 .mtab:hover:not(.locked) { color:var(--text); }
 .mtab.on { color:var(--accent); }
 .mtab.on::after { content:""; position:absolute; left:8px; right:8px; bottom:-1px; height:2px; background:var(--accent); border-radius:2px 2px 0 0; }
 .mtab.locked { color:var(--dim); cursor:not-allowed; }
 .mtab.locked .lock { color:var(--dim); }
-.mission-body { flex:1; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; }
-.msect { padding:16px 20px 8px; display:flex; align-items:baseline; gap:10px; }
+.mission-body { flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; }
+.msect { padding:16px var(--panel-pad) 8px; display:flex; align-items:baseline; flex-wrap:wrap; gap:10px; }
 
 /* Mission Overview's headline progress bar — a bigger, unmissable version of the same
    completion % the rollup tiles and the Map's bottom bar show (never a third number). */
@@ -613,12 +768,10 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .astate .sp { flex:1; min-width:20px; }
 
 /* ---------- Agent page (reasoning) ---------- */
-.subgrid.two { grid-template-columns:repeat(2,1fr); }
-@media (max-width:980px){ .subgrid.two { grid-template-columns:1fr; } }
-/* Current Situation summary strip */
-.sitgrid { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; padding:14px 16px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); margin-bottom:14px; }
-@media (max-width:1180px){ .sitgrid { grid-template-columns:repeat(3,1fr); } }
-@media (max-width:720px){ .sitgrid { grid-template-columns:repeat(2,1fr); } }
+.subgrid.two { grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr)); }
+/* Current Situation summary strip — five short readouts; auto-fit reflows to 3 or 2
+   across on a compact laptop rather than squeezing five unreadable columns. */
+.sitgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:var(--page-gap); padding:14px 16px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); margin-bottom:14px; }
 .sitcell { display:flex; flex-direction:column; gap:6px; min-width:0; }
 .sitcell .k { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
 .sitcell .v { font-family:var(--font-mono); font-size:14px; display:flex; align-items:center; gap:7px; }
@@ -628,15 +781,17 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .reason-note { display:flex; align-items:flex-start; gap:8px; padding:6px 13px 12px; font-size:11px; line-height:1.5; color:var(--dim); }
 .reason-note svg { width:13px; height:13px; flex:none; margin-top:2px; }
 .rlist { display:flex; flex-direction:column; }
-.ritem { display:flex; align-items:center; gap:10px; padding:8px 13px; border-bottom:1px solid var(--line); font-size:12.5px; }
+/* Agent reason lines are verbatim Scout text of arbitrary length — they wrap, never
+   truncate: a decision rationale the operator cannot finish reading is not honest. */
+.ritem { display:flex; align-items:flex-start; gap:10px; padding:8px 13px; border-bottom:1px solid var(--line); font-size:12.5px; }
 .ritem:last-child { border-bottom:none; }
 .ritem.dim .rtx { color:var(--muted); }
-.ritem .rdot { width:8px; height:8px; border-radius:50%; flex:none; }
-.ritem .rtx { color:var(--text); }
-.ritem .rav { margin-left:auto; }
+.ritem .rdot { width:8px; height:8px; border-radius:50%; flex:none; margin-top:5px; }
+.ritem .rtx { color:var(--text); min-width:0; overflow-wrap:anywhere; }
+.ritem .rav { flex:none; margin-left:auto; }
 
 /* ---------- pilot (embedded vehicle-local dashboard) ---------- */
-.pilot-bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; padding:11px 20px; border-bottom:1px solid var(--line); background:var(--panel-2); }
+.pilot-bar { flex:none; display:flex; align-items:center; gap:clamp(8px,1vw,16px); flex-wrap:wrap; padding:11px var(--panel-pad); border-bottom:1px solid var(--line); background:var(--panel-2); }
 .pilot-target { display:flex; align-items:center; gap:10px; min-width:0; }
 .pilot-target > .lbl { font-family:var(--font-mono); font-size:var(--fs-micro); letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
 .pilot-veh { display:flex; align-items:center; gap:6px; }
@@ -652,12 +807,14 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .pilot-btn:hover { border-color:var(--accent); background:var(--accent-dim); }
 .pilot-btn:active { transform:translateY(1px); }
 .pilot-btn svg { width:15px; height:15px; color:var(--muted); flex:none; }
-.pilot-stage { flex:1; min-height:0; background:var(--ground); position:relative; }
+/* The embedded dashboard fills the space left over — it never dictates page size, and
+   object-fit/100% keep the iframe inside the stage instead of forcing a scroll. */
+.pilot-stage { flex:1 1 auto; min-height:0; min-width:0; background:var(--ground); position:relative; overflow:hidden; }
 .pilot-frame { width:100%; height:100%; border:0; display:block; background:#fff; }
 .pilot-empty { display:flex; align-items:center; justify-content:center; height:100%; color:var(--muted); font-size:var(--fs-base); padding:40px; text-align:center; }
 
 /* ---------- terminal (Scout SSH access helper — not a shell) ---------- */
-.term-body { flex:1; overflow-y:auto; padding:24px 20px; }
+.term-body { flex:1 1 auto; min-height:0; overflow-y:auto; padding:clamp(14px,2vh,24px) var(--panel-pad); }
 .term-card { max-width:620px; margin:0 auto; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r); padding:18px 20px 20px; }
 .term-head { display:flex; align-items:center; gap:12px; padding-bottom:14px; border-bottom:1px solid var(--line); }
 .term-icon svg { width:22px; height:22px; color:var(--muted); }
@@ -665,14 +822,16 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .term-veh { font-size:var(--fs-md); font-weight:600; color:var(--text); }
 .term-sub { font-size:12px; color:var(--muted); }
 .term-linkstate { margin-left:auto; display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); }
-.term-fields { display:flex; gap:28px; padding:14px 0 4px; }
-.term-field { display:flex; flex-direction:column; gap:3px; }
+.term-fields { display:flex; flex-wrap:wrap; gap:10px 28px; padding:14px 0 4px; }
+.term-field { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.term-field .v { overflow-wrap:anywhere; }
 .term-field .k { font-family:var(--font-mono); font-size:var(--fs-micro); letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
 .term-field .v { font-size:var(--fs-base); color:var(--text); }
 .term-cmd-label { padding:12px 0 6px; }
 .term-cmd-label .lbl { font-family:var(--font-mono); font-size:var(--fs-micro); letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
-.term-cmd { display:flex; align-items:stretch; gap:8px; }
-.term-cmd-text { flex:1; display:flex; align-items:center; padding:10px 12px; background:var(--ground); border:1px solid var(--line-strong); border-radius:var(--r); color:var(--accent-bright); font-size:13px; user-select:all; overflow-x:auto; white-space:nowrap; }
+.term-cmd { display:flex; align-items:stretch; flex-wrap:wrap; gap:8px; }
+/* a long ssh command scrolls inside its own box — it never widens the card */
+.term-cmd-text { flex:1 1 240px; min-width:0; display:flex; align-items:center; padding:10px 12px; background:var(--ground); border:1px solid var(--line-strong); border-radius:var(--r); color:var(--accent-bright); font-size:13px; user-select:all; overflow-x:auto; white-space:nowrap; }
 .term-copy { display:inline-flex; align-items:center; gap:7px; padding:0 12px; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); color:var(--text); font-size:12.5px; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover); white-space:nowrap; }
 .term-copy:hover { border-color:var(--accent); background:var(--accent-dim); }
 .term-copy.done { border-color:var(--connected); color:var(--connected); }
@@ -684,16 +843,18 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .term-empty { color:var(--muted); font-size:var(--fs-base); text-align:center; padding:40px; }
 
 /* ---- Command & Control (Vehicle page): control authority + command queue ---- */
-.ctl-panel { padding:0 20px; display:flex; flex-direction:column; gap:12px; }
-/* authority bar — orthogonal to the comms axis; uses accent (interactive), not a status color */
-.ctl-auth-bar { display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:14px; padding:12px 14px; background:var(--panel); border:1px solid var(--line); border-radius:var(--r); }
+.ctl-panel { padding:0 var(--panel-pad); display:flex; flex-direction:column; gap:12px; }
+/* authority bar — orthogonal to the comms axis; uses accent (interactive), not a status
+   color. Flex-wrap rather than a rigid 3-column grid: on a compact laptop the note drops
+   to its own line and the Engage/Release button stays reachable, never clipped. */
+.ctl-auth-bar { display:flex; align-items:center; flex-wrap:wrap; gap:10px 14px; padding:12px 14px; background:var(--panel); border:1px solid var(--line); border-radius:var(--r); }
 .ctl-auth-bar.engaged { border-color:var(--accent); background:linear-gradient(0deg, var(--accent-dim), var(--accent-dim)), var(--panel); }
-.ctl-auth-l { display:flex; align-items:center; gap:10px; }
+.ctl-auth-l { flex:none; display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
 .auth-badge { display:inline-flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:11px; letter-spacing:.06em; font-weight:600; padding:4px 10px; border-radius:var(--r); color:var(--muted); background:var(--panel-2); border:1px solid var(--line-strong); }
 .auth-badge i { width:7px; height:7px; border-radius:50%; background:var(--dim); }
 .auth-badge.on { color:var(--accent-bright); background:var(--accent-dim); border-color:var(--accent); }
 .auth-badge.on i { background:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
-.ctl-auth-note { font-size:12px; line-height:1.5; color:var(--muted); }
+.ctl-auth-note { flex:1 1 200px; min-width:0; font-size:12px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
 .ctl-auth { padding:8px 15px; border-radius:var(--r); font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap; border:1px solid var(--line-strong); background:var(--panel-2); color:var(--text); transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); }
 .ctl-auth:active { transform:translateY(1px); }
 .ctl-auth.engage { border-color:var(--accent); color:var(--accent-bright); background:var(--accent-dim); }
@@ -730,9 +891,9 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .ctl-queue-h .tag { font-family:var(--font-mono); font-size:10px; color:var(--dim); margin-left:auto; }
 .ctl-row { display:flex; align-items:center; gap:12px; padding:8px 13px; border-bottom:1px solid var(--line); }
 .ctl-row:last-child { border-bottom:0; }
-.ctl-type { font-size:12px; color:var(--text); min-width:150px; }
-.ctl-when { font-size:11px; color:var(--muted); margin-left:auto; }
-.ctl-note { flex-basis:100%; font-size:11px; color:var(--muted); padding-left:2px; }
+.ctl-type { font-size:12px; color:var(--text); min-width:min(150px,100%); overflow-wrap:anywhere; }
+.ctl-when { flex:none; font-size:11px; color:var(--muted); margin-left:auto; }
+.ctl-note { flex-basis:100%; font-size:11px; color:var(--muted); padding-left:2px; overflow-wrap:anywhere; }
 .ctl-empty { padding:14px 13px; font-size:12px; color:var(--muted); }
 
 /* Detailed command-history row (Vehicle page): stacked, with source, normalized
@@ -751,10 +912,10 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .mu-drop { border:1px dashed var(--line); border-radius:var(--r); background:var(--panel-2); padding:14px; }
 .mu-drop textarea { width:100%; min-height:120px; box-sizing:border-box; resize:vertical; font-family:var(--font-mono); font-size:11px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:var(--r-sm); padding:9px; }
 .mu-row { display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
-.mu-preview { display:grid; grid-template-columns:1fr 1fr; gap:8px 20px; margin-top:12px; }
+.mu-preview { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr)); gap:8px 20px; margin-top:12px; }
 .mu-preview .mrow { display:flex; justify-content:space-between; gap:12px; padding:4px 0; border-bottom:1px solid var(--line); font-size:12px; }
 .mu-preview .k { color:var(--muted); } .mu-preview .val { color:var(--text); font-family:var(--font-mono); }
-.mu-err { color:var(--disconnected); font-size:11.5px; margin-top:8px; }
+.mu-err { color:var(--disconnected); font-size:11.5px; margin-top:8px; overflow-wrap:anywhere; }
 .mu-track { display:flex; align-items:center; gap:0; margin:14px 0 6px; }
 .mu-step { flex:1; text-align:center; font-family:var(--font-mono); font-size:10px; letter-spacing:.04em; color:var(--dim); position:relative; padding-top:16px; }
 .mu-step::before { content:""; position:absolute; top:4px; left:50%; width:9px; height:9px; margin-left:-4.5px; border-radius:50%; background:var(--line); }
@@ -764,9 +925,9 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 /* Scout reported success but the Operator's independent read-back is missing — deliberately
    its own colour: neither the green of a confirmed mission nor the red of a failed one. */
 .mu-step.caution { color:var(--caution); } .mu-step.caution::before { background:var(--caution); }
-.mu-step::after { content:""; position:absolute; top:8px; left:-50%; width:100%; height:1px; background:var(--line); z-index:-1; }
+.mu-step::after { content:""; position:absolute; top:8px; left:-50%; width:100%; height:1px; background:var(--line); z-index:var(--z-behind); }
 .mu-step:first-child::after { display:none; }
-.mu-verdict { font-size:12px; padding:10px 12px; border-radius:var(--r-sm); border:1px solid var(--line); margin-top:8px; }
+.mu-verdict { font-size:12px; padding:10px 12px; border-radius:var(--r-sm); border:1px solid var(--line); margin-top:8px; line-height:1.5; overflow-wrap:anywhere; }
 .mu-verdict.ok { color:var(--connected); border-color:rgba(62,207,142,.28); }
 .mu-verdict.bad { color:var(--disconnected); border-color:rgba(229,72,77,.28); }
 .mu-verdict.pending { color:var(--partitioned); border-color:rgba(242,169,59,.28); }
@@ -796,7 +957,7 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 /* Vehicle Home map marker (distinct from mission waypoints + the mission-readback house). */
 .veh-home-marker { position:relative; width:26px; height:26px; display:flex; align-items:flex-start; justify-content:center; color:var(--muted); filter:drop-shadow(0 1px 2px rgba(0,0,0,.7)); transition:transform var(--t-fast), color var(--t-hover); overflow:visible; }
 .veh-home-marker svg { width:26px; height:26px; }
-.veh-home-marker:hover { transform:scale(1.12); z-index:20; }
+.veh-home-marker:hover { transform:scale(1.12); z-index:var(--z-marker-hover); }
 .veh-home-marker.verified { color:var(--connected); }
 .veh-home-marker.unverified, .veh-home-marker.unknown { color:var(--caution); }
 .veh-home-marker.pending { color:var(--accent-bright); }
@@ -807,16 +968,18 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .mission-faded .veh-home-label { display:none; }
 
 /* Confirmation modal (Set Home — never a one-click action). */
-.modal-ov { position:fixed; inset:0; z-index:2000; display:flex; align-items:center; justify-content:center; background:rgba(6,10,15,.66); backdrop-filter:blur(2px); }
-.modal { width:min(420px,92vw); background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:0 18px 48px rgba(0,0,0,.6); overflow:hidden; }
-.modal-h { padding:14px 16px; font-size:14px; font-weight:600; color:var(--text); border-bottom:1px solid var(--line); background:var(--panel-2); }
-.modal-b { padding:14px 16px; font-size:12.5px; line-height:1.55; color:var(--muted); }
+.modal-ov { position:fixed; inset:0; z-index:var(--z-modal); display:flex; align-items:center; justify-content:center; padding:var(--sp-4); background:rgba(6,10,15,.66); backdrop-filter:blur(2px); }
+/* the dialog never exceeds the viewport — its BODY scrolls, so the confirm/cancel
+   footer stays on screen even on a 768px laptop with long warning copy */
+.modal { width:min(420px,92vw); max-height:100%; display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:0 18px 48px rgba(0,0,0,.6); overflow:hidden; }
+.modal-h { flex:none; padding:14px 16px; font-size:14px; font-weight:600; color:var(--text); border-bottom:1px solid var(--line); background:var(--panel-2); }
+.modal-b { flex:1 1 auto; min-height:0; overflow-y:auto; padding:14px 16px; font-size:12.5px; line-height:1.55; color:var(--muted); overflow-wrap:anywhere; }
 .modal-b p { margin:0 0 10px; }
 .modal-b .modal-warn { color:var(--caution); margin:12px 0 0; }
 .modal-kv { display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:5px 0; border-top:1px solid var(--line); }
 .modal-kv span { font-family:var(--font-mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase; color:var(--dim); }
 .modal-kv b { font-family:var(--font-mono); font-size:12.5px; font-weight:600; color:var(--text); font-variant-numeric:tabular-nums; }
-.modal-f { display:flex; gap:10px; padding:13px 16px; border-top:1px solid var(--line); background:var(--panel-2); }
+.modal-f { flex:none; display:flex; gap:10px; padding:13px 16px; border-top:1px solid var(--line); background:var(--panel-2); }
 .modal-btn { flex:1; padding:10px 12px; border-radius:var(--r); font-family:var(--font-mono); font-size:12px; font-weight:700; letter-spacing:.05em; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); }
 .modal-btn:active { transform:translateY(1px); }
 .modal-cancel { color:var(--muted); background:var(--panel); border:1px solid var(--line-strong); }
@@ -840,7 +1003,7 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .exp-slider-row { display:flex; align-items:center; gap:12px; }
 .exp-range { width:180px; accent-color:var(--accent); cursor:pointer; }
 .exp-range:disabled { opacity:.5; cursor:not-allowed; }
-.exp-err { font-size:11px; color:var(--disconnected); min-height:13px; text-align:right; }
+.exp-err { font-size:11px; color:var(--disconnected); min-height:13px; text-align:right; max-width:34ch; overflow-wrap:anywhere; }
 
 /* netem fields dimmed while Full Disconnect owns the mechanism */
 .exp-impair.dimmed, .exp-impair-adv.dimmed { opacity:.45; }
@@ -848,9 +1011,9 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 
 /* Full Disconnect — an experiment control, deliberately NOT styled like an emergency
    vehicle command (no red button); a neutral panel that tints amber only when armed. */
-.exp-disconnect { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:13px 14px; border:1px solid var(--line-strong); border-radius:var(--r); background:var(--panel-2); }
+.exp-disconnect { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px 16px; padding:13px 14px; border:1px solid var(--line-strong); border-radius:var(--r); background:var(--panel-2); }
 .exp-disconnect.armed { border-color:rgba(242,169,59,.5); background:rgba(242,169,59,.07); }
-.exp-disconnect-l { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.exp-disconnect-l { flex:1 1 220px; display:flex; flex-direction:column; gap:3px; min-width:0; }
 .exp-disconnect.armed .fld-lbl { color:var(--caution); }
 
 .exp-actions { flex-wrap:wrap; }
@@ -874,11 +1037,10 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .exp-requested { display:flex; align-items:baseline; gap:10px; padding:9px 12px; border:1px dashed var(--line-strong); border-radius:var(--r); background:var(--panel-2); font-size:12px; color:var(--muted); }
 .exp-requested .lbl { color:var(--partitioned); }
 
-.exp-status-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
-@media (max-width:640px){ .exp-status-grid { grid-template-columns:1fr; } }
-.exp-srow { display:flex; align-items:baseline; justify-content:space-between; gap:12px; background:var(--panel); padding:10px 13px; }
+.exp-status-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+.exp-srow { display:flex; align-items:baseline; justify-content:space-between; gap:12px; background:var(--panel); padding:10px 13px; min-width:0; }
 .exp-srow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); }
-.exp-srow .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); font-variant-numeric:tabular-nums; text-align:right; }
+.exp-srow .v { font-family:var(--font-mono); font-size:12.5px; color:var(--text); font-variant-numeric:tabular-nums; text-align:right; min-width:0; overflow-wrap:anywhere; }
 
 /* experiment history table */
 .exp-log tbody td { height:40px; }
@@ -887,14 +1049,13 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 
 /* ═══════════════ Plan page (survey mission planning) ═══════════════ */
 .app.plan .map-wrap { grid-column:3; }
-#plan-map { position:absolute; inset:0; }
 .toast.ok { border-color:rgba(62,207,142,.5); color:var(--connected); }
 
 /* left tools panel */
 .plan-state-chip { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.03em; padding:2px 6px; border-radius:var(--r-pill); background:var(--panel-2); border:1px solid var(--line-strong); color:var(--muted); }
 .plan-state-chip.valid, .plan-state-chip.uploaded { color:var(--connected); border-color:rgba(62,207,142,.4); }
 .plan-state-chip.route_outdated, .plan-state-chip.error { color:var(--caution); border-color:rgba(242,169,59,.4); }
-.plan-tools { flex:1; overflow-y:auto; padding:0 12px 14px; }
+.plan-tools { flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding:0 12px 14px; }
 .plan-sec { padding:13px 2px 6px; }
 .plan-sec .lbl { font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
 .plan-steps { display:flex; flex-direction:column; gap:2px; margin-bottom:4px; }
@@ -935,40 +1096,56 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .plan-inp .u { font-size:10.5px; color:var(--muted); }
 .plan-note { display:flex; gap:8px; align-items:flex-start; margin:10px 20px 0; font-size:10.5px; color:var(--muted); line-height:1.45; }
 .plan-note svg { width:14px; height:14px; flex:none; margin-top:1px; }
-.plan-vhead { margin:2px 20px; padding:7px 10px; border-radius:var(--r-sm); font-size:11.5px; font-weight:600; letter-spacing:.02em; }
+.plan-vhead { margin:2px 20px; padding:7px 10px; border-radius:var(--r-sm); font-size:11.5px; font-weight:600; letter-spacing:.02em; overflow-wrap:anywhere; }
 .plan-vhead.ok { background:rgba(62,207,142,.12); color:var(--connected); }
 .plan-vhead.bad { background:rgba(229,72,77,.12); color:var(--disconnected); }
-.plan-vbad { margin:2px 20px; padding:7px 10px; font-size:11.5px; color:var(--caution); }
-.plan-vlist { margin:6px 20px; padding-left:16px; font-size:11px; line-height:1.5; }
+.plan-vbad { margin:2px 20px; padding:7px 10px; font-size:11.5px; color:var(--caution); overflow-wrap:anywhere; }
+/* Validation errors come straight from the backend and can be long, single-token paths.
+   overflow-wrap:anywhere is what keeps them inside the inspector instead of forcing a
+   horizontal scrollbar across the whole panel. */
+.plan-vlist { margin:6px 20px; padding-left:16px; font-size:11px; line-height:1.5; overflow-wrap:anywhere; }
 .plan-vlist li.bad { color:var(--disconnected); }
 .plan-vlist li.warn { color:var(--caution); }
 .plan-checks { margin:6px 20px 0; display:flex; flex-direction:column; gap:2px; }
-.plan-check { display:flex; justify-content:space-between; font-size:10.5px; font-family:var(--font-mono); color:var(--muted); }
+.plan-check { display:flex; justify-content:space-between; gap:10px; font-size:10.5px; font-family:var(--font-mono); color:var(--muted); overflow-wrap:anywhere; }
 .plan-check.ok span:last-child { color:var(--connected); }
 .plan-check.bad { color:var(--text); } .plan-check.bad span:last-child { color:var(--disconnected); }
 .plan-sumgrid { padding:4px 20px; display:flex; flex-direction:column; }
 .plan-srow { display:flex; justify-content:space-between; gap:12px; padding:4px 0; border-bottom:1px solid var(--line); font-size:12px; }
-.plan-srow .k { color:var(--muted); } .plan-srow .v { color:var(--text); font-family:var(--font-mono); text-align:right; }
+.plan-srow .k { color:var(--muted); min-width:0; } .plan-srow .v { color:var(--text); font-family:var(--font-mono); text-align:right; min-width:0; overflow-wrap:anywhere; }
 
-/* map overlays: banner, legend swatches, action bar */
-.plan-banner { top:14px; left:14px; max-width:52%; padding:8px 12px; display:flex; align-items:center; gap:10px; font-size:11.5px; z-index:600; }
+/* map overlays: banner, legend swatches, action bar.
+   TOP-LEFT is the status/instruction corner. Its width stops short of whatever the
+   top-right corner is using (--map-tr-w, measured at runtime), so the banner and the
+   view controls can never overlap at any viewport. Long backend error detail WRAPS and
+   the banner scrolls internally — it is never truncated to a single clipped line. */
+.plan-banner {
+  top:var(--map-pad); left:var(--map-pad);
+  max-width:calc(100% - var(--map-pad) * 2 - var(--map-tr-w) - var(--map-ov-gap));
+  max-height:38%; overflow-y:auto;
+  padding:8px 12px; display:flex; align-items:flex-start; flex-wrap:wrap; gap:6px 10px;
+  font-size:11.5px; line-height:1.45; overflow-wrap:anywhere;
+}
 .plan-banner.warn { border-color:rgba(242,169,59,.5); }
 .plan-banner.ok { border-color:rgba(62,207,142,.5); }
 .plan-banner .pl-state { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.04em; padding:2px 6px; border-radius:var(--r-pill); background:var(--panel-2); border:1px solid var(--line-strong); color:var(--text); flex:none; }
-.plan-banner .pl-msg { color:var(--muted); }
+.plan-banner .pl-msg { color:var(--muted); min-width:0; }
 .plan-banner .pl-upl { color:var(--text); }
 .plan-banner .pl-upl.ok { color:var(--connected); } .plan-banner .pl-upl.bad { color:var(--disconnected); }
 .plan-banner .pl-link { color:var(--accent-bright); }
-/* Dynamic-view controls (Center on USV / on me) — top-right map overlay. */
-.plan-viewctl { top:14px; right:14px; display:flex; gap:6px; padding:6px; z-index:600; }
-.plan-viewctl button { font-family:var(--font-mono); font-size:10px; letter-spacing:.03em; padding:5px 9px; border-radius:var(--r); background:var(--panel-2); border:1px solid var(--line-strong); color:var(--text); cursor:pointer; }
+/* Dynamic-view controls (Center on USV / on me) — top-right map overlay, with Leaflet's
+   zoom control automatically dropping beneath it (see --map-tr-h). Wraps on a compact
+   laptop rather than pushing into the status banner. */
+.plan-viewctl { top:var(--map-pad); right:var(--map-pad); max-width:calc(100% - var(--map-pad) * 2); display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; padding:6px; }
+.plan-viewctl button { font-family:var(--font-mono); font-size:10px; letter-spacing:.03em; padding:5px 9px; border-radius:var(--r); background:var(--panel-2); border:1px solid var(--line-strong); color:var(--text); cursor:pointer; white-space:nowrap; }
 .plan-viewctl button:hover { border-color:var(--accent-bright); color:var(--accent-bright); }
-/* Upload eligibility hint in the action bar (armed+LOITER policy). Text-carried, not colour-only. */
-.pl-upload-hint { max-width:320px; padding:4px 9px; border-radius:var(--r-sm); font-size:11px; line-height:1.3; border:1px solid var(--line-strong); background:var(--panel-2); color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* Upload eligibility hint in the action bar (armed+LOITER policy). Text-carried, not
+   colour-only — so it must be readable in full, never ellipsised away. */
+.pl-upload-hint { flex:1 1 240px; max-width:52ch; min-width:0; padding:4px 9px; border-radius:var(--r-sm); font-size:11px; line-height:1.35; border:1px solid var(--line-strong); background:var(--panel-2); color:var(--muted); white-space:normal; overflow-wrap:anywhere; }
 .pl-upload-hint.warn { border-color:rgba(242,169,59,.5); color:var(--text); }
 .pl-upload-hint.block { border-color:rgba(229,72,77,.5); color:var(--text); }
-.plan-legend .pl-sw { display:inline-block; width:16px; height:0; border-top-width:3px; border-top-style:solid; margin-right:8px; vertical-align:middle; }
-.plan-legend .li { display:flex; align-items:center; font-size:10.5px; color:var(--text); }
+.plan-legend .pl-sw { flex:none; display:inline-block; width:16px; height:0; border-top-width:3px; border-top-style:solid; margin-right:8px; margin-top:6px; vertical-align:middle; }
+.plan-legend .li { display:flex; align-items:flex-start; font-size:10.5px; color:var(--text); }
 .pl-sw.boundary { border-top-color:#4C8DFF; }
 .pl-sw.navigable { border-top-color:#3ECF8E; border-top-style:dashed; }
 .pl-sw.nogo { border-top-color:#E5484D; height:9px; border:1px solid #E5484D; background:rgba(229,72,77,.16); margin-top:0; }
@@ -979,9 +1156,13 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .pl-sw.return { border-top-color:#F5C542; border-top-style:dashed; }
 .pl-sw.home { border:0; width:16px; height:16px; }
 .pl-sw.home::before { content:"H"; color:#F2A93B; font-weight:700; font-size:11px; }
-.plan-actionbar { position:absolute; bottom:0; left:0; right:0; display:flex; align-items:center; gap:8px; padding:9px 14px; background:rgba(9,13,18,.92); border-top:1px solid var(--line-strong); backdrop-filter:blur(4px); z-index:700; }
-.pl-act-grow { flex:1; }
-.pl-act { padding:8px 13px; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r-sm); color:var(--text); font-size:12px; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover); }
+/* The action bar is a real grid ROW of .map-wrap, not an overlay on the map. That is
+   what stops it burying the legend and the attribution, and what guarantees a keyboard
+   focus ring on Upload is never hidden behind it. Buttons wrap on a compact laptop; no
+   action is ever pushed off-screen. */
+.plan-actionbar { grid-row:2; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:9px var(--map-pad); background:var(--panel-2); border-top:1px solid var(--line-strong); z-index:var(--z-page-bar); }
+.pl-act-grow { flex:1 1 0; min-width:0; }
+.pl-act { flex:none; padding:8px 13px; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r-sm); color:var(--text); font-size:12px; cursor:pointer; white-space:nowrap; transition:border-color var(--t-hover), background var(--t-hover); }
 .pl-act:hover:not(:disabled) { border-color:var(--accent); }
 .pl-act:disabled { opacity:.4; cursor:not-allowed; }
 .pl-act.primary { background:var(--accent-dim); border-color:var(--accent); color:var(--accent-bright); }
@@ -1001,7 +1182,8 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .plan-help { margin:2px 20px 8px; font-size:10px; color:var(--muted); line-height:1.4; }
 .plan-note-sm { margin-top:6px; font-size:10px; }
 .plan-fl { display:block; font-size:10.5px; color:var(--muted); margin:6px 0 3px; }
-@media (max-width:1200px){ .app.plan.has-dock { grid-template-columns:var(--rail-w) 220px 1fr 260px; } }
+/* (the old .app.plan 1200px column override is gone — --dock-w / --inspector-w now
+   clamp on every page, so Plan needs no page-specific grid of its own) */
 
 /* ---------- guided tour (lib/tour.js) ----------
    Entry point is a ribbon button (between the search and the fleet summary), not a
@@ -1016,12 +1198,12 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
    painted under a dialog. The dim is FOUR rects around the spotlight rather than one
    sheet over it: everything outside is blocked, the cut-out stays clickable, so the
    operator can try the control a step is describing. */
-.tour-root { position:fixed; inset:0; z-index:3000; pointer-events:none; }
+.tour-root { position:fixed; inset:0; z-index:var(--z-tour); pointer-events:none; }
 .tour-root[hidden] { display:none; }
 .tour-mask { position:fixed; background:rgba(6,10,15,.72); pointer-events:auto; }
 .tour-ring { position:fixed; border:1px solid var(--accent); border-radius:var(--r); pointer-events:none; box-shadow:0 0 0 1px rgba(76,141,255,.25), 0 0 22px rgba(76,141,255,.28); }
 
-.tour-pop { position:fixed; width:min(392px,calc(100vw - 24px)); max-height:calc(100vh - 24px); display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:var(--shadow-pop); pointer-events:auto; }
+.tour-pop { position:fixed; width:min(392px,calc(100vw - 24px)); max-height:calc(100dvh - 24px); display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:var(--shadow-pop); pointer-events:auto; }
 .tour-arrow { position:absolute; width:9px; height:9px; background:var(--panel); border:1px solid var(--line-strong); transform:rotate(45deg); }
 .tour-pop[data-side="right"] .tour-arrow { left:-5px; margin-top:-5px; border-right:none; border-top:none; }
 .tour-pop[data-side="left"]  .tour-arrow { right:-5px; margin-top:-5px; border-left:none; border-bottom:none; }
@@ -1035,7 +1217,7 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .tour-x:hover { color:var(--text); border-color:var(--line-strong); }
 
 .tour-title { margin:7px 14px 0; font-size:var(--fs-md); font-weight:600; color:var(--text); line-height:1.35; }
-.tour-b { padding:9px 14px 2px; overflow-y:auto; font-size:12.5px; line-height:1.55; color:var(--muted); }
+.tour-b { flex:1 1 auto; min-height:0; padding:9px 14px 2px; overflow-y:auto; font-size:12.5px; line-height:1.55; color:var(--muted); }
 .tour-b p { margin:0 0 9px; }
 .tour-b b { color:var(--text); font-weight:600; }
 .tour-b ul { margin:0 0 9px; padding-left:16px; }
@@ -1070,25 +1252,36 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .plan-modebtn.on { background:var(--accent-dim); border-color:var(--accent); color:var(--accent-bright); font-weight:600; }
 .plan-help { font-size:10.5px; color:var(--dim); line-height:1.45; padding:2px 2px 4px; }
 
-.fleet-picklist { display:flex; flex-direction:column; gap:4px; }
-.fleet-pick { display:flex; align-items:center; gap:8px; padding:6px 8px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r-sm); cursor:pointer; font-size:12px; }
+/* A long fleet gets its own bounded scroll region so the picker cannot swallow the whole
+   tools panel; every other planning step stays reachable below it. */
+.fleet-picklist { display:flex; flex-direction:column; gap:4px; max-height:34vh; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain; }
+/* the row wraps: in a narrow dock the comm-state/position meta drops to its own line
+   rather than being cut off — upload eligibility depends on it */
+.fleet-pick { display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; padding:6px 8px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r-sm); cursor:pointer; font-size:12px; min-width:0; }
 .fleet-pick.on { border-color:var(--accent); background:var(--accent-dim); }
-.fleet-pick input { margin:0; }
-.fleet-pick .fp-name { font-weight:600; color:var(--text); }
-.fleet-pick .fp-meta { margin-left:auto; font-size:10px; font-family:var(--font-mono); color:var(--muted); }
+.fleet-pick input { flex:none; margin:0; }
+.fleet-pick .fp-name { flex:0 1 auto; font-weight:600; color:var(--text); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.fleet-pick .fp-meta { flex:0 1 auto; margin-left:auto; min-width:0; font-size:10px; font-family:var(--font-mono); color:var(--muted); text-align:right; overflow-wrap:anywhere; }
 .cs-connected { color:var(--connected); } .cs-partitioned { color:var(--partitioned); }
 .cs-disconnected { color:var(--disconnected); } .cs-unknown { color:var(--unknown); }
 
 .fleet-card { margin:4px 0; padding:8px 10px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r-sm); }
-.fleet-card .fc-h, .fleet-sumcard .fc-h { display:flex; align-items:center; gap:7px; font-size:12px; }
+.fleet-card .fc-h, .fleet-sumcard .fc-h { display:flex; align-items:center; gap:7px; font-size:12px; min-width:0; }
+.fleet-card .fc-h b, .fleet-sumcard .fc-h b { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .fc-sw { width:11px; height:11px; border-radius:3px; flex:none; box-shadow:0 0 0 1px rgba(0,0,0,.3) inset; }
-.fc-id { font-family:var(--font-mono); font-size:9.5px; color:var(--dim); }
-.fc-row { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px; color:var(--muted); margin-top:5px; }
+.fc-id { flex:none; font-family:var(--font-mono); font-size:9.5px; color:var(--dim); }
+.fc-row { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px; color:var(--muted); margin-top:5px; min-width:0; overflow-wrap:anywhere; }
 .fp-hsrc { color:var(--dim); font-size:9.5px; }
 
-.fleet-sumcard { margin:5px 0; padding:8px 10px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r-sm); cursor:pointer; }
+/* Per-vehicle upload results: each vehicle is its own card in a bounded, scrollable
+   list, so one vehicle's long backend error can neither overflow the panel nor hide the
+   other vehicles' statuses. */
+.fleet-sumlist { display:flex; flex-direction:column; max-height:46vh; overflow-y:auto; overscroll-behavior:contain; margin:0 20px; }
+.fleet-sumcard { margin:5px 0; padding:8px 10px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r-sm); cursor:pointer; min-width:0; }
 .fleet-sumcard.iso { border-color:var(--accent); }
-.fp-up { margin-left:auto; font-family:var(--font-mono); font-size:9px; letter-spacing:.03em; padding:1px 5px; border-radius:var(--r-pill); background:var(--panel); border:1px solid var(--line-strong); color:var(--muted); }
+.fp-up { flex:none; margin-left:auto; font-family:var(--font-mono); font-size:9px; letter-spacing:.03em; padding:1px 5px; border-radius:var(--r-pill); background:var(--panel); border:1px solid var(--line-strong); color:var(--muted); }
+/* the vehicle's own failure reason, shown next to its status and wrapped in place */
+.fp-err { margin-top:5px; padding:5px 7px; border-radius:var(--r-sm); border:1px solid rgba(229,72,77,.32); background:rgba(229,72,77,.07); color:var(--disconnected); font-size:10.5px; line-height:1.45; overflow-wrap:anywhere; }
 .fp-up.verified { color:var(--connected); border-color:rgba(62,207,142,.4); }
 .fp-up.failed, .fp-up.stale { color:var(--disconnected); border-color:rgba(229,72,77,.4); }
 .fp-up.uploading, .fp-up.verifying { color:var(--accent-bright); }

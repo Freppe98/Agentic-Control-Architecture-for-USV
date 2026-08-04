@@ -40,6 +40,24 @@ document.addEventListener("keydown", (e) => {
   if (helpFrom(e.target)) { e.preventDefault(); openTour(0); }
 });
 
+// Nav-rail tooltips. The rail became a scroll container (13 fixed nav items cannot fit
+// a 768px laptop at full size), and a scroll container clips absolutely-positioned
+// children on BOTH axes — so the tip is position:fixed and placed from the button's rect
+// here. It is clamped to the viewport so a tooltip on the first or last item is never
+// half off-screen. Delegated, because every page rebuilds #app.
+function placeTip(navEl) {
+  const tip = navEl && navEl.querySelector(".tip");
+  if (!tip) return;
+  const r = navEl.getBoundingClientRect();
+  tip.style.left = `${Math.round(r.right + 12)}px`;
+  tip.style.top = "0px";                       // measure at a known origin first
+  const h = tip.offsetHeight || 22;
+  const top = Math.min(Math.max(6, r.top + r.height / 2 - h / 2), window.innerHeight - h - 6);
+  tip.style.top = `${Math.round(top)}px`;
+}
+document.addEventListener("mouseover", (e) => { const n = navFrom(e.target); if (n) placeTip(n); });
+document.addEventListener("focusin", (e) => { const n = navFrom(e.target); if (n) placeTip(n); });
+
 window.addEventListener("hashchange", render);
 render();
 

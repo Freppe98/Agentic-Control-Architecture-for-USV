@@ -21,6 +21,7 @@ import { createSelectedRefresh } from "../services/selected-refresh.js";
 import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
 import { missionShowable, nextVisibility, toggleVisibility, toggleButton } from "../lib/mission-visibility.js";
 import { createTelemetryCache } from "../lib/telemetry-cache.js";
+import { attachMapLayout } from "../lib/map-layout.js";
 
 const HOME = [56.699893, 13.002148];
 
@@ -190,6 +191,7 @@ export function Map(root) {
        <div class="mprog" id="mprog"></div>
      </div>
      <div class="map-wrap">
+       <div class="map-stage" id="map-stage">
        <div id="map"></div>
        <div class="ov wind" id="wind"><div class="lbl">Wind</div><div class="arrow" id="wind-arrow">➜</div><div class="spd" id="wind-spd">—</div><div class="frm" id="wind-frm"></div></div>
        <div class="ov toast" id="map-toast"></div>
@@ -214,6 +216,7 @@ export function Map(root) {
            </div>
          </div>
        </div>
+       </div>
        <div class="mission-progress-bar" id="mpbar" style="display:none">
          <div class="mpb-fill" id="mpb-fill" style="width:0%"></div>
          <div class="mpb-label" id="mpb-label"></div>
@@ -227,9 +230,22 @@ export function Map(root) {
     btn.title = collapsed ? "Expand legend" : "Collapse legend";
   };
 
-  // Leaflet
-  map = L.map("map", { zoomControl: true, attributionControl: false }).setView(HOME, 16);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20 }).addTo(map);
+  // Leaflet. Zoom is placed TOP-RIGHT (theme.css then drops it below the wind widget via
+  // the measured --map-tr-h) so the top-left corner belongs to status/instruction text
+  // alone — the two used to be stacked in the same corner. Attribution is on: OSM tiles
+  // require it, and it now has an uncontested bottom-right corner to live in.
+  // trackResize:false — lib/map-layout.js owns resize for every map (see Plan.js for why
+  // Leaflet's own listener is the one that has to go).
+  map = L.map("map", { zoomControl: false, attributionControl: true, trackResize: false }).setView(HOME, 16);
+  L.control.zoom({ position: "topright" }).addTo(map);
+  L.control.scale({ position: "bottomright", imperial: false }).addTo(map);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20, attribution: "© OpenStreetMap" }).addTo(map);
+  // One shared resize/corner contract for every map in the station (lib/map-layout.js):
+  // ResizeObserver on the stage → coalesced invalidateSize, plus the measured top-corner
+  // extents that theme.css offsets the Leaflet controls, legend and toast from.
+  const detachMapLayout = attachMapLayout(map, document.getElementById("map-stage"), {
+    topRight: [document.getElementById("wind")],
+  });
   // Wide zoom hides mission waypoint numbers (leaving dots); close zoom restores them.
   // A single container class toggle — the mission Leaflet layers are never recreated.
   map.on("zoomend", applyMissionZoom);
@@ -1405,6 +1421,7 @@ export function Map(root) {
     if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
     authCtl.dispose();
     clearMissionOverlay();
+    detachMapLayout();
     if (map) { map.remove(); map = null; }
   };
 }
