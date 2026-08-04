@@ -58,6 +58,17 @@ const probeShell = (mapSel) => {
     ribbon: of(".ribbon"), rail: of(".rail"), dock: of(".dock"),
     mapWrap: of(".map-wrap"), mapStage: of(".map-stage"), map: mapEl ? box(mapEl) : null,
     inspector: of(".inspector"), page: of(".page"), contentMain: of(".content-main"),
+    legend: of(".legend"), actionBar: of(".plan-actionbar"),
+    legendComputed: (() => {
+      const e = document.querySelector(".legend");
+      if (!e) return null;
+      const s = getComputedStyle(e), bd = e.querySelector(".legend-body");
+      return { display: s.display, visibility: s.visibility, opacity: s.opacity,
+               maxHeight: s.maxHeight, zIndex: s.zIndex,
+               inStage: !!document.querySelector(".map-stage")?.contains(e),
+               rows: bd ? bd.children.length : 0,
+               bodyScrolls: bd ? bd.scrollHeight > bd.clientHeight : null };
+    })(),
     mapWrapPosition: (() => { const e = document.querySelector(".map-wrap"); return e ? getComputedStyle(e).position : null; })(),
     mapStagePosition: (() => { const e = document.querySelector(".map-stage"); return e ? getComputedStyle(e).position : null; })(),
     // the containing block the map actually resolved against — the single fact that
@@ -138,6 +149,29 @@ for (const [w, h] of VIEWPORTS) {
     // the map element itself, not just its wrapper
     for (const [name, r] of [["ribbon", ribbon], ["rail", rail], ["dock", dock], ["inspector", inspector]]) {
       check(`${at}: the map element does not overlap the ${name}`, !overlaps(s.map, r));
+    }
+
+    // ── the map legend: present, real, inside the stage, clear of the action bar ──
+    // A legend collapsed to zero height by a measured CSS variable does not look clipped,
+    // it VANISHES — so "exists in the DOM" is not the assertion; painted area is.
+    const lg = s.legend, lc = s.legendComputed;
+    check(`${at}: legend element exists`, !!lg && !!lc);
+    if (lg && lc) {
+      check(`${at}: legend has non-zero dimensions`, lg.w > 0 && lg.h > 0, `${lg.w}x${lg.h}`);
+      check(`${at}: legend is painted (not display:none/hidden/transparent)`,
+        lc.display !== "none" && lc.visibility !== "hidden" && Number(lc.opacity) > 0,
+        `${lc.display}/${lc.visibility}/${lc.opacity}`);
+      check(`${at}: legend lists its marker rows`, lc.rows > 0, `${lc.rows} rows`);
+      check(`${at}: legend is inside .map-stage`, lc.inStage === true);
+      check(`${at}: legend intersects the visible map stage`,
+        lg.r > s.mapStage.l && lg.l < s.mapStage.r && lg.b > s.mapStage.t && lg.t < s.mapStage.b);
+      check(`${at}: legend bottom is above the map-stage bottom`,
+        lg.b <= s.mapStage.b + 1, `legend.b=${lg.b} stage.b=${s.mapStage.b}`);
+      check(`${at}: legend is fully on screen`, lg.t >= -1 && lg.b <= h + 1, `${lg.t}..${lg.b} vs ${h}`);
+      if (s.actionBar) {
+        check(`${at}: legend does not overlap .plan-actionbar`, !overlaps(lg, s.actionBar),
+          overlaps(lg, s.actionBar) ? `${JSON.stringify(lg)} ∩ ${JSON.stringify(s.actionBar)}` : "");
+      }
     }
 
     // ── nothing in the shell is fixed or spanning the whole grid ──

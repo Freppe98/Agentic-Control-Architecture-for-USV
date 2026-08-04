@@ -162,9 +162,16 @@ test("a scrolling flex column never compresses its own children", () => {
 });
 
 test("the legend is bounded by the map stage and scrolls internally", () => {
-  assert.match(rule(".legend"), /max-height:\s*calc\(100% - var\(--map-pad\) \* 2 - var\(--map-tl-h\)/,
+  const legend = rule(".legend");
+  assert.match(legend, /calc\(100% - var\(--map-pad\) \* 2 - var\(--map-tl-h\)/,
     "legend height must derive from the stage and the measured top-left overlay, never a fixed offset");
+  // The floor is the safety net: --map-tl-h is an absolute measurement subtracted from a
+  // percentage of an independently-sized box, so the difference can reach zero. A legend at
+  // max-height:0 does not look clipped — it disappears silently.
+  assert.match(legend, /max-height:\s*max\(\s*\d+px\s*,/,
+    "the legend's max-height needs a floor so a measured variable can never collapse it to nothing");
   assert.match(rule(".legend-body"), /overflow-y:\s*auto/);
+  assert.match(rule(".legend > .legend-h"), /flex:\s*none/);
 });
 
 test("Leaflet control spacing comes from the shared tokens, not per-page pixels", () => {

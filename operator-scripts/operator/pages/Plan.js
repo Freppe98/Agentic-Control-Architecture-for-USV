@@ -25,6 +25,7 @@ import * as P from "../lib/planning.js";
 import * as FP from "../lib/fleet-plan.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
+import { missionLockState, lockMessage } from "../lib/mission-lock.js";
 import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
 import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { attachMapLayout } from "../lib/map-layout.js";
@@ -1096,13 +1097,34 @@ export function Plan(root) {
 
   // Operator-side upload eligibility (armed + confirmed-LOITER policy). Early feedback only —
   // Scout remains the safety authority and performs the final stationary/groundspeed check.
+  /** The page-local optimistic lock, bounded by lib/mission-lock.js. Also RELEASES a dead
+   *  lock: a finalize that never produced a command, or a tracked command the backend has
+   *  no record of, must not block uploads for the rest of the session. */
+  function missionLock() {
+    const v = selectedVehicle();
+    const lock = missionLockState({
+      phase: model.upload.phase, cmdId: model.upload.cmdId, startedAt: model.upload.at,
+      commands: cmds, missionUpload: (v && v.mission_upload) || null,
+    });
+    if (lock.release) {
+      model = { ...model, upload: { ...model.upload, ...lock.release } };
+      // Re-derive rather than recurse: the released model is no longer "uploading".
+      return { locked: false, state: lock.state, label: null, release: null };
+    }
+    return lock;
+  }
+
   function uploadGate() {
     const v = selectedVehicle();
     const t = (v && v.telemetry) || {};
     const connected = v ? commState(v) === "connected" : false;
     const groundspeed = v && v.speed != null ? v.speed : (t.groundspeed != null ? t.groundspeed : null);
-    const missionPending = model.upload.phase === "uploading"
-      || hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR");
+    // Two independent sources of "a mission write is running":
+    //   • the page's own bounded optimistic lock (this session pressed Upload), and
+    //   • the BACKEND queue, which is authoritative and expires stale commands at its TTL.
+    // The backend one also covers a second browser tab or a reload mid-upload.
+    const lock = missionLock();
+    const backendPending = hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR");
     return uploadEligibility({
       connected,
       armed: t.armed == null ? null : t.armed,
@@ -1111,7 +1133,9 @@ export function Plan(root) {
       groundspeed,
       hasAuthority: hasControl(),
       authorityRequired: true,
-      missionPending,
+      missionPending: lock.locked || backendPending,
+      // Say what it is actually waiting for, rather than the generic "another operation".
+      missionPendingReason: lockMessage(lock),
     });
   }
   function trackedUpload() { return model.upload.cmdId ? (cmds.find((c) => c.id === model.upload.cmdId) || null) : null; }
@@ -1137,7 +1161,20 @@ export function Plan(root) {
     renderAll();
     // Finalize: store the immutable original mission record (revision 0) AND create the
     // unchanged, read-back-verified MISSION_UPLOAD command in one call.
-    const res = await api.finalizeMission(payload);
+    // The try/catch is load-bearing: api.finalizeMission returns { ok:false } for an HTTP
+    // error, but `fetch` itself REJECTS when the request never completes (backend restart,
+    // connection reset, tab offline). Without this, doUpload threw, `upload.phase` stayed
+    // "uploading" with no command id, and the operator was locked out of uploading for the
+    // rest of the session with no way back except a page reload.
+    let res;
+    try {
+      res = await api.finalizeMission(payload);
+    } catch (e) {
+      model = { ...model, upload: { ...model.upload, phase: "error", cmdId: null,
+        error: "The upload request did not reach the operator backend — nothing was sent to the vehicle. The plan is preserved; check the backend link and try again." } };
+      renderAll();
+      return;
+    }
     if (res.ok && res.data && res.data.command) {
       const rec = res.data.mission || {};
       model = { ...model, upload: { ...model.upload, cmdId: res.data.command.id, missionId: rec.mission_id, revision: rec.mission_revision != null ? rec.mission_revision : 0 } };
@@ -1149,7 +1186,15 @@ export function Plan(root) {
     loadCommands(model.vehicleId); renderAll();
   }
   function syncUploadFromCommands() {
-    if (model.upload.phase !== "uploading" || !model.upload.cmdId) return;
+    if (model.upload.phase !== "uploading") return;
+    // Evaluate the bounded lock on EVERY command poll, not only when a tracked record shows
+    // up. This is the tick that ends a dead lock (submit that never produced a command; a
+    // command the backend has no record of) — previously both paths simply returned here
+    // and the lock lived until the page was reloaded.
+    const before = model.upload.phase;
+    missionLock();
+    if (model.upload.phase !== before) { renderAll(); return; }
+    if (!model.upload.cmdId) return;
     const cmd = trackedUpload();
     if (!cmd) return;
     const v = fleet.find((x) => x.id === model.vehicleId);
@@ -1171,10 +1216,13 @@ export function Plan(root) {
   function renderUploadStatus() {
     const u = model.upload;
     if (u.phase === "uploading") {
-      const cmd = trackedUpload();
-      const v = fleet.find((x) => x.id === model.vehicleId);
-      const stg = cmd ? missionUploadStage(cmd, (v && v.mission_upload) || null) : null;
-      return `<span class="pl-upl">${stg ? stg.stage : "Queued"}…</span>`;
+      // Name the stage the operator is actually waiting on (Submitting / Requested /
+      // Executing), not a generic "Queued" that never changes.
+      const lock = missionLockState({
+        phase: u.phase, cmdId: u.cmdId, startedAt: u.at, commands: cmds,
+        missionUpload: (selectedVehicle() || {}).mission_upload || null,
+      });
+      return `<span class="pl-upl">${esc(lock.label || "Queued")}…</span>`;
     }
     if (u.phase === "error") return `<span class="pl-upl bad">Upload failed — ${esc(u.error || "not verified")}. Plan preserved.</span>`;
     if (u.phase === "uploaded" && u.result) {

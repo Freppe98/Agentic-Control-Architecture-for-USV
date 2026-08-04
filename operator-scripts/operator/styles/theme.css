@@ -328,11 +328,20 @@ a { color:inherit; }
    height minus the padding and minus whatever the top-left overlay occupies, and the
    body scrolls inside that. Since the bottom bars now own their own grid row, "bottom
    of the stage" really is above them — the legend can no longer be buried. */
+/* max() is the floor, and it is not cosmetic. --map-tl-h is MEASURED from the live
+   top-left overlay, so it is an absolute px value subtracted from a percentage of a box
+   that can change independently. If the status banner ever grows large relative to a short
+   map stage, the subtraction can reach zero or go negative — and a legend with
+   max-height:0 does not look clipped, it VANISHES, with no scrollbar and no clue that a
+   marker key ever existed. The floor keeps it present and internally scrollable in that
+   case; a measurement can shrink the legend, never delete it. */
 .legend {
   bottom:var(--map-pad); left:var(--map-pad); width:var(--legend-w);
-  max-height:calc(100% - var(--map-pad) * 2 - var(--map-tl-h) - var(--map-ov-gap));
+  max-height:max(96px, calc(100% - var(--map-pad) * 2 - var(--map-tl-h) - var(--map-ov-gap)));
   display:flex; flex-direction:column; padding:9px 11px 10px; font-size:11px;
 }
+/* The header must never be squeezed away either — it is what identifies the panel. */
+.legend > .legend-h { flex:none; }
 .legend-h { flex:none; display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
 .legend-toggle { flex:none; background:transparent; border:1px solid var(--line-strong); color:var(--muted); border-radius:4px; width:18px; height:18px; line-height:1; cursor:pointer; font-family:var(--font-mono); font-size:12px; padding:0; }
 .legend-toggle:hover { color:var(--text); border-color:var(--accent); }

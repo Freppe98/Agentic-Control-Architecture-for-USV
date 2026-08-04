@@ -361,7 +361,108 @@ stay positioned as the containment backstop`.
 
 ---
 
-## 7. Remaining limitations
+## 7. Plan page: mission-operation lock, and the legend report (2026-08-04)
+
+### 7a. Stale "Another mission operation is already in progress" — root cause + fix
+
+**The backend was not holding a lock.** All MISSION_UPLOAD records for Scout were
+`status: EXECUTED`, `verified: true`, `mission_result: verified`, terminal lifecycle. The
+backend also expires any non-terminal command at its TTL (`_expire_stale_commands`,
+`COMMAND_TTL_S`), so it cannot hold a lock indefinitely. `hasPendingOfType()` was correctly
+returning false.
+
+The lock was the Plan page's own flag, `model.upload.phase === "uploading"`, which was
+**unbounded**. It was cleared in exactly one place — when a polled command record reached a
+terminal state — so three paths left it set for the rest of the session:
+
+1. **`api.finalizeMission` rejected.** `postJSON` returns `{ ok:false }` for an HTTP error,
+   but `fetch` itself *rejects* when the request never completes (backend restart,
+   connection reset, tab offline). `doUpload` had no `try/catch`, so it threw with
+   `upload.phase = "uploading"` and `cmdId = null`, and `syncUploadFromCommands` returned
+   immediately on the missing id, forever.
+2. **The tracked command was not in the polled queue** — `syncUploadFromCommands` returned
+   at `if (!cmd) return;` with no bound on how long that could continue.
+3. **No timeout of any kind.** `upload.at` was recorded and never read.
+
+Fix — `operator/lib/mission-lock.js`, a pure bounded lock. The ownership rule it encodes:
+the page flag is only an **optimistic** lock covering the window between pressing Upload and
+the command becoming visible in the backend queue; once the command is visible the backend
+is the authority. Every exit is bounded — `settled`, `submit_timeout` (20 s), or
+`tracking_lost` (20 s grace) — and each releasing exit returns a model patch carrying an
+operator-facing reason that states whether the vehicle was touched. Plus:
+
+- `doUpload` now catches a rejected finalize and reports it instead of dying mid-state.
+- `syncUploadFromCommands` evaluates the lock on **every** command poll, so a dead lock ends
+  on the next 3 s tick rather than at the next page reload.
+- `uploadEligibility` takes `missionPendingReason`, so the gate says *what* it is waiting for
+  ("Mission upload executing — wait for it to finish before uploading again.") instead of
+  the generic sentence. The generic text remains the fallback.
+
+Tests: `tests/mission-lock.test.mjs` (12) covers pending-blocks, confirmed-releases,
+rejected-releases, EXPIRED-releases, submit-timeout, tracking-lost, other-vehicle commands,
+a reloaded page not inheriting a stale flag, and disarmed+MANUAL being eligible with a clean
+queue.
+
+**Immediate recovery for a stuck page (no mission history touched):** reload the Plan page
+(F5). The model is rebuilt at `phase: "idle"`; nothing is deleted, no command is cancelled,
+and the immutable original mission records are untouched. With this fix the lock also clears
+itself within ~20 s without a reload.
+
+### 7b. Missing Plan legend — NOT REPRODUCED
+
+Could not be reproduced against the current code in any configuration tried:
+
+| scenario | legend |
+|---|---|
+| empty plan, boundary drawn, route generated, validated | present, 281 px, inside stage, clear of the action bar |
+| full generate → validate → **real upload** → verified (live Scout) | unchanged throughout |
+| long post-upload banner, viewports 1920×1080 / 1920×922 / 1920×800 / 1366×768 / 1366×650 / 1280×600 | present in all |
+| stale Plan.js markup (no `.map-stage`) | present, but **overlapping** the action bar |
+
+The last row is the only defect found, and it is the same mixed-version cache as §6 — a
+browser running the pre-change `Plan.js` against the current stylesheet. That would place
+the legend at the bottom of `.map-wrap`, on top of the action bar; before the §6 fix it
+placed it at the **viewport's** bottom-left, i.e. under the Windows taskbar, which does read
+as "completely absent".
+
+One real fragility was hardened regardless: `.legend`'s `max-height` subtracts the
+**measured** `--map-tl-h` (absolute px) from a percentage of an independently-sized box, so
+the difference can reach zero — and a legend at `max-height:0` does not look clipped, it
+vanishes silently. It now has a floor: `max(96px, calc(…))`, plus `flex:none` on the header.
+
+Runtime assertions added to `scripts/check_shell_layout.mjs` (as requested): the legend must
+exist, have non-zero dimensions, be painted (not `display:none`/`hidden`/transparent), list
+its rows, be inside `.map-stage`, intersect the visible stage, have its bottom above the
+stage bottom, be fully on screen, and not overlap `.plan-actionbar`. **220/220 checks pass**
+on Map and Plan at 1366×768 and 1920×1080.
+
+If it recurs, `npm run check:shell` will fail with the specific axis; the browser readout
+needed to go further is `document.querySelector(".plan-legend")` → `outerHTML`, computed
+`display/visibility/opacity/max-height`, `getBoundingClientRect()`, and the parent's class
+and rect.
+
+### 7c. Verified cycle (live Scout, disarmed, MANUAL)
+
+generate → validate → upload → independent readback, at 1366×768:
+
+| step | state | upload button |
+|---|---|---|
+| generated | ROUTE_GENERATED | disabled — "Validate the route first" |
+| validated | VALID | enabled — "Vehicle is disarmed — upload permitted (Scout verifies safety)." |
+| upload +1.5 s | UPLOADING | disabled — "Waiting for the operator backend to queue the upload" |
+| upload +4.5 s | UPLOADING | disabled — "Mission upload executing" |
+| upload +7.5 s | UPLOADED | enabled again |
+
+Scout's result: `EXACT_MATCH`, expected hash `sha256:a9f173aa0f4a…` == observed.
+The Operator's **independent** read-back (`GET /api/vehicles/2/pixhawk-mission`) returned
+`route_waypoint_count 18`, `pixhawk_item_count 19` (18 + Scout's Home at seq 0), and
+`route_content_hash sha256:a9f173aa0f4a…` — matching the expectation on all three axes.
+A second press mid-cycle was correctly held, then accepted once settled.
+Screenshot: `img/plan-cycle-1366x768.png`.
+
+---
+
+## 8. Remaining limitations
 
 - **Video and Messages** are still migration stubs. The shell is verified at every viewport;
   their page-specific layout cannot be audited until the pages exist. Video in particular
