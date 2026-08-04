@@ -1058,3 +1058,42 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .tour-skip:hover { border-color:var(--line-strong); }
 .tour-primary { color:var(--accent-bright); background:var(--accent-dim); border-color:rgba(76,141,255,.45); }
 .tour-primary:hover:not(:disabled) { border-color:var(--accent); background:rgba(76,141,255,.24); color:var(--accent-bright); }
+
+/* ── Plan page: Fleet Mission ─────────────────────────────────────────────── */
+.plan-state-chip.uploading, .plan-state-chip.verifying { color:var(--accent-bright); border-color:rgba(76,141,255,.4); }
+.plan-state-chip.verified { color:var(--connected); border-color:rgba(62,207,142,.4); }
+.plan-state-chip.partially_uploaded, .plan-state-chip.stale, .plan-state-chip.failed { color:var(--caution); border-color:rgba(242,169,59,.4); }
+
+.plan-modeseg { display:flex; gap:6px; margin:2px 0 4px; }
+.plan-modebtn { flex:1; padding:8px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r-sm); color:var(--muted); font-size:12px; cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), color var(--t-hover); }
+.plan-modebtn:hover { border-color:var(--accent); }
+.plan-modebtn.on { background:var(--accent-dim); border-color:var(--accent); color:var(--accent-bright); font-weight:600; }
+.plan-help { font-size:10.5px; color:var(--dim); line-height:1.45; padding:2px 2px 4px; }
+
+.fleet-picklist { display:flex; flex-direction:column; gap:4px; }
+.fleet-pick { display:flex; align-items:center; gap:8px; padding:6px 8px; background:var(--panel-2); border:1px solid var(--line-strong); border-radius:var(--r-sm); cursor:pointer; font-size:12px; }
+.fleet-pick.on { border-color:var(--accent); background:var(--accent-dim); }
+.fleet-pick input { margin:0; }
+.fleet-pick .fp-name { font-weight:600; color:var(--text); }
+.fleet-pick .fp-meta { margin-left:auto; font-size:10px; font-family:var(--font-mono); color:var(--muted); }
+.cs-connected { color:var(--connected); } .cs-partitioned { color:var(--partitioned); }
+.cs-disconnected { color:var(--disconnected); } .cs-unknown { color:var(--unknown); }
+
+.fleet-card { margin:4px 0; padding:8px 10px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r-sm); }
+.fleet-card .fc-h, .fleet-sumcard .fc-h { display:flex; align-items:center; gap:7px; font-size:12px; }
+.fc-sw { width:11px; height:11px; border-radius:3px; flex:none; box-shadow:0 0 0 1px rgba(0,0,0,.3) inset; }
+.fc-id { font-family:var(--font-mono); font-size:9.5px; color:var(--dim); }
+.fc-row { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px; color:var(--muted); margin-top:5px; }
+.fp-hsrc { color:var(--dim); font-size:9.5px; }
+
+.fleet-sumcard { margin:5px 0; padding:8px 10px; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--r-sm); cursor:pointer; }
+.fleet-sumcard.iso { border-color:var(--accent); }
+.fp-up { margin-left:auto; font-family:var(--font-mono); font-size:9px; letter-spacing:.03em; padding:1px 5px; border-radius:var(--r-pill); background:var(--panel); border:1px solid var(--line-strong); color:var(--muted); }
+.fp-up.verified { color:var(--connected); border-color:rgba(62,207,142,.4); }
+.fp-up.failed, .fp-up.stale { color:var(--disconnected); border-color:rgba(229,72,77,.4); }
+.fp-up.uploading, .fp-up.verifying { color:var(--accent-bright); }
+.fleet-metgrid { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin-top:6px; font-size:10.5px; }
+.fleet-metgrid span:nth-child(odd) { color:var(--muted); }
+.fleet-metgrid span:nth-child(even) { text-align:right; font-family:var(--font-mono); color:var(--text); }
+.fleet-legend { display:flex; flex-wrap:wrap; gap:8px 12px; margin:2px 0 6px; }
+.fleet-leg { display:flex; align-items:center; gap:5px; font-size:10.5px; color:var(--muted); cursor:pointer; }

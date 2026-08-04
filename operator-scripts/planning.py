@@ -59,8 +59,9 @@ TOLERANCE = 1e-9
 
 # Duration is an ESTIMATE only (the UI labels it so). This is the fallback planning speed
 # used when the operator supplies none; it is deliberately conservative and configurable
-# from the request — never an invented sonar-specific default baked in as truth.
-DEFAULT_PLANNING_SPEED_MPS = 1.5
+# from the request — never an invented sonar-specific default baked in as truth. Lowered
+# from 1.5 to 1.0 m/s to match the fleet-wide survey-speed default (single + fleet planning).
+DEFAULT_PLANNING_SPEED_MPS = 1.0
 
 
 class PlanningUnavailable(RuntimeError):

@@ -257,6 +257,27 @@ export async function validatePlan(body) {
   return r.data || { ok: false, error: "no_response" };
 }
 
+// --- Fleet survey planning (Plan page — Fleet Mission mode) ------------------
+// A fleet plan divides ONE shared survey area between two or more USVs. Generation returns one
+// INDEPENDENT child mission per vehicle plus fleet allocation + conflict validation. Upload is
+// NOT a new endpoint: the page orchestrates one finalizeMission() per vehicle (reusing the
+// unchanged canonicalise/hash/read-back-verify path per vehicle). Static pre-deployment
+// deconfliction — never runtime collision avoidance.
+
+/** Generate a fleet plan from shared geometry + selected vehicles (lib/fleet-plan.js
+ *  fleetPlanningBody). Returns the backend fleet plan { ok, fleet_plan_id, vehicles[],
+ *  allocation_summary, validation, ... } on 200, or { ok:false, ... } on 400/503. */
+export async function generateFleet(body) {
+  const r = await postJSON("/api/planning/fleet/generate", body);
+  return r.data || { ok: false, error: "no_response" };
+}
+
+/** Re-run fleet conflict validation on a fleet plan. Returns { ok, errors, warnings, checks }. */
+export async function validateFleet(fleetPlan) {
+  const r = await postJSON("/api/planning/fleet/validate", fleetPlan);
+  return r.data || { ok: false, error: "no_response" };
+}
+
 /** Finalize a generated survey: store the immutable original mission record (revision 0)
  *  AND create the verified MISSION_UPLOAD command in one call. body = lib/planning.js
  *  finalizePayload(model) = { vehicle_id, mission_package, confirm }. The command still

@@ -36,7 +36,7 @@ export function defaultParams() {
     primary_angle_deg: 0,
     dual_pass: false,
     secondary_angle_deg: null,     // null → primary + 90 at generation time
-    survey_speed_mps: 1.5,
+    survey_speed_mps: 1.0,         // default survey speed (matches backend DEFAULT_PLANNING_SPEED_MPS)
   };
 }
 

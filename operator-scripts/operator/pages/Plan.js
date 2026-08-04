@@ -22,6 +22,7 @@ import { NavRail } from "../components/NavRail.js";
 import { Ribbon, updateRibbon } from "../components/Ribbon.js";
 import { commState, noTelem } from "../lib/ui.js";
 import * as P from "../lib/planning.js";
+import * as FP from "../lib/fleet-plan.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
 import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
@@ -74,7 +75,16 @@ export function Plan(root) {
   // rather than a Plan-private one.
   const sharedSel = getSelectedVehicleId();
   if (sharedSel != null) model = { ...model, vehicleId: sharedSel };
-  let mode = null;            // active drawing mode: null|'boundary'|'nogo'|'home'|'approach'|'return'
+  let mode = null;            // active drawing mode: null|'boundary'|'nogo'|'home'|'approach'|'return'|'fhome'
+  // Planning mode (task Step 1). 'single' keeps the existing single-vehicle workflow verbatim;
+  // 'fleet' exposes the multi-vehicle workflow layered on the SAME shared geometry (model.boundary,
+  // model.noGoZones, model.params). Fleet-specific state lives in fleetModel (lib/fleet-plan.js).
+  let planMode = "single";
+  let fleetModel = FP.emptyFleet();
+  let fleetHomeTarget = null;  // vehicle id whose planning home the next map click sets
+  let isolateVehicle = null;   // fleet map: show only this vehicle's routes, or null for all
+  let busyFleet = false;       // fleet generate/validate in flight
+  let fleetError = null;
   let draftRing = [];         // in-progress polygon vertices ([lng,lat]) while drawing
   let selected = null;        // { type:'boundary'|'nogo'|'approach'|'return'|'home', id?/index? }
   const history = [];         // undo stack of prior models (drawing/edit actions)
@@ -193,6 +203,7 @@ export function Plan(root) {
     const pt = fromLL(e.latlng);
     if (mode === "boundary" || mode === "nogo") { draftRing.push(pt); drawDraft(); renderTools(); }
     else if (mode === "home") { apply(P.setHome(model, pt)); mode = null; map.doubleClickZoom.enable(); }
+    else if (mode === "fhome" && fleetHomeTarget != null) { fleetModel = FP.setVehicleHome(fleetModel, fleetHomeTarget, pt); mode = null; fleetHomeTarget = null; map.doubleClickZoom.enable(); renderAll(); }
     else if (mode === "approach") { apply(P.setApproach(model, [...model.approach, pt])); }
     else if (mode === "return") { apply(P.setReturns(model, [...model.returns, pt])); }
   }
@@ -227,9 +238,10 @@ export function Plan(root) {
       "Clear the entire plan?\n\nThis removes the boundary, no-go zones, home, approach and " +
       "return waypoints, the generated route and validation. It does NOT touch the mission " +
       "stored on any vehicle and issues no command. This cannot be undone.")) return;
-    history.length = 0; selected = null; draftRing = []; mode = null;
+    history.length = 0; selected = null; draftRing = []; mode = null; fleetHomeTarget = null;
     const keepVehicle = model.vehicleId;
     model = P.clearModel(); model.vehicleId = keepVehicle;
+    if (planMode === "fleet") { fleetModel = FP.emptyFleet(); isolateVehicle = null; fleetError = null; }
     map.doubleClickZoom.enable();
     renderAll();
   }
@@ -299,8 +311,11 @@ export function Plan(root) {
         }
       }
     }
-    // Navigable (shoreline-offset) area — only from a generated route (never faked).
-    const nav = model.generated && model.generated.navigable_boundary;
+    // Navigable (shoreline-offset) area — only from a generated route (never faked). In fleet
+    // mode it comes from the fleet plan's shared geometry.
+    const nav = planMode === "fleet"
+      ? (fleetModel.generated && fleetModel.generated.shared_geometry && fleetModel.generated.shared_geometry.navigable_boundary)
+      : (model.generated && model.generated.navigable_boundary);
     if (Array.isArray(nav)) nav.forEach((r) => L.polygon(r.map(toLL), { ...NAVIGABLE_STYLE }).addTo(layers.navigable));
 
     // No-go zones.
@@ -317,6 +332,8 @@ export function Plan(root) {
         }
       }
     });
+
+    if (planMode === "fleet") { drawFleetGeometry(); drawDraft(); return; }
 
     // Generated route segments (distinct styles per kind) + directional arrows on the
     // approach/return/connector legs + generated waypoint dots.
@@ -366,10 +383,33 @@ export function Plan(root) {
   }
 
   // ═══════════════ LEFT PANEL: tools + workflow ═══════════════
+  // Planning-mode selector (task Step 1) — rendered at the top of the dock in BOTH modes.
+  function modeToggleHtml() {
+    return `<div class="plan-sec"><span class="lbl">Planning mode</span></div>
+      <div class="plan-modeseg" role="radiogroup" aria-label="Planning mode">
+        <button class="plan-modebtn ${planMode === "single" ? "on" : ""}" id="pm-single" role="radio" aria-checked="${planMode === "single"}">Single Vehicle</button>
+        <button class="plan-modebtn ${planMode === "fleet" ? "on" : ""}" id="pm-fleet" role="radio" aria-checked="${planMode === "fleet"}">Fleet Mission</button>
+      </div>`;
+  }
+  function wireModeToggle() {
+    bind("pm-single", () => switchMode("single"));
+    bind("pm-fleet", () => switchMode("fleet"));
+  }
+  // Switching modes preserves the shared survey geometry (boundary, no-go zones, params) but does
+  // NOT carry incompatible per-vehicle state across. It resets only the generated allocation/route,
+  // never the drawn polygon or zones.
+  function switchMode(m) {
+    if (m === planMode) return;
+    mode = null; fleetHomeTarget = null; map.doubleClickZoom.enable();
+    planMode = m;
+    renderAll(); fitToPlan();
+  }
+
   function renderTools() {
-    const st = P.planState(model);
+    const st = planMode === "fleet" ? FP.deriveFleetStatus(fleetModel) : P.planState(model);
     document.getElementById("plan-state").textContent = st;
-    document.getElementById("plan-state").className = "lbl plan-state-chip " + st.toLowerCase();
+    document.getElementById("plan-state").className = "lbl plan-state-chip " + String(st).toLowerCase();
+    if (planMode === "fleet") { renderFleetTools(); return; }
 
     const steps = WORKFLOW.map(([k, label]) => {
       const done = stepDone(k);
@@ -385,6 +425,7 @@ export function Plan(root) {
     const startOpts = P.ROUTE_START_MODES.map((m) => `<option value="${m}" ${model.routeStartMode === m ? "selected" : ""}>${P.ROUTE_START_LABEL[m]}</option>`).join("");
 
     document.getElementById("plan-tools").innerHTML = `
+      ${modeToggleHtml()}
       <div class="plan-sec"><span class="lbl">Workflow</span></div>
       <div class="plan-steps">${steps}</div>
 
@@ -435,6 +476,7 @@ export function Plan(root) {
       </div>`;
 
     // wire
+    wireModeToggle();
     const veh = document.getElementById("plan-veh");
     if (veh) veh.onchange = () => {
       const id = veh.value ? +veh.value : null;
@@ -491,8 +533,118 @@ export function Plan(root) {
     }
   }
 
+  // ═══════════════ FLEET MISSION: dock tools ═══════════════
+  // Shared survey geometry (boundary + no-go zones) reuses the SAME drawing tools and model as
+  // single mode; only vehicle selection, per-vehicle homes/speed/colour and fleet settings are
+  // fleet-specific. The count is DERIVED from the selection — never a numeric input.
+  function reportedHome(v) {
+    const h = v && v.home;
+    if (h && h.latitude != null && h.longitude != null) return [h.longitude, h.latitude];
+    if (h && h.lat != null && h.lng != null) return [h.lng, h.lat];
+    return null;
+  }
+  function fleetVehName(id) {
+    const v = fleet.find((x) => String(x.id) === String(id));
+    return v ? (v.name || "USV-" + id) : "USV-" + id;
+  }
+  function renderFleetTools() {
+    const rows = fleet.map((v) => {
+      const id = String(v.id);
+      const sel = FP.isSelected(fleetModel, id);
+      const cs = commState(v);
+      const pos = isValidLatLng(v.lat, v.lng) && !isNullIsland(v.lat, v.lng) ? "position ✓" : "no position";
+      return `<label class="fleet-pick ${sel ? "on" : ""}"><input type="checkbox" data-fveh="${id}" ${sel ? "checked" : ""}/>
+        <span class="fp-name">${esc(v.name || "USV-" + id)}</span>
+        <span class="fp-meta">${esc(id)} · <span class="cs-${cs}">${cs}</span> · ${pos}</span></label>`;
+    }).join("") || `<div class="plan-empty">No vehicles in the registry yet.</div>`;
+
+    const cards = fleetModel.selectedVehicleIds.map((id) => {
+      const c = FP.vehicleConfig(fleetModel, id) || {};
+      const v = fleet.find((x) => String(x.id) === String(id));
+      const rep = v ? reportedHome(v) : null;
+      const homeTxt = c.home ? `${c.home[1].toFixed(5)}, ${c.home[0].toFixed(5)} <span class="fp-hsrc">(${c.homeSource === "operator" ? "operator" : "reported"})</span>` : `<span class="plan-empty">not set</span>`;
+      const setting = mode === "fhome" && String(fleetHomeTarget) === String(id);
+      return `<div class="fleet-card" style="border-left:3px solid ${c.colour}">
+        <div class="fc-h"><span class="fc-sw" style="background:${c.colour}"></span><b>${esc(fleetVehName(id))}</b><span class="fc-id">${esc(id)}</span></div>
+        <div class="fc-row"><span>Home</span><span>${homeTxt}</span></div>
+        <div class="plan-btnrow">
+          <button class="plan-tool ${setting ? "on" : ""}" data-fhset="${id}">${c.home ? "Move home" : "Set home on map"}</button>
+          ${rep && c.homeSource !== "operator" ? `<button class="plan-tool" data-fhrep="${id}">Use reported</button>` : ""}
+        </div>
+        <div class="fc-row"><label for="fs-${id}">Survey speed</label><span class="plan-inp"><input id="fs-${id}" data-fspeed="${id}" type="number" step="any" value="${c.survey_speed_mps}"/> <span class="u">m/s</span></span></div>
+      </div>`;
+    }).join("");
+
+    const balOpts = FP.BALANCE_METRICS.map((b) => `<option value="${b}" ${fleetModel.balanceMetric === b ? "selected" : ""}>${b === "estimated_duration" ? "Estimated duration" : "Route distance"}</option>`).join("");
+    const drawing = (mode === "boundary" || mode === "nogo");
+    const zoneList = model.noGoZones.map((z) => `<div class="plan-item ${selected && selected.type === "nogo" && selected.id === z.id ? "sel" : ""}" data-zone="${z.id}"><span>${z.id}</span><button class="plan-x" data-rmzone="${z.id}" title="Remove zone">✕</button></div>`).join("") || `<div class="plan-empty">No no-go zones</div>`;
+
+    document.getElementById("plan-tools").innerHTML = `
+      ${modeToggleHtml()}
+      <div class="plan-sec"><span class="lbl">Fleet vehicles (${FP.selectedCount(fleetModel)} selected)</span></div>
+      <div class="plan-help">Select two or more vehicles. A disconnected vehicle can still be planned; upload is gated on availability.</div>
+      <div class="fleet-picklist">${rows}</div>
+
+      <div class="plan-sec"><span class="lbl">Per-vehicle configuration</span></div>
+      ${cards || `<div class="plan-empty">Select vehicles to configure their home &amp; speed.</div>`}
+
+      <div class="plan-sec"><span class="lbl">Shared survey area</span></div>
+      <div class="plan-btnrow">
+        <button class="plan-tool ${mode === "boundary" ? "on" : ""}" id="pl-draw-boundary">${model.boundary ? "Redraw boundary" : "Draw boundary"}</button>
+        <button class="plan-tool" id="pl-del-boundary" ${model.boundary ? "" : "disabled"}>Delete</button>
+      </div>
+      ${drawing && mode === "boundary" ? `<div class="plan-draw-hint">Click to add vertices (${draftRing.length}). Double-click or Finish to close.<div class="plan-btnrow"><button id="pl-finish" ${P.ringIsValid(draftRing) ? "" : "disabled"}>Finish</button><button id="pl-cancel">Cancel</button></div></div>` : ""}
+      <div class="plan-btnrow"><button class="plan-tool ${mode === "nogo" ? "on" : ""}" id="pl-draw-nogo" ${P.canAddZone(model) ? "" : "disabled"}>Add no-go zone</button></div>
+      ${drawing && mode === "nogo" ? `<div class="plan-draw-hint">Click to add vertices (${draftRing.length}). Double-click or Finish to close.<div class="plan-btnrow"><button id="pl-finish" ${P.ringIsValid(draftRing) ? "" : "disabled"}>Finish</button><button id="pl-cancel">Cancel</button></div></div>` : ""}
+      <div class="plan-list">${zoneList}</div>
+
+      <div class="plan-sec"><span class="lbl">Fleet settings</span></div>
+      <div class="plan-prow"><label for="fleet-sep">Min. route separation <span class="plan-hint" title="Planning/warning threshold for the minimum planned distance between vehicle routes. NOT a runtime collision guarantee.">?</span></label><span class="plan-inp"><input id="fleet-sep" type="number" step="any" value="${fleetModel.minimumFleetSeparationM}"/> <span class="u">m</span></span></div>
+      <div class="plan-prow"><label for="fleet-bal">Balance by</label><span class="plan-inp"><select id="fleet-bal">${balOpts}</select></span></div>
+
+      <div class="plan-sec"><span class="lbl">Edit</span></div>
+      <div class="plan-btnrow">
+        <button class="plan-tool" id="pl-undo" ${history.length || draftRing.length ? "" : "disabled"}>Undo</button>
+        <button class="plan-tool danger" id="pl-clear">Clear all</button>
+      </div>`;
+
+    // wire
+    wireModeToggle();
+    document.querySelectorAll("[data-fveh]").forEach((cb) => cb.onchange = () => {
+      const id = cb.dataset.fveh;
+      const v = fleet.find((x) => String(x.id) === id);
+      fleetModel = FP.toggleVehicle(fleetModel, id, { home: v ? reportedHome(v) : null });
+      renderAll();
+    });
+    document.querySelectorAll("[data-fhset]").forEach((b) => b.onclick = () => {
+      fleetHomeTarget = b.dataset.fhset; setMode("fhome");
+    });
+    document.querySelectorAll("[data-fhrep]").forEach((b) => b.onclick = () => {
+      const id = b.dataset.fhrep; const v = fleet.find((x) => String(x.id) === id);
+      fleetModel = FP.setVehicleHome(fleetModel, id, reportedHome(v)); renderAll();
+    });
+    document.querySelectorAll("[data-fspeed]").forEach((inp) => inp.onchange = () => {
+      const v = inp.value === "" ? null : Number(inp.value);
+      fleetModel = FP.setVehicleSpeed(fleetModel, inp.dataset.fspeed, v); renderAll();
+    });
+    bind("pl-draw-boundary", () => setMode("boundary"));
+    bind("pl-del-boundary", () => apply(P.setBoundary(model, null)));
+    bind("pl-draw-nogo", () => { if (P.canAddZone(model)) setMode("nogo"); });
+    bind("pl-finish", finishShape);
+    bind("pl-cancel", cancelDraw);
+    bind("pl-undo", undo);
+    bind("pl-clear", clearAll);
+    const sep = document.getElementById("fleet-sep");
+    if (sep) sep.onchange = () => { fleetModel = FP.setSeparation(fleetModel, Number(sep.value)); renderAll(); };
+    const bal = document.getElementById("fleet-bal");
+    if (bal) bal.onchange = () => { fleetModel = FP.setBalanceMetric(fleetModel, bal.value); renderAll(); };
+    document.querySelectorAll("[data-rmzone]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); apply(P.removeNoGoZone(model, b.dataset.rmzone)); renderAll(); });
+    document.querySelectorAll("[data-zone]").forEach((el) => el.onclick = () => { selected = { type: "nogo", id: el.dataset.zone }; renderAll(); });
+  }
+
   // ═══════════════ RIGHT PANEL: params, validation, summary ═══════════════
   function renderInspector() {
+    if (planMode === "fleet") { renderFleetInspector(); return; }
     const p = model.params, m = model.generated && model.generated.metrics;
     const inp = document.getElementById("plan-inspector");
     const fld = (label, id, val, unit, hint) => `<div class="plan-prow"><label for="${id}">${label}${hint ? ` <span class="plan-hint" title="${hint}">?</span>` : ""}</label><span class="plan-inp"><input id="${id}" type="number" value="${val == null ? "" : val}" step="any"/> <span class="u">${unit}</span></span></div>`;
@@ -583,8 +735,232 @@ export function Plan(root) {
       <div class="plan-note">${infoIcon}<span>Duration is an estimate only. Distances are geodesic over the generated route.</span></div>`;
   }
 
+  // ═══════════════ FLEET MISSION: map, inspector, actions, upload ═══════════════
+  // The shared geometry model is `model` (boundary/no-go/params); fleetModel holds fleet state.
+  function fleetColour(id) { const c = FP.vehicleConfig(fleetModel, id); return (c && c.colour) || "#4C8DFF"; }
+  // Route-kind dash: survey solid, approach dashed, return dotted — each in the vehicle's colour.
+  function fleetSegStyle(kind, colour) {
+    if (kind === "primary" || kind === "secondary") return { color: colour, weight: 3, opacity: 0.95 };
+    if (kind === "pass_transition") return { color: colour, weight: 2, opacity: 0.7, dashArray: "4 5" };
+    if (kind === "final_home_connector" || kind === "return_connector" || kind === "return_approach")
+      return { color: colour, weight: 2.4, opacity: 0.9, dashArray: "2 5" };   // return: dotted
+    return { color: colour, weight: 2.6, opacity: 0.9, dashArray: "9 6" };      // approach: dashed
+  }
+  function drawFleetGeometry() {
+    // Per-vehicle planning-home markers (always shown so homes can be set before generation).
+    fleetModel.selectedVehicleIds.forEach((id) => {
+      const c = FP.vehicleConfig(fleetModel, id); if (!c || !c.home) return;
+      const mk = L.marker(toLL(c.home), { draggable: true, pane: "pl-markers", icon: L.divIcon({ className: "", html: `<div class="plan-home" style="color:${c.colour}">⌂</div>`, iconSize: [24, 24], iconAnchor: [12, 20] }) });
+      mk.bindTooltip(`${fleetVehName(id)} home`, { sticky: true });
+      mk.on("dragend", (e) => { fleetModel = FP.setVehicleHome(fleetModel, id, fromLL(e.latlng)); renderAll(); });
+      mk.addTo(layers.markers);
+    });
+    const fp = fleetModel.generated;
+    if (!fp || !Array.isArray(fp.vehicles)) return;
+    fp.vehicles.forEach((vp) => {
+      if (isolateVehicle && String(isolateVehicle) !== String(vp.vehicle_id)) return;
+      const colour = vp.colour || fleetColour(vp.vehicle_id);
+      (vp.mission_package.segments || []).forEach((s) => {
+        if (s.coordinates.length > 1) {
+          L.polyline(s.coordinates.map(toLL), { ...fleetSegStyle(s.kind, colour), pane: "pl-route" }).addTo(layers.route);
+          if (s.kind !== "primary" && s.kind !== "secondary") drawArrows(s.coordinates, colour);
+        }
+      });
+    });
+  }
+
+  function renderFleetInspector() {
+    const inp = document.getElementById("plan-inspector");
+    const p = model.params;
+    const fld = (label, id, val, unit, hint) => `<div class="plan-prow"><label for="${id}">${label}${hint ? ` <span class="plan-hint" title="${hint}">?</span>` : ""}</label><span class="plan-inp"><input id="${id}" type="number" value="${val == null ? "" : val}" step="any"/> <span class="u">${unit}</span></span></div>`;
+    inp.innerHTML = `
+      <div class="plan-card">
+        <div class="msect"><span class="lbl">Shared survey pattern</span></div>
+        <div class="plan-params">
+          ${fld("Shoreline clearance", "pp-clear", p.shoreline_clearance_m, "m")}
+          ${fld("Lane spacing", "pp-space", p.lane_spacing_m, "m", "Distance between parallel survey lines. Distinct from the fleet route separation.")}
+          ${fld("Survey angle", "pp-angle", p.primary_angle_deg, "°")}
+          <div class="plan-prow"><label for="pp-dual">Dual pass</label><span class="plan-inp"><input id="pp-dual" type="checkbox" ${p.dual_pass ? "checked" : ""}/> <span class="u">2nd pass, clipped per vehicle</span></span></div>
+          ${p.dual_pass ? fld("Secondary angle", "pp-angle2", P.effectiveSecondaryAngle(p), "°") : ""}
+        </div>
+      </div>
+      <div class="plan-card">
+        <div class="msect"><span class="lbl">Fleet validation</span></div>
+        ${renderFleetValidation()}
+      </div>
+      <div class="plan-card">
+        <div class="msect"><span class="lbl">Fleet summary</span></div>
+        ${renderFleetSummary()}
+        <div class="plan-note">${infoIcon}<span>Fleet planning performs static partitioning and pre-deployment route-conflict validation. It reduces planned route overlap but does <b>not</b> replace runtime vehicle-to-vehicle collision detection or avoidance.</span></div>
+      </div>`;
+    wireNum("pp-clear", "shoreline_clearance_m");
+    wireNum("pp-space", "lane_spacing_m");
+    wireNum("pp-angle", "primary_angle_deg");
+    wireNum("pp-angle2", "secondary_angle_deg");
+    const dual = document.getElementById("pp-dual");
+    if (dual) dual.onchange = () => apply(P.setParam(model, "dual_pass", dual.checked), false);
+  }
+  function renderFleetValidation() {
+    if (!FP.hasFleetPlan(fleetModel)) return `<div class="plan-empty">Generate a fleet plan to validate it.</div>`;
+    if (FP.isFleetOutdated(fleetModel, model)) return `<div class="plan-vbad">Fleet allocation is out of date — an input changed. Regenerate and validate before upload.</div>`;
+    const v = fleetModel.validation;
+    if (!v) return `<div class="plan-empty">Not validated yet — press Validate fleet.</div>`;
+    const errs = (v.errors || []).map((e) => `<li class="bad">${esc(e)}</li>`).join("");
+    const warns = (v.warnings || []).map((w) => `<li class="warn">${esc(w)}</li>`).join("");
+    const checks = Object.entries(v.checks || {}).map(([k, val]) => `<div class="plan-check ${val === true ? "ok" : val === false ? "bad" : "dim"}"><span>${k}</span><span>${val === true ? "✓" : val === false ? "✕" : "—"}</span></div>`).join("");
+    const sep = v.metrics && v.metrics.minimum_cross_route_separation_m;
+    return `<div class="plan-vhead ${v.ok ? "ok" : "bad"}">${v.ok ? "VALID — ready to upload" : "INVALID — resolve the errors below"}</div>
+      ${sep != null ? `<div class="plan-srow"><span class="k">Min. planned route separation</span><span class="v">${sep} m</span></div>` : ""}
+      ${errs || warns ? `<ul class="plan-vlist">${errs}${warns}</ul>` : ""}
+      <div class="plan-checks">${checks}</div>`;
+  }
+  function renderFleetSummary() {
+    const fp = fleetModel.generated;
+    if (!fp) return `<div class="plan-empty">No fleet plan generated yet.</div>`;
+    const s = fp.allocation_summary || {};
+    const vrows = (fp.vehicles || []).map((vp) => {
+      const m = vp.metrics; const up = (fleetModel.upload.vehicles[String(vp.vehicle_id)] || {}).status || "—";
+      const iso = isolateVehicle && String(isolateVehicle) === String(vp.vehicle_id);
+      return `<div class="fleet-sumcard ${iso ? "iso" : ""}" data-iso="${vp.vehicle_id}" style="border-left:3px solid ${vp.colour}">
+        <div class="fc-h"><span class="fc-sw" style="background:${vp.colour}"></span><b>${esc(vp.vehicle_name)}</b><span class="fc-id">${esc(String(vp.vehicle_id))}</span><span class="fp-up ${up.toLowerCase()}">${up}</span></div>
+        <div class="fleet-metgrid">
+          <span>Lines</span><span>${m.assigned_survey_line_count}</span>
+          <span>Waypoints</span><span>${m.waypoint_count}</span>
+          <span>Survey</span><span>${fmtLen(m.survey_distance_m)}</span>
+          <span>Approach/return</span><span>${fmtLen(m.approach_distance_m)} / ${fmtLen(m.return_distance_m)}</span>
+          <span>Total</span><span>${fmtLen(m.total_distance_m)}</span>
+          <span>Speed</span><span>${m.survey_speed_mps} m/s${m.survey_speed_is_default ? " (def)" : ""}</span>
+          <span>Est. duration</span><span>${fmtDur(m.estimated_duration_s)}</span>
+        </div></div>`;
+    }).join("");
+    const frows = [
+      ["Vehicles", String(s.vehicle_count)],
+      ["Survey lines", String(s.survey_line_count)],
+      ["Total survey distance", fmtLen(s.total_survey_distance_m)],
+      ["Max / min est. duration", `${fmtDur(s.max_estimated_duration_s)} / ${fmtDur(s.min_estimated_duration_s)}`],
+      ["Imbalance", `${s.imbalance_percent}%`],
+      ["Unassigned lines", String((s.unassigned_survey_line_ids || []).length)],
+      ["Duplicated lines", String((s.duplicate_survey_line_ids || []).length)],
+      ["Fleet plan", esc(fp.fleet_plan_id || "—") + " · v" + (fp.fleet_plan_version || 1)],
+    ];
+    const iso = `<div class="plan-btnrow"><button class="plan-tool ${isolateVehicle ? "" : "on"}" id="fleet-showall">Show all</button></div>`;
+    const html = `<div class="fleet-legend">${(fp.vehicles || []).map((vp) => `<span class="fleet-leg" data-iso="${vp.vehicle_id}"><span class="fc-sw" style="background:${vp.colour}"></span>${esc(vp.vehicle_name)}</span>`).join("")}</div>
+      ${iso}
+      ${vrows}
+      <div class="plan-sumgrid">${frows.map(([k, val]) => `<div class="plan-srow"><span class="k">${k}</span><span class="v">${val}</span></div>`).join("")}</div>`;
+    setTimeout(() => {
+      document.querySelectorAll("[data-iso]").forEach((el) => el.onclick = () => { isolateVehicle = el.dataset.iso; renderAll(); });
+      bind("fleet-showall", () => { isolateVehicle = null; renderAll(); });
+    }, 0);
+    return html;
+  }
+
+  function renderFleetActions() {
+    const canGen = FP.canGenerateFleet(fleetModel, model) && !busyFleet;
+    const canVal = FP.hasFleetPlan(fleetModel) && !FP.isFleetOutdated(fleetModel, model) && !busyFleet;
+    const canUp = FP.canUploadFleet(fleetModel, model);
+    const anyFailed = Object.values(fleetModel.upload.vehicles || {}).some((v) => v.status === "FAILED" || v.status === "STALE");
+    const genLabel = FP.hasFleetPlan(fleetModel) ? "Regenerate fleet" : "Generate fleet";
+    document.getElementById("plan-actions").innerHTML = `
+      <button class="pl-act" id="act-clear">Clear</button>
+      <div class="pl-act-grow"></div>
+      <button class="pl-act primary" id="act-fgen" ${canGen ? "" : "disabled"} title="${esc(fleetGenTitle())}">${busyFleet ? "Working…" : genLabel}</button>
+      <button class="pl-act" id="act-fval" ${canVal ? "" : "disabled"}>Validate fleet</button>
+      ${anyFailed ? `<button class="pl-act" id="act-fretry">Retry failed</button>` : ""}
+      <button class="pl-act success" id="act-fupload" ${canUp ? "" : "disabled"} title="${esc(canUp ? "Upload each child mission to its vehicle" : "Generate and validate a fleet plan first")}">Upload fleet</button>`;
+    bind("act-clear", clearAll);
+    bind("act-fgen", doGenerateFleet);
+    bind("act-fval", doValidateFleet);
+    bind("act-fretry", doRetryFailed);
+    bind("act-fupload", doFleetUpload);
+  }
+  function fleetGenTitle() {
+    if (FP.selectedCount(fleetModel) < FP.MIN_FLEET_VEHICLES) return "Select at least two vehicles";
+    if (!FP.everyHomeSet(fleetModel)) return "Set a planning home for every selected vehicle";
+    if (!P.hasBoundary(model)) return "Draw the shared survey boundary";
+    if (!(model.params.lane_spacing_m > 0)) return "Set the lane spacing";
+    return "Generate the fleet allocation and child missions";
+  }
+
+  async function doGenerateFleet() {
+    if (!FP.canGenerateFleet(fleetModel, model) || busyFleet) return;
+    busyFleet = true; fleetError = null; renderActions(); renderBanner();
+    try {
+      const res = await api.generateFleet(FP.fleetPlanningBody(fleetModel, model));
+      if (res && res.ok) { fleetModel = FP.applyFleetGenerated(fleetModel, model, res); isolateVehicle = null; fitToPlan(); }
+      else { fleetError = (res && (res.message || (res.errors && res.errors.join(" ")))) || "Fleet generation failed."; }
+    } catch (e) { fleetError = "Fleet generation request failed."; }
+    finally { busyFleet = false; renderAll(); }
+  }
+  async function doValidateFleet() {
+    if (!FP.hasFleetPlan(fleetModel) || busyFleet) return;
+    busyFleet = true; renderActions();
+    try {
+      const res = await api.validateFleet(fleetModel.generated);
+      fleetModel = FP.applyFleetValidation(fleetModel, res);
+    } catch (e) { fleetModel = FP.applyFleetValidation(fleetModel, { ok: false, errors: ["Fleet validation request failed."], warnings: [], checks: {} }); }
+    finally { busyFleet = false; renderAll(); }
+  }
+  function doRetryFailed() { fleetModel = FP.retryFailed(fleetModel); renderAll(); uploadNextPending(); }
+  async function doFleetUpload() {
+    if (!FP.canUploadFleet(fleetModel, model)) return;
+    const n = fleetModel.selectedVehicleIds.length;
+    if (!window.confirm(
+      `Upload ${n} child missions — one to each selected vehicle?\n\n` +
+      `Each mission is finalized and uploaded through the verified read-back path and stored as ` +
+      `an immutable original mission record. This OVERWRITES each vehicle's flight-controller ` +
+      `mission and is confirmed only by read-back. It does NOT start any mission.`)) return;
+    fleetModel = FP.beginUpload(fleetModel); renderAll();
+    await uploadNextPending();
+  }
+  async function uploadNextPending() {
+    const id = FP.nextPendingVehicle(fleetModel);
+    if (!id) { renderAll(); return; }
+    const vp = FP.vehiclePlan(fleetModel, id);
+    fleetModel = FP.markVehicle(fleetModel, id, "UPLOADING"); renderAll();
+    const v = fleet.find((x) => String(x.id) === String(id));
+    // Availability guard — a selected vehicle is never silently omitted; an unavailable one is
+    // marked FAILED with its reason, and the others still proceed.
+    if (!v) {
+      fleetModel = FP.markVehicle(fleetModel, id, "FAILED", { error: "Vehicle not in the registry." });
+      renderAll(); return uploadNextPending();
+    }
+    try {
+      const res = await api.finalizeMission(FP.finalizePayloadForVehicle(fleetModel, vp));
+      if (res.ok && res.data && res.data.command) {
+        const rec = res.data.mission || {};
+        fleetModel = FP.markVehicle(fleetModel, id, "UPLOADING", { cmdId: res.data.command.id, missionId: rec.mission_id, hash: vp.route_hash });
+      } else {
+        const d = res.data || {};
+        const err = Array.isArray(d.errors) && d.errors.length ? d.errors.join(" ") : (d.message || d.error || "Upload was not accepted.");
+        fleetModel = FP.markVehicle(fleetModel, id, "FAILED", { error: err });
+      }
+    } catch (e) {
+      fleetModel = FP.markVehicle(fleetModel, id, "FAILED", { error: "Upload request failed." });
+    }
+    renderAll();
+    await uploadNextPending();   // sequential: next selected vehicle
+  }
+  // Poll the per-vehicle upload command lifecycle → VERIFIED / FAILED (read-back verification is
+  // the ONLY verified; a delivered file is never success on its own). Reuses missionUploadStage.
+  function syncFleetUpload() {
+    const uploading = fleetModel.selectedVehicleIds.filter((id) => {
+      const u = fleetModel.upload.vehicles[id]; return u && u.status === "UPLOADING" && u.cmdId;
+    });
+    uploading.forEach((id) => {
+      api.getCommands(id).then((d) => {
+        const cmd = (d && d.commands || []).find((c) => c.id === fleetModel.upload.vehicles[id].cmdId);
+        if (!cmd) return;
+        const stg = missionUploadStage(cmd, null);
+        if (stg.state === "done") { fleetModel = FP.markVehicle(fleetModel, id, "VERIFIED"); renderAll(); }
+        else if (stg.state === "failed") { fleetModel = FP.markVehicle(fleetModel, id, "FAILED", { error: stg.reason }); renderAll(); }
+      }).catch(() => {});
+    });
+  }
+
   // ═══════════════ ACTION BAR + BANNER ═══════════════
   function renderActions() {
+    if (planMode === "fleet") { renderFleetActions(); return; }
     const st = P.planState(model);
     const genLabel = P.hasRoute(model) ? (P.isOutdated(model) ? "Regenerate" : "Regenerate") : "Generate route";
     const gate = uploadGate();
@@ -618,8 +994,9 @@ export function Plan(root) {
     return gate ? gate.message : "Finalize and upload the mission through the verified path";
   }
   function renderBanner() {
-    const st = P.planState(model);
     const b = document.getElementById("plan-banner");
+    if (planMode === "fleet") { renderFleetBanner(b); return; }
+    const st = P.planState(model);
     let cls = "info", extra = "";
     if (st === "ROUTE_OUTDATED" || st === "ERROR") cls = "warn";
     else if (st === "VALID" || st === "UPLOADED") cls = "ok";
@@ -627,6 +1004,38 @@ export function Plan(root) {
     const uploadInfo = renderUploadStatus();
     b.className = "ov plan-banner " + cls;
     b.innerHTML = `<span class="pl-state">${st}</span><span class="pl-msg">${P.PLAN_STATE_LABEL[st] || ""}${extra}</span>${uploadInfo}`;
+  }
+  const FLEET_STATE_LABEL = {
+    NOT_STARTED: "Select vehicles, draw the shared area, then generate the fleet plan.",
+    READY: "Fleet plan valid — ready to upload.",
+    UPLOADING: "Uploading child missions to each vehicle…",
+    PARTIALLY_UPLOADED: "Some vehicles verified, some failed — retry the failed ones.",
+    VERIFYING: "Verifying uploaded missions…",
+    VERIFIED: "All child missions uploaded and verified — fleet ready for operator launch.",
+    FAILED: "Fleet upload failed — the plan is preserved; review and retry.",
+    STALE: "Uploaded missions belong to an older plan — regenerate and re-upload.",
+  };
+  function renderFleetBanner(b) {
+    let st = FP.deriveFleetStatus(fleetModel);
+    let cls = "info", extra = "", label = FLEET_STATE_LABEL[st] || "";
+    // Before any upload begins, speak the PLAN phase (generated / valid / outdated) instead of a
+    // misleading upload status.
+    if (st === "NOT_STARTED" && FP.hasFleetPlan(fleetModel)) {
+      if (FP.isFleetOutdated(fleetModel, model)) { st = "OUT OF DATE"; cls = "warn"; label = "Fleet allocation is out of date — regenerate and validate before upload."; }
+      else if (fleetModel.validation && fleetModel.validation.ok) { st = "READY"; cls = "ok"; label = "Fleet plan valid — ready to upload."; }
+      else if (fleetModel.validation) { st = "INVALID"; cls = "warn"; label = "Fleet validation found blocking errors — resolve them before upload."; }
+      else { st = "GENERATED"; label = "Fleet plan generated — validate it before upload."; }
+    } else {
+      if (st === "VERIFIED") cls = "ok";
+      else if (st === "FAILED" || st === "PARTIALLY_UPLOADED" || st === "STALE") cls = "warn";
+    }
+    if (fleetError) { cls = "warn"; extra = ` — ${esc(fleetError)}`; }
+    const verified = fleetModel.selectedVehicleIds.filter((id) => (fleetModel.upload.vehicles[id] || {}).status === "VERIFIED").length;
+    const total = fleetModel.selectedVehicleIds.length;
+    const uploading = Object.keys(fleetModel.upload.vehicles || {}).length > 0;
+    const progress = (uploading && total) ? ` · ${verified}/${total} verified` : "";
+    b.className = "ov plan-banner " + cls;
+    b.innerHTML = `<span class="pl-state">${st}${progress}</span><span class="pl-msg">${label}${extra}</span>`;
   }
 
   // ═══════════════ GENERATE / VALIDATE ═══════════════
@@ -776,7 +1185,13 @@ export function Plan(root) {
   function fitToPlan() {
     const pts = [];
     if (model.boundary) model.boundary.forEach((p) => pts.push(toLL(p)));
-    (model.generated && model.generated.route_waypoints || []).forEach((w) => pts.push([w.latitude, w.longitude]));
+    if (planMode === "fleet") {
+      fleetModel.selectedVehicleIds.forEach((id) => { const c = FP.vehicleConfig(fleetModel, id); if (c && c.home) pts.push(toLL(c.home)); });
+      const fp = fleetModel.generated;
+      if (fp && Array.isArray(fp.vehicles)) fp.vehicles.forEach((vp) => (vp.mission_package.route_waypoints || []).forEach((w) => pts.push([w.latitude, w.longitude])));
+    } else {
+      (model.generated && model.generated.route_waypoints || []).forEach((w) => pts.push([w.latitude, w.longitude]));
+    }
     if (pts.length) map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 18 });
   }
   function vehName(id) { const v = fleet.find((x) => x.id === id); return id == null ? "—" : (v ? (v.name || "USV-" + id) : "USV-" + id); }
@@ -899,7 +1314,7 @@ export function Plan(root) {
   // re-selecting it in the dropdown.
   if (model.vehicleId != null) selectVehicleSideEffects(model.vehicleId);
   const stopFleet = api.poll(api.getFleet, 2000, onFleet, updateFeed, "fleet", { pauseWhenHidden: true });
-  const cmdTimer = setInterval(() => loadCommands(model.vehicleId), 3000);
+  const cmdTimer = setInterval(() => { loadCommands(model.vehicleId); if (planMode === "fleet") syncFleetUpload(); }, 3000);
   const authTimer = setInterval(() => loadAuthority(model.vehicleId), 4000);
   const clockId = setInterval(() => { updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }); }, 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
@@ -909,7 +1324,11 @@ export function Plan(root) {
 
   // Warn before navigating away with unsaved planning changes (hash router → beforeunload
   // covers a real tab close/reload; the in-app nav is a hash change the operator initiates).
-  function beforeUnload(e) { if (P.hasUnsavedWork(model) && model.upload.phase !== "uploaded") { e.preventDefault(); e.returnValue = ""; } }
+  function beforeUnload(e) {
+    const fleetWork = planMode === "fleet" && (FP.hasFleetPlan(fleetModel) || FP.selectedCount(fleetModel) > 0)
+      && !FP.fleetReady(fleetModel, model);
+    if ((P.hasUnsavedWork(model) && model.upload.phase !== "uploaded") || fleetWork) { e.preventDefault(); e.returnValue = ""; }
+  }
   window.addEventListener("beforeunload", beforeUnload);
 
   renderAll();

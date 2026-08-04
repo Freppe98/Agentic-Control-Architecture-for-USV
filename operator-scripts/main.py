@@ -15,6 +15,7 @@ import uuid
 
 import mission_contract
 import planning
+import fleet_planning
 import replan_package
 import scout_replan
 import vehicle_registry
@@ -2328,6 +2329,64 @@ async def planning_validate(request: Request):
             "ok": False, "error": "bad_request", "message": "Request body is not valid JSON."})
     result = planning.validate_plan(body, max_route_waypoints=MAX_ROUTE_WAYPOINTS)
     return result
+
+
+# ── Fleet survey planning (Plan page — Fleet Mission mode) ────────────────────────────
+# A fleet plan divides ONE shared survey area between two or more registered USVs. Generation
+# is a deterministic layer ABOVE the single-vehicle planner (fleet_planning.py): shared
+# geometry → survey lines → contiguous home-aware allocation → one INDEPENDENT child mission
+# per vehicle. Each child mission is an ordinary operator-survey-plan-v1 package, so upload is
+# NOT a new endpoint here — the frontend orchestrates one POST /api/missions/finalize per
+# vehicle, reusing the unchanged canonicalise/hash/read-back-verify path per vehicle. This is
+# static pre-deployment deconfliction, never runtime collision avoidance.
+
+
+@app.post("/api/planning/fleet/generate")
+async def fleet_generate(request: Request):
+    """Generate a fleet plan (child missions + allocation + fleet validation) from shared
+    survey geometry and the selected vehicles. Body: { boundary, shoreline_clearance_m,
+    no_go_zones[], lane_spacing_m, primary_angle_deg, dual_pass, secondary_angle_deg,
+    minimum_fleet_separation_m, balance_metric, vehicles:[{vehicle_id, vehicle_name, colour,
+    home, survey_speed_mps}], manual_assignments? }. Deterministic and read-only: no command
+    is created, no vehicle state is touched."""
+    if not planning.PLANNING_AVAILABLE:
+        return _planning_unavailable_response()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "bad_request", "message": "Request body is not valid JSON."})
+    try:
+        result = fleet_planning.generate_fleet(body, max_route_waypoints=MAX_ROUTE_WAYPOINTS)
+    except fleet_planning.FleetPlanError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "fleet_input_invalid", "message": str(exc),
+            "errors": str(exc).split("; ")})
+    except planning.DisconnectedNavigableError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "fleet_navigable_disconnected", "message": str(exc)})
+    except planning.ConnectorError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "fleet_connector_failed", "message": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "fleet_input_invalid", "message": str(exc)})
+    return result
+
+
+@app.post("/api/planning/fleet/validate")
+async def fleet_validate(request: Request):
+    """Re-run fleet conflict validation on a supplied fleet plan (blocking errors, warnings,
+    informational metrics). Body is a fleet plan (fleet_planning.generate_fleet output).
+    Read-only."""
+    if not planning.PLANNING_AVAILABLE:
+        return _planning_unavailable_response()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "bad_request", "message": "Request body is not valid JSON."})
+    return fleet_planning.validate_fleet(body)
 
 
 def _draft_path(draft_id: str):
