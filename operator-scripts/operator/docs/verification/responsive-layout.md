@@ -264,7 +264,7 @@ verified, their content is not yet built.)
 - **Long backend error** (240-char GEOS exception with a file path) — banner wraps to
   568×127 inside the stage with no horizontal overflow; toast wraps and clears both the
   banner and the view controls; action-bar hint wraps to two lines inside the bar; legend
-  still clear of the action bar. Screenshot: `img/responsive-plan-long-error-1366x768.png`.
+  still clear of the action bar.
 - **14 vehicles, 60-char names** on fleet / map / plan / vehicle at 1366×768 — document
   stays 1366×768, nothing escapes the viewport, names truncate with `title`, authority
   segments wrap so `LOCAL AGENT` is never cut to `LOCAL AGE`.
@@ -279,8 +279,17 @@ verified, their content is not yet built.)
 
 ### Screenshots
 
-`img/responsive-{map,plan,fleet,config}-{1366x768,1920x1080}.png`, plus
-`img/responsive-before-{map,plan}-1366x768.png` for the before/after.
+Not committed — the verification set ran to ~12 MB of PNGs, which is permanent weight in a
+repo whose numbers above are reproducible on demand. Regenerate any of it with a running
+backend:
+
+```bash
+npm install --no-save playwright && npx playwright install chromium
+npm run check:shell -- --base http://127.0.0.1:8210 --shots ./shots
+```
+
+That writes `shell-{map,plan}-{1366x768,1920x1080}.png` plus `shell-checks.json` (every
+assertion with its measured values).
 
 ---
 
@@ -352,8 +361,8 @@ stay positioned as the containment backstop`.
 - `npm test` — **433 pass / 0 fail**. `python -m unittest discover -s tests` — **540, OK**.
 - Cache headers verified: `Cache-Control: no-cache, must-revalidate` on
   `index.html`, `app.js`, `pages/Map.js`, `styles/theme.css`; `If-None-Match` still 304s.
-- Screenshots (live backend, real fleet):
-  `img/shell-{map,plan}-{1366x768,1920x1080}.png`.
+- Verified visually against the live backend with the real fleet; screenshots are
+  regenerable via `npm run check:shell -- --shots ./shots` rather than committed.
 
 > **Operator note:** a hard refresh (Ctrl+F5) is needed **once** to clear the mixed-version
 > cache already in the browser. From then on the `no-cache` header makes normal reloads
@@ -458,7 +467,6 @@ The Operator's **independent** read-back (`GET /api/vehicles/2/pixhawk-mission`)
 `route_waypoint_count 18`, `pixhawk_item_count 19` (18 + Scout's Home at seq 0), and
 `route_content_hash sha256:a9f173aa0f4a…` — matching the expectation on all three axes.
 A second press mid-cycle was correctly held, then accepted once settled.
-Screenshot: `img/plan-cycle-1366x768.png`.
 
 ---
 

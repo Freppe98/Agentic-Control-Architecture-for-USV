@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 
+# Node packages. The station has no runtime dependencies and no build step; this only
+# appears when someone installs Playwright locally to run scripts/check_shell_layout.mjs.
+node_modules/
+
 # Scout reference material (provided for porting; not part of the operator station)
 operator-scripts/_scout_ref/
 operator-scripts/services - scout USV.zip
