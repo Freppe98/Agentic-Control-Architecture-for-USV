@@ -208,7 +208,7 @@ export function Vehicle(root) {
     const body = fleet.map((v) => {
       const s = subsys(v);
       return `<tr data-id="${v.id}" class="${v.id === selId ? "sel" : ""}">
-        <td class="vcell"><span class="vc-in"><span class="statdot" style="background:var(--${cls(v) === "c" ? "connected" : cls(v) === "p" ? "partitioned" : cls(v) === "d" ? "disconnected" : "unknown"})"></span><b>${v.name || "USV-" + v.id}</b>${CommsPill(v)}</span></td>
+        <td class="vcell"><span class="vc-in"><span class="statdot" style="background:var(--${cls(v) === "c" ? "connected" : cls(v) === "p" ? "partitioned" : cls(v) === "d" ? "disconnected" : "unknown"})"></span><b title="${v.name || "USV-" + v.id}">${v.name || "USV-" + v.id}</b>${CommsPill(v)}</span></td>
         ${MXCOLS.map(([k]) => mcell(s[k])).join("")}
       </tr>`;
     }).join("");

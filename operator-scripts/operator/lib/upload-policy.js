@@ -31,16 +31,20 @@ const block = (reason) => ({ allowed: false, level: UPLOAD_LEVEL.BLOCK, reason, 
  * @param hasAuthority     operator holds OPERATOR control authority
  * @param authorityRequired whether authority is required (default true)
  * @param missionPending   another mission operation (upload/clear) is already in progress
+ * @param missionPendingReason what it is waiting for, e.g. "Mission upload executing — wait
+ *   for it to finish before uploading again." Optional; when the caller can name the stage
+ *   it is always preferred, because the generic sentence leaves an operator unable to tell a
+ *   real in-flight upload from a stuck flag, or to judge whether waiting will help.
  * @returns { allowed, level, reason, message }
  */
 export function uploadEligibility({
   connected, armed, mode, modeFresh, groundspeed,
-  hasAuthority, authorityRequired = true, missionPending,
+  hasAuthority, authorityRequired = true, missionPending, missionPendingReason = null,
   loiterSpeedHint = LOITER_SPEED_HINT_MPS,
 } = {}) {
   if (modeFresh === undefined) modeFresh = !!connected;
 
-  if (missionPending) return block("Another mission operation is already in progress.");
+  if (missionPending) return block(missionPendingReason || "Another mission operation is already in progress.");
   if (!connected) return block("Vehicle is disconnected — upload unavailable.");
   if (authorityRequired && !hasAuthority) return block("Take OPERATOR control before uploading.");
 

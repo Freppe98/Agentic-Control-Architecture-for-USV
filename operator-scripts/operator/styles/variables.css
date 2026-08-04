@@ -48,6 +48,15 @@
   /* ---- radii ---- */
   --r:5px; --r-sm:3px; --r-pill:999px;
 
+  /* ---- scrollbars ----
+     One design for every intentional scroll region in the station. Compact enough not to
+     eat a narrow panel (the nav rail is only ~58px wide), visible enough to read as an
+     affordance against the dark surfaces — never hidden, never transparent. */
+  --scrollbar-size:6px;
+  --scrollbar-track:rgba(255,255,255,.025);
+  --scrollbar-thumb:rgba(132,152,172,.34);
+  --scrollbar-thumb-hover:rgba(154,176,198,.56);
+
   /* ---- shadows ---- */
   --shadow-1:0 2px 10px rgba(0,0,0,.3);
   --shadow-2:0 4px 12px rgba(0,0,0,.4);
@@ -65,11 +74,85 @@
      ribbon brand cell; --nav-size is the square icon button. Widened ~50% (was 52/40)
      for a larger, easier target — the only place these sizes live, so the whole grid,
      the content offset and the ribbon brand track them automatically. --nav-icon is the
-     glyph size inside each button. */
+     glyph size inside each button.
+     These are the LARGE-DESKTOP values; the desktop bands at the bottom of this file
+     step them down. The rail is height-bound (13 fixed nav items), not width-bound, so
+     it is the viewport-HEIGHT bands that shrink it. */
   --rail-w:78px;
-  --dock-w:240px;
-  --inspector-w:344px;
-  --ribbon-h:48px;
   --nav-size:60px;
   --nav-icon:30px;
+  --nav-gap:5px;
+  --ribbon-h:48px;
+
+  /* Side panels shrink with the viewport so the central map / mission workspace keeps a
+     usable width on a 1366 laptop, and stop growing on a large desktop (the ceiling) so
+     extra width goes to the workspace rather than to whitespace. */
+  --dock-w:clamp(200px,15.5vw,240px);
+  --inspector-w:clamp(276px,21vw,344px);
+
+  /* ---- shared responsive rhythm (panels, cards, map controls) ---- */
+  --page-gap:clamp(8px,.8vw,16px);
+  --panel-pad:clamp(11px,1vw,20px);
+  --map-pad:clamp(8px,.7vw,14px);   /* inset of every map overlay AND Leaflet control */
+  --map-ov-gap:8px;                 /* gap BETWEEN stacked things in a map corner */
+  --legend-w:clamp(168px,13.5vw,206px);
+  --card-min:280px;                 /* auto-fit floor for responsive card grids */
+
+  /* Measured at runtime by lib/map-layout.js and written onto each .map-stage: how much
+     of a map corner our own overlays already occupy, so Leaflet's controls, the legend
+     and the toast can be offset off them instead of landing on top. 0 = corner is free.
+     Never a hard-coded per-page pixel offset. */
+  --map-tl-h:0px;
+  --map-tr-h:0px;
+  --map-tr-w:0px;
+
+  /* ---- z-index scale — the ONLY z values in the app ----
+     Leaflet owns its own range and we cannot renumber it: panes 200–700,
+     .leaflet-control 800, the corner containers 1000. Anything of ours that must paint
+     ABOVE a Leaflet control therefore has to start at 1100 — that, not caprice, is why
+     the map layer sits numerically so far from the page layer. */
+  --z-behind:-1;         /* decoration that must paint behind its own siblings */
+  --z-content:1;
+  --z-sticky-head:5;     /* sticky table headers inside their own scroller */
+  --z-marker-hover:20;   /* a hovered map marker lifts above its neighbours (inside
+                            Leaflet's markerPane, so it is local to that pane) */
+  --z-page-bar:10;       /* in-flow page action / status bars */
+  --z-nav-tip:60;        /* nav-rail hover tooltips */
+  --z-map-overlay:1100;  /* legend, status banner, wind, map view controls */
+  --z-map-toast:1200;    /* map-local toast — above every other map overlay */
+  --z-modal:2000;        /* confirmation dialogs */
+  --z-tour:3000;         /* guided tour, deliberately above a dialog */
+}
+
+/* ═══════════════ desktop bands ═══════════════
+   Three deliberate WIDTH bands (compact laptop ≤1450 · standard 1451–1919 · large
+   ≥1920, which is the :root default above) and three HEIGHT bands. Height matters more
+   than width here: the frozen 13-item nav rail must fit between the ribbon and the
+   bottom of the viewport, and a 768px laptop screen leaves roughly 600 CSS px once the
+   browser chrome and the taskbar are gone. No CSS transform / zoom is used — the
+   components genuinely resize. */
+
+/* Compact laptop — narrower side panels and tighter padding; the width that frees up
+   goes to the map / mission workspace, never to chrome. */
+@media (max-width:1450px) {
+  :root {
+    --rail-w:64px; --nav-size:48px; --nav-icon:24px; --ribbon-h:44px;
+    --card-min:250px;
+  }
+}
+
+/* Short viewport (typical 900px-class laptop, or any window with browser chrome). */
+@media (max-height:900px) {
+  :root { --rail-w:64px; --nav-size:46px; --nav-icon:23px; --nav-gap:3px; --ribbon-h:44px; }
+}
+/* 768px-class laptop screen. 13 × 40 + gaps + separator ≈ 580px, which fits the ~590px
+   left under a 40px ribbon. The rail also scrolls, as the safety valve beyond this. */
+@media (max-height:800px) {
+  :root { --rail-w:58px; --nav-size:40px; --nav-icon:20px; --nav-gap:2px; --ribbon-h:40px; --fs-xxl:20px; }
+}
+/* Extreme: a short window or 110%+ browser zoom on a 768px screen. Still a usable
+   desktop target; below this the rail scrolls rather than shrinking further, because
+   navigation must stay clickable. */
+@media (max-height:680px) {
+  :root { --rail-w:52px; --nav-size:36px; --nav-icon:18px; }
 }

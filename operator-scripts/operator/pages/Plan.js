@@ -25,8 +25,10 @@ import * as P from "../lib/planning.js";
 import * as FP from "../lib/fleet-plan.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
 import { hasPendingOfType } from "../lib/command.js";
+import { missionLockState, lockMessage } from "../lib/mission-lock.js";
 import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
 import { getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
+import { attachMapLayout } from "../lib/map-layout.js";
 import { pickInitialView, getSavedViewport, setSavedViewport, isValidLatLng, isNullIsland,
          TOFTASJON, DEFAULT_ZOOM, VIEW_RANK } from "../lib/map-view.js";
 
@@ -108,6 +110,7 @@ export function Plan(root) {
        <div class="dock-foot">${infoIcon}<span>Planning is operator-owned. The vehicle receives a finalized, validated mission through the existing verified upload path — nothing here starts a mission.</span></div>
      </div>
      <div class="map-wrap">
+       <div class="map-stage" id="plan-map-stage">
        <div id="plan-map"></div>
        <div class="ov plan-banner" id="plan-banner"></div>
        <div class="ov legend plan-legend" id="plan-legend">
@@ -129,6 +132,7 @@ export function Plan(root) {
          <button id="pl-center-usv" title="Centre the map on the selected USV's position">Center on USV</button>
          <button id="pl-center-op" title="Centre the map on your device location (asks permission)">Center on me</button>
        </div>
+       </div>
        <div class="plan-actionbar" id="plan-actions"></div>
      </div>
      <aside class="inspector plan-inspector" id="plan-inspector"></aside>`;
@@ -148,8 +152,27 @@ export function Plan(root) {
 
   const init0 = pickInitialView({ saved: getSavedViewport(), fallback: TOFTASJON });
   viewRank = init0.rank;
-  const map = L.map("plan-map", { zoomControl: true, attributionControl: false }).setView(init0.center, init0.zoom);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20 }).addTo(map);
+  // Zoom moves TOP-RIGHT, beneath the Center-on view controls (theme.css offsets it by
+  // the measured --map-tr-h). It used to sit top-left directly on top of the plan status
+  // banner, which is where the drawing instructions and every generation/validation error
+  // are printed — the two controls fought for the same 30x38 px on every viewport.
+  // trackResize:false — lib/map-layout.js is the SINGLE owner of resize for every map in
+  // the station. Leaflet's built-in window listener also calls invalidateSize, but with
+  // debounceMoveend, which parks a 200 ms timer that fires `moveend` on a map the router
+  // may already have removed (crash: "_leaflet_pos of undefined" in the moveend handler
+  // below). One owner, no dangling timer.
+  const map = L.map("plan-map", { zoomControl: false, attributionControl: true, trackResize: false })
+    .setView(init0.center, init0.zoom);
+  L.control.zoom({ position: "topright" }).addTo(map);
+  L.control.scale({ position: "bottomright", imperial: false }).addTo(map);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20, attribution: "© OpenStreetMap" }).addTo(map);
+  // Shared resize + corner-measurement contract (lib/map-layout.js). The banner is a
+  // top-left overlay, so the legend's max-height is derived from it and the two can never
+  // collide however long a validation message grows.
+  const detachMapLayout = attachMapLayout(map, document.getElementById("plan-map-stage"), {
+    topLeft: [document.getElementById("plan-banner")],
+    topRight: [document.getElementById("plan-viewctl")],
+  });
 
   // Interaction tracking + viewport persistence. The initial setView above ran BEFORE these
   // handlers were attached, so it does not count as interaction or persist a fallback view.
@@ -157,7 +180,9 @@ export function Plan(root) {
   map.on("moveend", () => {
     const wasProgrammatic = programmaticMove;
     programmaticMove = false;
-    if (!wasProgrammatic) { const c = map.getCenter(); setSavedViewport([c.lat, c.lng], map.getZoom()); }
+    // _mapPane is gone once the map has been removed; a late event must not persist a
+    // viewport (or throw) on a torn-down map.
+    if (!wasProgrammatic && map._mapPane) { const c = map.getCenter(); setSavedViewport([c.lat, c.lng], map.getZoom()); }
   });
 
   // Explicit stacking panes (task PART 3). The order guarantees the no-go RED fill/outline
@@ -819,10 +844,16 @@ export function Plan(root) {
     if (!fp) return `<div class="plan-empty">No fleet plan generated yet.</div>`;
     const s = fp.allocation_summary || {};
     const vrows = (fp.vehicles || []).map((vp) => {
-      const m = vp.metrics; const up = (fleetModel.upload.vehicles[String(vp.vehicle_id)] || {}).status || "—";
+      const u = fleetModel.upload.vehicles[String(vp.vehicle_id)] || {};
+      const m = vp.metrics; const up = u.status || "—";
       const iso = isolateVehicle && String(isolateVehicle) === String(vp.vehicle_id);
+      // Each vehicle owns its own result AND its own failure reason. One vehicle's long
+      // backend error is confined to that vehicle's card (it wraps, and the list scrolls),
+      // so it can never overflow the panel or hide the other vehicles' statuses.
+      const err = u.error ? `<div class="fp-err" title="${esc(String(u.error))}">${esc(String(u.error))}</div>` : "";
       return `<div class="fleet-sumcard ${iso ? "iso" : ""}" data-iso="${vp.vehicle_id}" style="border-left:3px solid ${vp.colour}">
-        <div class="fc-h"><span class="fc-sw" style="background:${vp.colour}"></span><b>${esc(vp.vehicle_name)}</b><span class="fc-id">${esc(String(vp.vehicle_id))}</span><span class="fp-up ${up.toLowerCase()}">${up}</span></div>
+        <div class="fc-h"><span class="fc-sw" style="background:${vp.colour}"></span><b title="${esc(vp.vehicle_name)}">${esc(vp.vehicle_name)}</b><span class="fc-id">${esc(String(vp.vehicle_id))}</span><span class="fp-up ${up.toLowerCase()}">${up}</span></div>
+        ${err}
         <div class="fleet-metgrid">
           <span>Lines</span><span>${m.assigned_survey_line_count}</span>
           <span>Waypoints</span><span>${m.waypoint_count}</span>
@@ -846,7 +877,7 @@ export function Plan(root) {
     const iso = `<div class="plan-btnrow"><button class="plan-tool ${isolateVehicle ? "" : "on"}" id="fleet-showall">Show all</button></div>`;
     const html = `<div class="fleet-legend">${(fp.vehicles || []).map((vp) => `<span class="fleet-leg" data-iso="${vp.vehicle_id}"><span class="fc-sw" style="background:${vp.colour}"></span>${esc(vp.vehicle_name)}</span>`).join("")}</div>
       ${iso}
-      ${vrows}
+      <div class="fleet-sumlist">${vrows}</div>
       <div class="plan-sumgrid">${frows.map(([k, val]) => `<div class="plan-srow"><span class="k">${k}</span><span class="v">${val}</span></div>`).join("")}</div>`;
     setTimeout(() => {
       document.querySelectorAll("[data-iso]").forEach((el) => el.onclick = () => { isolateVehicle = el.dataset.iso; renderAll(); });
@@ -1066,13 +1097,34 @@ export function Plan(root) {
 
   // Operator-side upload eligibility (armed + confirmed-LOITER policy). Early feedback only —
   // Scout remains the safety authority and performs the final stationary/groundspeed check.
+  /** The page-local optimistic lock, bounded by lib/mission-lock.js. Also RELEASES a dead
+   *  lock: a finalize that never produced a command, or a tracked command the backend has
+   *  no record of, must not block uploads for the rest of the session. */
+  function missionLock() {
+    const v = selectedVehicle();
+    const lock = missionLockState({
+      phase: model.upload.phase, cmdId: model.upload.cmdId, startedAt: model.upload.at,
+      commands: cmds, missionUpload: (v && v.mission_upload) || null,
+    });
+    if (lock.release) {
+      model = { ...model, upload: { ...model.upload, ...lock.release } };
+      // Re-derive rather than recurse: the released model is no longer "uploading".
+      return { locked: false, state: lock.state, label: null, release: null };
+    }
+    return lock;
+  }
+
   function uploadGate() {
     const v = selectedVehicle();
     const t = (v && v.telemetry) || {};
     const connected = v ? commState(v) === "connected" : false;
     const groundspeed = v && v.speed != null ? v.speed : (t.groundspeed != null ? t.groundspeed : null);
-    const missionPending = model.upload.phase === "uploading"
-      || hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR");
+    // Two independent sources of "a mission write is running":
+    //   • the page's own bounded optimistic lock (this session pressed Upload), and
+    //   • the BACKEND queue, which is authoritative and expires stale commands at its TTL.
+    // The backend one also covers a second browser tab or a reload mid-upload.
+    const lock = missionLock();
+    const backendPending = hasPendingOfType(cmds, "MISSION_UPLOAD") || hasPendingOfType(cmds, "MISSION_CLEAR");
     return uploadEligibility({
       connected,
       armed: t.armed == null ? null : t.armed,
@@ -1081,7 +1133,9 @@ export function Plan(root) {
       groundspeed,
       hasAuthority: hasControl(),
       authorityRequired: true,
-      missionPending,
+      missionPending: lock.locked || backendPending,
+      // Say what it is actually waiting for, rather than the generic "another operation".
+      missionPendingReason: lockMessage(lock),
     });
   }
   function trackedUpload() { return model.upload.cmdId ? (cmds.find((c) => c.id === model.upload.cmdId) || null) : null; }
@@ -1107,7 +1161,20 @@ export function Plan(root) {
     renderAll();
     // Finalize: store the immutable original mission record (revision 0) AND create the
     // unchanged, read-back-verified MISSION_UPLOAD command in one call.
-    const res = await api.finalizeMission(payload);
+    // The try/catch is load-bearing: api.finalizeMission returns { ok:false } for an HTTP
+    // error, but `fetch` itself REJECTS when the request never completes (backend restart,
+    // connection reset, tab offline). Without this, doUpload threw, `upload.phase` stayed
+    // "uploading" with no command id, and the operator was locked out of uploading for the
+    // rest of the session with no way back except a page reload.
+    let res;
+    try {
+      res = await api.finalizeMission(payload);
+    } catch (e) {
+      model = { ...model, upload: { ...model.upload, phase: "error", cmdId: null,
+        error: "The upload request did not reach the operator backend — nothing was sent to the vehicle. The plan is preserved; check the backend link and try again." } };
+      renderAll();
+      return;
+    }
     if (res.ok && res.data && res.data.command) {
       const rec = res.data.mission || {};
       model = { ...model, upload: { ...model.upload, cmdId: res.data.command.id, missionId: rec.mission_id, revision: rec.mission_revision != null ? rec.mission_revision : 0 } };
@@ -1119,7 +1186,15 @@ export function Plan(root) {
     loadCommands(model.vehicleId); renderAll();
   }
   function syncUploadFromCommands() {
-    if (model.upload.phase !== "uploading" || !model.upload.cmdId) return;
+    if (model.upload.phase !== "uploading") return;
+    // Evaluate the bounded lock on EVERY command poll, not only when a tracked record shows
+    // up. This is the tick that ends a dead lock (submit that never produced a command; a
+    // command the backend has no record of) — previously both paths simply returned here
+    // and the lock lived until the page was reloaded.
+    const before = model.upload.phase;
+    missionLock();
+    if (model.upload.phase !== before) { renderAll(); return; }
+    if (!model.upload.cmdId) return;
     const cmd = trackedUpload();
     if (!cmd) return;
     const v = fleet.find((x) => x.id === model.vehicleId);
@@ -1141,10 +1216,13 @@ export function Plan(root) {
   function renderUploadStatus() {
     const u = model.upload;
     if (u.phase === "uploading") {
-      const cmd = trackedUpload();
-      const v = fleet.find((x) => x.id === model.vehicleId);
-      const stg = cmd ? missionUploadStage(cmd, (v && v.mission_upload) || null) : null;
-      return `<span class="pl-upl">${stg ? stg.stage : "Queued"}…</span>`;
+      // Name the stage the operator is actually waiting on (Submitting / Requested /
+      // Executing), not a generic "Queued" that never changes.
+      const lock = missionLockState({
+        phase: u.phase, cmdId: u.cmdId, startedAt: u.at, commands: cmds,
+        missionUpload: (selectedVehicle() || {}).mission_upload || null,
+      });
+      return `<span class="pl-upl">${esc(lock.label || "Queued")}…</span>`;
     }
     if (u.phase === "error") return `<span class="pl-upl bad">Upload failed — ${esc(u.error || "not verified")}. Plan preserved.</span>`;
     if (u.phase === "uploaded" && u.result) {
@@ -1332,14 +1410,15 @@ export function Plan(root) {
   window.addEventListener("beforeunload", beforeUnload);
 
   renderAll();
-  // Leaflet needs a size recalc once the grid has laid out.
-  setTimeout(() => map.invalidateSize(), 60);
+  // (no setTimeout size recalc any more — attachMapLayout's ResizeObserver fires as soon
+  // as the grid gives the stage a real box, and keeps firing for every later change)
 
   return function cleanup() {
     stopFleet(); clearInterval(cmdTimer); clearInterval(authTimer); clearInterval(clockId);
     clearTimeout(geoTimer);
     window.removeEventListener("beforeunload", beforeUnload);
     if (toastTimer) clearTimeout(toastTimer);
+    detachMapLayout();
     map.remove();
   };
 }
