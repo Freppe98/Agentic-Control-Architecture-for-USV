@@ -284,7 +284,84 @@ verified, their content is not yet built.)
 
 ---
 
-## 6. Remaining limitations
+## 6. Regression: the map covered the whole shell (fixed same day)
+
+Reported from the real station at `10.0.0.23:8210/app/`: the ribbon, rail, dock and
+inspector were gone and Leaflet filled the entire browser content area.
+
+### Root cause — two parts
+
+**a) The latent defect.** Converting `.map-wrap` from `position:relative` to
+`display:grid` dropped its positioning. `#map { position:absolute; inset:0 }` resolves
+against its nearest *positioned* ancestor, so the map's containment depended entirely on
+`.map-stage` being present in the DOM. With no positioned ancestor at all, the containing
+block falls through to the **initial containing block — the viewport**. Measured:
+
+| markup | `#map` offsetParent | `#map` rect @1920×1080 |
+|---|---|---|
+| with `.map-stage` | `.map-stage` | 1258×1032 at (318, 48) |
+| without `.map-stage` | `BODY` → viewport | **1920×1080 at (0, 0)** |
+
+**b) The trigger.** The browser was running a **cached older `pages/Map.js`** (which emits
+no `.map-stage`) against the **new `theme.css`**. Confirmed from the report screenshot: the
+Leaflet zoom control sits at the map's *top-left*, which only the pre-change Map.js
+produces — the new one places it top-right. The server was serving correct new files
+throughout; `FastAPI StaticFiles` sends `etag` + `last-modified` but **no `Cache-Control`**,
+so the browser fell back to heuristic freshness and reused some modules of an unhashed,
+unbundled module graph without revalidating. There is no service worker.
+
+### Fix
+
+1. `.map-wrap` keeps `position:relative` **as well as** `display:grid`. A grid container may
+   be positioned, nothing is absolutely positioned against it, and it makes escaping the map
+   cell impossible whatever markup is inside. This is the whole structural change — the
+   responsive architecture is unaltered.
+2. `main.py`: `RevalidatingStaticFiles` sends `Cache-Control: no-cache, must-revalidate` on
+   `/app`. `no-cache` means "never reuse without asking", not "do not store" — the etag
+   still yields a cheap 304 (verified). This stops a single deploy being served as a mix of
+   module versions, which is the real hazard for a no-build ES-module app.
+
+### Why the audit passed a broken page
+
+A map rendered at 1920×1080 over the shell is, trivially, *inside* the viewport. Overflow
+and clipping sweeps are blind to it by construction. Only **relative geometry between shell
+regions** can see it, so that is what is now asserted:
+
+- `scripts/check_shell_layout.mjs` (`npm run check:shell`) — runtime, against a live
+  backend. For Map and Plan at 1366×768 and 1920×1080 it captures every direct child of
+  `.app` (class, grid-row/column, position, z-index, rect) and asserts: each region present
+  and visible; `#map`'s `offsetParent` is `.map-stage`; the map does not fill the viewport;
+  `map.top ≥ ribbon.bottom`, `map.left ≥ dock.right`, `map.right ≤ inspector.left`,
+  `rail.right ≤ dock.left`; **no region overlaps any other**; nothing is `position:fixed`
+  or spanning `1 / -1` except the ribbon. **186/186 pass.**
+- `tests/layout-shell.test.mjs` gains four static guards (in `npm test`, no browser
+  needed): `.map-wrap`/`.map-stage` must stay positioned; no shell region may be fixed or
+  span the full grid; no *second* rule may re-declare a region's placement (source order
+  would silently decide the layout); Map.js and Plan.js must emit `#map`/`#plan-map` inside
+  `.map-stage` inside `.map-wrap` with the bottom bar outside the stage; and each page's
+  root class must still match a declared `.app` `grid-template-columns` rule.
+
+Both guards were verified **non-vacuous** by reverting the fix: the runtime checker fails
+with `map does NOT fill the viewport — 1920x1080 vs viewport 1920x1080`, `offsetParent =
+BODY` and four region-overlap failures (exit 1); the static test fails with `.map-wrap must
+stay positioned as the containment backstop`.
+
+### Results after the fix
+
+- `npm run check:shell` — **186/186**, Map + Plan at 1366×768 and 1920×1080, no page errors.
+- `npm test` — **433 pass / 0 fail**. `python -m unittest discover -s tests` — **540, OK**.
+- Cache headers verified: `Cache-Control: no-cache, must-revalidate` on
+  `index.html`, `app.js`, `pages/Map.js`, `styles/theme.css`; `If-None-Match` still 304s.
+- Screenshots (live backend, real fleet):
+  `img/shell-{map,plan}-{1366x768,1920x1080}.png`.
+
+> **Operator note:** a hard refresh (Ctrl+F5) is needed **once** to clear the mixed-version
+> cache already in the browser. From then on the `no-cache` header makes normal reloads
+> sufficient.
+
+---
+
+## 7. Remaining limitations
 
 - **Video and Messages** are still migration stubs. The shell is verified at every viewport;
   their page-specific layout cannot be audited until the pages exist. Video in particular

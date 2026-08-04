@@ -4583,6 +4583,29 @@ def index():
     return RedirectResponse(url="/app/", status_code=307)
 
 
+class RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that forces the browser to revalidate every asset.
+
+    The operator station is a no-build ES-module app: index.html references app.js, which
+    imports pages/*.js, components/*.js and lib/*.js by plain relative path, and there is
+    no bundler and therefore no content hash anywhere in a URL. Plain StaticFiles sends
+    only `etag` + `last-modified` and NO `Cache-Control`, so a browser falls back to
+    heuristic freshness (roughly 10% of the file's age) and may serve some modules from
+    cache without revalidating while fetching others.
+
+    That mixes versions of a single deploy, and mixed versions are not a cosmetic problem
+    here: an older cached Map.js against a newer theme.css rendered the Leaflet map over
+    the entire application shell. `no-cache` does not mean "do not store" — the copy is
+    still cached and the etag still yields a cheap 304 — it means "never reuse without
+    asking", which is exactly the guarantee an unhashed module graph needs.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
+        return response
+
+
 # Operator station (design-system frontend) — the only supported dashboard.
 # The classic static/ frontend has been retired; "/" redirects here.
-app.mount("/app", StaticFiles(directory=BASE_DIR / "operator", html=True), name="operator")
+app.mount("/app", RevalidatingStaticFiles(directory=BASE_DIR / "operator", html=True), name="operator")

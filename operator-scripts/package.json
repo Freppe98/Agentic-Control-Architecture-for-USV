@@ -4,6 +4,8 @@
   "type": "module",
   "description": "USV operator station frontend (vanilla ES modules) + FastAPI backend. type:module lets Node run the ES-module unit tests and --check the browser modules.",
   "scripts": {
-    "test": "node --test \"tests/**/*.test.mjs\""
-  }
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "check:shell": "node scripts/check_shell_layout.mjs"
+  },
+  "//check:shell": "Runtime shell-geometry assertions against a RUNNING backend (default http://127.0.0.1:8210): every shell region owns its own grid cell and the map never covers the ribbon/rail/dock/inspector. Viewport-overflow tests cannot catch a full-screen map, so this checks relative rectangles instead. Needs Playwright, which is deliberately not a dependency of the station: npm install --no-save playwright && npx playwright install chromium."
 }

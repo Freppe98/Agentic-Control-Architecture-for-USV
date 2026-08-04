@@ -271,7 +271,18 @@ a { color:inherit; }
    Plan action bar outside the viewport. Giving them a real row means the map's bottom
    edge is genuinely the bottom of the map — no reserved offsets, no overlap. A hidden
    bar collapses the row to 0 and the stage simply gets the height back. */
-.map-wrap { grid-row:2; grid-column:3; display:grid; grid-template-rows:minmax(0,1fr) auto; min-width:0; min-height:0; overflow:hidden; background:#0C141C; }
+/* position:relative on BOTH the wrapper and the stage, and it is not decoration.
+   `#map { position:absolute; inset:0 }` resolves against its nearest POSITIONED ancestor.
+   .map-stage normally provides that — but when this rule set converted .map-wrap from
+   `position:relative` to `display:grid` and dropped the positioning, the only thing
+   keeping the map inside its grid cell was .map-stage existing in the DOM. If it does not
+   (a browser running a cached older page module against this stylesheet), the containing
+   block falls all the way through to the initial containing block and the map renders at
+   1920x1080 over the entire shell — ribbon, rail, dock and inspector included.
+   Keeping .map-wrap positioned costs nothing (a grid container may be positioned, and
+   nothing is absolutely positioned against it) and makes escaping the map cell
+   impossible, whatever markup is inside. */
+.map-wrap { grid-row:2; grid-column:3; position:relative; display:grid; grid-template-rows:minmax(0,1fr) auto; min-width:0; min-height:0; overflow:hidden; background:#0C141C; }
 .map-stage { position:relative; min-width:0; min-height:0; overflow:hidden; }
 #map, #plan-map { position:absolute; inset:0; width:100%; height:100%; }
 .leaflet-container { background:#0C141C; }

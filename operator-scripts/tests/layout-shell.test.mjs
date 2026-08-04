@@ -15,6 +15,8 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(join(here, "..", "operator", "styles", "theme.css"), "utf8");
 const vars = readFileSync(join(here, "..", "operator", "styles", "variables.css"), "utf8");
+const mapPage = readFileSync(join(here, "..", "operator", "pages", "Map.js"), "utf8");
+const planPage = readFileSync(join(here, "..", "operator", "pages", "Plan.js"), "utf8");
 
 /** Comment-stripped { selector, body } pairs. Rules inside @media get their own entry;
  *  nothing here nests deeper than one level, so a flat scan is enough. */
@@ -71,6 +73,73 @@ test("the map column gives its bottom bar a real row instead of overlaying the m
     const bar = rule(sel);
     assert.match(bar, /grid-row:\s*2/, `${sel} must occupy the map column's second row`);
     assert.doesNotMatch(bar, /position:\s*absolute/, `${sel} must not be absolutely positioned over the map`);
+  }
+});
+
+test("an absolutely positioned map can never escape its grid cell", () => {
+  // REGRESSION. `#map { position:absolute; inset:0 }` resolves against its nearest
+  // POSITIONED ancestor. When .map-wrap was converted from position:relative to
+  // display:grid and lost its positioning, the only thing holding the map inside its grid
+  // cell was .map-stage being present in the DOM — and a browser serving one cached older
+  // page module against this stylesheet made the map 1920x1080 over the whole shell:
+  // ribbon, rail, dock and inspector all buried. Both levels must stay positioned.
+  assert.match(rule(".map-wrap"), /position:\s*relative/,
+    ".map-wrap must stay positioned as the containment backstop");
+  assert.match(rule(".map-stage"), /position:\s*relative/);
+  assert.match(rule("#map, #plan-map"), /position:\s*absolute/);
+  assert.match(rule("#map, #plan-map"), /inset:\s*0/);
+  // and nothing may lift a shell region out of the grid or over it
+  for (const sel of [".map-wrap", ".map-stage", ".ribbon", ".rail", ".dock", ".inspector",
+                     ".page", ".content-main"]) {
+    assert.doesNotMatch(rule(sel), /position:\s*fixed/, `${sel} must not be position:fixed`);
+  }
+  // only the ribbon may span the full grid width
+  for (const sel of [".map-wrap", ".rail", ".dock", ".inspector", ".page", ".content-main"]) {
+    assert.doesNotMatch(rule(sel), /grid-column:\s*1\s*\/\s*-1/, `${sel} must not span every column`);
+    assert.doesNotMatch(rule(sel), /grid-row:\s*1\s*\/\s*-1/, `${sel} must not span every row`);
+  }
+  assert.match(rule(".ribbon"), /grid-column:\s*1 \/ -1/, "the ribbon is the one region that spans the shell width");
+});
+
+test("no later rule re-declares the placement of a shell region", () => {
+  // A generic `.map-wrap { … }` appearing again further down theme.css would silently win
+  // over the placement above by source order. Placement properties may be declared exactly
+  // once per region (a page-scoped override like `.app.plan .map-wrap` is fine — it is a
+  // different, more specific selector, and is counted separately).
+  const PLACEMENT = /(^|;)\s*(grid-row|grid-column|position)\s*:/;
+  for (const sel of [".map-wrap", ".map-stage", ".rail", ".dock", ".inspector", ".page", ".content-main"]) {
+    const decls = RULES.filter((r) => r.sel === sel && PLACEMENT.test(r.body));
+    assert.equal(decls.length, 1, `${sel} declares placement in ${decls.length} separate rules — source order then decides the layout`);
+  }
+});
+
+test("Map and Plan emit the map inside .map-stage, inside .map-wrap", () => {
+  // The CSS backstop above makes a missing wrapper survivable; this keeps the markup
+  // itself correct, so the map fills the stage rather than the whole map column.
+  for (const [name, src, id] of [["Map", mapPage, "map"], ["Plan", planPage, "plan-map"]]) {
+    const wrap = src.match(/<div class="map-wrap">([\s\S]*?)<aside/);
+    assert.ok(wrap, `${name}.js must render a .map-wrap`);
+    const stage = wrap[1].match(/<div class="map-stage"[^>]*>([\s\S]*?)<\/div>\s*<div class="(?:plan-actionbar|mission-progress-bar)/);
+    assert.ok(stage, `${name}.js must wrap its map + overlays in .map-stage, with the bottom bar OUTSIDE it`);
+    assert.match(stage[1], new RegExp(`<div id="${id}"`), `${name}.js: #${id} must live inside .map-stage`);
+  }
+});
+
+test("the root class each map page sets still matches a declared grid", () => {
+  // .app.plan has no grid of its own — it inherits .app.has-dock. If Plan.js ever set a
+  // class combination with no matching grid-template-columns, every column would collapse.
+  const declared = RULES.filter((r) => /grid-template-columns/.test(r.body) && r.sel.startsWith(".app"))
+    .map((r) => r.sel.replace(/^\.app/, "").split(".").filter(Boolean));
+  const rootClass = (src, name) => {
+    const m = src.match(/root\.className\s*=\s*"([^"]+)"/);
+    assert.ok(m, `${name}.js must set root.className`);
+    return m[1].split(/\s+/);
+  };
+  for (const [name, src] of [["Map", mapPage], ["Plan", planPage]]) {
+    const classes = rootClass(src, name);
+    assert.ok(classes.includes("app"), `${name}.js root class must include "app"`);
+    const matched = declared.some((need) => need.every((c) => classes.includes(c)));
+    assert.ok(matched, `${name}.js root class "${classes.join(" ")}" matches no .app grid-template-columns rule`);
   }
 });
 
