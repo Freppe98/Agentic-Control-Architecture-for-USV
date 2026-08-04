@@ -88,7 +88,15 @@ api_js = OP_DIR / "operator" / "services" / "api.js"
 
 def _to_template(path):
     # `/api/commands/${id}` and `/api/comms/history/${id}` -> `/api/.../{p}`
-    return re.sub(r"\$\{[^}]+\}", "{p}", path)
+    #
+    # Two things are NOT part of a route path and must be cut before matching. A call whose
+    # QUERY STRING is built by a nested template literal — `/api/x/operations${id != null ?
+    # `?vehicle_id=${id}` : ""}` — is truncated mid-expression by the extraction regex above
+    # (it stops at the inner backtick), so strip an unterminated `${…}` tail first; then drop
+    # any query string. Both leave the real path, which is the only thing routing depends on.
+    path = re.sub(r"\$\{[^}]*$", "", path)
+    path = path.split("?", 1)[0]
+    return re.sub(r"\$\{[^}]+\}", "{p}", path).rstrip()
 
 
 def _route_matches(method, path):

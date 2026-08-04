@@ -55,10 +55,15 @@ function worstSev(...sevs) {
 // MANUAL / RTL; the mission + arming controls follow. HOLD and GUIDED are demoted to a
 // collapsed "Advanced modes" group — HOLD is a PASSIVE hold (kept for backend
 // compatibility) and must never read as LOITER's equal.
+// Mission START / PAUSE / RESUME are deliberately absent, and must not come back. Scout's Local
+// Agent owns the mission-execution lifecycle as complete verified transactions, and the station
+// exposes exactly ONE lifecycle action path: the Agent page's Mission lifecycle card
+// (/agent/mission_execution/*). The legacy queued MISSION_PAUSE / MISSION_RESUME were a second,
+// competing pause/resume that records no mission sequence and verifies no continuation. What
+// remains below are genuine manual supervisory mode commands — never the implementation of Start.
 const PRIMARY_CMDS = [
   ["SET_MODE_AUTO", "AUTO"], ["SET_MODE_MANUAL", "MANUAL"],
   ["SET_MODE_LOITER", "LOITER"], ["RTL", "RTL"],
-  ["MISSION_PAUSE", "PAUSE MISSION"], ["MISSION_RESUME", "RESUME MISSION"],
   ["ARM", "ARM"], ["DISARM", "DISARM"],
 ];
 const ADVANCED_CMDS = [["SET_MODE_HOLD", "HOLD"], ["SET_MODE_GUIDED", "GUIDED"]];
@@ -421,6 +426,7 @@ export function Vehicle(root) {
         </div>
         <div class="ctl-cmds${hasControl ? "" : " locked"}">${primaryBtns}</div>
         ${hasControl ? "" : `<div class="ctl-lock-note">${lockSvg}<span>Commands are locked. Take Control (Scout-confirmed) to enable them.</span></div>`}
+        <div class="ctl-advanced-note">These are manual supervisory mode commands. Mission <b>Start</b>, <b>Pause</b> and <b>Resume</b> are Scout-owned transactions and live on the <b>Agent</b> page's Mission lifecycle card — Start there holds position, sets and verifies Home, synchronizes the planning package and starts AUTO as one verified operation.</div>
         <details class="ctl-advanced">
           <summary>Advanced modes</summary>
           <div class="ctl-cmds${hasControl ? "" : " locked"}">${advancedBtns}</div>

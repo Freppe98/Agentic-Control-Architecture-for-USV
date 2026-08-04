@@ -407,6 +407,58 @@ export function getReplanOperations(id) {
   return getJSON(`/api/replan/operations${id != null ? `?vehicle_id=${id}` : ""}`);
 }
 
+// --- Mission-execution lifecycle (Scout Local Agent /agent/mission_execution/*, port 8090) ----
+// Scout owns the WHOLE lifecycle. Start is ONE Scout-side transaction — verified LOITER → set
+// Home to the current launch position → verify Home → synchronize the planning package →
+// verified AUTO → progression confirmation → RUNNING. The station therefore has NO
+// browser-driven LOITER → Set Home → AUTO sequence for Start, and none of these calls go
+// through the command queue (api.createCommand) or the Pixhawk readback route.
+//
+// Outcomes carry the same three-state model as replanning, plus one the lifecycle needs:
+//   200 + body error / accepted:false → FAILED   — Scout processed it; the VEHICLE op failed
+//   409                               → rejected — precondition / lifecycle / replanning /
+//                                                  write-arbitration conflict
+//   202                               → unknown  — reconcile with a read; NEVER resend
+//   503                               → unavailable ·  200 + supported:false → older Scout
+// lib/mission-execution.js interpretOperation() derives this; do not read `ok` as success.
+
+/** Scout's canonical mission-execution status for a vehicle (state, effective_state, can_*,
+ *  verified Home, sequence, replanning overlay, return completion). Read-only — an older Scout
+ *  answers supported:false and nothing (READY, can_start, completion) is ever fabricated. */
+export function getMissionExecutionStatus(id) {
+  return getReplan(`/api/vehicles/${id}/mission-execution/status`);
+}
+
+/** Start the mission — one Scout transaction. body: { mission_id? } (defaults server-side to the
+ *  vehicle's active original mission so Scout can fail closed on MISSION_ID_MISMATCH). */
+export function startMissionExecution(id, body = {}) {
+  return postJSON(`/api/vehicles/${id}/mission-execution/start`, body);
+}
+
+/** Pause the mission (record sequence → verified LOITER → confirm mission loaded → PAUSED).
+ *  NOT a stop/cancel: no mission is cleared, replaced or reset. Idempotent while PAUSED. */
+export function pauseMissionExecution(id) {
+  return postJSON(`/api/vehicles/${id}/mission-execution/pause`, {});
+}
+
+/** Resume the mission (verify mission loaded → verify Home/position → verified AUTO → observe
+ *  sequence). Watch sequence.continuation_verified: RUNNING with `false` is a WARNING. */
+export function resumeMissionExecution(id) {
+  return postJSON(`/api/vehicles/${id}/mission-execution/resume`, {});
+}
+
+/** Rearm Scout's mission-execution controller from a terminal state. Issues NO vehicle command,
+ *  changes NO mode, clears NO Pixhawk mission and re-uploads NO mission — controller state only. */
+export function rearmMissionExecution(id) {
+  return postJSON(`/api/vehicles/${id}/mission-execution/rearm`, {});
+}
+
+/** The mission-execution write trace (start/pause/resume/rearm) with each unknown's
+ *  reconciliation verdict, newest last. Optionally filtered to one vehicle. */
+export function getMissionExecutionOperations(id) {
+  return getJSON(`/api/mission-execution/operations${id != null ? `?vehicle_id=${id}` : ""}`);
+}
+
 /** Small polling helper so pages don't each reinvent setInterval + error handling.
  *  `key` is optional — pass one (e.g. "fleet") to make this feed's health readable
  *  via getFeedHealth() for an operator-facing freshness indicator.

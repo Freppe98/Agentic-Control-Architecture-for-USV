@@ -40,7 +40,15 @@ const MAP_MODES = [
 ];
 const MAP_SAFETY = [["ARM", "ARM"], ["DISARM", "DISARM"]];
 const MAP_VEHICLE = [...MAP_MODES, ...MAP_SAFETY];
-const MAP_MISSION = [["MISSION_PAUSE", "PAUSE MISSION"], ["MISSION_RESUME", "RESUME MISSION"]];
+// Mission START / PAUSE / RESUME are NOT here, and must not come back. Scout's Local Agent owns
+// the mission-execution lifecycle as complete transactions (verified LOITER → set + verify Home →
+// synchronize the planning package → verified AUTO → RUNNING, and the mirrored pause/resume), and
+// the station has exactly ONE lifecycle action path: the Agent page's Mission lifecycle card
+// (/agent/mission_execution/*). The legacy queued MISSION_PAUSE / MISSION_RESUME commands were a
+// SECOND, competing pause/resume that neither records the mission sequence nor verifies
+// continuation, so a click here could contradict Scout's own controller. The mode buttons above
+// stay: they are explicit manual supervisory commands, never the implementation of Start.
+const MAP_MISSION = [];
 const MAP_VEHICLE_TYPES = new Set(MAP_VEHICLE.map(([t]) => t));
 const MAP_MISSION_TYPES = new Set(MAP_MISSION.map(([t]) => t));
 const HIGH_RISK = new Set(["ARM", "DISARM", "RTL", "SET_MODE_AUTO"]);
@@ -1242,14 +1250,18 @@ export function Map(root) {
     return cmdBtns(MAP_VEHICLE, gateCtx) + lockNote(gateCtx.hasControl, av, stale) + cmdStatus(MAP_VEHICLE_TYPES);
   }
 
-  // Agent/supervisory commands ONLY — pause/resume the mission the local agent runs —
-  // plus the agent's current and immediately-previous status (no long history here;
-  // the Agent page owns the full reasoning view). Current status is approximated from
-  // mission_state (LIVE while connected, LAST KNOWN when stale); the previous status
-  // needs an onboard decision log the agent does not emit yet → honest gap. "Last
-  // command" here is scoped to MISSION-type commands only, mirroring vehicleCommands.
+  // Agent/supervisory panel: the agent's current and immediately-previous status (no long
+  // history here; the Agent page owns the full reasoning view). Current status is approximated
+  // from mission_state (LIVE while connected, LAST KNOWN when stale); the previous status needs
+  // an onboard decision log the agent does not emit yet → honest gap.
+  //
+  // There are deliberately NO mission lifecycle buttons on this page. Start / Pause / Resume are
+  // Scout-owned transactions on the Local Agent, and the station exposes them in exactly one
+  // place — the Agent page's Mission lifecycle card — so two paths can never disagree about
+  // whether the mission is running.
   function agentCommands(gateCtx, av, stale, v) {
-    return cmdBtns(MAP_MISSION, gateCtx) + lockNote(gateCtx.hasControl, av, stale) + agentStatusBlock(v) + cmdStatus(MAP_MISSION_TYPES);
+    return `<div class="ctl-lock-note">${lockSvg}<span>Mission <b>Start</b>, <b>Pause</b> and <b>Resume</b> live on the <b>Agent</b> page's Mission lifecycle card — Scout runs each as one verified transaction (hold, set and verify Home, synchronize the package, AUTO). They are not queued commands.</span></div>`
+      + agentStatusBlock(v) + cmdStatus(MAP_MISSION_TYPES);
   }
 
   function agentStatusBlock(v) {

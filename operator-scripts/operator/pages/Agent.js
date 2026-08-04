@@ -24,6 +24,7 @@ import { AVAIL, availSlot, availTag } from "../lib/availability.js";
 import { createAuthorityController } from "../lib/authority.js";
 import { canonicalVehicleId } from "../lib/selection.js";
 import * as replan from "../lib/replan.js";
+import * as mx from "../lib/mission-execution.js";
 
 const clockSvg =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
@@ -60,6 +61,18 @@ function num(v, { max = null } = {}) {
   return n;
 }
 const pill = (label, tint) => `<span class="pill ${tint}">${label}</span>`;
+// Mission-execution outcome → pill tint. `failed` (an HTTP 200 whose body carried Scout's error)
+// and `unknown` are deliberately distinct: one is a definite vehicle-level failure, the other is
+// an undecided outcome awaiting reconciliation — never the same colour, never the same word.
+const MX_TINT = { accepted: "c", failed: "d", rejected: "d", unknown: "p", unavailable: "u", unsupported: "u", pending: "p" };
+const escAttr = (s) => String(s).replace(/"/g, "&quot;");
+/** A lat/lng pair from Scout rendered as a fixed-precision coordinate, or an honest dash. */
+function coord(p) {
+  if (!p || typeof p !== "object") return `<span class="txt-u">—</span>`;
+  const lat = Number(p.latitude ?? p.lat), lng = Number(p.longitude ?? p.lng ?? p.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return `<span class="txt-u">—</span>`;
+  return `<span class="mono">${lat.toFixed(6)}, ${lng.toFixed(6)}</span>`;
+}
 
 export function Agent(root) {
   let fleet = [], selId = null, events = [];
@@ -69,6 +82,13 @@ export function Agent(root) {
   // Scout except explicit operator writes; `replanMsg` holds the last write's outcome pill.
   let replanStatus = null, replanReadiness = null, replanConfig = null, replanExperiment = null;
   let replanMsg = null, replanBusy = false, replanForVid = null;
+
+  // Mission-execution lifecycle state, per SELECTED vehicle only. `mxStatus` is Scout's canonical
+  // status (the ONLY thing the primary button is derived from — never the last click, never the
+  // previous label); `mxResult` is the last operation's interpreted outcome; `mxOps` is the
+  // backend's write trace. All tagged with `mxForVid` so a fetch that lands after the operator
+  // switched vehicles is discarded rather than rendered on the wrong Scout.
+  let mxStatus = null, mxOps = [], mxResult = null, mxBusy = false, mxForVid = null;
 
   const authCtl = createAuthorityController(() => renderDetail());
   function loadAuthority(id) {
@@ -101,6 +121,44 @@ export function Agent(root) {
       replanForVid = forId;
       renderDetail();
     });
+  }
+
+  // Poll Scout's mission-execution lifecycle for the SELECTED vehicle. READS ONLY — a poll never
+  // starts, pauses, resumes or rearms anything, so reconnect/poll can never re-issue a lifecycle
+  // operation. Tagged with the vehicle it was fetched for and discarded if the selection moved.
+  function loadMissionExecution(id) {
+    if (id == null) { mxStatus = null; mxOps = []; return; }
+    const forId = id;
+    Promise.allSettled([
+      api.getMissionExecutionStatus(id), api.getMissionExecutionOperations(id),
+    ]).then(([st, ops]) => {
+      if (forId !== selId) return;                 // selection moved — discard stale fetch
+      mxStatus = st.status === "fulfilled" ? st.value : null;
+      const list = ops.status === "fulfilled" ? ops.value : null;
+      mxOps = list && Array.isArray(list.operations) ? list.operations : [];
+      mxForVid = forId;
+      renderDetail();
+    });
+  }
+
+  // ONE explicit lifecycle write, then reconcile by re-reading Scout's status. The button label
+  // is NOT changed optimistically: it stays whatever Scout's last authoritative status derives,
+  // merely disabled while the write is in flight. A 200 carrying Scout's error is a FAILURE and
+  // is shown as one; an unknown (202) is shown as unknown with the backend's reconciliation
+  // verdict, and is never retried automatically.
+  function mxWrite(label, fn) {
+    if (mxBusy || selId == null) return;
+    const id = selId;
+    mxBusy = true;
+    mxResult = { label, view: { outcome: "pending" } };
+    renderDetail();
+    Promise.resolve(fn(id)).then((r) => {
+      if (id !== selId) return;                    // isolation: never show on another vehicle
+      mxResult = { label, view: mx.interpretOperation(r), at: new Date().toISOString() };
+    }).catch((e) => {
+      if (id !== selId) return;
+      mxResult = { label, view: { outcome: mx.OUTCOME.UNAVAILABLE, message: String(e) } };
+    }).finally(() => { mxBusy = false; loadMissionExecution(id); });
   }
 
   // One explicit supervisory WRITE, then reconcile with a fresh read. `busy` disables the
@@ -265,10 +323,194 @@ export function Agent(root) {
       ${banner}
       <div class="subgrid two">${situationCard}${decisionCard}</div>
       <div class="subgrid two">${watchCard}${policyCard}</div>
+      ${missionExecutionSection(v)}
       ${replanSection(v, { connected, stale })}
       <div class="subgrid two">${transitionsCard}${inputsCard}</div>
       ${timelineCard}`;
+    wireMissionExecution();
     wireReplan();
+  }
+
+  // ================= Mission execution lifecycle (Scout /agent/mission_execution/*) =========
+  // The station's ONE authoritative lifecycle control. Scout owns the whole transaction — the
+  // operator never issues a separate LOITER / Set Home / AUTO sequence to implement Start, and
+  // never runs a second FSM. Everything below is derived by lib/mission-execution.js from Scout's
+  // canonical status; the button follows STATUS, not the last click.
+  function missionExecutionSection(v) {
+    // Isolation guard: only render lifecycle state actually fetched for THIS vehicle.
+    const forThis = mxForVid != null && v && mxForVid === v.id;
+    const raw = forThis ? mxStatus : null;
+    const S = mx.normalizeStatus(raw);
+    const ops = forThis ? mxOps : [];
+    const res = forThis ? mxResult : null;
+
+    const head = `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Mission execution (Scout Local Agent)</span>
+        <span class="tag">Scout owns the whole transaction — start, pause, resume, replanning handoff, return and final hold. The operator issues no separate LOITER, Set Home or AUTO for Start.</span>
+        ${res ? `<span style="margin-left:8px">${rp(res.label + ": " + (res.view.outcome === "pending" ? "sending…" : mx.outcomeLabel(res.view.outcome)), MX_TINT[res.view.outcome] || "u")}</span>` : ""}
+      </div>`;
+
+    if (!S.supported) {
+      return head + gapBody("Mission lifecycle not supported by this Scout version. No state, readiness, Home verification, continuation or completion is shown, because this Scout reports none.");
+    }
+    if (!S.present) {
+      return head + gapBody("Scout mission-execution status is unavailable — the Local Agent did not answer. Nothing about the lifecycle can be shown; no action is offered.");
+    }
+    return head +
+      `<div class="subgrid two">${mxControlCard(S, res, ops)}${mxHomeCard(S, ops)}</div>
+       <div class="subgrid two">${mxSequenceCard(S)}${mxReturnCard(S)}</div>
+       ${mxOperationsCard(ops)}`;
+  }
+
+  // --- Primary control: header + the single lifecycle action, derived from status only -------
+  function mxControlCard(S, res, ops) {
+    const act = mx.primaryAction(S);
+    const rearm = mx.rearmAvailability(S);
+    const lastCode = (ops.slice(-1)[0] || {}).scout_error_code || null;
+    const blockers = mx.startBlockers(S, { lastErrorCode: lastCode });
+    const complete = mx.isComplete(S);
+
+    // Disabled while a write is in flight — but the LABEL never changes optimistically.
+    const btnEnabled = act.enabled && !mxBusy;
+    const effectiveDiffers = S.effectiveState && S.effectiveState !== S.state;
+    const stateCond = S.replanning.active ? rp("REPLANNING", "p")
+      : complete ? rp("COMPLETE", "c")
+      : S.transitional || S.activeOperationId ? rp("IN PROGRESS", "p")
+      : rp(String(S.state || "—"), S.state === "RUNNING" ? "c" : S.state === "FAILED" || S.state === "SUSPENDED" ? "d" : "u");
+
+    return card("Mission lifecycle", stateCond,
+      S.state === "FAILED" || S.state === "SUSPENDED" ? "caution" : S.replanning.active ? "caution" : complete ? "ok" : S.state === "RUNNING" ? "ok" : "idle",
+      `<div class="metrics">
+         ${row("State", `<b>${val(S.state)}</b> — ${mx.stateLabel(S.state)}${S.unknownState ? " " + rp("UNRECOGNIZED STATE", "p") : ""}`)}
+         ${row("Effective state", effectiveDiffers
+            ? `<b>${val(S.effectiveState)}</b>${S.replanning.active ? " " + rp("replanning controller owns the vehicle", "p") : ""}`
+            : `<span class="txt-u">same as state</span>`)}
+         ${row("Vehicle mode", val(S.mode))}
+         ${row("Authority", S.authority ? `<span class="txt-${S.authority === "LOCAL_AGENT" ? "c" : "p"}">${S.authority}</span>` : `<span class="txt-u">—</span>`)}
+         ${row("Mission id", `<span class="mono">${val(S.missionId)}</span>`)}
+         ${row("Active route hash", `<span class="mono">${shortHash(S.activeRouteHash)}</span>`)}
+         ${row("Original route hash", `<span class="mono">${shortHash(S.originalRouteHash)}</span>`)}
+         ${row("Active operation id", S.activeOperationId ? `<span class="mono">${S.activeOperationId}</span>` : `<span class="txt-u">none</span>`)}
+         ${row("Mission execution enabled", S.missionExecutionEnabled === false ? rp("DISABLED", "d") : S.missionExecutionEnabled === true ? rp("ENABLED", "c") : rp("not reported", "u"))}
+       </div>
+       <div style="padding:10px 13px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+         <button class="btn" id="mx-primary" data-action="${act.action || ""}" ${btnEnabled ? "" : "disabled"} title="${escAttr(act.reason || "")}">${act.label}</button>
+         ${rearm.available ? `<button class="btn ghost" id="mx-rearm" ${rearm.enabled && !mxBusy ? "" : "disabled"} title="Resets the Local Agent mission-execution state only — no vehicle command, no mode change, no Pixhawk mission cleared, no mission re-uploaded">Rearm Mission Controller</button>` : ""}
+         ${mxBusy ? `<span class="cond">sending — waiting for Scout's authoritative result…</span>` : act.reason ? `<span class="cond">${act.reason}</span>` : ""}
+       </div>
+       ${res && res.view.outcome !== "pending" ? `<div class="reason-note">${res.view.outcome === "accepted" ? gapSvg : warnSvg}<span><b>${res.label}</b>: ${mx.operationSummary(res.view)}</span></div>` : ""}
+       ${!act.enabled && act.action === null && blockers.length ? `<div class="reason-note">${warnSvg}<span>Start unavailable: ${blockers.join(" · ")}</span></div>` : ""}
+       ${rearm.available ? `<div class="reason-note">${gapSvg}<span>Rearm resets the Local Agent mission-execution controller. It does <b>not</b> clear the Pixhawk mission, switch vehicle mode or re-upload the original mission — it prepares the controller for another explicitly prepared run.</span></div>` : ""}
+       <div class="reason-note">${gapSvg}<span>${mx.START_HOME_NOTE}</span></div>`, false);
+  }
+
+  // --- Home: what Start does to it, and what Scout verified ---------------------------------
+  function mxHomeCard(S, ops) {
+    // The requested launch Home comes from the most recent operation that carried a home_result;
+    // it is Scout's report of what it asked for, never an operator-side Home decision.
+    const lastHome = ops.slice().reverse().map((o) => o.home_result).find((h) => h && typeof h === "object") || null;
+    const req = lastHome && lastHome.requested_position;
+    const ver = (lastHome && lastHome.home_position) || S.home.verified;
+    const dist = S.home.verificationDistanceM != null ? S.home.verificationDistanceM
+      : (lastHome && typeof lastHome.verification_distance_m === "number" ? lastHome.verification_distance_m : null);
+    const verified = lastHome ? lastHome.verified : (S.home.verified ? true : null);
+    const rp2 = S.returnCompletion;
+    return card("Home (set and verified by Scout)",
+      verified === true ? rp("VERIFIED", "c") : verified === false ? rp("NOT VERIFIED", "d") : rp("not reported", "u"),
+      verified === true ? "ok" : verified === false ? "caution" : "idle",
+      `<div class="metrics">
+         ${row("Requested launch Home", coord(req))}
+         ${row("Verified Home", coord(ver))}
+         ${row("Verification distance", dist == null ? `<span class="txt-u">—</span>` : dist.toFixed(2) + " m")}
+         ${row("Home verification", verified === true ? rp("VERIFIED BY SCOUT", "c") : verified === false ? rp("NOT VERIFIED", "d") : rp("not reported", "u"))}
+         ${row("Package Home synchronized", lastHome && lastHome.package_synchronized != null ? (lastHome.package_synchronized ? rp("SYNCHRONIZED", "c") : rp("NOT SYNCHRONIZED", "d")) : rp("not reported", "u"))}
+         ${row("Distance to Home (return)", rp2.distanceToHomeM == null ? `<span class="txt-u">—</span>` : rp2.distanceToHomeM.toFixed(1) + " m")}
+         ${row("Home error", lastHome && lastHome.error ? `<span class="txt-d">${lastHome.error}</span>` : `<span class="txt-u">—</span>`)}
+       </div>
+       <div class="reason-note">${warnSvg}<span><b>Start Mission resets Home to the vehicle's current launch position.</b> Scout sets it, reads it back, verifies it and synchronizes the planning package to it. The Home in the original plan is not retained.</span></div>`, false);
+  }
+
+  // --- Pause/resume sequence evidence, including the continuation warning --------------------
+  function mxSequenceCard(S) {
+    const q = S.sequence, cont = mx.continuationView(S);
+    const contPill = cont.state === "verified" ? rp("CONTINUATION VERIFIED", "c")
+      : cont.state === "not_verified" ? rp("CONTINUATION NOT VERIFIED", "d")
+      : rp("not tested", "u");
+    return card("Pause / resume sequence evidence", contPill,
+      cont.state === "not_verified" ? "caution" : cont.state === "verified" ? "ok" : "idle",
+      `<div class="metrics">
+         ${row("Current / count", q.current == null && q.count == null ? `<span class="txt-u">—</span>` : `${q.current == null ? "?" : q.current} / ${q.count == null ? "?" : q.count}`)}
+         ${row("Before pause", val(q.beforePause))}
+         ${row("At resume", val(q.atResume))}
+         ${row("First after resume", val(q.firstAfterResume))}
+         ${row("Continuation verified", q.continuationVerified === true ? rp("TRUE", "c") : q.continuationVerified === false ? rp("FALSE", "d") : rp("not reported", "u"))}
+         ${row("Started / paused / resumed", `<span class="mono">${fmtTime(S.timestamps.start)} · ${fmtTime(S.timestamps.pause)} · ${fmtTime(S.timestamps.resume)}</span>`)}
+       </div>
+       ${cont.state === "not_verified"
+          ? `<div class="reason-note" style="border-left:3px solid var(--disconnected)">${warnSvg}<span><b>AUTO resumed, but continuation from the paused waypoint was not verified.</b> Check whether the Pixhawk restarted the mission at waypoint 0. The mode transition succeeded — continuation did not.</span></div>`
+          : `<div class="reason-note">${gapSvg}<span>${cont.message}</span></div>`}`, false);
+  }
+
+  // --- Replanning handoff + return completion ------------------------------------------------
+  function mxReturnCard(S) {
+    const prog = mx.returnProgress(S);
+    const rc = S.returnCompletion;
+    const complete = mx.isComplete(S);
+    const pct = prog ? Math.round(prog.fraction * 100) : 0;
+    const cond = complete ? rp("COMPLETED_HOLD · FINAL LOITER VERIFIED", "c")
+      : S.state === "RETURNING_HOME" || S.state === "HOME_ARRIVAL_PENDING" || S.state === "FINAL_HOLD_REQUESTED"
+        ? rp(String(S.state), "p")
+        : S.replanning.active ? rp("REPLANNING", "p") : rp("idle", "u");
+    return card("Replanning handoff & return completion", cond,
+      complete ? "ok" : S.replanning.active || S.state === "RETURNING_HOME" ? "caution" : "idle",
+      `<div class="metrics">
+         ${row("Mission execution", `<b>${val(S.effectiveState || S.state)}</b>`)}
+         ${row("Replanning FSM", S.replanning.fsmState ? `<b>${S.replanning.fsmState}</b>` : `<span class="txt-u">—</span>`)}
+         ${row("Distance to Home", rc.distanceToHomeM == null ? `<span class="txt-u">—</span>` : rc.distanceToHomeM.toFixed(1) + " m")}
+         ${row("Arrival radius", rc.arrivalRadiusM == null ? `<span class="txt-u">—</span>` : rc.arrivalRadiusM + " m")}
+         ${row("Arrival persistence", prog ? `${prog.done} / ${prog.total} s` : `<span class="txt-u">—</span>`)}
+         ${row("Arrival confirmed", rc.arrivalConfirmed === true ? rp("CONFIRMED", "c") : rc.arrivalConfirmed === false ? rp("NOT CONFIRMED", "u") : rp("not reported", "u"))}
+         ${row("Final LOITER verified", rc.finalLoiterVerified === true ? rp("VERIFIED", "c") : rc.finalLoiterVerified === false ? rp("NOT VERIFIED", "d") : rp("not reported", "u"))}
+         ${row("Mission complete", complete ? rp("COMPLETE", "c") : rp("NOT COMPLETE", "u"))}
+       </div>
+       ${prog ? `<div style="padding:2px 13px 10px"><div style="height:6px;border-radius:3px;background:var(--line);overflow:hidden"><div style="height:100%;width:${pct}%;background:${complete ? "var(--connected)" : "var(--partitioned)"}"></div></div><div class="cond" style="margin-top:4px">arrival persistence ${prog.done} / ${prog.total} s (${pct}%)</div></div>` : ""}
+       ${S.replanning.active
+          ? `<div class="reason-note">${warnSvg}<span>The replanning controller owns the vehicle. Mission execution issues no competing mode command, and Start / Pause / Resume stay disabled until Scout hands control back.</span></div>`
+          : ""}
+       <div class="reason-note">${gapSvg}<span>The mission is complete only when Scout reports <b>COMPLETED_HOLD</b> <i>and</i> <b>final_loiter_verified = true</b>. Reaching Home, or the persistence bar filling, is not completion. Replanning ending in SAFE_HOLD / SUSPENDED / FAILED / FALLBACK_RTL leaves mission execution SUSPENDED — the original mission is not resumed automatically.</span></div>`, false);
+  }
+
+  // --- Lifecycle write trace (operation results, not poll-derived guesses) --------------------
+  function mxOperationsCard(ops) {
+    if (!ops.length) return card("Mission lifecycle operations", "", "idle",
+      `<div style="padding:10px 13px"><span class="cond">No start / pause / resume / rearm has been issued for this vehicle in this session.</span></div>`, true);
+    return card("Mission lifecycle operations", `${ops.length}`, "idle",
+      `<div class="rlist" style="padding:8px 13px">
+         ${ops.slice(-12).reverse().map((o) => `<div class="ritem">
+            <span class="cond mono">${fmtTime(o.requested_at)}</span>
+            <span class="rtx"><b>${String(o.operation || "").toUpperCase()}</b> ${rp(mx.outcomeLabel(o.outcome), MX_TINT[o.outcome] || "u")}${o.resulting_state ? " → " + o.resulting_state : ""}${o.verified_mode ? " · mode " + o.verified_mode : ""}${o.scout_error_code ? ` · <span class="txt-d">${o.scout_error_code}</span>` : ""}${o.continuation_verified === false ? " · " + rp("CONTINUATION NOT VERIFIED", "d") : ""}${o.reconciliation ? ` · reconciled: ${o.reconciliation.resolved}` : ""}</span>
+            <span class="rav mono">${o.operation_id || ""}</span>
+          </div>`).join("")}
+       </div>`, true);
+  }
+
+  function wireMissionExecution() {
+    const primary = document.getElementById("mx-primary");
+    if (primary) primary.onclick = () => {
+      const action = primary.dataset.action;
+      if (action === "start") {
+        if (!window.confirm("Start Mission?\n\nScout will hold position, set the CURRENT launch position as Home, verify it, synchronize the planning package and then start AUTO. The originally planned Home is not retained.")) return;
+        mxWrite("Start Mission", (id) => api.startMissionExecution(id, {}));
+      } else if (action === "pause") {
+        mxWrite("Pause Mission", (id) => api.pauseMissionExecution(id));
+      } else if (action === "resume") {
+        mxWrite("Resume Mission", (id) => api.resumeMissionExecution(id));
+      }
+    };
+    const rearmBtn = document.getElementById("mx-rearm");
+    if (rearmBtn) rearmBtn.onclick = () => {
+      if (!window.confirm("Rearm the mission controller?\n\nThis resets the Local Agent's mission-execution state only. It does NOT clear the Pixhawk mission, does NOT change vehicle mode and does NOT re-upload the original mission.")) return;
+      mxWrite("Rearm controller", (id) => api.rearmMissionExecution(id));
+    };
   }
 
   // ================= Replanning supervisory view (Scout Local Agent /agent/replan/*) =======
@@ -667,11 +909,15 @@ export function Agent(root) {
     if (id === selId) return;
     selId = id;
     authCtl.reset();
-    // Isolation: clear the previous vehicle's replan panels immediately, then load this one's.
+    // Isolation: clear the previous vehicle's replan + mission-execution panels immediately (so
+    // no stale lifecycle state, operation result or completion claim can be read as this
+    // vehicle's), then load this one's.
     replanStatus = replanReadiness = replanConfig = replanExperiment = null;
     replanMsg = null; replanForVid = null;
+    mxStatus = null; mxOps = []; mxResult = null; mxForVid = null;
     loadAuthority(id);
     loadReplan(id);
+    loadMissionExecution(id);
   }
 
   function onFleet(data) {
@@ -680,6 +926,7 @@ export function Agent(root) {
       selId = (fleet.find((v) => v.online) || fleet.find((v) => v.lat != null) || fleet[0]).id;
       loadAuthority(selId);
       loadReplan(selId);
+      loadMissionExecution(selId);
     }
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
     document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { select(canonicalVehicleId(el.dataset.id)); onFleet(fleet); }));
@@ -694,11 +941,17 @@ export function Agent(root) {
   // never a write — so this poll can never resend a supervisory operation. Skipped while a
   // write is in flight so a reconciling read does not race the write's own follow-up read.
   const replanId = setInterval(() => { if (!replanBusy) loadReplan(selId); }, 2500);
+  // Mission-execution status poll for the SELECTED vehicle. Reads only — it can never start,
+  // pause, resume or rearm anything, so a reconnect or a backgrounded tab cannot re-issue a
+  // lifecycle operation. Skipped while a write is in flight so the reconciling read that follows
+  // the write is the one that decides the button, and paced faster than the replan poll because
+  // Start/Pause/Resume move through several transitional states.
+  const mxId = setInterval(() => { if (!mxBusy) loadMissionExecution(selId); }, 2000);
   loadEvents();
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(eventsId); clearInterval(replanId); authCtl.dispose(); };
+  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(eventsId); clearInterval(replanId); clearInterval(mxId); authCtl.dispose(); };
 }
 
 function titleCase(s) {

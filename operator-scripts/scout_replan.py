@@ -30,6 +30,13 @@ an error, and never a fabricated safe default for a missing safety field.
 
 ONE MOCKING SURFACE: this module does its own HTTP through the module-level `requests`, so a
 test swaps `scout_replan.requests` (mirroring how the existing suite swaps `main.requests`).
+
+SHARED TRANSPORT: `read()` and `write()` below are the Local Agent (port 8090) transport for
+the WHOLE station, not only for replanning — `scout_mission_execution.py` calls them for
+Scout's mission-execution lifecycle routes. They take a `subsystem` label purely so an error
+string names the right API ("replanning" / "mission-execution"); the outcome model, the
+timeouts and the mocking surface stay singular, so the two subsystems can never drift apart
+on what "unknown" means.
 """
 from __future__ import annotations
 
@@ -95,7 +102,7 @@ def _base_result(operation, base):
     }
 
 
-def _read(operation, base, path):
+def read(operation, base, path, *, subsystem="replanning"):
     """A GET proxy. A transport failure is `unavailable` (reachable:false) — never fabricated
     state. A 404 is `unsupported` (older Scout). A 2xx carries Scout's body verbatim."""
     out = _base_result(operation, base)
@@ -104,14 +111,14 @@ def _read(operation, base, path):
         resp = requests.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     except requests.RequestException as exc:
         out.update(reachable=False, outcome=OUTCOME_UNAVAILABLE,
-                   error=f"Scout replanning API unreachable: {exc}")
+                   error=f"Scout {subsystem} API unreachable: {exc}")
         return out
     out["http_status"] = resp.status_code
     body = _parse_body(resp)
     out["scout"] = body
     if resp.status_code == 404:
         out.update(supported=False, outcome=OUTCOME_UNSUPPORTED,
-                   error="Scout does not implement this replanning route")
+                   error=f"Scout does not implement this {subsystem} route")
         return out
     if 200 <= resp.status_code < 300:
         out.update(ok=True, outcome=OUTCOME_ACCEPTED)
@@ -121,7 +128,8 @@ def _read(operation, base, path):
     return out
 
 
-def _write(operation, base, path, method, json_body=None):
+def write(operation, base, path, method, json_body=None, *, subsystem="replanning",
+          conflict_error="Scout refused: a replanning transaction is active"):
     """A PUT/PATCH/POST/DELETE proxy with the three-state outcome model. A transport failure
     (timeout / dropped connection) or an ambiguous 5xx is `unknown` — the write MAY have
     landed (Scout's stores are idempotent), so we never call it a failure; a later GET
@@ -143,16 +151,15 @@ def _write(operation, base, path, method, json_body=None):
     out["scout_error_code"] = _extract_error_code(body)
     if resp.status_code == 404:
         out.update(supported=False, outcome=OUTCOME_UNSUPPORTED,
-                   error="Scout does not implement this replanning route")
+                   error=f"Scout does not implement this {subsystem} route")
         return out
     if 200 <= resp.status_code < 300:
         out.update(ok=True, outcome=OUTCOME_ACCEPTED)
         return out
     if resp.status_code == 409:
-        # Deliberate concurrency refusal — a definite reject the UI must present as such
-        # ("a transaction is active"), never as a generic network failure.
-        out.update(outcome=OUTCOME_REJECTED, transaction_active=True,
-                   error="Scout refused: a replanning transaction is active")
+        # Deliberate refusal — a definite reject the UI must present as such (a precondition /
+        # lifecycle / arbitration conflict), never as a generic network failure.
+        out.update(outcome=OUTCOME_REJECTED, transaction_active=True, error=conflict_error)
         return out
     if 400 <= resp.status_code < 500:
         out.update(outcome=OUTCOME_REJECTED,
@@ -163,6 +170,10 @@ def _write(operation, base, path, method, json_body=None):
     out.update(outcome=OUTCOME_UNKNOWN,
                error=f"Scout server error (HTTP {resp.status_code}) — outcome unknown")
     return out
+
+
+# Historic private names, kept so the replanning call sites below read unchanged.
+_read, _write = read, write
 
 
 # ── Planning package (single-slot, idempotent PUT; idempotent DELETE) ─────────────────

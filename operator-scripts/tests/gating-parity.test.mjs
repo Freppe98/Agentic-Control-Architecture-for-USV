@@ -16,8 +16,10 @@ import assert from "node:assert/strict";
 import { commandGate, commandGateCtx } from "../operator/lib/home.js";
 import { createAuthorityController, handoffGate } from "../operator/lib/authority.js";
 
-// Commands rendered on the Vehicle page (PRIMARY_CMDS + ADVANCED_CMDS). Map renders the
-// same types across its mode/safety/mission rows. SET_HOME is Map-only (no Vehicle button).
+// Every command type BOTH pages resolve through the shared gate. MISSION_PAUSE/MISSION_RESUME
+// no longer have buttons on either page — the mission lifecycle is Scout-owned and lives on the
+// Agent page (see tests/mission-execution.test.mjs) — but they remain backend command types, so
+// the shared gate must still answer for them identically. SET_HOME is Map-only (no Vehicle button).
 const SHARED_CMDS = [
   "SET_MODE_AUTO", "SET_MODE_MANUAL", "SET_MODE_LOITER", "RTL",
   "MISSION_PAUSE", "MISSION_RESUME", "ARM", "DISARM",

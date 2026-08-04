@@ -17,6 +17,7 @@ import mission_contract
 import planning
 import fleet_planning
 import replan_package
+import scout_mission_execution
 import scout_replan
 import vehicle_registry
 
@@ -4310,13 +4311,16 @@ def _compute_replan_readiness(vid, base):
     }
 
 
-def _replan_target(vehicle_id):
-    """(vid, base) for a replanning route, or a JSONResponse to return directly.
+def _local_agent_target(vehicle_id, subsystem):
+    """(vid, base) for ANY Local Agent (port 8090) route, or a JSONResponse to return directly.
 
     Three honest cases, mirroring the Pixhawk/authority proxies:
       unknown vehicle id            → 404 (no such vehicle)
       known, no Local Agent route   → 200 supported:false (nothing to talk to here)
-      known, Local Agent configured → (vid, base) for the live proxy."""
+      known, Local Agent configured → (vid, base) for the live proxy.
+
+    The base URL comes from local_agent_base(), so a route ALWAYS targets the vehicle in the
+    path and one vehicle's Local Agent is never substituted for another's."""
     vid = parse_vehicle_id(vehicle_id)
     if vid not in known_vehicle_ids():
         return None, JSONResponse(status_code=404, content={
@@ -4326,8 +4330,12 @@ def _replan_target(vehicle_id):
         return None, JSONResponse(status_code=200, content={
             "ok": False, "supported": False, "reachable": False,
             "vehicle_id": vehicle_slug(vid), "outcome": "unsupported",
-            "error": "No Scout Local Agent replanning API configured for this vehicle"})
+            "error": f"No Scout Local Agent {subsystem} API configured for this vehicle"})
     return (vid, base), None
+
+
+def _replan_target(vehicle_id):
+    return _local_agent_target(vehicle_id, "replanning")
 
 
 def _replan_status_code(result):
@@ -4575,6 +4583,296 @@ def replan_operation_trace(vehicle_id: Optional[str] = None, limit: int = 200):
     if limit and limit > 0:
         items = items[-limit:]
     return {"ok": True, "operations": items, "count": len(replan_operations),
+            "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
+# ── Mission-execution lifecycle (Scout Local Agent /agent/mission_execution/*, port 8090) ──
+# Scout owns this lifecycle OUTRIGHT — Start is ONE Scout-side transaction (verified LOITER →
+# set Home to the launch position → verify Home → synchronize the planning package → verified
+# AUTO → progression confirmation → RUNNING), and Pause/Resume are likewise single transactions.
+# The Operator Station therefore recreates NO mission-execution FSM, issues NO separate LOITER /
+# SET_HOME / AUTO commands for Start, and routes NONE of this through the operator command queue
+# or the Flask (8080) Pixhawk surface. It forwards an explicit operator intent, preserves Scout's
+# body, records the write, and reconciles an operation whose HTTP verdict was lost.
+#
+# A write is NEVER auto-resent: an UNKNOWN outcome (timeout / ambiguous 5xx) is resolved by
+# READING canonical status (scout_mission_execution.reconcile) — resending a Start could re-run a
+# whole Home/AUTO transaction the vehicle already performed.
+MAX_MISSION_EXECUTION_OPERATIONS = 2000
+mission_execution_operations = []   # [ {seq, vehicle_id, operation, requested_at, outcome, ...} ]
+_mx_op_seq = 0
+
+# Per-vehicle observation memory, used ONLY to deduplicate lifecycle events sourced from status
+# POLLING. Keyed by canonical vehicle id, so one vehicle's lifecycle can never suppress or emit
+# another's. Reads never write to Scout — this is operator-side memory of what was already logged.
+_mx_observed = {}   # vid -> {history:set(), state:(state,effective), arrival:bool, final_loiter:bool}
+
+
+def _mx_memory(vid):
+    return _mx_observed.setdefault(vid, {
+        "history": set(), "state": None, "arrival": False, "final_loiter": False})
+
+
+def _mx_event(vid, *, severity, message, detail):
+    _append_event(severity=severity, etype="mission-execution", source="operator-backend",
+                  vehicle_id=vid, vehicle=name_of(vid), message=message, detail=detail)
+
+
+def _record_mission_execution_operation(vid, result, *, requested_at, mission_id=None,
+                                        reconciliation=None):
+    """Append ONE mission-execution write to the operation trace and the operator event log.
+
+    Records everything the task requires to audit a run without re-deriving it: vehicle id,
+    operation, requested timestamp, operational outcome (accepted / failed / rejected / unknown
+    / unavailable / unsupported), Scout's HTTP status, Scout's error code, Scout's operation id,
+    the mission id, the resulting lifecycle state, and the reconciliation verdict when the
+    outcome was unknown. Reads are NOT logged — only writes, which are the operations a
+    reconnect must never duplicate."""
+    global _mx_op_seq
+    _mx_op_seq += 1
+    seq = result.get("sequence") or {}
+    entry = {
+        "seq": _mx_op_seq,
+        "vehicle_id": vehicle_slug(vid),
+        "vehicle": name_of(vid),
+        "operation": (result.get("operation") or "").replace("mission_execution.", ""),
+        "requested_at": requested_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "outcome": result.get("operational_outcome"),
+        "transport_outcome": result.get("outcome"),
+        "http_status": result.get("http_status"),
+        "scout_error_code": result.get("scout_error_code"),
+        "scout_error_message": result.get("scout_error_message"),
+        "operation_id": result.get("operation_id"),
+        "mission_id": result.get("mission_id") or mission_id,
+        "route_hash": result.get("route_hash"),
+        "previous_state": result.get("previous_state"),
+        "resulting_state": result.get("current_state"),
+        "verified_mode": result.get("verified_mode"),
+        "final": result.get("final"),
+        "idempotent": result.get("idempotent"),
+        "home_result": result.get("home_result"),
+        "sequence": result.get("sequence"),
+        "continuation_verified": seq.get("continuation_verified"),
+        "supported": result.get("supported", True),
+        "unknown": result.get("operational_outcome") == scout_mission_execution.OUTCOME_UNKNOWN,
+        "reconciliation": reconciliation,
+    }
+    mission_execution_operations.append(entry)
+    if len(mission_execution_operations) > MAX_MISSION_EXECUTION_OPERATIONS:
+        del mission_execution_operations[
+            :len(mission_execution_operations) - MAX_MISSION_EXECUTION_OPERATIONS]
+
+    outcome = entry["outcome"]
+    sev = ("warning" if outcome in (scout_mission_execution.OUTCOME_UNKNOWN,
+                                    scout_mission_execution.OUTCOME_FAILED)
+           else "caution" if outcome == scout_mission_execution.OUTCOME_REJECTED else "info")
+    msg = f"Mission {entry['operation']} -> {outcome}"
+    if entry["scout_error_code"]:
+        msg += f" ({entry['scout_error_code']})"
+    elif entry["resulting_state"]:
+        msg += f" ({entry['resulting_state']})"
+    _mx_event(vid, severity=sev, message=msg, detail=entry)
+
+    # The continuation warning is its own event: Scout can report RUNNING and verified AUTO while
+    # continuation_verified is false, and that must never be rounded up to "resumed successfully".
+    if entry["operation"] == "resume" and seq.get("continuation_verified") is False:
+        _mx_event(vid, severity="warning", detail=entry,
+                  message="AUTO resumed, but waypoint continuation was NOT verified - the "
+                          "Pixhawk may have restarted the mission at waypoint 0")
+    return entry
+
+
+def _mx_ingest_status_events(vid, summary, body):
+    """Emit lifecycle events observed through status POLLING, deduplicated per vehicle.
+
+    Two sources, never both for the same fact: Scout's own transition `history` when it supplies
+    one (each entry logged once, by fingerprint), otherwise the operator's observation of a
+    CHANGED (state, effective_state) pair. Return-completion milestones (arrival confirmed, final
+    LOITER verified) are latched so a repeating poll cannot re-log them."""
+    if not summary.get("present"):
+        return
+    mem = _mx_memory(vid)
+
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    logged_history = False
+    for item in history[-50:]:
+        if not isinstance(item, dict):
+            continue
+        fp = json.dumps({k: item.get(k) for k in
+                         ("timestamp", "ts", "at", "from", "to", "state", "operation_id",
+                          "reason", "event")}, sort_keys=True, default=str)
+        if fp in mem["history"]:
+            continue
+        mem["history"].add(fp)
+        logged_history = True
+        frm = item.get("from") or item.get("from_state")
+        to = item.get("to") or item.get("to_state") or item.get("state")
+        reason = item.get("reason") or item.get("event")
+        # ASCII arrows only: these messages are also printed to the operator console, which on
+        # Windows is cp1252 and cannot encode "→".
+        _mx_event(vid, severity="info", detail={"source": "scout-history", **item},
+                  message=f"Mission execution {frm or '?'} -> {to or '?'}"
+                          + (f" ({reason})" if reason else ""))
+    if len(mem["history"]) > 500:
+        mem["history"] = set(list(mem["history"])[-500:])
+
+    observed = (summary.get("state"), summary.get("effective_state"))
+    if not logged_history and mem["state"] != observed:
+        if mem["state"] is not None:      # first observation is a baseline, not a transition
+            _mx_event(vid, severity="info",
+                      detail={"source": "operator-observed", "state": observed[0],
+                              "effective_state": observed[1], "mode": summary.get("mode"),
+                              "mission_id": summary.get("mission_id"),
+                              "active_operation_id": summary.get("active_operation_id")},
+                      message=f"Mission execution state {mem['state'][0] or '?'} -> "
+                              f"{observed[0] or '?'}"
+                              + (f" (effective {observed[1]})"
+                                 if observed[1] and observed[1] != observed[0] else ""))
+        mem["state"] = observed
+
+    rc = summary.get("return_completion") or {}
+    if rc.get("arrival_confirmed") is True and not mem["arrival"]:
+        mem["arrival"] = True
+        _mx_event(vid, severity="info", detail={"source": "return-completion", **rc},
+                  message="Home arrival confirmed by Scout")
+    if rc.get("final_loiter_verified") is True and not mem["final_loiter"]:
+        mem["final_loiter"] = True
+        _mx_event(vid, severity="info", detail={"source": "return-completion", **rc},
+                  message="Final LOITER verified - mission execution complete (COMPLETED_HOLD)")
+    # A rearm/new run clears the latches so the NEXT run can log its own milestones.
+    if summary.get("state") in ("READY", "NOT_READY"):
+        mem["arrival"] = mem["final_loiter"] = False
+
+
+def _mx_status_code(result):
+    """The honest HTTP status for a mission-execution outcome. Deliberately non-500 for every
+    handled case so the frontend poll never sees a console error for an unreachable/older Scout,
+    and deliberately 200 for a vehicle-level FAILURE — Scout processed the request, the vehicle
+    operation did not succeed, and the body (ok:false + Scout's error code) says exactly that."""
+    outcome = result.get("operational_outcome", result.get("outcome"))
+    if outcome == scout_mission_execution.OUTCOME_UNSUPPORTED:
+        return 200          # older Scout — a handled, honest "not supported", not an error
+    if outcome == scout_mission_execution.OUTCOME_UNAVAILABLE:
+        return 503          # a read that failed — honest "unavailable", never fabricated state
+    if outcome == scout_mission_execution.OUTCOME_UNKNOWN:
+        return 202          # accepted-but-unconfirmed: reconciled by a read, never resent
+    if outcome == scout_mission_execution.OUTCOME_REJECTED:
+        # Preserve Scout's own 409 (precondition / lifecycle / replanning / arbitration).
+        return 409 if result.get("http_status") == 409 else 400
+    return 200
+
+
+def _mx_response(vid, result):
+    result = dict(result)
+    result["vehicle_id"] = vehicle_slug(vid)
+    return JSONResponse(status_code=_mx_status_code(result), content=result)
+
+
+def _mission_execution_write(vehicle_id, operation, fn, *, mission_id=None):
+    """Shared body for the four write routes: resolve the SELECTED vehicle's Local Agent, issue
+    the operation, interpret Scout's body (a 200 carrying `error` is a FAILURE, not a success),
+    reconcile an UNKNOWN outcome with a status read, and record the write."""
+    target, err = _local_agent_target(vehicle_id, "mission-execution")
+    if err is not None:
+        return err
+    vid, base = target
+    requested_at = datetime.now(timezone.utc).isoformat()
+    result = scout_mission_execution.interpret_operation(fn(base))
+
+    reconciliation = None
+    if result.get("operational_outcome") == scout_mission_execution.OUTCOME_UNKNOWN:
+        # No verdict reached us. Read Scout's canonical status and resolve from ITS state —
+        # never a blind resend of a transaction that may already have run on the vehicle.
+        reconciliation = scout_mission_execution.reconcile(
+            base, operation, expected_mission_id=mission_id)
+        result["reconciliation"] = reconciliation
+    result["requested_mission_id"] = mission_id
+    _record_mission_execution_operation(vid, result, requested_at=requested_at,
+                                        mission_id=mission_id, reconciliation=reconciliation)
+    return _mx_response(vid, result)
+
+
+@app.get("/api/vehicles/{vehicle_id}/mission-execution/status")
+def mission_execution_status(vehicle_id: str):
+    """Scout's canonical mission-execution status, pulled live from the SELECTED vehicle's Local
+    Agent. Read-only. The response carries Scout's body verbatim under `scout` plus a derived
+    `summary` — every field of which is Scout's word or None. An older Scout that 404s the route
+    is supported:false; READY, can_start, verified Home, continuation and completion are NEVER
+    fabricated. Polling this route also feeds the deduplicated lifecycle event log."""
+    target, err = _local_agent_target(vehicle_id, "mission-execution")
+    if err is not None:
+        return err
+    vid, base = target
+    result = scout_mission_execution.get_status(base)
+    summary = scout_mission_execution.summarize_status(result)
+    body = result.get("scout") if isinstance(result.get("scout"), dict) else {}
+    _mx_ingest_status_events(vid, summary, body)
+    out = dict(result)
+    out["summary"] = summary
+    return _mx_response(vid, out)
+
+
+@app.post("/api/vehicles/{vehicle_id}/mission-execution/start")
+async def mission_execution_start(vehicle_id: str, request: Request):
+    """Start the mission — ONE Scout-side transaction. The Operator issues NO separate LOITER,
+    Set Home or AUTO command here; Scout performs and verifies each step and reports the result.
+
+    Body: { mission_id? } — defaults to this vehicle's active original mission so Scout can fail
+    closed with MISSION_ID_MISMATCH rather than starting a route the operator did not approve.
+    Start RESETS Home to the vehicle's current launch position (Scout sets and verifies it); the
+    originally planned Home is not retained."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    vid = parse_vehicle_id(vehicle_id)
+    mission_id = (body or {}).get("mission_id") or active_original_by_vehicle.get(vid)
+    return _mission_execution_write(
+        vehicle_id, "start",
+        lambda base: scout_mission_execution.post_start(base, mission_id),
+        mission_id=mission_id)
+
+
+@app.post("/api/vehicles/{vehicle_id}/mission-execution/pause")
+def mission_execution_pause(vehicle_id: str):
+    """Pause the mission: Scout records the mission sequence, commands a VERIFIED LOITER and
+    confirms the mission is still loaded. This is NOT a stop/cancel — it clears no mission,
+    uploads no replacement and resets no sequence. Repeating it while PAUSED is idempotent."""
+    return _mission_execution_write(vehicle_id, "pause", scout_mission_execution.post_pause)
+
+
+@app.post("/api/vehicles/{vehicle_id}/mission-execution/resume")
+def mission_execution_resume(vehicle_id: str):
+    """Resume the mission: Scout verifies the expected mission is still loaded, verifies Home and
+    position, commands a VERIFIED AUTO and observes the sequence. Scout can report RUNNING with
+    continuation_verified=false — the mode transition worked but continuation from the paused
+    waypoint could not be proven. That is preserved and surfaced as a warning, never as success."""
+    return _mission_execution_write(vehicle_id, "resume", scout_mission_execution.post_resume)
+
+
+@app.post("/api/vehicles/{vehicle_id}/mission-execution/rearm")
+def mission_execution_rearm(vehicle_id: str):
+    """Rearm the Local Agent's mission-execution controller from a terminal state (COMPLETED_HOLD
+    / SUSPENDED / FAILED). Issues NO vehicle command, does NOT change vehicle mode, does NOT clear
+    the Pixhawk mission and does NOT re-upload the original mission — it only prepares the
+    controller for another explicitly prepared run. This is not a vehicle reset."""
+    return _mission_execution_write(vehicle_id, "rearm", scout_mission_execution.post_rearm)
+
+
+@app.get("/api/mission-execution/operations")
+def mission_execution_operation_trace(vehicle_id: Optional[str] = None, limit: int = 200):
+    """The mission-execution write trace (start / pause / resume / rearm), newest last, optionally
+    filtered to one vehicle. This is the reconnect-safe record of accepted / failed / rejected /
+    unknown operations — including each unknown's reconciliation verdict — so the frontend renders
+    what actually happened instead of re-deriving it from polling."""
+    items = mission_execution_operations
+    if vehicle_id is not None:
+        vid = parse_vehicle_id(vehicle_id)
+        items = [o for o in items if o["vehicle_id"] == vehicle_slug(vid)]
+    if limit and limit > 0:
+        items = items[-limit:]
+    return {"ok": True, "operations": items, "count": len(mission_execution_operations),
             "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
