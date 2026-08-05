@@ -27,6 +27,13 @@ import planning  # noqa: E402
 import fleet_planning as F  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+# Finalizing a mission writes the DURABLE mission snapshot. Point it at a throwaway directory
+# for this whole module so a test run can never overwrite the station's real mission store.
+import pathlib  # noqa: E402
+import tempfile  # noqa: E402
+main.MISSION_STORE_DIR = pathlib.Path(tempfile.mkdtemp(prefix="operator-mission-store-"))
+main.MISSION_STORE_PATH = main.MISSION_STORE_DIR / "mission_store.json"
+
 requires_geometry = unittest.skipUnless(
     planning.PLANNING_AVAILABLE, "shapely/pyproj/numpy not installed")
 

@@ -185,6 +185,19 @@ def put_planning_package(base, package):
     return _write("planning_package.put", base, "/agent/replan/planning_package", "PUT", package)
 
 
+def post_planning_package(base, package):
+    """POST the replan-planning-package-v1 package to Scout's single package slot.
+
+    Same route, same single slot, same idempotency as the PUT above — Scout accepts both
+    verbs. The operator sync uses POST because that is the verb Scout's v1 receiving side
+    documents as the submission entry point; a Scout that has not been rebuilt with the v1
+    receiver 404s it, which surfaces as `unsupported` (an older Scout) rather than a
+    fabricated success. There is deliberately NO automatic fall back to the PUT verb: the
+    older PUT handler validates the OLD package shape, so retrying there would trade an
+    honest "not supported" for a confusing schema rejection."""
+    return _write("planning_package.post", base, "/agent/replan/planning_package", "POST", package)
+
+
 def delete_planning_package(base):
     return _write("planning_package.delete", base, "/agent/replan/planning_package", "DELETE")
 

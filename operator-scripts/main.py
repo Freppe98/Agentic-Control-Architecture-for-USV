@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import asyncio
 import json
 import math
+import os
 import time
 import uuid
 
@@ -24,6 +25,11 @@ import vehicle_registry
 
 @asynccontextmanager
 async def lifespan(app):
+    # Restore the durable mission store BEFORE serving: readiness, the planning-package sync
+    # and the mission-execution routes all read it, and an empty store must be an honest
+    # "no approved mission" rather than a race against startup. Fails closed (see
+    # _load_mission_store): a corrupt snapshot starts an EMPTY store, never a partial one.
+    print(f"[MISSION STORE] {_load_mission_store()}")
     # Background monitor: log comms-state transitions once per second.
     task = asyncio.create_task(_comms_monitor_loop())
     yield
@@ -2514,12 +2520,148 @@ def delete_draft(draft_id: str):
 # the substrate a Local Agent revision will later derive from; NONE of that replanning is
 # implemented here (see PART 6/7 of the task) — only the record and read-only APIs.
 #
-# In-memory, like the command queue / event log (resets on restart); durable storage is a
-# later item. The record's route_hash is the SAME canonical hash the upload command is
-# verified against (mission_contract.route_content_hash) — never a second identity.
-original_missions = {}            # {mission_id: record}
-mission_id_by_command = {}        # {upload_command_id: mission_id}
-active_original_by_vehicle = {}   # {vehicle_id: mission_id}  (latest finalized revision 0)
+# The record's route_hash is the SAME canonical hash the upload command is verified against
+# (mission_contract.route_content_hash) — never a second identity.
+#
+# These two stores are DURABLE (see the snapshot below): an approved, verified mission and
+# which mission is active per vehicle must survive an operator-station restart, because they
+# cannot be reconstructed — only a fresh plan → upload → verified read-back creates one, and
+# losing the record silently drops replanning readiness for a vehicle that is still flying
+# that route. `mission_id_by_command` deliberately stays in memory: it links a record to a
+# COMMAND, and the command queue does not survive a restart, so a persisted link would point
+# at nothing. After a restart the snapshot's recorded upload_status is the surviving truth.
+original_missions = {}            # {mission_id: record}   (durable)
+mission_id_by_command = {}        # {upload_command_id: mission_id}  (in-memory: see above)
+active_original_by_vehicle = {}   # {vehicle_id: mission_id}  (latest finalized revision 0; durable)
+
+# ── Durable mission store ─────────────────────────────────────────────────────────────
+# ONE atomic JSON snapshot of exactly the two stores above. Deliberately narrow: nothing
+# transient is persisted — no telemetry, no commands, no event log, no readiness/Pixhawk
+# read-back caches, no Scout package responses. Those are live evidence, and a restored copy
+# of live evidence would be a fabricated observation; they are re-read from the vehicle and
+# from Scout on the next poll.
+#
+# Writes are atomic (temp file + os.replace) so a crash mid-write can never leave a half
+# written snapshot behind, and the store FAILS CLOSED on load: a corrupt, unreadable or
+# incompatible file is logged and the station starts with an EMPTY mission store rather than
+# a partially-loaded one. Half a mission store is worse than none — it would present a
+# mission whose geometry may not be what the vehicle is carrying.
+MISSION_STORE_DIR = BASE_DIR / "runtime_data"
+MISSION_STORE_PATH = MISSION_STORE_DIR / "mission_store.json"
+MISSION_STORE_VERSION = 1
+
+
+def _mission_store_snapshot():
+    """The exact JSON-able payload written to disk."""
+    return {
+        "version": MISSION_STORE_VERSION,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "original_missions": original_missions,
+        # JSON object keys are strings; vehicle ids are ints, so they are stringified here
+        # and parsed back through parse_vehicle_id on load.
+        "active_original_by_vehicle": {str(k): v for k, v in active_original_by_vehicle.items()},
+    }
+
+
+def _save_mission_store():
+    """Persist the mission store atomically. Never raises: a station that cannot write its
+    snapshot must keep operating on its in-memory truth, loudly, rather than fail a mission
+    operation because of a disk problem."""
+    try:
+        MISSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = MISSION_STORE_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_mission_store_snapshot(), fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, MISSION_STORE_PATH)          # atomic on Windows and POSIX
+        return True
+    except Exception as exc:
+        print(f"[MISSION STORE] could not write {MISSION_STORE_PATH}: {exc} - "
+              "continuing with the in-memory store; this restart will lose it")
+        return False
+
+
+def _validate_mission_store(data):
+    """(missions, active) from a snapshot, or raise ValueError. Validates the WHOLE file
+    before anything is adopted, so a single bad record rejects the file instead of loading
+    the rest — partial mission state is exactly what must never be presented as approved."""
+    if not isinstance(data, dict):
+        raise ValueError("snapshot root is not an object")
+    version = data.get("version")
+    if version != MISSION_STORE_VERSION:
+        raise ValueError(f"unsupported snapshot version {version!r} "
+                         f"(this build reads {MISSION_STORE_VERSION})")
+    raw_missions = data.get("original_missions")
+    raw_active = data.get("active_original_by_vehicle")
+    if not isinstance(raw_missions, dict) or not isinstance(raw_active, dict):
+        raise ValueError("original_missions / active_original_by_vehicle are not objects")
+
+    missions = {}
+    for mid, rec in raw_missions.items():
+        if not isinstance(mid, str) or not mid:
+            raise ValueError(f"invalid mission id {mid!r}")
+        if not isinstance(rec, dict):
+            raise ValueError(f"record for {mid} is not an object")
+        if rec.get("mission_id") != mid:
+            raise ValueError(f"record for {mid} carries mission_id {rec.get('mission_id')!r}")
+        if parse_vehicle_id(rec.get("vehicle_id")) is None:
+            raise ValueError(f"record {mid} has unresolvable vehicle_id {rec.get('vehicle_id')!r}")
+        if not isinstance(rec.get("route_waypoints"), list) or not rec["route_waypoints"]:
+            raise ValueError(f"record {mid} has no route waypoints")
+        if not isinstance(rec.get("route_hash"), str) or not rec["route_hash"]:
+            raise ValueError(f"record {mid} has no route hash")
+        if rec.get("upload_status") not in MISSION_UPLOAD_STATUSES:
+            raise ValueError(f"record {mid} has upload_status {rec.get('upload_status')!r}")
+        # The record is immutable geometry: its stored hash must still be the canonical hash
+        # of its own waypoints. A record that fails this was altered on disk.
+        recomputed = mission_contract.route_content_hash(rec["route_waypoints"])
+        if recomputed != rec["route_hash"]:
+            raise ValueError(f"record {mid} route hash does not match its waypoints "
+                             f"(stored {rec['route_hash']}, recomputed {recomputed})")
+        rec = dict(rec)
+        rec["vehicle_id"] = parse_vehicle_id(rec.get("vehicle_id"))
+        missions[mid] = rec
+
+    active = {}
+    for raw_vid, mid in raw_active.items():
+        vid = parse_vehicle_id(raw_vid)
+        if vid is None:
+            raise ValueError(f"active mission is keyed by unresolvable vehicle {raw_vid!r}")
+        if mid not in missions:
+            raise ValueError(f"vehicle {raw_vid} points at unknown mission {mid!r}")
+        if missions[mid]["vehicle_id"] != vid:
+            raise ValueError(f"mission {mid} is active for {raw_vid} but belongs to "
+                             f"{missions[mid]['vehicle_id']}")
+        active[vid] = mid
+    return missions, active
+
+
+def _load_mission_store():
+    """Restore the mission store at startup. Returns a short status string for the log.
+
+    Fails CLOSED: any read/parse/validation problem leaves BOTH stores empty and is logged;
+    the snapshot file is left on disk untouched for inspection rather than being repaired or
+    partially adopted."""
+    original_missions.clear()
+    active_original_by_vehicle.clear()
+    if not MISSION_STORE_PATH.exists():
+        return "no snapshot - starting with an empty mission store"
+    try:
+        with open(MISSION_STORE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        missions, active = _validate_mission_store(data)
+    except Exception as exc:
+        print(f"[MISSION STORE] REFUSED {MISSION_STORE_PATH}: {exc}")
+        print("[MISSION STORE] starting with an EMPTY mission store; no record was partially "
+              "loaded. Re-plan and re-upload to restore an approved mission.")
+        return f"refused ({exc})"
+    original_missions.update(missions)
+    active_original_by_vehicle.update(active)
+    if not missions:
+        return "snapshot held no records"
+    active_txt = ", ".join(f"{vehicle_slug(v)}={m}" for v, m in sorted(active.items())) or "none"
+    return f"restored {len(missions)} mission record(s); active: {active_txt}"
 
 # The command lifecycle → mission upload_status projection. QUEUED/SENT are both "queued"
 # from the mission's point of view; a verified read-back is the only VERIFIED.
@@ -2554,11 +2696,16 @@ def _sync_mission_record_status(cmd):
     if rec is None:
         return
     new_status = _mission_upload_status_for(cmd)
+    previous = rec.get("upload_status")
     rec["upload_status"] = new_status
     if new_status == "VERIFIED" and not rec.get("verified_at"):
         rec["verified_at"] = datetime.now(timezone.utc).isoformat()
     if new_status == "FAILED":
         rec["upload_failure_reason"] = cmd.get("reason")
+    if new_status != previous:
+        # Every upload-status change, verification included, is durable: a restart must not
+        # demote a VERIFIED mission back to whatever the last snapshot happened to hold.
+        _save_mission_store()
 
 
 def _new_mission_record(vehicle_id, package, command):
@@ -2602,7 +2749,8 @@ def _new_mission_record(vehicle_id, package, command):
     }
     original_missions[mission_id] = rec
     mission_id_by_command[command["id"]] = mission_id
-    active_original_by_vehicle[vehicle_id] = mission_id
+    active_original_by_vehicle[vehicle_id] = mission_id   # replaces this vehicle's active one
+    _save_mission_store()      # finalization + active-original replacement, in one snapshot
     return rec
 
 
@@ -3339,7 +3487,9 @@ async def receive_agent_status(request: Request):
         if (_unidentified_log_at is None
                 or (now - _unidentified_log_at).total_seconds() >= STATUS_HEARTBEAT_SECONDS):
             _unidentified_log_at = now
-            print("[STATUS] accepted=false reason=unidentified_vehicle — packet carries no "
+            # ASCII only: this line goes to the Windows console, where a non-ASCII dash is
+            # re-encoded into '?' noise by the default code page.
+            print("[STATUS] accepted=false reason=unidentified_vehicle - packet carries no "
                   f"resolvable identity (expected one of {', '.join(_PACKET_ID_KEYS)} or "
                   "`source`); further identical rejections suppressed")
         return JSONResponse(status_code=400, content={
@@ -4209,17 +4359,189 @@ def _record_replan_operation(vid, result, *, mission_id=None):
     return entry
 
 
+# ── Bounded Pixhawk read-back evidence for polling (readiness) ────────────────────────
+# A full `GET /agent/pixhawk_mission` makes Scout download the entire mission from the flight
+# controller over MAVLink. Readiness is POLLED (the Agent page refreshes it every 2.5 s), so
+# calling it unconditionally would mean a continuous mission download per open browser tab for
+# as long as the page is open — expensive on the vehicle, and it buys nothing, because an
+# immutable mission's read-back does not change between two polls seconds apart.
+#
+# So routine polling reads through this short-TTL cache and LABELS the evidence with its age;
+# it never presents stale evidence as fresh. An explicit operation that must decide something
+# (the planning-package sync, which gates on the read-back matching the approved hash) passes
+# max_age_s=0 and always pays for a live download.
+PIXHAWK_READBACK_TTL_S = 10.0
+_pixhawk_readback_cache = {}     # {vid: (fetched_at: datetime, result: dict)}
+
+
+def _pixhawk_readback(vid, base, now, *, max_age_s=PIXHAWK_READBACK_TTL_S):
+    """One Pixhawk read-back for `vid`, reusing cached evidence younger than `max_age_s`.
+
+    Always returns the normalized `_scout_mission_read` dict plus two honesty fields:
+      `evidence_age_s`  how old this read-back is, in seconds (0.0 for a fresh download)
+      `evidence_cached` whether it was served from the cache rather than downloaded now
+    so a caller can never mistake a cached read-back for a live one. `max_age_s=0` forces a
+    live download. Unreachable results are cached too — a Scout that is down should not be
+    re-polled at full rate either, and `reachable:false` is itself the answer."""
+    entry = _pixhawk_readback_cache.get(vid)
+    if entry is not None and max_age_s > 0:
+        fetched_at, cached = entry
+        age = (now - fetched_at).total_seconds()
+        if 0 <= age <= max_age_s:
+            out = dict(cached)
+            out["evidence_age_s"] = round(age, 3)
+            out["evidence_cached"] = True
+            return out
+    result = _scout_mission_read(vid, base, now)
+    _pixhawk_readback_cache[vid] = (now, result)
+    out = dict(result)
+    out["evidence_age_s"] = 0.0
+    out["evidence_cached"] = False
+    return out
+
+
+def _first_present(*values):
+    """The first non-None value, or None. Distinguishes "absent" from a legitimate False."""
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_scout_package(scout, legacy_geometry=None):
+    """Flatten Scout's planning-package GET body into the ONE evidence shape the operator
+    reasons with, for BOTH the replan-planning-package-v1 response and the pre-v1 flat one.
+
+    Scout's v1 GET nests its evidence:
+
+        { stored, usable, package:{…}, summary:{…}, envelope:{…}, readiness:{…} }
+
+    while the older Scout put mission_id / route hash / counts / geometry_validation directly
+    on the response. Reading only the flat shape against a v1 Scout is what made a stored,
+    usable package report `mission_id: null` and `route_hash: null`, which then blanked the
+    hash comparison and held REPLANNING READY false against a package Scout itself called
+    ready. Precedence here is explicit — nested first, flat as the legacy fallback — so
+    neither Scout generation silently loses a field.
+
+    This is a pure reader: it extracts and labels Scout's evidence and decides NOTHING. The
+    operator-side comparisons (mission id match, the route-hash chain, consistency, readiness)
+    are computed by the caller, which owns the active mission record Scout cannot see.
+    """
+    scout = _as_dict(scout)
+    package = _as_dict(scout.get("package"))
+    summary = _as_dict(scout.get("summary"))
+    scout_readiness = _as_dict(scout.get("readiness"))
+    geometry = _as_dict(legacy_geometry)
+
+    mission_id = _first_present(package.get("mission_id"), summary.get("mission_id"),
+                                scout.get("mission_id"))
+    route_hash = _first_present(
+        package.get("route_hash"), package.get("original_route_hash"),
+        package.get("route_content_hash"),
+        summary.get("route_hash"), summary.get("original_route_hash"),
+        summary.get("route_content_hash"),
+        # legacy flat response (a pre-v1 Scout names the same value route_content_hash)
+        scout.get("route_hash"), scout.get("original_route_hash"),
+        scout.get("route_content_hash"))
+
+    route_count = summary.get("route_waypoint_count")
+    if route_count is None:
+        for key in ("route_waypoints", "route"):
+            seq = package.get(key)
+            if isinstance(seq, (list, tuple)):
+                route_count = len(seq)
+                break
+    if route_count is None:
+        route_count = _first_present(scout.get("route_waypoint_count"), scout.get("route_count"))
+
+    # Geometry evidence. The v1 summary says WHAT the package carries; the v1 readiness block
+    # says what Scout CHECKED. They are reported apart, because carrying geometry and having
+    # validated it are different claims.
+    has_geometry = summary.get("has_navigable_geometry")
+    has_boundary = summary.get("has_navigable_boundary")
+    if has_geometry is None and has_boundary is None:
+        if "navigable_geometry" in package:
+            boundary_available = bool(package.get("navigable_geometry"))
+        else:
+            boundary_available = geometry.get("boundary_available")
+    else:
+        boundary_available = bool(has_geometry or has_boundary)
+    boundary_checked = _first_present(scout_readiness.get("navigable_geometry_checked"),
+                                      geometry.get("boundary_checked"))
+
+    # An EMPTY no-go set is an answer, not an absence: a package that explicitly carries zero
+    # no-go zones has available evidence (Scout looked and reported none), so availability is
+    # keyed on the field being reported at all — never on the zone count being non-zero.
+    if (summary.get("no_go_zones_present") is not None
+            or summary.get("no_go_zone_count") is not None
+            or "no_go_zones" in package):
+        no_go_available = True
+    else:
+        no_go_available = geometry.get("no_go_available")
+    no_go_checked = _first_present(scout_readiness.get("no_go_zones_checked"),
+                                   geometry.get("no_go_checked"))
+
+    # connector_proven_safe is TRI-state and stays tri-state: null means Scout did not prove
+    # the connector safe either way. It is never widened to true.
+    if "connector_proven_safe" in scout_readiness:
+        connector_proven_safe = scout_readiness.get("connector_proven_safe")
+    else:
+        connector_proven_safe = geometry.get("connector_proven_safe")
+
+    return {
+        "stored": _first_present(scout.get("stored"), summary.get("stored"),
+                                 package.get("stored")),
+        "usable": _first_present(scout.get("usable"), summary.get("usable")),
+        "mission_id": mission_id,
+        "route_hash": route_hash,
+        "route_count": route_count,
+        "boundary_available": boundary_available,
+        "boundary_checked": boundary_checked,
+        "no_go_available": no_go_available,
+        "no_go_checked": no_go_checked,
+        "connector_proven_safe": connector_proven_safe,
+        "shoreline_clearance_available": geometry.get("shoreline_clearance_available"),
+        # Scout's own verdicts, echoed rather than re-derived. `mission_id_consistent` is
+        # deliberately NOT used as a gate: Scout cannot compare mission ids when the Pixhawk
+        # read-back exposes none, so it honestly reports null — the operator, which owns the
+        # active mission record, performs that comparison itself.
+        "scout_replanning_ready": scout_readiness.get("replanning_ready"),
+        "scout_state": scout_readiness.get("state"),
+        "scout_mission_verified": scout_readiness.get("mission_verified"),
+        "scout_route_hash_match": scout_readiness.get("route_hash_match"),
+        "scout_mission_id_consistent": scout_readiness.get("mission_id_consistent"),
+    }
+
+
 def _compute_replan_readiness(vid, base):
     """The combined readiness summary (task Section 3). Keeps the Vehicle mission and the Scout
     planning package as two DISTINCT operations, never letting a successful Pixhawk upload hide
-    a package failure, and reports limitations separately. Returns a JSON-able dict."""
+    a package failure, and reports limitations separately. Returns a JSON-able dict.
+
+    The package verdict is computed from evidence, not copied from Scout:
+
+        mission_id_match  package mission id == the operator's ACTIVE mission id
+        hash_match        package route hash == the record's route hash == the Pixhawk's
+        consistent        stored and usable and mission_id_match and hash_match
+        replanning_ready  mission_ready and consistent and Scout's own readiness verdict
+
+    The operator makes the mission-id comparison itself because Scout cannot: the Pixhawk
+    mission read-back carries no operator mission id, so Scout reports `mission_id_consistent:
+    null` — an honest "cannot compare", never a failure. The operator owns the active mission
+    record, so it can and does compare."""
     now = datetime.now(timezone.utc)
 
-    # A. Vehicle mission — the immutable revision-0 record + a live Pixhawk readback.
+    # A. Vehicle mission — the immutable revision-0 record + a BOUNDED Pixhawk read-back.
+    # This path is polled, so it goes through the age-labelled cache rather than forcing a
+    # fresh mission download on every refresh (see _pixhawk_readback).
     mission_id = active_original_by_vehicle.get(vid)
     rec = original_missions.get(mission_id) if mission_id else None
     flask_base = vehicle_api_base(vid)
-    readback = _scout_mission_read(vid, flask_base, now) if flask_base else None
+    readback = _pixhawk_readback(vid, flask_base, now) if flask_base else None
 
     record_hash = rec.get("route_hash") if rec else None
     upload_status = rec.get("upload_status") if rec else None
@@ -4237,6 +4559,11 @@ def _compute_replan_readiness(vid, base):
         "pixhawk_verified": pixhawk_verified,
         "readback_reachable": bool(readback and readback.get("reachable")),
         "readback_hash": readback_hash, "readback_hash_match": readback_hash_match,
+        "readback_partial": bool(readback.get("partial")) if readback else None,
+        # How old this read-back evidence is. Polling reuses a bounded cache, so the age is
+        # reported rather than implied — a cached read-back is never shown as a live one.
+        "readback_age_s": readback.get("evidence_age_s") if readback else None,
+        "readback_cached": readback.get("evidence_cached") if readback else None,
         "home_valid": home_valid, "home_source": home_source,
         "boundary_supplied": boundary_supplied,
     }
@@ -4251,19 +4578,33 @@ def _compute_replan_readiness(vid, base):
                 or _scout_field(pkg, "geometry_validation") or {})
     if not isinstance(geometry, dict):
         geometry = {}
-    package_mission_id = _scout_field(pkg, "mission_id") or _scout_field(status, "mission_id")
-    package_hash = (_scout_field(pkg, "route_content_hash")
-                    or _scout_field(status, "route_content_hash"))
-    stored_flag = _scout_field(pkg, "stored")
+    # Scout's package evidence, read through ONE normalizer that understands both the v1
+    # nested response and the pre-v1 flat one (see _normalize_scout_package).
+    ev = _normalize_scout_package(pkg.get("scout"), geometry)
+    package_mission_id = ev["mission_id"] or _scout_field(status, "mission_id")
+    package_hash = ev["route_hash"] or _scout_field(status, "route_content_hash")
+    stored_flag = ev["stored"]
     package_stored = (bool(stored_flag) if stored_flag is not None
                       else bool(package_mission_id or package_hash))
-    package_usable = consistency not in ("PLANNING_PACKAGE_MISSING", "PLANNING_PACKAGE_UNUSABLE", None) \
-        or (package_stored and consistency is None and scout_reachable)
+    if ev["usable"] is not None:
+        package_usable = bool(ev["usable"])        # Scout states it outright in v1
+    else:
+        package_usable = consistency not in ("PLANNING_PACKAGE_MISSING", "PLANNING_PACKAGE_UNUSABLE", None) \
+            or (package_stored and consistency is None and scout_reachable)
     consistency_ok = consistency == PACKAGE_CONSISTENT
+
+    # The three comparisons the OPERATOR owns. Scout cannot make the mission-id one at all
+    # (the Pixhawk read-back carries no operator mission id, so Scout reports null), and it
+    # cannot see the operator's immutable record — so a null from Scout is never read as a
+    # failure here; the operator compares against its own active mission instead.
     mission_id_match = bool(package_mission_id and mission_id and package_mission_id == mission_id)
-    hash_available = bool(package_hash)
-    hash_match = bool(record_hash and package_hash and record_hash == package_hash)
+    hash_available = bool(package_hash and record_hash)
+    # The full chain: the package's route == the approved route == the route on the Pixhawk.
+    hash_match = bool(package_hash and record_hash and package_hash == record_hash
+                      and readback_hash_match)
     hash_mismatch = bool(record_hash and package_hash and record_hash != package_hash)
+    package_consistent = bool(package_stored and package_usable
+                              and mission_id_match and hash_match)
 
     planning_package = {
         "scout_reachable": scout_reachable,
@@ -4272,26 +4613,46 @@ def _compute_replan_readiness(vid, base):
         "mission_id": package_mission_id, "mission_id_match": mission_id_match,
         "route_hash": package_hash, "hash_match": hash_match, "hash_mismatch": hash_mismatch,
         "hash_comparison_available": hash_available,
-        "consistency": consistency, "consistent": consistency_ok,
-        "route_count": _scout_field(pkg, "route_waypoint_count", "route_count"),
-        "boundary_available": geometry.get("boundary_available"),
-        "boundary_checked": geometry.get("boundary_checked"),
-        "no_go_available": geometry.get("no_go_available"),
-        "no_go_checked": geometry.get("no_go_checked"),
-        "connector_proven_safe": geometry.get("connector_proven_safe"),
-        "shoreline_clearance_available": geometry.get("shoreline_clearance_available"),
+        "consistency": consistency, "consistent": package_consistent,
+        "scout_consistency_ok": consistency_ok,
+        "route_count": ev["route_count"],
+        "boundary_available": ev["boundary_available"],
+        "boundary_checked": ev["boundary_checked"],
+        "no_go_available": ev["no_go_available"],
+        "no_go_checked": ev["no_go_checked"],
+        "connector_proven_safe": ev["connector_proven_safe"],
+        "shoreline_clearance_available": ev["shoreline_clearance_available"],
+        # Scout's own readiness verdict, echoed verbatim — including the mission-id comparison
+        # it honestly cannot make.
+        "scout_replanning_ready": ev["scout_replanning_ready"],
+        "scout_state": ev["scout_state"],
+        "scout_mission_verified": ev["scout_mission_verified"],
+        "scout_route_hash_match": ev["scout_route_hash_match"],
+        "scout_mission_id_consistent": ev["scout_mission_id_consistent"],
     }
+
+    # Scout's own readiness gate. A v1 Scout states it directly; a pre-v1 Scout has no
+    # readiness block, and there its package-consistency verdict is the equivalent gate — so
+    # an older Scout is not held un-ready for a field it never shipped.
+    scout_ready_flag = ev["scout_replanning_ready"]
+    scout_ready_ok = consistency_ok if scout_ready_flag is None else bool(scout_ready_flag)
 
     # Limitations — reported SEPARATELY from readiness, never as a silent pass.
     limitations = []
     if not boundary_supplied:
         limitations.append("Navigable boundary absent — connector cannot be proven safe")
-    if geometry.get("connector_proven_safe") is False:
+    if ev["connector_proven_safe"] is False:
         limitations.append("Scout could not prove the current-position connector safe")
     if hash_mismatch:
         limitations.append("Package route hash does NOT match the approved route — replanning blocked")
     if not hash_available and scout_reachable:
         limitations.append("Scout did not report a package route hash — hash comparison unavailable")
+    if hash_available and not readback_hash_match:
+        limitations.append("Pixhawk read-back hash does not confirm the approved route — the "
+                           "package/record/flight-controller hash chain is unproven")
+    if scout_ready_flag is False:
+        limitations.append("Scout reports its own replanning readiness as false"
+                           + (f" (state {ev['scout_state']})" if ev["scout_state"] else ""))
     limitations.append("shoreline_clearance_m is scalar metadata, not geometry Scout can "
                        "run an onboard clearance check against")
     for lim in (geometry.get("limitations") or []):
@@ -4299,9 +4660,7 @@ def _compute_replan_readiness(vid, base):
             limitations.append(lim)
 
     mission_ready = bool(pixhawk_verified and home_valid)
-    replanning_ready = bool(
-        mission_ready and package_stored and package_usable and consistency_ok
-        and mission_id_match and boundary_supplied and not hash_mismatch)
+    replanning_ready = bool(mission_ready and package_consistent and scout_ready_ok)
 
     return {
         "ok": True, "vehicle_id": vehicle_slug(vid), "generated_at": now.isoformat(),
@@ -4480,6 +4839,166 @@ async def replan_put_package(vehicle_id: str, request: Request):
         "limitations": meta["limitations"],
     }
     return JSONResponse(status_code=_replan_status_code(result), content=envelope)
+
+
+def _sync_precondition_failure(vid, stage, code, message, evidence):
+    """A refused sync: which gate stopped it, why, and every piece of evidence gathered up to
+    that point. 409 because the request was well-formed and the STATE refused it — a sync that
+    fails its preconditions has sent nothing to Scout, and the operator needs to see which
+    precondition to fix, not a generic error."""
+    return JSONResponse(status_code=409, content={
+        "ok": False, "vehicle_id": vehicle_slug(vid), "synced": False,
+        "failed_stage": stage, "error": code, "message": message,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **evidence,
+    })
+
+
+@app.post("/api/vehicles/{vehicle_id}/replan/planning-package/sync")
+async def replan_sync_package(vehicle_id: str, request: Request):
+    """MANUAL, explicit synchronization of the approved planning package to Scout.
+
+    This is the ONLY path that sends a package, and it is never called by polling — an
+    operator (or an operator-driven test) invokes it deliberately. Body: `{ mission_id? }`,
+    defaulting to the vehicle's active original mission.
+
+    It fails closed at seven gates, in order, and reports WHICH one refused:
+
+      1. the vehicle resolves to a canonical id with a Local Agent (8090) route;
+      2. an immutable revision-0 original mission record exists AND belongs to this vehicle;
+      3. its upload_status is VERIFIED (an unverified upload is not an approved mission);
+      4. a LIVE Pixhawk read-back is reachable and NOT partial (a truncated download proves
+         nothing about what is on the flight controller);
+      5. the record's route_hash equals the read-back's route_content_hash — the flight
+         controller is carrying exactly the route this package describes;
+      6. the record builds a complete replan-planning-package-v1 (no thinned metadata);
+      7. Scout accepts the POST.
+
+    Gates 4/5 run a SECOND live read-back after Scout accepts, so acceptance is bracketed by
+    two consistency reads: the route on the flight controller is proven unchanged across the
+    write. That second download is the cost of ACCEPTANCE only — ordinary readiness polling
+    never pays it (see _pixhawk_readback).
+
+    Issues no vehicle command: it does not arm, change mode, upload, clear or execute
+    anything. It writes one package to Scout's single package slot and reads it back."""
+    target, err = _replan_target(vehicle_id)
+    if err is not None:
+        return err
+    vid, base = target
+    now = datetime.now(timezone.utc)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # ── Gate 2: the immutable original mission record, owned by THIS vehicle ──────────────
+    mission_id = (body or {}).get("mission_id") or active_original_by_vehicle.get(vid)
+    rec = original_missions.get(mission_id) if mission_id else None
+    if rec is None:
+        return _sync_precondition_failure(
+            vid, "mission_record", "no_mission_record",
+            "No immutable original mission record for this vehicle — finalize a survey first.",
+            {"mission_id": mission_id})
+    if rec.get("vehicle_id") != vid:
+        # Isolation: one vehicle's approved geometry can never be synced to another's Scout.
+        return _sync_precondition_failure(
+            vid, "mission_record", "mission_belongs_to_another_vehicle",
+            "That mission was approved for a different vehicle and will not be synced here.",
+            {"mission_id": mission_id,
+             "mission_vehicle_id": vehicle_slug(rec.get("vehicle_id"))})
+
+    # ── Gate 3: VERIFIED upload ──────────────────────────────────────────────────────────
+    upload_status = rec.get("upload_status")
+    if upload_status != "VERIFIED":
+        return _sync_precondition_failure(
+            vid, "upload_status", "mission_not_verified",
+            f"Mission upload_status is {upload_status!r} — only a VERIFIED mission may be "
+            f"synced as a planning package.",
+            {"mission_id": mission_id, "upload_status": upload_status})
+
+    # ── Gate 4: a live, complete Pixhawk read-back ───────────────────────────────────────
+    flask_base = vehicle_api_base(vid)
+    if flask_base is None:
+        return _sync_precondition_failure(
+            vid, "pixhawk_readback", "no_vehicle_api",
+            "No vehicle Flask API (port 8080) configured — the Pixhawk read-back that proves "
+            "the flight controller carries this route cannot be performed.",
+            {"mission_id": mission_id})
+    readback = _pixhawk_readback(vid, flask_base, now, max_age_s=0)   # consistency read 1/2
+    if not readback.get("reachable"):
+        return _sync_precondition_failure(
+            vid, "pixhawk_readback", "readback_unreachable",
+            "The Pixhawk mission read-back is unreachable — refusing to sync a package whose "
+            "route cannot be confirmed against the flight controller.",
+            {"mission_id": mission_id, "pixhawk_readback": readback})
+    if readback.get("partial"):
+        return _sync_precondition_failure(
+            vid, "pixhawk_readback", "readback_partial",
+            "The Pixhawk mission read-back is PARTIAL — an incomplete download proves nothing "
+            "about the route on the flight controller.",
+            {"mission_id": mission_id, "pixhawk_readback": readback})
+
+    # ── Gate 5: the read-back route content hash equals the approved route hash ───────────
+    record_hash = rec.get("route_hash")
+    readback_hash = readback.get("route_content_hash")
+    if not readback_hash:
+        return _sync_precondition_failure(
+            vid, "hash_match", "readback_hash_unavailable",
+            "The read-back did not report a route_content_hash — the content comparison that "
+            "proves the route is unavailable, so the sync fails closed.",
+            {"mission_id": mission_id, "route_hash": record_hash,
+             "pixhawk_readback": readback})
+    if record_hash != readback_hash:
+        return _sync_precondition_failure(
+            vid, "hash_match", "route_hash_mismatch",
+            "The route on the flight controller does NOT match the approved mission route — "
+            "refusing to sync a planning package for a route the vehicle is not flying.",
+            {"mission_id": mission_id, "route_hash": record_hash,
+             "readback_hash": readback_hash, "pixhawk_readback": readback})
+
+    # ── Gate 6: build the v1 package (pure; fails closed on incomplete metadata) ──────────
+    try:
+        package, pkg_meta = replan_package.build_v1_package(rec, vehicle_id=vehicle_slug(vid))
+    except replan_package.PackageError as exc:
+        return _sync_precondition_failure(
+            vid, "package_build", "planning_package_unbuildable", str(exc),
+            {"mission_id": mission_id, "route_hash": record_hash})
+
+    # ── Gate 7: the one write. Scout's verdict is preserved VERBATIM, never reinterpreted ──
+    post = scout_replan.post_planning_package(base, package)
+    _record_replan_operation(vid, post, mission_id=mission_id)
+
+    # ── Evidence after the write: Scout's stored package, the readiness verdict, and a
+    # SECOND live read-back closing the consistency bracket around the acceptance.
+    after = datetime.now(timezone.utc)
+    stored = scout_replan.get_planning_package(base)
+    readiness = _compute_replan_readiness(vid, base)
+    readback_after = _pixhawk_readback(vid, flask_base, after, max_age_s=0)  # read 2/2
+    readback_after_hash = readback_after.get("route_content_hash")
+    route_unchanged = bool(readback_after.get("reachable")
+                           and not readback_after.get("partial")
+                           and readback_after_hash == record_hash)
+
+    accepted = post.get("outcome") == scout_replan.OUTCOME_ACCEPTED
+    return JSONResponse(status_code=_replan_status_code(post), content={
+        "ok": accepted, "synced": accepted, "vehicle_id": vehicle_slug(vid),
+        "failed_stage": None if accepted else "scout_post",
+        "generated_at": after.isoformat(),
+        "mission_id": mission_id, "route_hash": record_hash,
+        "upload_status": upload_status,
+        # What the operator built and sent — the package itself is echoed so the exact wire
+        # bytes are reviewable next to Scout's verdict, not merely summarized.
+        "operator_package": pkg_meta,
+        "package_sent": package,
+        # Scout's own words: the POST outcome, then the package it says it now holds.
+        "scout_post": post,
+        "scout_package": stored,
+        # Consistency bracket: the flight-controller route before and after the write.
+        "pixhawk_readback_before": readback,
+        "pixhawk_readback_after": readback_after,
+        "route_unchanged_across_write": route_unchanged,
+        "readiness": readiness,
+    })
 
 
 @app.delete("/api/vehicles/{vehicle_id}/replan/planning-package")

@@ -566,8 +566,10 @@ export function Agent(root) {
          ${row("Readback hash match", vm.readback_reachable ? badge(vm.readback_hash_match, "MATCH", "NO MATCH") : rp("readback unreachable", "u"))}
          ${row("Home valid", badge(vm.home_valid, "VALID" + (vm.home_source ? " · " + vm.home_source : ""), "INVALID"))}
          ${row("Package stored", badge(pk.stored, "STORED", "NOT STORED"))}
-         ${row("Package consistency", pk.consistency ? rp(pk.consistency.replace("PLANNING_PACKAGE_", ""), pk.consistent ? "c" : "d") : rp("unknown", "u"))}
+         ${row("Package consistency", pk.consistency ? rp(pk.consistency.replace("PLANNING_PACKAGE_", ""), pk.consistent ? "c" : "d") : badge(pk.consistent, "CONSISTENT", "NOT CONSISTENT"))}
          ${row("Mission id / hash match", `${badge(pk.mission_id_match, "ID", "ID?")} ${pk.hash_comparison_available ? badge(pk.hash_match, "HASH", "HASH✗") : rp("hash n/a", "u")}`)}
+         ${pk.scout_state == null && pk.scout_replanning_ready == null ? ""
+           : row("Scout readiness", `${badge(pk.scout_replanning_ready, "READY", "NOT READY")}${pk.scout_state ? " " + rp(pk.scout_state, "u") : ""}`)}
          ${row("Boundary supplied", badge(vm.boundary_supplied, "YES", "NO"))}
          ${row("Connector proven safe", pk.connector_proven_safe == null ? rp("unknown", "u") : badge(pk.connector_proven_safe, "PROVEN", "NOT PROVEN"))}
        </div>

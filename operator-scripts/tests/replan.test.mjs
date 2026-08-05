@@ -182,3 +182,31 @@ test("api.js exposes per-vehicle replan methods on the /api/vehicles/{id}/replan
   assert.match(src, /\/api\/vehicles\/\$\{id\}\/replan\/status/);
   assert.match(src, /\/api\/vehicles\/\$\{id\}\/replan\/planning-package/);
 });
+
+// ── replan-planning-package-v1: the manual sync must stay MANUAL ────────────────────────
+// The whole safety property of the sync is that it is operator-initiated. A poll that writes
+// would resend the approved package on every page refresh and on every reconnect, so these
+// guards pin the wiring at the source level (there is no DOM harness for Agent.js here).
+test("api.js exposes syncReplanPackage as a POST to the explicit sync route", () => {
+  const src = read("../operator/services/api.js");
+  assert.match(src, /export function syncReplanPackage\b/);
+  assert.match(src, /syncReplanPackage\(id, body = \{\}\) \{ return postJSON\(`\/api\/vehicles\/\$\{id\}\/replan\/planning-package\/sync`/);
+});
+
+test("no automatic sync on an ordinary page refresh: the poll path never calls it", () => {
+  const src = read("../operator/pages/Agent.js");
+  // The replan poller and its interval exist …
+  assert.match(src, /function loadReplan\(id\)/);
+  assert.match(src, /setInterval\(\(\) => \{ if \(!replanBusy\) loadReplan\(selId\); \}/);
+  // … and loadReplan issues reads only — no sync, no package write, of any spelling.
+  const body = src.slice(src.indexOf("function loadReplan(id)"),
+    src.indexOf("function loadMissionExecution(id)"));
+  for (const forbidden of ["syncReplanPackage", "putReplanPackage", "deleteReplanPackage",
+    "putReplanExperiment", "patchReplanConfig", "resetReplanController"]) {
+    assert.equal(body.includes(forbidden), false, `loadReplan must not call ${forbidden}`);
+  }
+  // No interval anywhere in the page drives a sync either.
+  for (const m of src.matchAll(/setInterval\(([\s\S]{0,160}?)\d+\s*\)/g)) {
+    assert.equal(m[1].includes("syncReplanPackage"), false, "an interval must never sync");
+  }
+});

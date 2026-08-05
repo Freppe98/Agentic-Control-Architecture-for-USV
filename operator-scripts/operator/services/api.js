@@ -385,6 +385,13 @@ export function getReplanPackage(id) { return getReplan(`/api/vehicles/${id}/rep
  *  body: { mission_id? }. Returns { ok, status, data }; watch data.outcome (accepted/rejected/
  *  unknown). An "unknown" (202) is reconciled by a later getReplanPackage(), never re-PUT. */
 export function putReplanPackage(id, body = {}) { return putJSON(`/api/vehicles/${id}/replan/planning-package`, body); }
+/** MANUAL synchronization of the approved replan-planning-package-v1 to Scout. body: { mission_id? }.
+ *  This is the ONLY call that sends a package, and it is EXPLICIT-OPERATOR-ONLY: it must never be
+ *  called from loadReplan() or any interval, because a poll that writes would resend the package on
+ *  every page refresh. The backend gates it on VERIFIED upload + a live, complete Pixhawk read-back
+ *  whose route_content_hash equals the approved route hash, then POSTs once and returns all the
+ *  evidence (package sent, Scout's verdict, Scout's stored package, readiness, both read-backs). */
+export function syncReplanPackage(id, body = {}) { return postJSON(`/api/vehicles/${id}/replan/planning-package/sync`, body); }
 /** Clear Scout's stored planning package. Idempotent. */
 export function deleteReplanPackage(id) { return delJSON(`/api/vehicles/${id}/replan/planning-package`); }
 

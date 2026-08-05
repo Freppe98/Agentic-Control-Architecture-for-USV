@@ -30,6 +30,13 @@ import mission_contract  # noqa: E402
 import planning  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+# Finalizing a mission writes the DURABLE mission snapshot. Point it at a throwaway directory
+# for this whole module so a test run can never overwrite the station's real mission store.
+import pathlib  # noqa: E402
+import tempfile  # noqa: E402
+main.MISSION_STORE_DIR = pathlib.Path(tempfile.mkdtemp(prefix="operator-mission-store-"))
+main.MISSION_STORE_PATH = main.MISSION_STORE_DIR / "mission_store.json"
+
 SCOUT_VID = 2
 
 # A ~265 m x 165 m rectangular lake near the project home (GeoJSON [lng, lat]).

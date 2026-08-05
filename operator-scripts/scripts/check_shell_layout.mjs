@@ -26,7 +26,7 @@ const SHOTS = arg("shots", null);
 let chromium;
 try { ({ chromium } = await import("playwright")); }
 catch {
-  console.error("playwright is not installed — `npm install --no-save playwright && npx playwright install chromium`");
+  console.error("playwright is not installed; run `npm install --no-save playwright && npx playwright install chromium`");
   process.exit(2);
 }
 
@@ -192,11 +192,13 @@ const passed = checks.filter((c) => c.ok).length;
 console.log(`shell layout: ${passed}/${checks.length} checks passed`);
 if (fails.length) {
   console.error("\nFAILED:");
-  fails.forEach((f) => console.error("  ✖ " + f));
+  fails.forEach((f) => console.error("  - " + f));
   process.exit(1);
 }
 if (SHOTS) {
   writeFileSync(join(SHOTS, "shell-checks.json"), JSON.stringify(checks, null, 2));
   console.log(`screenshots + results in ${SHOTS}`);
 }
-console.log("OK — the shell owns the screen on Map and Plan at every tested viewport.");
+// ASCII only: this line goes to the Windows console, where a non-ASCII dash is re-encoded
+// into '?' noise by the default code page.
+console.log("OK - the shell owns the screen on Map and Plan at every tested viewport.");

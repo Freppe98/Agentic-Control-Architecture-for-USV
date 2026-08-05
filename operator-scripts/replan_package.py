@@ -31,8 +31,20 @@ route-segment labels. The mapping is explicit and documented; the one judgment i
 SURVEY, because it is the lead-in that keeps the secondary coverage block contiguous and it
 is neither outbound nor a return leg. Scout's vocabulary is coarser than the operator's, so
 this coarsening is a documented, reported limitation — never a silent reinterpretation.
+TWO CONTRACTS LIVE HERE DURING THE MIGRATION
+--------------------------------------------
+`build_package` below builds the ORIGINAL package shape (`usv_id`/`revision`/`route`/
+`navigable_boundary`) that the Scout Local Agent currently deployed on port 8090 validates.
+`build_v1_package` at the bottom of this module builds `replan-planning-package-v1`, the
+newer shape Scout's replanning rework accepts, which preserves the operator's FULL geometry
+and provenance (detailed `segments`, detailed `original_execution_order`, the ring-nested
+navigable geometry and no-go zones) instead of flattening it. They are deliberately separate
+functions over the same record: neither is derived from the other, so a fix to one contract
+can never silently reshape the other.
 """
 from __future__ import annotations
+
+import copy
 
 import mission_contract
 
@@ -90,8 +102,17 @@ def _valid_coord(lat, lng):
 
 def normalize_home(home):
     """A `{latitude, longitude}` Home from any of the shapes the record / live home-block use
-    ({lat,lng}, {latitude,longitude}, {home_position:{...}}), or None when no valid fix exists.
-    Never fabricates 0,0 — an absent Home stays absent so readiness reports it honestly."""
+    ({lat,lng}, {latitude,longitude}, {home_position:{...}}, or a positional [lng, lat] pair),
+    or None when no valid fix exists. Never fabricates 0,0 — an absent Home stays absent so
+    readiness reports it honestly.
+
+    The positional branch is load-bearing, not defensive: the mission record's own
+    `planning_inputs.planning_home` IS a bare `[lng, lat]` pair (planning._point_of), so
+    without it the documented "fall back to the plan's planning home" path could never fire
+    on a real record and a Scout that is not reporting a verified Home would look home-less."""
+    if isinstance(home, (list, tuple)) and len(home) == 2:
+        coord = _valid_coord(home[1], home[0])           # positional order is [lng, lat]
+        return None if coord is None else {"latitude": coord[0], "longitude": coord[1]}
     if not isinstance(home, dict):
         return None
     src = home.get("home_position") if isinstance(home.get("home_position"), dict) else home
@@ -249,3 +270,296 @@ def build_package(record, home, *, usv_id, revision=None, source=SOURCE):
         "limitations": limitations,
     }
     return package, meta
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# replan-planning-package-v1 — the lossless wire package
+# ══════════════════════════════════════════════════════════════════════════════════════
+# The v1 contract exists because the older package above FLATTENS the operator's planning
+# product to fit a coarser consumer: it keeps only the exterior navigable ring, drops the
+# typed `segments` entirely, and collapses the 6-field `original_execution_order` entries to
+# a single per-waypoint label. Scout's replanner needs the real geometry to reason about a
+# safe return, so v1 carries the operator's structures UNCHANGED:
+#
+#   planning_home             [lng, lat]                       — one positional pair
+#   boundary                  [[lng, lat], ...]                — the survey ring, flat
+#   navigable_geometry        [[[lng, lat], ...], ...]         — a LIST OF RINGS (inset may
+#                                                                be a MultiPolygon)
+#   no_go_zones               [[[lng, lat], ...], ...]         — a LIST OF RINGS; [] stays []
+#   route_waypoints           [{latitude, longitude, loiter_time_s}, ...]
+#   segments                  full objects (segment_id, kind, coordinates, length_m,
+#                             raw_point_count, final_point_count, start/end_execution_seq)
+#   original_execution_order  full objects (execution_seq, latitude, longitude,
+#                             source_segment_id, source_segment_kind, source_index)
+#
+# Note the two DELIBERATELY DIFFERENT conventions in one package: geometry is positional
+# `[lng, lat]` (GeoJSON order, what the planner stores and the map draws), while route
+# waypoints are named `{latitude, longitude}` objects (what mission-contract-v1 hashes).
+# Converting either one to the other would move bytes Scout verifies, so neither is
+# "harmonized" here.
+#
+# `route_hash` is COPIED from the verified record, never recomputed into the package. The
+# record's hash is the value the Pixhawk read-back was verified against; recomputing from a
+# differently-normalized route would silently mint a second identity. We still cross-check
+# the copy against `mission_contract.route_content_hash` (the SAME calculator that produced
+# it) and refuse to build when they disagree — that is a tamper check on the record, not an
+# alternative source for the field.
+
+PACKAGE_VERSION_V1 = "replan-planning-package-v1"
+
+# The exact top-level fields of the v1 wire package, in wire order. Named as a tuple so a
+# test can assert the package carries these and nothing else — an extra key is as much a
+# contract break as a missing one.
+V1_FIELDS = (
+    "package_version", "route_contract_version", "mission_id", "mission_revision",
+    "vehicle_id", "route_hash", "planning_home", "boundary", "navigable_geometry",
+    "no_go_zones", "shoreline_clearance_m", "route_waypoints", "segments",
+    "original_execution_order", "immutable", "created_at", "source",
+)
+
+# The fields every detailed record entry must carry. Preserved verbatim (plus anything else
+# the record holds) — the point of v1 is that this metadata SURVIVES, so a missing one is a
+# hard error rather than a quietly thinner package.
+V1_SEGMENT_FIELDS = ("segment_id", "kind", "coordinates", "length_m", "raw_point_count",
+                     "final_point_count", "start_execution_seq", "end_execution_seq")
+V1_EXECUTION_ORDER_FIELDS = ("execution_seq", "latitude", "longitude", "source_segment_id",
+                             "source_segment_kind", "source_index")
+
+
+def canonical_vehicle_id(vehicle_id):
+    """The canonical `usv-<n>` slug for any accepted spelling (2, "2", "usv-2", "USV-2").
+
+    Pure and registry-free ON PURPOSE: the builder must stay network- and state-free, and the
+    slug is a pure function of the numeric identity the record already carries. Returns None
+    for anything that is not a positive vehicle number, so the caller fails closed rather
+    than shipping a package addressed to nobody."""
+    if isinstance(vehicle_id, bool):
+        return None
+    if isinstance(vehicle_id, int):
+        n = vehicle_id
+    else:
+        text = str(vehicle_id or "").strip().lower()
+        if text.startswith("usv-"):
+            text = text[4:]
+        try:
+            n = int(text)
+        except (TypeError, ValueError):
+            return None
+    return f"usv-{n}" if n > 0 else None
+
+
+def _positional_pair(pt, what):
+    """One `[lng, lat]` pair, validated and copied. Raises PackageError with `what` in the
+    message rather than emitting a half-valid geometry Scout would have to guess about."""
+    if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+        raise PackageError(f"{what} is not a [longitude, latitude] pair")
+    coord = _valid_coord(pt[1], pt[0])          # positional order is [lng, lat]
+    if coord is None:
+        raise PackageError(f"{what} is not a valid [longitude, latitude] coordinate")
+    return [float(pt[0]), float(pt[1])]
+
+
+def _positional_ring(ring, what):
+    """A `[[lng, lat], ...]` ring, validated point by point. An empty ring is refused: an
+    empty polygon is not geometry, and shipping one would read as "checked, nothing there"."""
+    if not isinstance(ring, list) or not ring:
+        raise PackageError(f"{what} is not a non-empty ring of [longitude, latitude] points")
+    return [_positional_pair(p, f"{what}[{i}]") for i, p in enumerate(ring)]
+
+
+def _positional_rings(rings, what):
+    """A `[[[lng, lat], ...], ...]` list of rings. An EMPTY LIST is preserved as `[]` — for
+    no_go_zones that is the meaningful, checkable statement "there are no zones", which is
+    categorically different from the field being absent."""
+    if rings is None:
+        raise PackageError(f"{what} is absent")
+    if not isinstance(rings, list):
+        raise PackageError(f"{what} is not a list of rings")
+    return [_positional_ring(r, f"{what}[{i}]") for i, r in enumerate(rings)]
+
+
+def _v1_route_waypoints(record):
+    """The canonical route: the record's `route_waypoints` verbatim, as the exact three
+    hashed fields. These are the bytes `route_hash` digests, so nothing is added here — the
+    per-waypoint provenance lives in `original_execution_order`, position-aligned, instead."""
+    waypoints = record.get("route_waypoints")
+    if not isinstance(waypoints, list) or not waypoints:
+        raise PackageError("mission record has no route_waypoints — nothing to package")
+    out = []
+    for i, wp in enumerate(waypoints):
+        if not isinstance(wp, dict):
+            raise PackageError(f"route waypoint {i} is not an object")
+        coord = _valid_coord(wp.get("latitude"), wp.get("longitude"))
+        if coord is None:
+            raise PackageError(f"route waypoint {i} has an invalid coordinate")
+        out.append({
+            "latitude": coord[0],
+            "longitude": coord[1],
+            "loiter_time_s": round(float(wp.get("loiter_time_s", 0) or 0), 3),
+        })
+    return out
+
+
+def _v1_detailed_list(items, required, what, count=None):
+    """A list of detailed record objects, DEEP-COPIED whole. Every field in `required` must be
+    present; every other field the record carries rides along untouched. The deep copy is what
+    makes the builder non-mutating in both directions — the package can never alias, and so
+    can never later corrupt, the immutable record's nested lists."""
+    if not isinstance(items, list) or not items:
+        raise PackageError(f"mission record has no {what} — v1 requires the full metadata")
+    if count is not None and len(items) != count:
+        raise PackageError(f"{what} has {len(items)} entries but the route has {count} "
+                           f"waypoints — the record's provenance is not 1:1 with its route")
+    out = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise PackageError(f"{what}[{i}] is not an object")
+        missing = [f for f in required if item.get(f) is None]
+        if missing:
+            raise PackageError(f"{what}[{i}] is missing {', '.join(missing)} — refusing to "
+                               f"ship a package with thinned-out metadata")
+        out.append(copy.deepcopy(item))
+    return out
+
+
+def build_v1_package(record, *, vehicle_id=None, source=SOURCE):
+    """Build the `replan-planning-package-v1` wire package from an immutable revision-0
+    mission record. Returns (package, meta).
+
+    PURE: no network, no clock, no global state. The same record always yields byte-identical
+    output — `created_at` is the RECORD's creation time, not `now()`, precisely so that
+    re-sending an unchanged mission produces an unchanged package and Scout's single-slot
+    store stays idempotent.
+
+    NON-MUTATING: the record is only read; every nested structure that reaches the package is
+    a fresh copy.
+
+    Raises PackageError — never a thinner package — when the record cannot yield a complete,
+    hash-consistent v1 package.
+    """
+    if not isinstance(record, dict):
+        raise PackageError("mission record is not an object")
+
+    mission_id = record.get("mission_id")
+    if not isinstance(mission_id, str) or not mission_id.strip():
+        raise PackageError("mission record has no mission_id")
+
+    # v1 packages describe the ORIGINAL approved mission. A derived revision is a different
+    # artifact with a different provenance and is not what Scout replans from.
+    revision = record.get("mission_revision")
+    if revision != 0:
+        raise PackageError(f"mission record is revision {revision!r} — a v1 planning package "
+                           f"is built only from the immutable revision-0 original")
+    if record.get("immutable") is not True:
+        raise PackageError("mission record is not marked immutable — refusing to package it")
+
+    usv = canonical_vehicle_id(vehicle_id if vehicle_id is not None else record.get("vehicle_id"))
+    if usv is None:
+        raise PackageError("mission record has no resolvable vehicle identity")
+    # Identity isolation: an explicit target must be the record's own vehicle. One USV's
+    # approved geometry must never be addressable to another USV's Scout.
+    record_usv = canonical_vehicle_id(record.get("vehicle_id"))
+    if vehicle_id is not None and record_usv is not None and usv != record_usv:
+        raise PackageError(f"mission record belongs to {record_usv} — refusing to build a "
+                           f"package addressed to {usv}")
+
+    contract_version = record.get("route_contract_version")
+    if contract_version != mission_contract.CONTRACT_VERSION:
+        raise PackageError(f"mission record route_contract_version is {contract_version!r}, "
+                           f"not {mission_contract.CONTRACT_VERSION}")
+
+    route_waypoints = _v1_route_waypoints(record)
+
+    # The hash is COPIED, then tamper-checked against the same calculator that produced it.
+    stored_hash = record.get("route_hash")
+    if not isinstance(stored_hash, str) or not stored_hash.startswith(mission_contract.HASH_PREFIX):
+        raise PackageError("mission record has no canonical route_hash")
+    if stored_hash != mission_contract.route_content_hash(record.get("route_waypoints") or []):
+        raise PackageError("mission record route_hash disagrees with its route waypoints — "
+                           "refusing to package an altered route")
+
+    inputs = record.get("planning_inputs") if isinstance(record.get("planning_inputs"), dict) else {}
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+
+    planning_home = _positional_pair(inputs.get("planning_home"), "planning_home")
+    boundary = _positional_ring(inputs.get("boundary"), "boundary")
+
+    navigable = record.get("navigable_geometry")
+    if navigable is None:
+        navigable = inputs.get("navigable_boundary")
+    navigable_geometry = _positional_rings(navigable, "navigable_geometry")
+    if not navigable_geometry:
+        raise PackageError("navigable_geometry is empty — Scout cannot prove a return safe "
+                           "against no navigable area")
+
+    # `[]` is a real, checkable answer here and is preserved as one — hence the explicit
+    # None test rather than an `or`, which would erase the distinction.
+    zones = record.get("no_go_zones")
+    if zones is None:
+        zones = inputs.get("no_go_zones")
+    no_go_zones = _positional_rings(zones, "no_go_zones")
+
+    clearance = metrics.get("shoreline_clearance_m")
+    if clearance is None:
+        clearance = inputs.get("shoreline_clearance_m")
+    if clearance is None:
+        raise PackageError("mission record has no shoreline_clearance_m")
+
+    created_at = record.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        raise PackageError("mission record has no created_at")
+
+    package = {
+        "package_version": PACKAGE_VERSION_V1,
+        "route_contract_version": contract_version,
+        "mission_id": mission_id,
+        "mission_revision": 0,
+        "vehicle_id": usv,
+        "route_hash": stored_hash,
+        "planning_home": planning_home,
+        "boundary": boundary,
+        "navigable_geometry": navigable_geometry,
+        "no_go_zones": no_go_zones,
+        "shoreline_clearance_m": clearance,
+        "route_waypoints": route_waypoints,
+        "segments": _v1_detailed_list(record.get("segments"), V1_SEGMENT_FIELDS, "segments"),
+        "original_execution_order": _v1_detailed_list(
+            record.get("original_execution_order"), V1_EXECUTION_ORDER_FIELDS,
+            "original_execution_order", count=len(route_waypoints)),
+        "immutable": True,
+        "created_at": created_at,
+        "source": source,
+    }
+
+    # What the operator KNOWS it sent, so the UI can show it beside Scout's verdict without
+    # re-deriving anything from the package it just built.
+    meta = {
+        "package_version": PACKAGE_VERSION_V1,
+        "mission_id": mission_id,
+        "vehicle_id": usv,
+        "route_hash": stored_hash,
+        "route_waypoint_count": len(route_waypoints),
+        "segment_count": len(package["segments"]),
+        "execution_order_count": len(package["original_execution_order"]),
+        "navigable_ring_count": len(navigable_geometry),
+        "no_go_zone_count": len(no_go_zones),
+        "boundary_point_count": len(boundary),
+        "shoreline_clearance_m": clearance,
+        "limitations": _v1_limitations(no_go_zones),
+    }
+    return package, meta
+
+
+def _v1_limitations(no_go_zones):
+    """What the package does NOT prove, stated by the operator rather than left for Scout to
+    discover. Reported alongside every sync so an absent constraint is never read as a
+    cleared one."""
+    limitations = []
+    if not no_go_zones:
+        limitations.append("no no-go zones were defined for this mission — an empty list is "
+                           "the operator's actual input, not a missing constraint")
+    limitations.append("shoreline_clearance_m is a scalar metadata value — it is not itself "
+                       "geometry Scout can run an onboard clearance check against")
+    limitations.append("no survey graph is supplied — Scout cannot re-derive coverage lanes "
+                       "from this package, only reuse the approved route and geometry")
+    return limitations

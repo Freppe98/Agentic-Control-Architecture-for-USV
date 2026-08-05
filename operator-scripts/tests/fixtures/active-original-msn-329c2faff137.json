@@ -1,0 +1,508 @@
+{
+  "mission_id": "msn-329c2faff137",
+  "mission_revision": 0,
+  "parent_revision_id": null,
+  "vehicle_id": 2,
+  "mission_package_version": "operator-survey-plan-v1",
+  "route_contract_version": "mission-contract-v1",
+  "route_hash": "sha256:21e7f7d4ba7fd2c10ccea1621d290de0b8755966804fc6f9754479e0ec60d990",
+  "input_revision": "rev:90e67bd8e08df695",
+  "planning_inputs": {
+    "boundary": [
+      [
+        12.810675501823427,
+        56.67900608133739
+      ],
+      [
+        12.811399698257448,
+        56.67915779135489
+      ],
+      [
+        12.811338007450104,
+        56.678811655955606
+      ],
+      [
+        12.810675501823427,
+        56.67900608133739
+      ]
+    ],
+    "shoreline_clearance_m": 1,
+    "navigable_boundary": [
+      [
+        [
+          12.8107148,
+          56.6790047
+        ],
+        [
+          12.8113809,
+          56.6791442
+        ],
+        [
+          12.8113242,
+          56.6788259
+        ],
+        [
+          12.8107148,
+          56.6790047
+        ]
+      ]
+    ],
+    "no_go_zones": [],
+    "lane_spacing_m": 10,
+    "primary_angle_deg": 0,
+    "dual_pass": false,
+    "secondary_angle_deg": null,
+    "planning_home": [
+      12.81108856201172,
+      56.679159264264676
+    ],
+    "route_start_mode": "planning_home",
+    "approach_waypoints": [
+      [
+        12.81108319759369,
+        56.6791253873248
+      ],
+      [
+        12.811107337474825,
+        56.67906794374839
+      ]
+    ],
+    "return_waypoints": [
+      [
+        12.811107337474825,
+        56.67906794374839
+      ],
+      [
+        12.81108319759369,
+        56.6791253873248
+      ]
+    ]
+  },
+  "navigable_geometry": [
+    [
+      [
+        12.8107148,
+        56.6790047
+      ],
+      [
+        12.8113809,
+        56.6791442
+      ],
+      [
+        12.8113242,
+        56.6788259
+      ],
+      [
+        12.8107148,
+        56.6790047
+      ]
+    ]
+  ],
+  "no_go_zones": [],
+  "segments": [
+    {
+      "segment_id": "seg-01-start_connector",
+      "kind": "start_connector",
+      "coordinates": [
+        [
+          12.81108856201172,
+          56.679159264264676
+        ],
+        [
+          12.81108319759369,
+          56.6791253873248
+        ]
+      ],
+      "length_m": 3.79,
+      "raw_point_count": 2,
+      "final_point_count": 2,
+      "start_execution_seq": 0,
+      "end_execution_seq": 1
+    },
+    {
+      "segment_id": "seg-02-approach",
+      "kind": "approach",
+      "coordinates": [
+        [
+          12.81108319759369,
+          56.6791253873248
+        ],
+        [
+          12.811107337474825,
+          56.67906794374839
+        ]
+      ],
+      "length_m": 6.57,
+      "raw_point_count": 2,
+      "final_point_count": 2,
+      "start_execution_seq": 1,
+      "end_execution_seq": 2
+    },
+    {
+      "segment_id": "seg-03-survey_entry_connector",
+      "kind": "survey_entry_connector",
+      "coordinates": [
+        [
+          12.811107337474825,
+          56.67906794374839
+        ],
+        [
+          12.81131761504382,
+          56.67882781940192
+        ]
+      ],
+      "length_m": 29.68,
+      "raw_point_count": 2,
+      "final_point_count": 2,
+      "start_execution_seq": 2,
+      "end_execution_seq": 3
+    },
+    {
+      "segment_id": "seg-04-primary",
+      "kind": "primary",
+      "coordinates": [
+        [
+          12.81131761504382,
+          56.67882781940192
+        ],
+        [
+          12.811300237262243,
+          56.67912734540832
+        ],
+        [
+          12.811131990144847,
+          56.67909210006077
+        ],
+        [
+          12.811144374350915,
+          56.678878660788854
+        ],
+        [
+          12.810971133195396,
+          56.678929501930824
+        ],
+        [
+          12.810963743346681,
+          56.67905685448809
+        ],
+        [
+          12.810795496867778,
+          56.67902160869026
+        ],
+        [
+          12.810797891577293,
+          56.67898034282779
+        ]
+      ],
+      "length_m": 110.04,
+      "raw_point_count": 8,
+      "final_point_count": 8,
+      "start_execution_seq": 3,
+      "end_execution_seq": 10
+    },
+    {
+      "segment_id": "seg-05-return_connector",
+      "kind": "return_connector",
+      "coordinates": [
+        [
+          12.810797891577293,
+          56.67898034282779
+        ],
+        [
+          12.811107337474825,
+          56.67906794374839
+        ]
+      ],
+      "length_m": 21.33,
+      "raw_point_count": 2,
+      "final_point_count": 2,
+      "start_execution_seq": 10,
+      "end_execution_seq": 11
+    },
+    {
+      "segment_id": "seg-06-return_approach",
+      "kind": "return_approach",
+      "coordinates": [
+        [
+          12.811107337474825,
+          56.67906794374839
+        ],
+        [
+          12.81108319759369,
+          56.6791253873248
+        ]
+      ],
+      "length_m": 6.57,
+      "raw_point_count": 2,
+      "final_point_count": 2,
+      "start_execution_seq": 11,
+      "end_execution_seq": 12
+    },
+    {
+      "segment_id": "seg-07-final_home_connector",
+      "kind": "final_home_connector",
+      "coordinates": [
+        [
+          12.81108319759369,
+          56.6791253873248
+        ],
+        [
+          12.81108856201172,
+          56.679159264264676
+        ]
+      ],
+      "length_m": 3.79,
+      "raw_point_count": 2,
+      "final_point_count": 2,
+      "start_execution_seq": 12,
+      "end_execution_seq": 13
+    }
+  ],
+  "original_execution_order": [
+    {
+      "execution_seq": 0,
+      "latitude": 56.6791593,
+      "longitude": 12.8110886,
+      "source_segment_id": "seg-01-start_connector",
+      "source_segment_kind": "start_connector",
+      "source_index": 0
+    },
+    {
+      "execution_seq": 1,
+      "latitude": 56.6791254,
+      "longitude": 12.8110832,
+      "source_segment_id": "seg-01-start_connector",
+      "source_segment_kind": "start_connector",
+      "source_index": 1
+    },
+    {
+      "execution_seq": 2,
+      "latitude": 56.6790679,
+      "longitude": 12.8111073,
+      "source_segment_id": "seg-02-approach",
+      "source_segment_kind": "approach",
+      "source_index": 1
+    },
+    {
+      "execution_seq": 3,
+      "latitude": 56.6788278,
+      "longitude": 12.8113176,
+      "source_segment_id": "seg-03-survey_entry_connector",
+      "source_segment_kind": "survey_entry_connector",
+      "source_index": 1
+    },
+    {
+      "execution_seq": 4,
+      "latitude": 56.6791273,
+      "longitude": 12.8113002,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 1
+    },
+    {
+      "execution_seq": 5,
+      "latitude": 56.6790921,
+      "longitude": 12.811132,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 2
+    },
+    {
+      "execution_seq": 6,
+      "latitude": 56.6788787,
+      "longitude": 12.8111444,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 3
+    },
+    {
+      "execution_seq": 7,
+      "latitude": 56.6789295,
+      "longitude": 12.8109711,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 4
+    },
+    {
+      "execution_seq": 8,
+      "latitude": 56.6790569,
+      "longitude": 12.8109637,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 5
+    },
+    {
+      "execution_seq": 9,
+      "latitude": 56.6790216,
+      "longitude": 12.8107955,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 6
+    },
+    {
+      "execution_seq": 10,
+      "latitude": 56.6789803,
+      "longitude": 12.8107979,
+      "source_segment_id": "seg-04-primary",
+      "source_segment_kind": "primary",
+      "source_index": 7
+    },
+    {
+      "execution_seq": 11,
+      "latitude": 56.6790679,
+      "longitude": 12.8111073,
+      "source_segment_id": "seg-05-return_connector",
+      "source_segment_kind": "return_connector",
+      "source_index": 1
+    },
+    {
+      "execution_seq": 12,
+      "latitude": 56.6791254,
+      "longitude": 12.8110832,
+      "source_segment_id": "seg-06-return_approach",
+      "source_segment_kind": "return_approach",
+      "source_index": 1
+    },
+    {
+      "execution_seq": 13,
+      "latitude": 56.6791593,
+      "longitude": 12.8110886,
+      "source_segment_id": "seg-07-final_home_connector",
+      "source_segment_kind": "final_home_connector",
+      "source_index": 1
+    }
+  ],
+  "route_waypoints": [
+    {
+      "latitude": 56.6791593,
+      "longitude": 12.8110886,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6791254,
+      "longitude": 12.8110832,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6790679,
+      "longitude": 12.8111073,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6788278,
+      "longitude": 12.8113176,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6791273,
+      "longitude": 12.8113002,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6790921,
+      "longitude": 12.811132,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6788787,
+      "longitude": 12.8111444,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6789295,
+      "longitude": 12.8109711,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6790569,
+      "longitude": 12.8109637,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6790216,
+      "longitude": 12.8107955,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6789803,
+      "longitude": 12.8107979,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6790679,
+      "longitude": 12.8111073,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6791254,
+      "longitude": 12.8110832,
+      "loiter_time_s": 0.0
+    },
+    {
+      "latitude": 56.6791593,
+      "longitude": 12.8110886,
+      "loiter_time_s": 0.0
+    }
+  ],
+  "metrics": {
+    "boundary_area_m2": 823.52,
+    "navigable_area_m2": 696.32,
+    "waypoint_count": 14,
+    "total_length_m": 181.77,
+    "coverage_length_m": 110.04,
+    "transit_length_m": 71.73,
+    "lane_spacing_m": 10,
+    "shoreline_clearance_m": 1,
+    "primary_angle_deg": 0,
+    "secondary_angle_deg": null,
+    "dual_pass": false,
+    "no_go_zone_count": 0,
+    "approach_waypoint_count": 2,
+    "return_waypoint_count": 2,
+    "route_start_mode": "planning_home",
+    "survey_speed_mps": 1,
+    "survey_speed_is_default": false,
+    "estimated_duration_s": 181.8,
+    "route_quality": {
+      "raw_waypoint_count": 14,
+      "final_waypoint_count": 14,
+      "removed_waypoint_count": 0,
+      "raw_connector_waypoint_count": 0,
+      "final_connector_waypoint_count": 0,
+      "connector_length_before_m": 0,
+      "connector_length_after_m": 0,
+      "coverage_fragment_count": 1,
+      "fragment_reorders": 0,
+      "backtracking_events": 0,
+      "minimum_segment_length_m": 3.79,
+      "cleanup_applied": true,
+      "coverage_fragments": [
+        {
+          "pass_kind": "primary",
+          "fragment_index": 0,
+          "sweep_coordinate": 0,
+          "point_count": 8,
+          "length_m": 110.02,
+          "start": [
+            12.8113176,
+            56.6788278
+          ],
+          "end": [
+            12.8107979,
+            56.6789803
+          ],
+          "row_index": 0
+        }
+      ]
+    }
+  },
+  "created_at": "2026-08-05T10:49:20.224168+00:00",
+  "upload_command_id": "b04dd5fc-78c4-4a57-867e-bb9a87f48970",
+  "upload_status": "VERIFIED",
+  "verified_at": "2026-08-05T10:51:13.701713+00:00",
+  "upload_failure_reason": null,
+  "immutable": true,
+  "revision_reason": null,
+  "blocked_segments": null,
+  "derived_from_route_hash": null
+}
