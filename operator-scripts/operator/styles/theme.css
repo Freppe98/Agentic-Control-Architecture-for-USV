@@ -1018,6 +1018,82 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .rdy-banner.warn { color:var(--caution); border-color:rgba(242,169,59,.3); background:rgba(242,169,59,.07); font-weight:600; }
 .rdy-banner.dim { color:var(--dim); font-weight:600; }
 
+/* Control owner, shown BESIDE vehicle readiness rather than scored as one of its items —
+   handing authority to the Local Agent is what a mission requires, never a defect. */
+.rdy-owner { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:9px; padding-top:9px; border-top:1px solid var(--line); }
+.rdy-owner .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+
+/* ---- Agent Mission card (Map inspector) — the normal mission-operation control -------- */
+.amx { display:flex; flex-direction:column; gap:10px; }
+.amx-h { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+.amx-state { font-family:var(--font-mono); font-size:11px; font-weight:700; letter-spacing:.05em; padding:4px 9px; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel); color:var(--muted); }
+.amx-state.ok { color:var(--connected); border-color:rgba(62,207,142,.34); background:rgba(62,207,142,.09); }
+.amx-state.caution { color:var(--caution); border-color:rgba(242,169,59,.32); background:rgba(242,169,59,.08); }
+.amx-state.warn { color:var(--disconnected); border-color:rgba(229,72,77,.34); background:rgba(229,72,77,.09); }
+.amx-state.idle { color:var(--dim); }
+.amx-sub { font-size:12px; color:var(--muted); min-width:0; }
+/* One row per line. The compact card carries at most two identity rows (Mission, WP), and
+   flowing them side by side is what squeezed the mission id down to an ellipsis. */
+.amx-grid { display:grid; grid-template-columns:1fr; gap:4px 12px; }
+.amx-row { display:flex; align-items:baseline; justify-content:space-between; gap:8px; min-width:0; }
+.amx-row .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); flex:none; }
+.amx-row .v { font-size:12.5px; color:var(--text); text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.amx-row .v.mono { font-family:var(--font-mono); font-size:11.5px; }
+
+/* Active-operation progress: Scout's own transitional step, never a predicted next state. */
+.amx-prog { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--caution); }
+.amx-spin { width:11px; height:11px; flex:none; border-radius:50%; border:2px solid rgba(242,169,59,.28); border-top-color:var(--caution); animation:amx-spin 900ms linear infinite; }
+@keyframes amx-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .amx-spin { animation:none; } }
+/* PASSIVE readiness verification — muted, never the caution-orange above. A refresh of the
+   readiness proof is not something happening to the vehicle, and colouring it like a live
+   transaction is how a routine 10 s re-check came to read as an alarm. */
+.amx-prog.checking { color:var(--muted); }
+.amx-prog.checking .amx-spin { border-color:var(--line-strong); border-top-color:var(--muted); }
+
+.amx-btns { display:flex; flex-wrap:wrap; gap:8px; }
+.amx-btn { flex:1 1 auto; min-width:92px; padding:10px 13px; border-radius:var(--r); font-family:var(--font-mono); font-size:12px; font-weight:600; letter-spacing:.04em; cursor:pointer; border:1px solid var(--line-strong); background:var(--panel-2); color:var(--text); transition:border-color var(--t-hover), background var(--t-hover), transform var(--t-fast); }
+.amx-btn.primary:not(:disabled) { border-color:rgba(76,141,255,.45); color:var(--accent-bright); background:var(--accent-dim); }
+.amx-btn:hover:not(:disabled) { border-color:var(--accent); background:var(--accent-dim); }
+.amx-btn.warn:not(:disabled) { border-color:rgba(242,169,59,.4); color:var(--caution); background:var(--panel-2); }
+.amx-btn.warn:hover:not(:disabled) { border-color:var(--caution); background:rgba(242,169,59,.13); }
+.amx-btn:active:not(:disabled) { transform:translateY(1px); }
+.amx-btn:disabled { opacity:.42; cursor:not-allowed; color:var(--dim); }
+
+.amx-note { font-size:11.5px; line-height:1.5; color:var(--muted); }
+.amx-note.warn { color:var(--caution); }
+
+/* The one-shot readiness note + its explicit Refresh. Deliberately the quietest row in the card:
+   the Start preflight is no longer polled, its result is information rather than a gate, and
+   nothing here may read as a control that affects the vehicle. */
+.amx-info { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:11px; color:var(--dim); }
+.amx-info-t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.amx-refresh { flex:0 0 auto; padding:3px 9px; border-radius:var(--r); border:1px solid var(--line); background:transparent; color:var(--muted); font-family:var(--font-mono); font-size:10.5px; letter-spacing:.04em; cursor:pointer; transition:border-color var(--t-hover), color var(--t-hover); }
+.amx-refresh:hover:not(:disabled) { border-color:var(--line-strong); color:var(--text); }
+.amx-refresh:disabled { opacity:.45; cursor:not-allowed; }
+.amx-result { font-size:11.5px; line-height:1.5; color:var(--muted); padding-top:8px; border-top:1px solid var(--line); }
+.amx-result.ok { color:var(--connected); }
+.amx-result.warn { color:var(--caution); }
+
+/* Agent page: the raw lifecycle writes, COLLAPSED BY DEFAULT. Normal Start/Pause/Resume/Stop
+   live on the Map's Agent Mission card; this section exists for diagnosis only and is styled to
+   read that way — never as the primary control. */
+.mx-fallback { margin:2px 13px 12px; padding-top:9px; border-top:1px solid var(--line); }
+.mx-fallback > summary { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--dim); cursor:pointer; list-style:none; }
+.mx-fallback > summary::-webkit-details-marker { display:none; }
+.mx-fallback > summary::before { content:"▸ "; }
+.mx-fallback[open] > summary::before { content:"▾ "; }
+.mx-fallback > summary:hover { color:var(--muted); }
+.mx-fallback .reason-note { padding-left:0; padding-right:0; }
+
+/* Release Control lives behind this: normal mission operation never needs it. */
+.adv-auth { margin-top:10px; }
+.adv-auth > summary { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--dim); cursor:pointer; list-style:none; }
+.adv-auth > summary::-webkit-details-marker { display:none; }
+.adv-auth > summary::before { content:"▸ "; }
+.adv-auth[open] > summary::before { content:"▾ "; }
+.adv-auth > summary:hover { color:var(--muted); }
+
 /* Mission card: "+ Home" sub-note next to the executable waypoint count. */
 .pxm-sub { font-family:var(--font-mono); font-size:10px; color:var(--dim); }
 

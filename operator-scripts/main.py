@@ -15,6 +15,7 @@ import time
 import uuid
 
 import mission_contract
+import mission_lifecycle
 import planning
 import fleet_planning
 import replan_package
@@ -3155,37 +3156,32 @@ def cancel_pending_commands(vid: int, now, reason: str):
                        source="operator-backend")
 
 
-@app.post("/api/control_authority/{vehicle}")
-async def set_control_authority(vehicle: str, request: Request):
-    """Body: { "authority": "OPERATOR" | "LOCAL_AGENT" }. Take Control → OPERATOR,
-    Release Control → LOCAL_AGENT (RC is a hardware takeover and is NOT requestable).
-    Forwards to Scout's POST /agent/control_authority and returns a normalized ack
-    ({requested, authority} where authority is Scout's acknowledged effective value)
-    so the frontend confirms against the effective state, not the button press.
+def apply_control_authority(vid: int, authority: str, *, source="operator"):
+    """(payload, http_status) for ONE authority hand-off — the single implementation.
 
-    On a confirmed Release (authority=LOCAL_AGENT) also cancels any still-pending
-    command-queue entries for this vehicle (queue safety — see cancel_pending_commands)
-    so a stale operator command cannot fire once autonomy is back in control. Take
-    Control does NOT cancel — the operator is taking the wheel. Scout remains the sole
-    source of truth for the authority value itself."""
-    body = await request.json()
-    authority = str(body.get("authority") or "").upper()
+    Extracted from the POST route so the mission-lifecycle orchestration layer
+    (mission_lifecycle.py) performs the SAME hand-off, with the same queue-safety
+    cancellation and the same event, instead of a parallel copy that could drift. Scout
+    remains the sole source of truth for the value itself; this returns Scout's
+    acknowledged effective authority, never the requested one dressed up as confirmed.
+
+    `source` only labels the event: an automatic transfer inside a Start/Resume/Stop
+    transaction is recorded as such, so the event log distinguishes it from an operator
+    pressing Take Control / Release Control by hand."""
     if authority not in REQUESTABLE_AUTHORITY:
-        return JSONResponse(status_code=400, content={
-            "ok": False, "error": "invalid authority",
-            "authority": body.get("authority"), "allowed": list(REQUESTABLE_AUTHORITY)})
-
-    vid = parse_vehicle_id(vehicle)
+        return {"ok": False, "error": "invalid authority", "authority": authority,
+                "allowed": list(REQUESTABLE_AUTHORITY)}, 400
     if vid not in known_vehicle_ids():
-        return JSONResponse(status_code=404, content={
-            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
+        return {"ok": False, "error": "unknown vehicle", "vehicle_id": vid}, 404
 
     base = vehicle_api_base(vid)
     if base is None:
-        return JSONResponse(status_code=409, content={
+        return {
             "ok": False, "available": False, "vehicle_id": vid,
             "error": "no Scout control-authority API configured for this vehicle",
-            "message": "This vehicle has no control-authority backend; authority cannot be changed."})
+            "message": "This vehicle has no control-authority backend; authority cannot be "
+                       "changed.",
+        }, 409
 
     try:
         r = requests.post(f"{base}/agent/control_authority",
@@ -3193,9 +3189,9 @@ async def set_control_authority(vehicle: str, request: Request):
         r.raise_for_status()
         result = r.json() if r.content else {}
     except requests.RequestException as exc:
-        return JSONResponse(status_code=502, content={
-            "ok": False, "error": "Scout control-authority API unreachable",
-            "detail": str(exc)})
+        return {"ok": False, "error": "Scout control-authority API unreachable",
+                "message": f"Scout control-authority API unreachable: {exc}",
+                "detail": str(exc)}, 502
 
     if authority == "LOCAL_AGENT":
         cancel_pending_commands(vid, datetime.now(timezone.utc),
@@ -3211,6 +3207,8 @@ async def set_control_authority(vehicle: str, request: Request):
         last_authority_by_id[vid] = eff_val
         human = "Operator" if eff_val == "OPERATOR" else "Local Agent" if eff_val == "LOCAL_AGENT" else eff_val
         verb = "Take Control" if authority == "OPERATOR" else "Release Control"
+        if source != "operator":
+            verb = f"{source} transaction"
         _append_event(severity="caution" if eff_val == "OPERATOR" else "info",
                       # ASCII "->" — see the note in record_agent_changes: this string is
                       # printed to the console, where cp1252 cannot encode "→".
@@ -3221,7 +3219,54 @@ async def set_control_authority(vehicle: str, request: Request):
         "ok": True, "vehicle_id": vid, "requested": authority,
         "authority": eff if eff in REPORTABLE_AUTHORITY else None,
         "available": True, "reachable": True, "source": "scout", "raw": result,
-    }
+    }, 200
+
+
+def read_control_authority(vid: int):
+    """The live authority read, in the same shape the GET route returns. Used by the route
+    AND by the orchestration layer's read-back verification — a POST is never treated as a
+    transfer until a READ confirms it."""
+    if vid not in known_vehicle_ids():
+        return {"ok": False, "error": "unknown vehicle", "vehicle_id": vid,
+                "available": False, "reachable": False, "authority": None}
+    base = vehicle_api_base(vid)
+    if base is None:
+        return {
+            "ok": True, "vehicle_id": vid, "available": False, "reachable": False,
+            "authority": None, "source": "scout",
+            "reason": "No Scout control-authority API configured for this vehicle",
+        }
+    return _scout_authority_read(vid, base)
+
+
+@app.post("/api/control_authority/{vehicle}")
+async def set_control_authority(vehicle: str, request: Request):
+    """Body: { "authority": "OPERATOR" | "LOCAL_AGENT" }. Take Control → OPERATOR,
+    Release Control → LOCAL_AGENT (RC is a hardware takeover and is NOT requestable).
+    Forwards to Scout's POST /agent/control_authority and returns a normalized ack
+    ({requested, authority} where authority is Scout's acknowledged effective value)
+    so the frontend confirms against the effective state, not the button press.
+
+    This is the MANUAL override path and stays exactly that. Normal mission operation no
+    longer depends on it: Start / Resume / Stop arrange and verify authority themselves
+    (mission_lifecycle.py), so the operator never has to press Release Control to run a
+    mission. Take Control remains available at all times.
+
+    On a confirmed Release (authority=LOCAL_AGENT) also cancels any still-pending
+    command-queue entries for this vehicle (queue safety — see cancel_pending_commands)
+    so a stale operator command cannot fire once autonomy is back in control. Take
+    Control does NOT cancel — the operator is taking the wheel. Scout remains the sole
+    source of truth for the authority value itself."""
+    body = await request.json()
+    authority = str(body.get("authority") or "").upper()
+    if authority not in REQUESTABLE_AUTHORITY:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "invalid authority",
+            "authority": body.get("authority"), "allowed": list(REQUESTABLE_AUTHORITY)})
+    payload, code = apply_control_authority(parse_vehicle_id(vehicle), authority)
+    if code == 200:
+        return payload
+    return JSONResponse(status_code=code, content=payload)
 
 
 @app.get("/api/control_authority/{vehicle}")
@@ -3236,15 +3281,7 @@ def get_control_authority(vehicle: str):
     if vid not in known_vehicle_ids():
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
-
-    base = vehicle_api_base(vid)
-    if base is None:
-        return {
-            "ok": True, "vehicle_id": vid, "available": False, "reachable": False,
-            "authority": None, "source": "scout",
-            "reason": "No Scout control-authority API configured for this vehicle",
-        }
-    return _scout_authority_read(vid, base)
+    return read_control_authority(vid)
 
 
 # --- Pixhawk mission (direct proxy to Scout Flask, NOT the command queue) ---
@@ -4517,7 +4554,7 @@ def _normalize_scout_package(scout, legacy_geometry=None):
     }
 
 
-def _compute_replan_readiness(vid, base):
+def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_TTL_S):
     """The combined readiness summary (task Section 3). Keeps the Vehicle mission and the Scout
     planning package as two DISTINCT operations, never letting a successful Pixhawk upload hide
     a package failure, and reports limitations separately. Returns a JSON-able dict.
@@ -4532,16 +4569,22 @@ def _compute_replan_readiness(vid, base):
     The operator makes the mission-id comparison itself because Scout cannot: the Pixhawk
     mission read-back carries no operator mission id, so Scout reports `mission_id_consistent:
     null` — an honest "cannot compare", never a failure. The operator owns the active mission
-    record, so it can and does compare."""
+    record, so it can and does compare.
+
+    `max_readback_age_s` bounds how old the Pixhawk read-back evidence may be. The default is the
+    age-labelled polling cache; a caller that is about to AUTHORIZE A VEHICLE WRITE passes 0 and
+    pays for a live MAVLink download, because a ten-second-old hash is evidence about the past.
+    The Start transaction is the caller that does that (mission_lifecycle.run_start)."""
     now = datetime.now(timezone.utc)
 
     # A. Vehicle mission — the immutable revision-0 record + a BOUNDED Pixhawk read-back.
-    # This path is polled, so it goes through the age-labelled cache rather than forcing a
-    # fresh mission download on every refresh (see _pixhawk_readback).
+    # Display paths go through the age-labelled cache rather than forcing a fresh mission
+    # download on every refresh; max_readback_age_s=0 forces a live one (see _pixhawk_readback).
     mission_id = active_original_by_vehicle.get(vid)
     rec = original_missions.get(mission_id) if mission_id else None
     flask_base = vehicle_api_base(vid)
-    readback = _pixhawk_readback(vid, flask_base, now) if flask_base else None
+    readback = (_pixhawk_readback(vid, flask_base, now, max_age_s=max_readback_age_s)
+                if flask_base else None)
 
     record_hash = rec.get("route_hash") if rec else None
     upload_status = rec.get("upload_status") if rec else None
@@ -5202,6 +5245,73 @@ def _record_mission_execution_operation(vid, result, *, requested_at, mission_id
     return entry
 
 
+def _record_lifecycle_transaction(vid, env, *, requested_at):
+    """Append ONE orchestrated lifecycle transaction (start / pause / resume / stop) to the same
+    write trace the raw operations use, so the Agent page's history renders both without
+    branching. Adds what only a transaction has: its phases and the authority hand-off it
+    performed, which is the audit trail for "who held the wheel, and who moved it"."""
+    global _mx_op_seq
+    _mx_op_seq += 1
+    seq = env.get("sequence") if isinstance(env.get("sequence"), dict) else {}
+    entry = {
+        "seq": _mx_op_seq,
+        "vehicle_id": vehicle_slug(vid),
+        "vehicle": name_of(vid),
+        "operation": env.get("operation"),
+        "requested_at": requested_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "outcome": env.get("outcome"),
+        "transport_outcome": env.get("outcome"),
+        "http_status": env.get("http_status"),
+        "scout_error_code": env.get("scout_error_code"),
+        "scout_error_message": env.get("scout_error_message"),
+        "operation_id": env.get("operation_id"),
+        "mission_id": env.get("mission_id"),
+        "route_hash": env.get("route_hash"),
+        "previous_state": env.get("previous_state"),
+        "resulting_state": env.get("resulting_state"),
+        "verified_mode": env.get("verified_mode"),
+        "final": env.get("final"),
+        "idempotent": env.get("idempotent"),
+        "home_result": env.get("home_result"),
+        "sequence": env.get("sequence"),
+        "continuation_verified": seq.get("continuation_verified"),
+        "supported": env.get("supported", True),
+        "unknown": env.get("outcome") == scout_mission_execution.OUTCOME_UNKNOWN,
+        "reconciliation": env.get("reconciliation"),
+        "error": env.get("error"),
+        # What only a TRANSACTION has: the phases it ran and the authority hand-off it
+        # performed. This is the audit trail for "who held the wheel, and who moved it".
+        "phases": env.get("phases"),
+        "authority": env.get("authority") or {},
+    }
+    mission_execution_operations.append(entry)
+    if len(mission_execution_operations) > MAX_MISSION_EXECUTION_OPERATIONS:
+        del mission_execution_operations[
+            :len(mission_execution_operations) - MAX_MISSION_EXECUTION_OPERATIONS]
+
+    outcome = entry["outcome"]
+    sev = ("warning" if outcome in (scout_mission_execution.OUTCOME_UNKNOWN,
+                                    scout_mission_execution.OUTCOME_FAILED)
+           else "caution" if outcome in (scout_mission_execution.OUTCOME_REJECTED,
+                                         mission_lifecycle.OUTCOME_BLOCKED)
+           else "info")
+    msg = f"Mission {entry['operation']} -> {outcome}"
+    if entry["scout_error_code"]:
+        msg += f" ({entry['scout_error_code']})"
+    elif outcome == mission_lifecycle.OUTCOME_BLOCKED and env.get("error_code"):
+        msg += f" ({env['error_code']})"
+    elif entry["resulting_state"]:
+        msg += f" ({entry['resulting_state']})"
+    _mx_event(vid, severity=sev, message=msg, detail=entry)
+
+    if entry["operation"] == "resume" and seq.get("continuation_verified") is False:
+        _mx_event(vid, severity="warning", detail=entry,
+                  message="AUTO resumed, but waypoint continuation was NOT verified - the "
+                          "Pixhawk may have restarted the mission at waypoint 0")
+    return entry
+
+
 def _mx_ingest_status_events(vid, summary, body):
     """Emit lifecycle events observed through status POLLING, deduplicated per vehicle.
 
@@ -5332,42 +5442,122 @@ def mission_execution_status(vehicle_id: str):
     return _mx_response(vid, out)
 
 
+# ── The ONE endpoint per operator intent (authority orchestration included) ────────────────
+# The frontend calls exactly one of these per button press. The authority hand-off is NOT a
+# separate call the browser makes first — mission_lifecycle.py performs it, verifies it by
+# read-back, and reports it as a PHASE of the same operation. That is the whole point: the
+# operator never has to press Release Control, and the two halves can never be issued out of
+# order or half-done by a page that forgot one.
+def _lifecycle_deps():
+    """The operator-backend facts the orchestration layer runs on. Built per request so a test
+    that swaps a store or a transport sees the swap."""
+    return mission_lifecycle.Deps(
+        active_mission_id=lambda vid: active_original_by_vehicle.get(vid),
+        mission_record=lambda mid: original_missions.get(mid),
+        # `fresh=True` is passed by the START transaction only, and it forces a live Pixhawk
+        # mission download instead of the bounded polling cache. That is what makes the Start
+        # proof a proof about NOW — and it is why the station no longer has to poll a copy of it.
+        readiness=lambda vid, base, fresh=False: _compute_replan_readiness(
+            vid, base, max_readback_age_s=0.0 if fresh else PIXHAWK_READBACK_TTL_S),
+        get_authority=read_control_authority,
+        set_authority=lambda vid, value: apply_control_authority(
+            vid, value, source="mission-execution")[0],
+    )
+
+
+def _lifecycle_transaction(vehicle_id, operation, runner):
+    """Shared body for start / pause / resume / stop: resolve the vehicle's Local Agent, run the
+    ONE transaction, record it in the write trace and answer at its honest HTTP status."""
+    target, err = _local_agent_target(vehicle_id, "mission-execution")
+    if err is not None:
+        return err
+    vid, base = target
+    requested_at = datetime.now(timezone.utc).isoformat()
+    env = runner(_lifecycle_deps(), vid, base, vehicle_slug(vid))
+    _record_lifecycle_transaction(vid, env, requested_at=requested_at)
+    return JSONResponse(status_code=mission_lifecycle.status_code(env), content=env)
+
+
 @app.post("/api/vehicles/{vehicle_id}/mission-execution/start")
 async def mission_execution_start(vehicle_id: str, request: Request):
-    """Start the mission — ONE Scout-side transaction. The Operator issues NO separate LOITER,
-    Set Home or AUTO command here; Scout performs and verifies each step and reports the result.
+    """START — one operation, two phases: verified authority transfer, then Scout's own Start.
 
-    Body: { mission_id? } — defaults to this vehicle's active original mission so Scout can fail
-    closed with MISSION_ID_MISMATCH rather than starting a route the operator did not approve.
+    The Operator issues NO separate LOITER, Set Home or AUTO command; Scout performs and
+    verifies each step. Before anything is sent it requires the vehicle's ACTIVE PERSISTED
+    mission record to be VERIFIED, the Pixhawk read-back hash to match, the planning package to
+    be stored/usable/consistent, Scout's replanning readiness to be true, and Scout's own Start
+    eligibility. It then transfers authority to LOCAL_AGENT and READS IT BACK before contacting
+    Scout at all.
+
+    Body: { mission_id? } — OPTIONAL and never trusted over the persisted record. The active
+    mission id is what is forwarded; a supplied id that does not match it is rejected here, so
+    a browser can never point a Start at a route the operator did not approve.
+
     Start RESETS Home to the vehicle's current launch position (Scout sets and verifies it); the
     originally planned Home is not retained."""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    vid = parse_vehicle_id(vehicle_id)
-    mission_id = (body or {}).get("mission_id") or active_original_by_vehicle.get(vid)
-    return _mission_execution_write(
+    supplied = (body or {}).get("mission_id")
+    return _lifecycle_transaction(
         vehicle_id, "start",
-        lambda base: scout_mission_execution.post_start(base, mission_id),
-        mission_id=mission_id)
+        lambda deps, vid, base, slug: mission_lifecycle.run_start(
+            deps, vid, base, slug, supplied_mission_id=supplied))
 
 
 @app.post("/api/vehicles/{vehicle_id}/mission-execution/pause")
 def mission_execution_pause(vehicle_id: str):
-    """Pause the mission: Scout records the mission sequence, commands a VERIFIED LOITER and
-    confirms the mission is still loaded. This is NOT a stop/cancel — it clears no mission,
-    uploads no replacement and resets no sequence. Repeating it while PAUSED is idempotent."""
-    return _mission_execution_write(vehicle_id, "pause", scout_mission_execution.post_pause)
+    """PAUSE — authority stays LOCAL_AGENT (the mission is still the agent's to run). Scout
+    records the mission sequence, commands a VERIFIED LOITER and confirms the mission is still
+    loaded; the operator backend then verifies PAUSED/LOITER against canonical status. This is
+    NOT a stop/cancel — it clears no mission, uploads no replacement and resets no sequence."""
+    return _lifecycle_transaction(
+        vehicle_id, "pause",
+        lambda deps, vid, base, slug: mission_lifecycle.run_pause(deps, vid, base, slug))
 
 
 @app.post("/api/vehicles/{vehicle_id}/mission-execution/resume")
 def mission_execution_resume(vehicle_id: str):
-    """Resume the mission: Scout verifies the expected mission is still loaded, verifies Home and
-    position, commands a VERIFIED AUTO and observes the sequence. Scout can report RUNNING with
+    """RESUME — verifies authority is STILL LOCAL_AGENT and re-acquires it only if it is not,
+    then Scout verifies the expected mission is loaded, verifies Home and position, commands a
+    VERIFIED AUTO and observes the sequence. Scout can report RUNNING with
     continuation_verified=false — the mode transition worked but continuation from the paused
-    waypoint could not be proven. That is preserved and surfaced as a warning, never as success."""
-    return _mission_execution_write(vehicle_id, "resume", scout_mission_execution.post_resume)
+    waypoint could not be proven. That is preserved and surfaced as a warning, never as
+    success."""
+    return _lifecycle_transaction(
+        vehicle_id, "resume",
+        lambda deps, vid, base, slug: mission_lifecycle.run_resume(deps, vid, base, slug))
+
+
+@app.post("/api/vehicles/{vehicle_id}/mission-execution/stop")
+def mission_execution_stop(vehicle_id: str):
+    """STOP — end the run, then return OPERATOR authority only after Scout reports STOPPED with
+    a verified LOITER.
+
+    PENDING ON SCOUT. Scout does not implement POST /agent/mission_execution/stop yet, so this
+    answers `unsupported` and changes NOTHING — no authority move, no vehicle command, no
+    fabricated terminal state. Stop is deliberately NOT emulated from a low-level LOITER plus
+    operator-side bookkeeping, is never reported as FAILED, and Rearm is not a substitute for
+    it. It must not disarm, clear the Pixhawk mission, delete the planning package or invoke
+    RTL. See SCOUT_STOP_API.md for the contract this is written against."""
+    return _lifecycle_transaction(
+        vehicle_id, "stop",
+        lambda deps, vid, base, slug: mission_lifecycle.run_stop(deps, vid, base, slug))
+
+
+@app.get("/api/vehicles/{vehicle_id}/mission-execution/preflight")
+def mission_execution_preflight(vehicle_id: str):
+    """READ-ONLY Start preflight: the resolved active mission identity plus the five precondition
+    checks, computed by the SAME function the Start transaction enforces — so the Map card's
+    readiness display and the gate can never disagree. Issues no write of any kind."""
+    target, err = _local_agent_target(vehicle_id, "mission-execution")
+    if err is not None:
+        return err
+    vid, base = target
+    out = mission_lifecycle.preflight(_lifecycle_deps(), vid, base)
+    out["vehicle_id"] = vehicle_slug(vid)
+    return out
 
 
 @app.post("/api/vehicles/{vehicle_id}/mission-execution/rearm")

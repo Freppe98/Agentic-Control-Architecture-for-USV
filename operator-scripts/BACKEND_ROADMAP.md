@@ -171,3 +171,20 @@ Architectural owners per [`SYSTEM_INFORMATION_MODEL.md`](SYSTEM_INFORMATION_MODE
 **Then** (cross-component, after #1–#3): **surface the agent reasoning already emitted.** Per the information model, `payload.agent.*` (`current_behaviour`, `decision_reason`, `autonomy_level`, `current_policy`) is already sent by the Local Agent but **dropped** in `normalize_agent_message` — forwarding it closes much of the Autonomy page with no agent change. `decision_confidence` / `next_eval_s` / `active_constraints` remain a genuine agent-contract addition.
 
 Anything touching `main.py` or the `POST /agent/status` schema is an outward-facing contract change — propose, get a green light, then implement.
+
+---
+
+## Blocked on Scout (Local Agent, port 8090)
+
+| Slot | Pages | Owner | Prio | State |
+|---|---|---|---|---|
+| **`POST /agent/mission_execution/stop` + `can_stop` in status** | Map (Agent Mission card), Agent (diagnostics) | Local Agent | **P0** | **Requested — contract written, Operator side complete** |
+
+Stop is the one normal mission-lifecycle operation the operator cannot perform. The Operator
+model, proxy (`scout_mission_execution.post_stop`), transaction
+(`mission_lifecycle.run_stop`), route (`POST /api/vehicles/{id}/mission-execution/stop`) and UI
+are already implemented against the contract in [`SCOUT_STOP_API.md`](SCOUT_STOP_API.md);
+shipping the Scout side is the only remaining work. Until then the button is visibly disabled
+with the reason "this Scout does not implement stop yet" — Stop is never emulated from a
+low-level LOITER plus operator-side state, never reported as FAILED, and Rearm is never offered
+as a substitute.

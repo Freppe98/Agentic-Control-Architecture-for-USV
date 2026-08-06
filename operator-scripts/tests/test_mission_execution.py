@@ -130,8 +130,36 @@ def op_body(operation="start", **over):
     return body
 
 
+def green_readiness(**over):
+    """A readiness verdict in which every Start precondition the OPERATOR owns is satisfied.
+
+    Start is no longer a naked proxy: it is a transaction that first requires a VERIFIED mission
+    record, a matching Pixhawk read-back hash, a stored/usable/consistent planning package and
+    Scout's replanning readiness (mission_lifecycle.start_preconditions). Tests that are about
+    the PROXY semantics — 409s, 200-with-error, timeouts, reconciliation — pin those semantics,
+    not the preconditions, so the harness arms them and the precondition behaviour gets its own
+    dedicated tests in tests/test_mission_lifecycle.py."""
+    out = {
+        "ok": True, "mission_ready": True, "replanning_ready": True,
+        "vehicle_mission": {"mission_id": "msn-0001", "record_present": True,
+                            "route_hash": "sha256:aaa", "upload_status": "VERIFIED",
+                            "pixhawk_verified": True, "readback_reachable": True,
+                            "readback_hash": "sha256:aaa", "readback_hash_match": True,
+                            "home_valid": True, "home_source": "verified_home"},
+        "planning_package": {"stored": True, "usable": True, "consistent": True,
+                             "mission_id": "msn-0001", "mission_id_match": True,
+                             "route_hash": "sha256:aaa", "hash_match": True,
+                             "consistency": "PLANNING_PACKAGE_CONSISTENT"},
+        "limitations": [],
+    }
+    out.update(over)
+    return out
+
+
 class MissionExecutionTestCase(unittest.TestCase):
-    """Shared harness: a fake Local Agent + a clean per-test operator state."""
+    """Shared harness: a fake Local Agent + a clean per-test operator state, with the Start
+    preconditions and the control-authority proxy ARMED GREEN (see green_readiness) so these
+    tests keep pinning what they were written to pin — the Scout proxy's HTTP semantics."""
 
     def setUp(self):
         self.fake = FakeLA()
@@ -143,8 +171,45 @@ class MissionExecutionTestCase(unittest.TestCase):
         main.event_log.clear()
         main.commands.clear() if hasattr(main, "commands") else None
 
+        # A canonical status is the default so a Start's precondition read finds a startable
+        # Scout. Individual tests override it (or clear the whole response map for the
+        # older-Scout / unreachable cases).
+        self.set_status(status_body())
+
+        # Green preconditions: an active VERIFIED mission record, matching hashes, a consistent
+        # package, and a Scout already holding LOCAL_AGENT authority (so acquire_authority
+        # short-circuits and the test's POSTs are Scout lifecycle calls only).
+        self._real_readiness = main._compute_replan_readiness
+        self._real_read_authority = main.read_control_authority
+        self._real_apply_authority = main.apply_control_authority
+        self.authority_value = "LOCAL_AGENT"
+        self.authority_writes = []
+        main._compute_replan_readiness = (
+            lambda vid, base, *, max_readback_age_s=main.PIXHAWK_READBACK_TTL_S: green_readiness())
+        main.read_control_authority = lambda vid: {
+            "ok": True, "vehicle_id": vid, "available": True, "reachable": True,
+            "authority": self.authority_value, "source": "scout"}
+
+        def _apply(vid, authority, source="operator"):
+            self.authority_writes.append((vid, authority, source))
+            self.authority_value = authority
+            return {"ok": True, "vehicle_id": vid, "requested": authority,
+                    "authority": authority, "available": True, "reachable": True}, 200
+        main.apply_control_authority = _apply
+
+        for vid in (SCOUT_VID, SAR_VID):
+            main.active_original_by_vehicle[vid] = "msn-0001"
+        main.original_missions["msn-0001"] = {
+            "mission_id": "msn-0001", "upload_status": "VERIFIED", "route_hash": "sha256:aaa"}
+
     def tearDown(self):
         scout_replan.requests = self._real_requests
+        main._compute_replan_readiness = self._real_readiness
+        main.read_control_authority = self._real_read_authority
+        main.apply_control_authority = self._real_apply_authority
+        for vid in (SCOUT_VID, SAR_VID):
+            main.active_original_by_vehicle.pop(vid, None)
+        main.original_missions.pop("msn-0001", None)
 
     # -- helpers ---------------------------------------------------------------------
     def set_status(self, body, status=200):
@@ -152,6 +217,18 @@ class MissionExecutionTestCase(unittest.TestCase):
 
     def set_op(self, operation, resp):
         self.fake.set("POST", f"/agent/mission_execution/{operation}", resp)
+
+    def set_status_sequence(self, *responses):
+        """Script consecutive GET /status answers. A START now READS status twice: once for its
+        own precondition check (which must find a startable Scout) and once to reconcile an
+        UNKNOWN write (which is where the state under test belongs). The last entry sticks."""
+        self.fake.set("GET", "/agent/mission_execution/status", list(responses))
+
+    def only_default(self, resp):
+        """Drop every matched response so `resp` answers EVERY call — the older-Scout (404) and
+        unreachable-Scout cases, which must not be masked by the harness's default status."""
+        self.fake.responses.clear()
+        self.fake.default = resp
 
 
 # ── 1. All five Scout routes, on the selected vehicle's Local Agent base ────────────────
@@ -171,30 +248,61 @@ class TestRoutes(MissionExecutionTestCase):
             self.assertEqual(r.status_code, 200, op)
             self.assertIn(f"{SCOUT_BASE}/agent/mission_execution/{op}", self.fake.urls("POST"), op)
 
-    def test_start_sends_the_expected_mission_id_when_one_is_known(self):
+    def test_the_stop_route_reaches_scouts_stop(self):
+        """PENDING ON SCOUT: the route exists and is exercised end to end here; against a real
+        Scout today it 404s and answers `unsupported`. See SCOUT_STOP_API.md."""
+        self.set_status(status_body(state="RUNNING", can_start=False, can_pause=True))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="STOPPED",
+                                             verified_mode="LOITER"), 200))
+        r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/stop")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(f"{SCOUT_BASE}/agent/mission_execution/stop", self.fake.urls("POST"))
+
+    def test_start_forwards_the_active_persisted_mission_id(self):
         self.set_op("start", FakeResp(op_body("start"), 200))
         main.active_original_by_vehicle[SCOUT_VID] = "msn-active-77"
+        main.original_missions["msn-active-77"] = {
+            "mission_id": "msn-active-77", "upload_status": "VERIFIED",
+            "route_hash": "sha256:aaa"}
         try:
             self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start")
         finally:
-            main.active_original_by_vehicle.pop(SCOUT_VID, None)
+            main.original_missions.pop("msn-active-77", None)
         sent = [b for (m, u, b) in self.fake.calls if u.endswith("/start")][0]
         self.assertEqual(sent, {"mission_id": "msn-active-77"})
 
-    def test_start_body_mission_id_overrides_the_active_one(self):
+    def test_a_ui_supplied_mission_id_that_mismatches_is_rejected_locally(self):
+        """The persisted active record WINS. A browser must never be able to point a Start at a
+        route the operator did not approve, so a mismatching id is refused HERE — Scout is not
+        contacted at all, which is what makes `blocked` distinct from Scout's own rejection."""
         self.set_op("start", FakeResp(op_body("start"), 200))
-        self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start",
-                         json={"mission_id": "msn-explicit"})
-        sent = [b for (m, u, b) in self.fake.calls if u.endswith("/start")][0]
-        self.assertEqual(sent, {"mission_id": "msn-explicit"})
+        r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start",
+                             json={"mission_id": "msn-somebody-elses"})
+        self.assertEqual(r.status_code, 409)
+        d = r.json()
+        self.assertEqual(d["outcome"], "blocked")
+        self.assertEqual(d["error_code"], "MISSION_ID_MISMATCH")
+        self.assertIn("msn-0001", d["error"])
+        self.assertEqual([u for u in self.fake.urls("POST")], [],
+                         "a locally-rejected Start must never reach Scout")
 
-    def test_start_sends_an_empty_body_when_no_mission_id_is_known(self):
-        """Scout treats the body as optional — an absent id is sent as {}, never guessed."""
+    def test_a_ui_supplied_mission_id_matching_the_active_record_is_accepted(self):
+        self.set_op("start", FakeResp(op_body("start"), 200))
+        r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start",
+                             json={"mission_id": "msn-0001"})
+        self.assertEqual(r.status_code, 200)
+        sent = [b for (m, u, b) in self.fake.calls if u.endswith("/start")][0]
+        self.assertEqual(sent, {"mission_id": "msn-0001"})
+
+    def test_start_without_an_active_mission_record_is_blocked_not_guessed(self):
+        """No active record means there is nothing to forward. The Start is refused with an
+        explicit reason rather than sent with an empty body and left to Scout to sort out."""
         main.active_original_by_vehicle.pop(SCOUT_VID, None)
         self.set_op("start", FakeResp(op_body("start"), 200))
-        self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start")
-        sent = [b for (m, u, b) in self.fake.calls if u.endswith("/start")][0]
-        self.assertEqual(sent, {})
+        r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error_code"], "NO_ACTIVE_MISSION")
+        self.assertEqual(self.fake.urls("POST"), [])
 
     def test_pause_and_resume_send_an_empty_json_body(self):
         for op in ("pause", "resume", "rearm"):
@@ -302,7 +410,7 @@ class TestHttpSemantics(MissionExecutionTestCase):
         self.assertEqual(d["home_result"]["verification_distance_m"], 0.4)
 
     def test_older_scout_404_is_unsupported_and_fabricates_nothing(self):
-        self.fake.default = FakeResp(None, 404)
+        self.only_default(FakeResp(None, 404))
         s = self.client.get(f"/api/vehicles/{SCOUT_VID}/mission-execution/status")
         self.assertEqual(s.status_code, 200)          # a handled "not supported", not an error
         body = s.json()
@@ -354,7 +462,7 @@ class TestHttpSemantics(MissionExecutionTestCase):
         self.assertEqual([e for e in main.event_log if e["type"] == "mission-execution"], [])
 
     def test_an_unreachable_scout_status_is_unavailable_never_fabricated(self):
-        self.fake.default = real_requests.RequestException("connection refused")
+        self.only_default(real_requests.RequestException("connection refused"))
         r = self.client.get(f"/api/vehicles/{SCOUT_VID}/mission-execution/status")
         self.assertEqual(r.status_code, 503)
         self.assertIs(r.json()["summary"]["reachable"], False)
@@ -365,7 +473,9 @@ class TestHttpSemantics(MissionExecutionTestCase):
 class TestUnknownAndReconciliation(MissionExecutionTestCase):
     def test_a_write_timeout_is_unknown_not_a_failure(self):
         self.set_op("start", real_requests.Timeout("read timed out"))
-        self.set_status(status_body(state="RUNNING", can_start=False, can_pause=True))
+        self.set_status_sequence(
+            FakeResp(status_body(), 200),      # preflight: startable
+            FakeResp(status_body(state="RUNNING", can_start=False, can_pause=True), 200))
         r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start")
         self.assertEqual(r.status_code, 202)         # accepted-but-unconfirmed
         self.assertEqual(r.json()["operational_outcome"], mx.OUTCOME_UNKNOWN)
@@ -381,13 +491,11 @@ class TestUnknownAndReconciliation(MissionExecutionTestCase):
 
     def test_unknown_start_reconciles_to_running_by_reading_status(self):
         self.set_op("start", real_requests.Timeout("boom"))
-        self.set_status(status_body(state="RUNNING", effective_state="RUNNING", mode="AUTO",
-                                    mission_id="msn-0001", can_start=False, can_pause=True))
-        main.active_original_by_vehicle[SCOUT_VID] = "msn-0001"
-        try:
-            d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
-        finally:
-            main.active_original_by_vehicle.pop(SCOUT_VID, None)
+        self.set_status_sequence(
+            FakeResp(status_body(), 200),      # preflight: startable
+            FakeResp(status_body(state="RUNNING", effective_state="RUNNING", mode="AUTO",
+                                 mission_id="msn-0001", can_start=False, can_pause=True), 200))
+        d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
         rec = d["reconciliation"]
         self.assertEqual(rec["resolved"], "running")
         self.assertIs(rec["mission_id_match"], True)
@@ -395,12 +503,10 @@ class TestUnknownAndReconciliation(MissionExecutionTestCase):
 
     def test_unknown_start_against_a_different_mission_is_a_mismatch_not_a_success(self):
         self.set_op("start", real_requests.Timeout("boom"))
-        self.set_status(status_body(state="RUNNING", mission_id="msn-OTHER"))
-        main.active_original_by_vehicle[SCOUT_VID] = "msn-0001"
-        try:
-            d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
-        finally:
-            main.active_original_by_vehicle.pop(SCOUT_VID, None)
+        self.set_status_sequence(
+            FakeResp(status_body(), 200),      # preflight: startable
+            FakeResp(status_body(state="RUNNING", mission_id="msn-OTHER"), 200))
+        d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
         self.assertEqual(d["reconciliation"]["resolved"], "mission_mismatch")
         self.assertIs(d["reconciliation"]["mission_id_match"], False)
 
@@ -444,14 +550,17 @@ class TestUnknownAndReconciliation(MissionExecutionTestCase):
 
     def test_an_in_flight_operation_leaves_the_outcome_undecided(self):
         self.set_op("start", real_requests.Timeout("boom"))
-        self.set_status(status_body(state="SETTING_HOME", active_operation_id="op-9"))
+        self.set_status_sequence(
+            FakeResp(status_body(), 200),      # preflight: startable
+            FakeResp(status_body(state="SETTING_HOME", active_operation_id="op-9"), 200))
         d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
         self.assertEqual(d["reconciliation"]["resolved"], "in_progress")
 
     def test_a_failed_reconciling_read_stays_unknown(self):
         self.set_op("start", real_requests.Timeout("boom"))
-        self.fake.set("GET", "/agent/mission_execution/status",
-                      real_requests.RequestException("still down"))
+        self.set_status_sequence(
+            FakeResp(status_body(), 200),      # preflight succeeded…
+            real_requests.RequestException("still down"))   # …then the link died
         d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
         self.assertEqual(d["reconciliation"]["resolved"], mx.OUTCOME_UNKNOWN)
 

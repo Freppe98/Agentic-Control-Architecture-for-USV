@@ -7,8 +7,11 @@ import { NavRail } from "../components/NavRail.js";
 import { Ribbon, updateRibbon } from "../components/Ribbon.js";
 import { CommsPill } from "../components/CommsPill.js";
 import { BatteryBar } from "../components/BatteryBar.js";
+// StatusBadges carries the AuthoritySeg — and it is the ONLY place the Map displays control
+// authority. The inspector used to repeat it in the readiness title, a Control Owner card, the
+// Manual Control card and the Agent Mission grid; four readouts of one fact is not four times
+// the clarity. AuthoritySeg is deliberately NOT imported here any more.
 import { StatusBadges } from "../components/StatusBadges.js";
-import { AuthoritySeg } from "../components/AuthoritySeg.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
@@ -22,6 +25,9 @@ import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission
 import { missionShowable, nextVisibility, toggleVisibility, toggleButton } from "../lib/mission-visibility.js";
 import { createTelemetryCache } from "../lib/telemetry-cache.js";
 import { attachMapLayout } from "../lib/map-layout.js";
+import * as mx from "../lib/mission-execution.js";
+import { readinessView, preflightNote } from "../lib/mission-readiness.js";
+import { asText, esc, escAttr } from "../lib/format.js";
 
 const HOME = [56.699893, 13.002148];
 
@@ -40,14 +46,12 @@ const MAP_MODES = [
 ];
 const MAP_SAFETY = [["ARM", "ARM"], ["DISARM", "DISARM"]];
 const MAP_VEHICLE = [...MAP_MODES, ...MAP_SAFETY];
-// Mission START / PAUSE / RESUME are NOT here, and must not come back. Scout's Local Agent owns
-// the mission-execution lifecycle as complete transactions (verified LOITER → set + verify Home →
-// synchronize the planning package → verified AUTO → RUNNING, and the mirrored pause/resume), and
-// the station has exactly ONE lifecycle action path: the Agent page's Mission lifecycle card
-// (/agent/mission_execution/*). The legacy queued MISSION_PAUSE / MISSION_RESUME commands were a
-// SECOND, competing pause/resume that neither records the mission sequence nor verifies
-// continuation, so a click here could contradict Scout's own controller. The mode buttons above
-// stay: they are explicit manual supervisory commands, never the implementation of Start.
+// The legacy QUEUED MISSION_PAUSE / MISSION_RESUME commands are NOT here and must not come back.
+// They were a SECOND, competing pause/resume that neither records the mission sequence nor
+// verifies continuation. Mission Start / Pause / Resume / Stop live in the Agent Mission card
+// below, which calls ONE orchestrated operator endpoint per intent — the endpoint that also
+// performs and verifies the authority hand-off. The mode buttons above stay: they are explicit
+// MANUAL supervisory commands and are never the implementation of a mission lifecycle operation.
 const MAP_MISSION = [];
 const MAP_VEHICLE_TYPES = new Set(MAP_VEHICLE.map(([t]) => t));
 const MAP_MISSION_TYPES = new Set(MAP_MISSION.map(([t]) => t));
@@ -99,6 +103,39 @@ export function Map(root) {
   // the inspector on every phase change so the display always reflects the effective
   // authority confirmed by Scout, never the button press.
   const authCtl = createAuthorityController(() => renderInspector());
+  // ---- Agent Mission (Scout's mission-execution lifecycle) — the NORMAL operational control ---
+  // `status` is Scout's canonical status and is the ONLY thing the buttons are derived from;
+  // `preflight` is the backend's Start-precondition verdict (the SAME function the Start
+  // transaction enforces, so the card and the gate cannot disagree); `result` is the last
+  // transaction's interpreted outcome. `forVid` tags every fetch with the vehicle it was made
+  // for, so a reply that lands after the operator switched USVs is discarded rather than shown
+  // against the wrong Scout. `busy` is the single-flight guard: while a transaction is in
+  // flight every lifecycle button is disabled, so a double press cannot submit twice.
+  //
+  // THE PREFLIGHT IS NOT POLLED. It used to be, on this same 3 s tick, and that is what made a
+  // stable vehicle's card alternate between READY / Start Mission and NOT_READY every few
+  // seconds: the backend serves the preflight's Pixhawk read-back evidence through a 10 s cache
+  // (main.PIXHAWK_READBACK_TTL_S), so roughly every tenth poll paid for a live MAVLink mission
+  // download, and a download that timed out or arrived partial answered can_start:false — with
+  // three blockers, because the package hash chain and Scout's replanning readiness are both
+  // anchored on the read-back. Not one of those was a fact about the vehicle.
+  //
+  // So Start availability now comes from STABLE blockers only (mx.startGate), and the preflight
+  // runs ONCE at a meaningful moment — vehicle selection, after a mission write, after a
+  // lifecycle transaction (which synchronizes the package), on reconnect, or from the card's
+  // explicit Refresh — and is shown as INFORMATION. `preflightAt` / `preflightFor` /
+  // `preflightReason` are what it was, when, and why it was run; `refreshing` drives a small
+  // spinner and NOTHING else. The authoritative proof is the Start transaction's own, which runs
+  // fresh and fail-closed before any vehicle write (mission_lifecycle.run_start).
+  const mission = {
+    status: null, result: null, busy: false, forVid: null,
+    preflight: null, preflightAt: null, preflightFor: null, preflightReason: null,
+    refreshing: false,
+  };
+  // Per-vehicle comm state from the previous fleet poll, so a DISCONNECTED → CONNECTED
+  // transition can trigger exactly one preflight (task 8's "after reconnect") without any
+  // recurring read.
+  const lastCommState = {};
   const markers = {};
   let homeMarker = null;         // dedicated Vehicle Home (HOME_POSITION) marker, selected vehicle
   // Set-Home CLICK FEEDBACK ONLY — never the source of Home's verified/not-verified
@@ -860,6 +897,99 @@ export function Map(root) {
     });
   }
 
+  // ---- Agent Mission: the LIGHTWEIGHT status poll ------------------------------------------
+  // READS ONLY, and reads only Scout's canonical mission-execution status — the lifecycle state,
+  // mode, waypoint progress, active operation and the explicit replanning overlay. A poll never
+  // starts, pauses, resumes or stops anything, so a reconnect or a page refresh can never
+  // re-issue a lifecycle operation.
+  //
+  // IT MUST NEVER CALL THE PREFLIGHT. That is the whole point of this change and it is pinned by
+  // tests/mission-readiness.test.mjs: the preflight is an expensive, short-lived proof and
+  // recomputing it on a timer made the Agent Mission card flicker between READY and NOT_READY on
+  // a vehicle that was not changing. Start availability comes from mx.startGate(), whose inputs
+  // are all here in the status; the authoritative proof runs inside the Start transaction.
+  function loadMissionStatus(id) {
+    if (id == null) { mission.status = null; mission.forVid = null; return; }
+    const forId = id;
+    api.getMissionExecutionStatus(id).then((st) => {
+      if (forId !== selId) return;                 // selection moved — discard the stale fetch
+      mission.status = st;
+      mission.forVid = forId;
+      renderInspector();
+    }).catch((e) => {
+      if (forId !== selId) return;
+      mission.status = null;
+      mission.forVid = forId;
+      logQuiet("mission-execution status", e);
+      renderInspector();
+    });
+  }
+
+  // ---- Agent Mission: the ONE-SHOT, NON-POLLED preflight ------------------------------------
+  // Run at a moment where the answer can actually have changed — never on a timer:
+  //
+  //   "selection"    the operator selected this vehicle
+  //   "mission"      a mission write (upload / clear / replan) succeeded on the vehicle
+  //   "transaction"  a lifecycle transaction finished (Start synchronizes the planning package)
+  //   "reconnect"    the vehicle came back after a disconnect
+  //   "manual"       the operator pressed Refresh on the card
+  //
+  // Its result is INFORMATION (preflightNote → the card's `info` line). It does not feed the
+  // Start gate, so a refresh — in flight, failed, or reporting an incomplete proof — can never
+  // change which buttons the operator is offered.
+  function refreshPreflight(id, reason) {
+    if (id == null || mission.refreshing) return;
+    const forId = id;
+    mission.refreshing = true;
+    if (forId === selId) renderInspector();
+    api.getMissionExecutionPreflight(id).then((pf) => {
+      if (forId !== selId) return;
+      mission.preflight = pf;
+      mission.preflightAt = Date.now();
+      mission.preflightFor = forId;
+      mission.preflightReason = reason;
+    }).catch((e) => {
+      // A failed request tells us nothing about the vehicle, so the previous note stands
+      // untouched — exactly as it must, since the note is not a gate.
+      logQuiet("mission-execution preflight", e);
+    }).finally(() => {
+      mission.refreshing = false;
+      if (forId === selId) renderInspector();
+    });
+  }
+
+  // ONE orchestrated transaction per operator intent. The browser does NOT transfer authority
+  // itself and does not sequence two calls: the endpoint below performs the authority hand-off,
+  // verifies it by read-back and issues the Scout operation as one operation with phases.
+  // `mission.busy` is set BEFORE the await and cleared in finally, so a second press during the
+  // round-trip is impossible (the buttons are also rendered disabled from the same flag).
+  function missionTransaction(label, action, fn) {
+    if (mission.busy || selId == null) return;
+    const id = selId;
+    mission.busy = true;
+    mission.result = { label, action, view: { outcome: "pending" }, at: Date.now() };
+    renderInspector();
+    Promise.resolve(fn(id)).then((r) => {
+      if (id !== selId) return;                    // isolation: never show on another vehicle
+      mission.result = { label, action, view: mx.interpretTransaction(r), at: Date.now() };
+    }).catch((e) => {
+      if (id !== selId) return;
+      mission.result = { label, action, at: Date.now(),
+        view: { outcome: mx.OUTCOME.UNAVAILABLE, message: asText(e && e.message) || String(e) } };
+    }).finally(() => {
+      mission.busy = false;
+      loadMissionStatus(id);
+      // A completed transaction is one of the non-polling preflight moments: Start synchronizes
+      // the planning package, and every lifecycle operation can move the state the preconditions
+      // are computed against. ONE read, here, rather than one every 3 s forever.
+      refreshPreflight(id, "transaction");
+      // The authority display is part of the SAME operation, so refresh it here rather than
+      // waiting up to 2 s for the next poll to reveal who ended up holding the wheel.
+      loadAuthority(id);
+      renderInspector();
+    });
+  }
+
   // Command queue + history for the selected vehicle (the reverse/control path). Used
   // to show each command's lifecycle: requested → sent → acknowledged → confirmed /
   // rejected / timed-out. Never assumes success — the vehicle reports the status.
@@ -891,7 +1021,13 @@ export function Map(root) {
       const v = commandVerification(c);
       if (missionWriteNeedsRefetch(v.outcome, c.result)) fire = true;
     });
-    if (fire) refreshController.refreshMission(id, "command");
+    if (fire) {
+      refreshController.refreshMission(id, "command");
+      // A successful mission write is the other moment the Start preconditions genuinely change
+      // (a new route means a new hash to read back and a new package to be consistent with), so
+      // the one-shot preflight is re-run here — once per write, not once per poll.
+      refreshPreflight(id, "mission");
+    }
   }
 
   // Resolve the in-flight Set-Home command's queue lifecycle (QUEUED → SENT → EXECUTED/
@@ -1066,15 +1202,165 @@ export function Map(root) {
     renderInspector(); renderPxm(); updateHomeMarker();
   }
 
-  function renderReadiness(gateCtx) {
-    const r = deploymentReadiness(gateCtx);
+  // VEHICLE deployment readiness — DEPLOYMENT EVIDENCE ONLY: Pixhawk connected, GPS ready,
+  // mission loaded, Home verified. Properties OF THE VEHICLE, and the only inputs to the
+  // VEHICLE READY / VEHICLE NOT READY banner.
+  //
+  // Authority is not rendered here at all — not as a tab, not as an item, not as a Control
+  // Owner card. Two separate reasons, both load-bearing:
+  //   • it is not a readiness fact. Handing authority to the Local Agent is what a mission
+  //     REQUIRES, so it can never make the vehicle unfit — the inversion the bench test caught,
+  //     which deploymentReadiness() still guards by never scoring it;
+  //   • it is already shown, once, in the Status area above. A second readout here is where the
+  //     inspector started saying the same thing in three places.
+  // deploymentReadiness() keeps reporting controlOwner in its DATA — the safety gating and the
+  // status APIs are untouched; this view simply does not print it a second time. Whether the
+  // AGENT MISSION is startable is a third, separate question, answered by the Agent Mission
+  // card from Scout's own state plus the backend Start preflight.
+  function renderReadiness(gateCtx, authVal) {
+    const r = deploymentReadiness({ ...gateCtx, authority: authVal });
     const items = r.items.map((i) =>
       `<div class="rdy-item ${i.ok ? "ok" : "no"}"><span class="rdy-mk">${i.ok ? "✓" : "✕"}</span>${i.label}</div>`).join("");
     const banner = r.ready
-      ? `<div class="rdy-banner ok">READY FOR MISSION</div>`
-      : `<div class="rdy-banner ${r.loiterAvailable ? "warn" : "dim"}" title="${r.loiterAvailable ? "LOITER remains available as an immediate anti-drift safety hold." : ""}">NOT READY</div>`;
+      ? `<div class="rdy-banner ok">VEHICLE READY</div>`
+      : `<div class="rdy-banner ${r.loiterAvailable ? "warn" : "dim"}" title="${r.loiterAvailable ? "LOITER remains available as an immediate anti-drift safety hold." : ""}">VEHICLE NOT READY</div>`;
     return `<div class="rdy">${items}</div>${banner}`;
   }
+
+  // ---- Agent Mission card — the NORMAL operational mission control ------------------------
+  // Everything here is derived from Scout's canonical mission-execution status (never from the
+  // last click, never from the previous label, and — since this change — never from a polled
+  // Start preflight). The card's whole shape — chip, ONE short line, identity rows, at most ONE
+  // concise blocker, buttons — comes from lib/mission-execution.js missionCardView(), the one
+  // tested place the state→presentation mapping is authored, so the Map cannot drift from it.
+  //
+  // COMPACT BY CONTRACT. This card carries no paragraph: no Pixhawk-readback explanation, no
+  // planning-package essay, no authority-orchestration narration, no "why this Scout has no
+  // Stop endpoint", and never several failures concatenated. Each of those still exists — as
+  // the `title` of the element it belongs to, and in full on the Agent diagnostics page.
+  // Authority is not a row here; the Status area above shows it once.
+  function renderAgentMission(v) {
+    // Isolation guard: only render lifecycle state actually fetched for THIS vehicle.
+    const forThis = mission.forVid != null && v && mission.forVid === v.id;
+    const S = mx.normalizeStatus(forThis ? mission.status : null);
+    const pfFor = mission.preflightFor != null && v && mission.preflightFor === v.id;
+    const pf = pfFor ? preflightNote(mission.preflight, { at: mission.preflightAt }) : null;
+    const res = forThis ? mission.result : null;
+
+    // START AVAILABILITY: stable blockers only. Disconnected, unsupported, no mission, another
+    // operation in flight, explicit replanning, already running, a terminal state needing Rearm.
+    // Nothing here is a short-lived proof, so nothing here can flicker. The Start transaction
+    // performs the real, fresh, fail-closed proof before any vehicle write.
+    const gate = mx.startGate(S, {
+      connected: commState(v) === "connected",
+      busy: mission.busy,
+      missionId: mission.preflight && mission.preflight.mission_id,
+    });
+    const rv = readinessView(gate, { refreshing: mission.refreshing && pfFor });
+    // A START issued from this station, as distinct from any other transaction — it is the one
+    // with phase-specific operator copy.
+    const starting = mission.busy && !!res && res.action === "start";
+    const card = mx.missionCardView(S, {
+      busy: mission.busy, startBlocked: !gate.canStart, startBlockedReason: gate.reason,
+      readiness: rv, starting, preflight: pf,
+      // Home comes from Scout's own continuously-reported home_status (lib/home.js), which is a
+      // better source than the mission-execution status' verified_home block.
+      homeVerified: homeStatus(v).verified,
+      missionId: mission.preflight && mission.preflight.mission_id,
+      unavailableDetail: "Mission lifecycle status could not be read from the Scout Local " +
+        "Agent. Nothing about the mission is assumed — no lifecycle action is offered.",
+    });
+
+    // The chip + ONE short line. Whatever long thing the model had to say (the replanning FSM,
+    // the operation id, the completion evidence) is this line's tooltip, not a paragraph.
+    const head = `<div class="amx-h" title="${escAttr(card.headlineTitle || "")}">
+        <span class="amx-state ${card.tone}">${esc(card.chip)}</span>
+        <span class="amx-sub">${esc(card.headline)}</span>
+      </div>`;
+
+    const rows = card.rows.length
+      ? `<div class="amx-grid">${card.rows.map((r) =>
+          `<div class="amx-row"><span class="k">${esc(r.k)}</span><span class="v${r.mono ? " mono" : ""}" title="${escAttr(r.title || "")}">${esc(r.v)}</span></div>`).join("")}</div>`
+      : "";
+
+    // Progress. While the START transaction runs this is PHASE-SPECIFIC and NEUTRAL — "Checking
+    // mission readiness…", "Taking agent control…", "Holding position…", "Setting and verifying
+    // Home…", "Starting AUTO…" — each one Scout's observed step (or, before Scout has moved, the
+    // backend's provable first phase). Never a predicted next state, never a fake percentage.
+    const progress = card.working
+      ? `<div class="amx-prog"><span class="amx-spin"></span><span>${esc(card.headline)}${S.activeOperationId ? ` · ${esc(S.activeOperationId)}` : ""}</span></div>`
+      // A one-shot preflight refresh, in its own muted presentation. Deliberately not the
+      // caution-orange progress line above — nothing is happening to the vehicle — and it
+      // changes no button, because readiness.canStart came from the gate, not from this.
+      : card.checking
+        ? `<div class="amx-prog checking" title="${escAttr(rv.detail || "")}"><span class="amx-spin"></span><span>${esc(card.checkingText || "Checking…")}</span></div>`
+        : "";
+
+    const buttons = card.buttons.length
+      ? `<div class="amx-btns">${card.buttons.map((b) => {
+          const title = b.enabled ? mission_ACTION_TITLE[b.action] || "" : (b.reason || "");
+          return `<button class="amx-btn ${b.kind}${b.tone === "warn" ? " warn" : ""}" data-mx="${b.action}"${b.enabled ? "" : " disabled"} title="${escAttr(title)}">${esc(b.label)}</button>`;
+        }).join("")}</div>`
+      : "";
+
+    // ONE blocker line, short, with the full evidence on hover. Never a stack of failures.
+    const blocker = card.blocker
+      ? `<div class="amx-note${card.blocker.tone === "warn" ? " warn" : ""}" title="${escAttr(card.blocker.title || "")}">${esc(card.blocker.text)}</div>`
+      : "";
+
+    // Home, before Start: ONE neutral line saying the Start transaction will set it. It is not a
+    // blocker and not a warning — the transaction sets Home to the launch position and verifies
+    // it as one of its own phases.
+    const home = card.home
+      ? `<div class="amx-note${card.home.tone === "warn" ? " warn" : ""}" title="${escAttr(card.home.title || "")}">${esc(card.home.text)}</div>`
+      : "";
+
+    // The one-shot preflight, as INFORMATION, beside the control that re-runs it. Both are muted:
+    // this line never gates anything and pressing Refresh never touches the vehicle. Withheld
+    // entirely for an unsupported or unreachable Scout — there is nothing there to preflight, and
+    // offering a Refresh that cannot answer is its own small lie.
+    const info = card.present === false ? "" : `<div class="amx-info">
+        ${card.info ? `<span class="amx-info-t" title="${escAttr(card.info.title || "")}">${esc(card.info.text)}${mission.preflightAt && pfFor ? ` · ${esc(fmtAgo((Date.now() - mission.preflightAt) / 1000))}` : ""}</span>` : `<span class="amx-info-t">Readiness not checked yet</span>`}
+        <button class="amx-refresh" data-mx-refresh="1"${mission.refreshing ? " disabled" : ""} title="Re-run the read-only Start preflight once. Writes nothing, commands nothing, and does not change which buttons are offered.">Refresh</button>
+      </div>`;
+
+    // A Start that did not happen reads as ONE compact actionable error; the precondition
+    // evidence, Scout's code and the phase detail are the tooltip. Every other transaction keeps
+    // the one-word outcome line.
+    const startFail = res && res.action === "start" ? mx.startFailure(res.view) : null;
+    const resultNote = startFail
+      ? `<div class="amx-result warn" title="${escAttr([startFail.detail, mx.transactionSummary(res.view)].filter(Boolean).join(" — "))}">
+           <b>${esc(startFail.title)}</b>: ${esc(startFail.text)}
+         </div>`
+      : res
+        ? `<div class="amx-result ${res.view.outcome === "accepted" ? "ok" : res.view.outcome === "pending" ? "" : "warn"}" title="${escAttr(res.view.outcome === "pending" ? "" : mx.transactionSummary(res.view))}">
+           <b>${esc(res.label)}</b>: ${esc(res.view.outcome === "pending" ? "sending…" : mx.outcomeLabel(res.view.outcome))}
+         </div>`
+        : "";
+
+    return `<div class="amx">${head}${rows}${progress}${buttons}${blocker}${home}${info}${resultNote}</div>`;
+  }
+
+  // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation
+  // does, including its authority phase — the operator never arranges authority by hand.
+  const mission_ACTION_TITLE = {
+    start: "Start the mission: the operator station transfers control authority to the Local " +
+      "Agent and verifies it, then Scout holds position, sets and verifies Home at the launch " +
+      "position, synchronizes the planning package and starts AUTO.",
+    pause: "Pause the mission: Scout records the sequence and commands a verified LOITER. " +
+      "Control authority stays with the Local Agent.",
+    resume: "Resume the mission from the paused waypoint. Authority is re-acquired and " +
+      "verified only if it was lost.",
+    stop: "End the mission run. Control authority returns to the operator only after Scout " +
+      "reports STOPPED with a verified LOITER.",
+    rearm: "Prepare the Local Agent's mission-execution controller for another run. Issues no " +
+      "vehicle command, changes no mode, clears no Pixhawk mission.",
+    "take-control": "Take Control — request OPERATOR authority as an explicit manual override.",
+  };
+
+  // (shortMissionId lives in lib/mission-execution.js now; the local authorityLabel() helper is
+  // gone with the Agent Mission card's Authority row — the Status area is the one authority
+  // readout in this inspector.)
 
   function commsTimeline() {
     const h = commsHist;
@@ -1111,12 +1397,20 @@ export function Map(root) {
     const authVal = stale ? null : av.value;
     // One authored policy for both the write-enable and the hand-off affordances
     // (lib/authority.js) — never re-derived here. See the strict-ownership contract there.
-    const { canTake, canRelease, hasControl } = handoffGate(av, { stale });
+    const { canTake, canRelease } = handoffGate(av, { stale });
 
     // Deployment interlock context — Vehicle Home is set + shown from the Pixhawk
     // Mission card (renderPxm); this gateCtx is only for the command gating below.
     const gateCtx = homeGateCtx(v);
 
+    // SECTION ORDER IS A PRODUCT DECISION, pinned by tests/map-inspector.test.mjs:
+    //   vehicle header → Status → Vehicle Commands → Agent Mission → Vehicle readiness →
+    //   secondary information.
+    // Vehicle Commands sits DIRECTLY below Status because it is the primary immediate manual
+    // control — the mode/ARM row an operator reaches for without reading anything else. Agent
+    // Mission follows it, never precedes it: supervising the agent is the second question, and
+    // a card that pushes the manual controls below the fold puts the slower answer first.
+    // Authority appears exactly once, in Status.
     box.innerHTML = `
       <div class="isec">
         <div class="idcard">
@@ -1133,25 +1427,31 @@ export function Map(root) {
       <div class="isec">
         <div class="sec-title"><span class="lbl">Status</span></div>
         ${StatusBadges(v, authVal, { phase: av.phase, pending: av.pending })}
-      </div>
-      <div class="isec">
-        <div class="sec-title"><span class="lbl">Control authority</span>${AuthoritySeg(authVal, { phase: av.phase, pending: av.pending })}</div>
-        <div class="qa">
-          <button data-authority="OPERATOR" ${canTake ? "" : "disabled"} title="Take Control — request OPERATOR authority">Take Control</button>
-          <button data-authority="LOCAL_AGENT" ${canRelease ? "" : "disabled"} title="Release Control — hand authority back to the Local Agent">Release Control</button>
-        </div>
-        ${authNote(av, stale)}
-      </div>
-      <div class="isec">
-        <div class="sec-title"><span class="lbl">Deployment readiness</span></div>
-        ${renderReadiness(gateCtx)}
+        ${authStatusNote(av, stale)}
       </div>
       <div class="isec">
         <div class="sec-title"><span class="lbl">Vehicle Commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">Pixhawk · state reported by vehicle</span></div>
         ${vehicleCommands(gateCtx, av, stale)}
+        ${takeControl(av, stale, canTake)}
+        <details class="adv-auth">
+          <summary>Advanced authority</summary>
+          <div class="qa" style="margin-top:8px">
+            <button data-authority="LOCAL_AGENT" ${canRelease ? "" : "disabled"} title="Release Control — hand authority back to the Local Agent">Release Control</button>
+          </div>
+          <div class="auth-note">Normal mission operation does not need this. Start, Resume and
+            Stop transfer and verify authority themselves as part of the same operation.</div>
+        </details>
       </div>
       <div class="isec">
-        <div class="sec-title"><span class="lbl">Agent Commands</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">supervisory · local agent</span></div>
+        <div class="sec-title"><span class="lbl">Agent Mission</span></div>
+        ${renderAgentMission(v)}
+      </div>
+      <div class="isec">
+        <div class="sec-title"><span class="lbl">Vehicle readiness</span></div>
+        ${renderReadiness(gateCtx, authVal)}
+      </div>
+      <div class="isec">
+        <div class="sec-title"><span class="lbl">Agent status</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">supervisory · local agent</span></div>
         ${agentCommands(gateCtx, av, stale, v)}
       </div>
       <div class="isec">
@@ -1191,24 +1491,154 @@ export function Map(root) {
     box.querySelectorAll("button[data-cmd]").forEach((btn) => {
       btn.onclick = () => sendCommand(btn.dataset.cmd);
     });
+    box.querySelectorAll("button[data-mx]").forEach((btn) => {
+      btn.onclick = () => onMissionAction(btn.dataset.mx, v);
+    });
+    // The EXPLICIT preflight refresh: one read-only backend call, on demand. This is the only
+    // operator-facing way the preflight runs on request, and it exists precisely so that not
+    // polling it costs the operator nothing.
+    box.querySelectorAll("button[data-mx-refresh]").forEach((btn) => {
+      btn.onclick = () => refreshPreflight(v.id, "manual");
+    });
   }
 
-  // Pending/rejected/timeout notice for the authority hand-off, plus the honest
-  // "no authority source / unknown / RC override" states. Never claims success on a
-  // click — only the effective value confirmed by Scout settles it.
-  function authNote(av, stale) {
-    if (stale) return `<div class="auth-note warn">Authority is UNKNOWN — telemetry is stale. Commands are locked until the link is current.</div>`;
+  // ONE user intent → ONE operator endpoint. The authority hand-off is part of that endpoint's
+  // transaction, so there is deliberately no "release control, then start" sequence here.
+  async function onMissionAction(action, v) {
+    if (mission.busy) return;              // synchronous double-submit guard (buttons are also
+                                           // rendered disabled from the same flag)
+    const vname = v ? (v.name || "USV-" + v.id) : "vehicle";
+    if (action === "start") {
+      const ok = await confirmModal({
+        title: "Start Mission?",
+        bodyHtml: `<p>Start the agent mission on <b>${esc(vname)}</b>.</p>
+          <p>Control authority is transferred to the <b>Local Agent</b> and verified first — you
+          do not need to release control yourself.</p>
+          <p>Scout then holds position, sets the <b>current launch position as Home</b>, verifies
+          it, synchronizes the planning package and starts AUTO. <b>The originally planned Home
+          is not retained.</b></p>`,
+        cancelLabel: "Cancel", confirmLabel: "Start Mission",
+      });
+      if (!ok) return;
+      missionTransaction("Start Mission", action, (id) => api.startMissionExecution(id, {}));
+      return;
+    }
+    if (action === "pause") {
+      missionTransaction("Pause", action, (id) => api.pauseMissionExecution(id));
+      return;
+    }
+    if (action === "resume") {
+      missionTransaction("Resume Mission", action, (id) => api.resumeMissionExecution(id));
+      return;
+    }
+    if (action === "stop") {
+      const ok = await confirmModal({
+        title: "Stop Mission?",
+        bodyHtml: `<p>End the mission run on <b>${esc(vname)}</b>.</p>
+          <p>Scout holds position and settles in STOPPED. This does <b>not</b> disarm the
+          vehicle, clear the Pixhawk mission, delete the planning package or invoke RTL.</p>
+          <p>Control authority returns to you only once Scout reports STOPPED with a verified
+          LOITER.</p>`,
+        cancelLabel: "Cancel", confirmLabel: "Stop Mission",
+      });
+      if (!ok) return;
+      missionTransaction("Stop Mission", action, (id) => api.stopMissionExecution(id));
+      return;
+    }
+    if (action === "rearm") {
+      const ok = await confirmModal({
+        title: "Rearm the mission controller?",
+        bodyHtml: `<p>This prepares the Local Agent's mission-execution controller for another
+          run.</p><p>It issues <b>no</b> vehicle command, changes <b>no</b> mode, clears
+          <b>no</b> Pixhawk mission and re-uploads <b>no</b> mission.</p>`,
+        cancelLabel: "Cancel", confirmLabel: "Rearm",
+      });
+      if (!ok) return;
+      missionTransaction("Rearm controller", action, (id) => api.rearmMissionExecution(id));
+      return;
+    }
+    if (action === "take-control") {
+      const ok = await confirmModal({
+        title: "Take Control?",
+        bodyHtml: `<p>This requests OPERATOR authority for <b>${esc(vname)}</b> so operator commands can execute.</p><p>This does <b>not</b> arm the vehicle or change its mode.</p>`,
+        cancelLabel: "Cancel", confirmLabel: "Take Control",
+      });
+      if (!ok) return;
+      authCtl.request("OPERATOR", (a) => api.setControlAuthority(v.id, a));
+    }
+  }
+
+  // THE ONE authority narration in the inspector, and it sits beside Status — the same place
+  // the AuthoritySeg shows the value. It reports only what the segmented badge cannot:
+  // a hand-off in flight, a refused/timed-out request, and the freshness caveats that make the
+  // displayed value last-known rather than current.
+  //
+  // A SETTLED OPERATOR or LOCAL_AGENT deliberately produces NOTHING. "Operator holds control"
+  // under a badge already reading Operator is the duplication this refinement removes, and the
+  // rest of the inspector must not repeat this line either — one warning, one place.
+  //
+  // Freshness is unchanged: the value shown is still whatever the controller confirmed (Scout's
+  // effective authority), StatusBadges still renders UNKNOWN outright once the vehicle is
+  // operationally stale, and nothing here promotes a stale value to a current one — it marks it.
+  function authStatusNote(av, stale) {
+    const line = (cls, text, title) =>
+      `<div class="auth-note ${cls}" title="${escAttr(title || "")}">${esc(text)}</div>`;
     const p = av.pending;
-    if (p && p.phase === "pending") return `<div class="auth-note pending">Requesting ${p.requested === "OPERATOR" ? "OPERATOR" : "LOCAL_AGENT"} authority — awaiting confirmation from the vehicle…</div>`;
-    if (p && p.phase === "confirmed") return `<div class="auth-note ok">Authority confirmed: ${av.value}.</div>`;
-    if (p && p.phase === "rejected") return `<div class="auth-note warn">Request rejected — ${p.reason || "not accepted"}.</div>`;
-    if (p && p.phase === "timeout") return `<div class="auth-note warn">Request timed out — ${p.reason || "no confirmation"}.</div>`;
-    if (!av.available) return `<div class="auth-note">No control-authority source for this vehicle.</div>`;
-    if (!av.reachable) return `<div class="auth-note warn">Control-authority service unreachable — authority is UNKNOWN.</div>`;
-    if (av.value === "RC") return `<div class="auth-note warn">RC transmitter override is active — it holds physical control.</div>`;
-    if (av.value === "OPERATOR") return `<div class="auth-note ok">Operator holds control — commands enabled.</div>`;
-    if (av.value === "LOCAL_AGENT") return `<div class="auth-note">Local Agent holds control — Take Control to command directly.</div>`;
-    return "";
+    if (p && p.phase === "pending") {
+      return line("pending", "Authority change requested…",
+        `Requesting ${p.requested} authority — awaiting confirmation from the vehicle. The ` +
+        "displayed authority stays at the last confirmed value until Scout confirms the change.");
+    }
+    if (p && p.phase === "rejected") {
+      return line("warn", "Authority request rejected", p.reason || "The request was not accepted.");
+    }
+    if (p && p.phase === "timeout") {
+      return line("warn", "Authority request timed out",
+        p.reason || "No effective-authority confirmation arrived from the vehicle.");
+    }
+    if (stale) {
+      return line("warn", "Authority not current",
+        "Telemetry is stale, so the effective authority cannot be confirmed. Manual commands " +
+        "stay locked until the link is current.");
+    }
+    if (!av.available) {
+      return line("", "No authority source", "This vehicle reports no control-authority source.");
+    }
+    if (!av.reachable) {
+      return line("warn", "Authority unconfirmed",
+        "The control-authority service is unreachable. The value shown is the last one Scout " +
+        "confirmed and is not being refreshed.");
+    }
+    if (av.value === "RC") {
+      return line("warn", "RC override active",
+        "An RC transmitter holds physical control. Software writes stay disabled until it releases.");
+    }
+    return "";   // settled OPERATOR / LOCAL_AGENT — the Status badge already says so
+  }
+
+  // The explicit manual override, kept as ONE compact button immediately below the manual
+  // vehicle commands it unlocks. Shown whenever the operator does not already hold confirmed
+  // control — which is exactly the LOCAL_AGENT (and RC, and unknown) case. It is never hidden
+  // when merely un-pressable: a disabled button with a reason is what tells the operator the
+  // override exists and why it cannot be used right now.
+  //
+  // When OPERATOR already holds authority there is nothing to take, so the row disappears
+  // entirely rather than becoming a second Control Owner card — the Status badge is the
+  // ownership display.
+  function takeControl(av, stale, canTake) {
+    const { hasControl } = handoffGate(av, { stale });
+    if (hasControl) return "";
+    const title = canTake
+      ? "Take Control — request OPERATOR authority so you can command the vehicle directly. " +
+        "This does not arm the vehicle or change its mode."
+      : stale ? "Take Control is unavailable — the link is not current, so a hand-off could " +
+          "not be confirmed."
+      : av.phase === "pending" ? "An authority request is already in flight."
+      : av.available === false ? "This vehicle reports no control-authority source."
+      : "Take Control is unavailable right now.";
+    return `<div class="qa" style="margin-top:9px">
+      <button data-authority="OPERATOR" ${canTake ? "" : "disabled"} title="${escAttr(title)}">Take Control</button>
+    </div>`;
   }
 
   // A row of command buttons. Each button is gated by the shared commandGate policy
@@ -1234,9 +1664,13 @@ export function Map(root) {
         return `<button class="ctl-cmd${hr ? " hr" : ""}${safety ? " safety" : ""}${homeLocked ? " home-locked" : ""}${busy ? " awaiting" : ""}" data-cmd="${type}"${dis ? " disabled" : ""} title="${title.replace(/"/g, "&quot;")}">${label}</button>`;
       }).join("") + `</div>`;
   }
+  // Why the command row is disabled — the cause, not a second authority readout. It names the
+  // action that fixes it (Take Control, immediately below) and leaves "who holds the wheel" to
+  // the Status area.
   function lockNote(hasControl, av, stale) {
     if (hasControl) return "";
-    return `<div class="ctl-lock-note">${lockSvg}<span>${stale ? "Link not current" : av.value === "OPERATOR" ? "" : "Commands are locked"} — Take Control (OPERATOR, Scout-confirmed) to enable.</span></div>`;
+    const why = stale ? "Link not current" : "Commands are locked";
+    return `<div class="ctl-lock-note" title="Vehicle commands execute only on a Scout-confirmed OPERATOR authority.">${lockSvg}<span>${why} — Take Control to enable.</span></div>`;
   }
   // Vehicle/Pixhawk commands ONLY — real ArduRover modes + the ARM/DISARM safety pair.
   // Independent of the local agent. The "Last command" line reports the queue lifecycle
@@ -1255,13 +1689,13 @@ export function Map(root) {
   // from mission_state (LIVE while connected, LAST KNOWN when stale); the previous status needs
   // an onboard decision log the agent does not emit yet → honest gap.
   //
-  // There are deliberately NO mission lifecycle buttons on this page. Start / Pause / Resume are
-  // Scout-owned transactions on the Local Agent, and the station exposes them in exactly one
-  // place — the Agent page's Mission lifecycle card — so two paths can never disagree about
-  // whether the mission is running.
+  // The mission LIFECYCLE controls are in the Agent Mission card above — this page is the normal
+  // operational surface, so Start / Pause / Resume / Stop belong here and nowhere else. The
+  // Agent page keeps the diagnostic depth (identity, hashes, Home evidence, sequence evidence,
+  // replanning FSM, return evidence, test injection, advanced reset) and no longer carries the
+  // normal controls, so two surfaces can never disagree about whether the mission is running.
   function agentCommands(gateCtx, av, stale, v) {
-    return `<div class="ctl-lock-note">${lockSvg}<span>Mission <b>Start</b>, <b>Pause</b> and <b>Resume</b> live on the <b>Agent</b> page's Mission lifecycle card — Scout runs each as one verified transaction (hold, set and verify Home, synchronize the package, AUTO). They are not queued commands.</span></div>`
-      + agentStatusBlock(v) + cmdStatus(MAP_MISSION_TYPES);
+    return agentStatusBlock(v) + cmdStatus(MAP_MISSION_TYPES);
   }
 
   function agentStatusBlock(v) {
@@ -1317,6 +1751,13 @@ export function Map(root) {
       selId = id; commsHist = null; loadCommsHistory(id);
       authCtl.reset(); loadAuthority(id);
       cmds = []; loadCommands(id);
+      // Per-USV lifecycle state: never carry one Scout's mission state (or the outcome of a
+      // transaction issued against it) onto another vehicle's card.
+      mission.status = mission.preflight = mission.result = null;
+      mission.forVid = mission.preflightFor = mission.preflightAt = mission.preflightReason = null;
+      loadMissionStatus(id);
+      // Initial vehicle selection is one of the allowed one-shot preflight moments.
+      refreshPreflight(id, "selection");
       // Share the selection so the Plan page (and any other page) follows the operator to
       // this vehicle, and hand the id to the refresh controller — which immediately reads
       // the latest telemetry-adjacent mission overlay and ignores any late reply from the
@@ -1349,6 +1790,7 @@ export function Map(root) {
     // rendering "—". Freshness is untouched (comm_state/last_seen_age_s carry through), so a
     // retained value is still marked stale when the link degrades.
     fleet = telemCache.mergeFleet(Array.isArray(data) ? data : []);
+    detectReconnect();
     if (selId == null && fleet.length) {
       // First fleet payload: adopt the shared selection if it still names a real vehicle,
       // else fall back to a reporting vehicle. Routing through select() gives the controller
@@ -1364,6 +1806,21 @@ export function Map(root) {
     }
     updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
     updateRibbon({ counts: counts() });
+  }
+
+  // A vehicle that has just come back from a disconnect is the last of the non-polling preflight
+  // moments: the link was down, so whatever the last preflight said about the Pixhawk read-back
+  // is simply old. ONE read on the transition — never a recurring one while it stays connected,
+  // and never one while it stays disconnected either.
+  function detectReconnect() {
+    fleet.forEach((v) => {
+      const now = commState(v);
+      const was = lastCommState[v.id];
+      lastCommState[v.id] = now;
+      if (was && was !== "connected" && now === "connected" && v.id === selId) {
+        refreshPreflight(v.id, "reconnect");
+      }
+    });
   }
 
   // Prefer the shared cross-page selection when it still names a vehicle in the current
@@ -1413,6 +1870,12 @@ export function Map(root) {
   timers.push(setInterval(() => loadCommsHistory(selId), 3000));  // refresh selected vehicle's comms log
   timers.push(setInterval(() => loadAuthority(selId), 2000));  // refresh selected vehicle's control authority
   timers.push(setInterval(() => loadCommands(selId), 3000));  // refresh selected vehicle's command lifecycle
+  // Agent Mission: Scout's canonical lifecycle STATUS only — state, mode, waypoint progress,
+  // active operation, explicit replanning. READ-ONLY: this poll can never issue a lifecycle
+  // operation, and it deliberately does NOT call the Start preflight, whose ~10 s read-back
+  // recomputation is what made the card flicker between READY and NOT_READY. 3 s keeps the
+  // card's state, progress and button set current at a fraction of the Scout traffic.
+  timers.push(setInterval(() => loadMissionStatus(selId), 3000));
   // Watchdog for an in-flight Set Home. loadCommands() already resolves it on every
   // poll, but the poll is exactly what stops when the operator backend is unreachable —
   // and that is a case the flash must still time out of, so the deadline is also

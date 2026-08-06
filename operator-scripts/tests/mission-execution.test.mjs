@@ -47,17 +47,21 @@ const envelope = (over = {}) => ({
 const S = (over) => normalizeStatus(envelope(over));
 
 // ── A. Every Scout state is known, and the overlay is not one of them ───────────────────
-test("all nineteen Scout mission-execution states are supported", () => {
-  for (const s of ["NOT_READY", "READY", "START_REQUESTED", "START_HOLD_REQUESTED",
-    "START_HOLD_CONFIRMED", "SETTING_HOME", "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE",
-    "STARTING_AUTO", "RUNNING", "PAUSE_REQUESTED", "PAUSED", "RESUME_REQUESTED",
-    "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED", "COMPLETED_HOLD",
-    "SUSPENDED", "FAILED"]) {
+test("every Scout mission-execution state, including the pending STOP sequence, is known", () => {
+  // The STOP states are part of the contract the Operator is written against even though Scout
+  // has not shipped the endpoint yet (SCOUT_STOP_API.md); an unknown state would be displayed
+  // raw and flagged, which is the wrong answer for a state we do know the meaning of.
+  for (const s of ["NOT_READY", "NOT_STARTED", "READY", "START_REQUESTED",
+    "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME", "VERIFYING_HOME",
+    "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "RUNNING", "PAUSE_REQUESTED", "PAUSED",
+    "RESUME_REQUESTED", "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
+    "STOPPED", "CANCELLED", "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED",
+    "COMPLETED_HOLD", "SUSPENDED", "FAILED"]) {
     assert.ok(STATES.includes(s), s);
     assert.equal(isUnknownState(s), false, s);
     assert.notEqual(stateLabel(s), "Unknown", s);
   }
-  assert.equal(STATES.length, 19);
+  assert.equal(STATES.length, 25);
 });
 
 test("REPLANNING is an effective-state OVERLAY, never a stored state", () => {
@@ -231,9 +235,28 @@ test("start blockers report Scout's own status fields", () => {
     mission_execution_enabled: false, authority_status: "OPERATOR",
     last_error: "NO_PLANNING_PACKAGE" }));
   assert.ok(b.some((x) => /MISSION_EXECUTION_DISABLED/.test(x)));
-  assert.ok(b.some((x) => /authority OPERATOR/.test(x) && /LOCAL_AGENT/.test(x)));
   assert.ok(b.some((x) => /NOT_READY/.test(x)));
   assert.ok(b.some((x) => /NO_PLANNING_PACKAGE/.test(x)));
+});
+
+test("OPERATOR authority is NOT a start blocker — the Start transaction resolves it", () => {
+  // Mission execution does need LOCAL_AGENT, but the Start transaction acquires and verifies it
+  // as its first phase. Listing it as a blocker told the operator to go and press Release
+  // Control by hand, which is exactly the manual authority management this station removed.
+  const b = startBlockers(S({ state: "NOT_READY", can_start: false,
+    authority_status: "OPERATOR" }));
+  assert.equal(b.some((x) => /Release Control/i.test(x)), false, b);
+  assert.equal(b.some((x) => /authority OPERATOR/.test(x)), false, b);
+});
+
+test("a STRUCTURED last_error renders as text, never as [object Object]", () => {
+  const b = startBlockers(S({ state: "NOT_READY", can_start: false,
+    last_error: { code: "NO_PLANNING_PACKAGE", message: "no package stored" } }));
+  const line = b.find((x) => /Scout last error/.test(x));
+  assert.ok(line, b);
+  assert.doesNotMatch(line, /\[object Object\]/);
+  assert.match(line, /NO_PLANNING_PACKAGE/);
+  assert.match(line, /no package stored/);
 });
 
 test("replanning and an active operation are reported as start blockers", () => {
@@ -458,13 +481,14 @@ const mapSrc = read("../operator/pages/Map.js");
 const vehicleSrc = read("../operator/pages/Vehicle.js");
 const apiSrc = read("../operator/services/api.js");
 
-test("the Agent page derives its primary button from status, never from the click", () => {
-  // The label comes from primaryAction(status). The click handler dispatches on the button's
-  // data-action and calls a write — it never assigns a new label or a new local state.
+test("the Agent page's fallback controls derive from status, never from the click", () => {
+  // The Agent page keeps the lifecycle writes only as a collapsed DIAGNOSTIC fallback, and even
+  // there the enablement comes from primaryAction(status) / stopAvailability(status). The click
+  // handler dispatches and calls a write — it never assigns a label or a local state.
   assert.match(agentSrc, /mx\.primaryAction\(S\)/);
-  assert.match(agentSrc, /act\.label/);
+  assert.match(agentSrc, /mx\.stopAvailability\(S\)/);
   const handler = agentSrc.slice(agentSrc.indexOf("function wireMissionExecution"),
-    agentSrc.indexOf("function wireMissionExecution") + 1400);
+    agentSrc.indexOf("function wireMissionExecution") + 1800);
   assert.doesNotMatch(handler, /\.label\s*=/);
   assert.doesNotMatch(handler, /mxStatus\s*=/);
   assert.doesNotMatch(handler, /textContent\s*=/);
@@ -477,11 +501,19 @@ test("a lifecycle write never mutates the status it will be judged by", () => {
   assert.match(w, /loadMissionExecution\(id\)/);        // reconcile by re-reading Scout
 });
 
-test("the Agent page calls Pause 'Pause Mission' and never 'Stop Mission'", () => {
+test("Stop is a real, separate operation — never Pause wearing Stop's label", () => {
+  // Pause holds the mission; Stop ends the run. Conflating them is how an operator comes to
+  // believe a mission is over when the Local Agent still owns the vehicle.
   assert.match(agentSrc, /"Pause Mission"/);
-  assert.doesNotMatch(agentSrc, /Stop Mission/i);
-  assert.doesNotMatch(mapSrc, /Stop Mission/i);
-  assert.doesNotMatch(vehicleSrc, /Stop Mission/i);
+  assert.match(mapSrc, /Stop Mission/);                 // the Map card offers a real Stop
+  assert.match(apiSrc, /export function stopMissionExecution\(/);
+  assert.doesNotMatch(vehicleSrc, /Stop Mission/i);     // never a vehicle-page mode command
+  // Stop is never implemented as a LOITER command, and Rearm is never routed to it.
+  const stopWiring = mapSrc.slice(mapSrc.indexOf("async function onMissionAction"),
+    mapSrc.indexOf("async function onMissionAction") + 3000);
+  assert.doesNotMatch(stopWiring, /SET_MODE_LOITER/);
+  assert.match(stopWiring, /action === "stop"[\s\S]{0,900}api\.stopMissionExecution\(id\)/);
+  assert.match(stopWiring, /action === "rearm"[\s\S]{0,900}api\.rearmMissionExecution\(id\)/);
 });
 
 test("the Agent page implements Start as ONE Scout call, not LOITER → Set Home → AUTO", () => {
@@ -545,10 +577,14 @@ test("Map and Vehicle no longer render competing MISSION_PAUSE / MISSION_RESUME 
   assert.match(mapSrc, /const MAP_MISSION = \[\];/);
 });
 
-test("Map and Vehicle point at the Agent page as the one lifecycle path", () => {
-  for (const [name, src] of [["Map", mapSrc], ["Vehicle", vehicleSrc]]) {
-    assert.match(src, /Mission lifecycle card/, name);
-  }
+test("the MAP is the normal operational surface for the mission lifecycle", () => {
+  // The product decision: normal Start / Pause / Resume / Stop belong on the Map, and the Agent
+  // page is a diagnostic surface. The Vehicle page still defers rather than growing a third.
+  assert.match(mapSrc, /Agent Mission/);
+  // missionCardView is lifecycleControls in its compact operational form — the Map renders the
+  // shared model, the Agent page keeps the diagnostic depth.
+  assert.match(mapSrc, /missionCardView/);
+  assert.match(vehicleSrc, /Mission lifecycle card/);
 });
 
 test("manual supervisory mode commands are deliberately KEPT on both pages", () => {

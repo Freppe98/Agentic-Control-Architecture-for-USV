@@ -294,10 +294,33 @@ export function setHomeOutcome({ cmd = null, cmdId = null, startedAt = 0, now = 
 }
 
 /**
- * Compact deployment-readiness model.
- * @param ctx { connected, gpsFresh, posValid, missionLoaded, homeVerified, hasControl }
- * @returns {{ items: {key,label,ok}[], ready, loiterAvailable }}
- *   ready = all required autonomous-operation conditions satisfied.
+ * VEHICLE DEPLOYMENT READINESS — is the vehicle itself fit to be operated?
+ *
+ * THREE CONCEPTS THAT ARE NOT THE SAME THING, and used to be conflated here:
+ *
+ *   1. Vehicle deployment readiness (THIS function) — Pixhawk connected, GPS ready, mission
+ *      loaded, Home verified. Properties OF THE VEHICLE.
+ *   2. Control owner — OPERATOR or LOCAL_AGENT. Reported alongside, never scored. It is a fact
+ *      about who holds the wheel, not a defect.
+ *   3. Agent mission readiness — Scout's canonical mission-execution state / can_start, the
+ *      planning package's consistency, and the active verified mission identity + hash. Lives
+ *      in the backend Start preflight and on the Map's Agent Mission card.
+ *
+ * "Operator authority" used to be a REQUIRED readiness item, which produced the exact
+ * contradiction the bench test found: the Map read READY FOR MISSION while the operator held
+ * control and flipped to NOT READY the moment authority moved to LOCAL_AGENT — i.e. it called
+ * the vehicle unfit precisely when it was correctly configured to fly the mission. Handing
+ * authority to the agent is what a mission REQUIRES; it can never make the vehicle "not ready".
+ *
+ * The converse is equally guarded: OPERATOR authority does not imply the agent mission is
+ * startable. That question belongs to concept 3, which knows about the mission record, the
+ * package and Scout's own eligibility — and to the Start transaction, which performs and
+ * verifies the authority transfer itself.
+ *
+ * @param ctx { connected, gpsFresh, posValid, missionLoaded, homeVerified, hasControl, authority }
+ * @returns {{ items, ready, loiterAvailable, controlOwner, blocksAgentMission }}
+ *   ready         = every VEHICLE condition satisfied. Independent of who holds authority.
+ *   controlOwner  = { value, label, isOperator, isAgent } — informational, never scored.
  *   loiterAvailable = LOITER remains an emergency/safety option even when !ready.
  */
 export function deploymentReadiness(ctx = {}) {
@@ -307,11 +330,20 @@ export function deploymentReadiness(ctx = {}) {
     { key: "gps", label: "GPS ready", ok: gpsReady },
     { key: "mission", label: "Mission loaded", ok: !!ctx.missionLoaded },
     { key: "home", label: "Home verified", ok: !!ctx.homeVerified },
-    { key: "authority", label: "Operator authority", ok: !!ctx.hasControl },
   ];
+  const authority = ctx.authority == null ? (ctx.hasControl ? "OPERATOR" : null)
+    : String(ctx.authority).toUpperCase();
   return {
     items,
     ready: items.every((i) => i.ok),
+    controlOwner: {
+      value: authority,
+      label: authority === "OPERATOR" ? "Operator"
+        : authority === "LOCAL_AGENT" ? "Local Agent"
+        : authority === "RC" ? "RC override" : "Unknown",
+      isOperator: authority === "OPERATOR",
+      isAgent: authority === "LOCAL_AGENT",
+    },
     // LOITER only needs connectivity + operator control — independent of mission readiness.
     loiterAvailable: !!(ctx.connected && ctx.hasControl),
   };

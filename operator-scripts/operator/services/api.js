@@ -436,22 +436,48 @@ export function getMissionExecutionStatus(id) {
   return getReplan(`/api/vehicles/${id}/mission-execution/status`);
 }
 
-/** Start the mission — one Scout transaction. body: { mission_id? } (defaults server-side to the
- *  vehicle's active original mission so Scout can fail closed on MISSION_ID_MISMATCH). */
+// ONE OPERATOR ENDPOINT PER USER INTENT. The authority hand-off is NOT a separate call this
+// module makes first: the backend's orchestration layer (mission_lifecycle.py) transfers
+// authority, verifies it by read-back, issues the Scout operation and reports the whole thing
+// as ONE response with phases. There is deliberately no browser-side sequence of
+// setControlAuthority() + start() — that is precisely the manual authority management the
+// operator no longer performs, and a page that got the order wrong could strand the vehicle
+// between owners.
+
+/** START — one operation: verified LOCAL_AGENT transfer, then Scout's own Start transaction.
+ *  body: { mission_id? } is OPTIONAL and never trusted over the persisted active record; the
+ *  backend forwards the ACTIVE mission id and rejects a supplied id that does not match it. */
 export function startMissionExecution(id, body = {}) {
   return postJSON(`/api/vehicles/${id}/mission-execution/start`, body);
 }
 
-/** Pause the mission (record sequence → verified LOITER → confirm mission loaded → PAUSED).
- *  NOT a stop/cancel: no mission is cleared, replaced or reset. Idempotent while PAUSED. */
+/** PAUSE — authority stays LOCAL_AGENT. Scout records the sequence, commands a verified LOITER
+ *  and confirms the mission is still loaded. NOT a stop/cancel: no mission is cleared, replaced
+ *  or reset. Idempotent while PAUSED. */
 export function pauseMissionExecution(id) {
   return postJSON(`/api/vehicles/${id}/mission-execution/pause`, {});
 }
 
-/** Resume the mission (verify mission loaded → verify Home/position → verified AUTO → observe
- *  sequence). Watch sequence.continuation_verified: RUNNING with `false` is a WARNING. */
+/** RESUME — re-acquires and verifies LOCAL_AGENT only if authority was lost, then Scout verifies
+ *  the mission is loaded, verifies Home/position, commands a verified AUTO and observes the
+ *  sequence. Watch sequence.continuation_verified: RUNNING with `false` is a WARNING. */
 export function resumeMissionExecution(id) {
   return postJSON(`/api/vehicles/${id}/mission-execution/resume`, {});
+}
+
+/** STOP — end the run, then return OPERATOR authority only once Scout reports STOPPED with a
+ *  verified LOITER. PENDING ON SCOUT: until Scout ships POST /agent/mission_execution/stop this
+ *  answers `unsupported` and changes nothing. Stop is never emulated from a LOITER command,
+ *  never reported as FAILED, and Rearm is never offered as a substitute. See SCOUT_STOP_API.md. */
+export function stopMissionExecution(id) {
+  return postJSON(`/api/vehicles/${id}/mission-execution/stop`, {});
+}
+
+/** READ-ONLY Start preflight: the resolved active mission id plus the five precondition checks,
+ *  computed by the SAME backend function the Start transaction enforces — so the card's
+ *  readiness display and the gate cannot disagree. Writes nothing. */
+export function getMissionExecutionPreflight(id) {
+  return getReplan(`/api/vehicles/${id}/mission-execution/preflight`);
 }
 
 /** Rearm Scout's mission-execution controller from a terminal state. Issues NO vehicle command,

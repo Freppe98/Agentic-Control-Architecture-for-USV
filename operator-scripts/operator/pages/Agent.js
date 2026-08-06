@@ -25,6 +25,7 @@ import { createAuthorityController } from "../lib/authority.js";
 import { canonicalVehicleId } from "../lib/selection.js";
 import * as replan from "../lib/replan.js";
 import * as mx from "../lib/mission-execution.js";
+import { asText, esc, escAttr } from "../lib/format.js";
 
 const clockSvg =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>';
@@ -64,8 +65,8 @@ const pill = (label, tint) => `<span class="pill ${tint}">${label}</span>`;
 // Mission-execution outcome → pill tint. `failed` (an HTTP 200 whose body carried Scout's error)
 // and `unknown` are deliberately distinct: one is a definite vehicle-level failure, the other is
 // an undecided outcome awaiting reconciliation — never the same colour, never the same word.
-const MX_TINT = { accepted: "c", failed: "d", rejected: "d", unknown: "p", unavailable: "u", unsupported: "u", pending: "p" };
-const escAttr = (s) => String(s).replace(/"/g, "&quot;");
+const MX_TINT = { accepted: "c", failed: "d", rejected: "d", blocked: "d", unknown: "p",
+  unavailable: "u", unsupported: "u", pending: "p" };
 /** A lat/lng pair from Scout rendered as a fixed-precision coordinate, or an honest dash. */
 function coord(p) {
   if (!p || typeof p !== "object") return `<span class="txt-u">—</span>`;
@@ -154,7 +155,13 @@ export function Agent(root) {
     renderDetail();
     Promise.resolve(fn(id)).then((r) => {
       if (id !== selId) return;                    // isolation: never show on another vehicle
-      mxResult = { label, view: mx.interpretOperation(r), at: new Date().toISOString() };
+      // An ORCHESTRATED transaction (start/pause/resume/stop) answers with a phases envelope
+      // and can carry the operator-side outcome `blocked`; the raw proxy (rearm) does not.
+      // Detected from the body rather than from the label so the two can never be confused.
+      const body = (r && r.data) || {};
+      const view = Array.isArray(body.phases)
+        ? mx.interpretTransaction(r) : mx.interpretOperation(r);
+      mxResult = { label, view, at: new Date().toISOString() };
     }).catch((e) => {
       if (id !== selId) return;
       mxResult = { label, view: { outcome: mx.OUTCOME.UNAVAILABLE, message: String(e) } };
@@ -361,16 +368,22 @@ export function Agent(root) {
        ${mxOperationsCard(ops)}`;
   }
 
-  // --- Primary control: header + the single lifecycle action, derived from status only -------
+  // --- Lifecycle state + evidence. NORMAL CONTROLS ARE NOT HERE ------------------------------
+  // This page is a diagnostic, reasoning, evidence and test surface. Start / Pause / Resume /
+  // Stop are NORMAL mission operation and live on the Map's Agent Mission card, which is the
+  // operational surface and which also performs the authority hand-off. Putting them in two
+  // places is how an operator ends up switching pages mid-mission and how two surfaces come to
+  // disagree about whether the mission is running.
+  //
+  // What remains here is the DIAGNOSTIC FALLBACK: the same operations, behind an explicitly
+  // labelled section that is COLLAPSED BY DEFAULT (see mxFallbackControls), for the case where
+  // the Map card cannot be used and an engineer needs the raw path. Rearm stays a first-class
+  // advanced tool — it is a controller-maintenance action, not normal mission operation.
   function mxControlCard(S, res, ops) {
-    const act = mx.primaryAction(S);
     const rearm = mx.rearmAvailability(S);
     const lastCode = (ops.slice(-1)[0] || {}).scout_error_code || null;
     const blockers = mx.startBlockers(S, { lastErrorCode: lastCode });
     const complete = mx.isComplete(S);
-
-    // Disabled while a write is in flight — but the LABEL never changes optimistically.
-    const btnEnabled = act.enabled && !mxBusy;
     const effectiveDiffers = S.effectiveState && S.effectiveState !== S.state;
     const stateCond = S.replanning.active ? rp("REPLANNING", "p")
       : complete ? rp("COMPLETE", "c")
@@ -392,15 +405,43 @@ export function Agent(root) {
          ${row("Active operation id", S.activeOperationId ? `<span class="mono">${S.activeOperationId}</span>` : `<span class="txt-u">none</span>`)}
          ${row("Mission execution enabled", S.missionExecutionEnabled === false ? rp("DISABLED", "d") : S.missionExecutionEnabled === true ? rp("ENABLED", "c") : rp("not reported", "u"))}
        </div>
+       <div class="reason-note">${gapSvg}<span><b>Normal mission controls are on the Map page.</b>
+         Start, Pause, Resume and Stop live in the Map's <b>Agent Mission</b> card, which runs
+         each as one operation including the control-authority hand-off. This page is the
+         diagnostic, evidence and test surface for the same lifecycle.</span></div>
        <div style="padding:10px 13px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-         <button class="btn" id="mx-primary" data-action="${act.action || ""}" ${btnEnabled ? "" : "disabled"} title="${escAttr(act.reason || "")}">${act.label}</button>
          ${rearm.available ? `<button class="btn ghost" id="mx-rearm" ${rearm.enabled && !mxBusy ? "" : "disabled"} title="Resets the Local Agent mission-execution state only — no vehicle command, no mode change, no Pixhawk mission cleared, no mission re-uploaded">Rearm Mission Controller</button>` : ""}
-         ${mxBusy ? `<span class="cond">sending — waiting for Scout's authoritative result…</span>` : act.reason ? `<span class="cond">${act.reason}</span>` : ""}
+         ${mxBusy ? `<span class="cond">sending — waiting for Scout's authoritative result…</span>` : ""}
        </div>
-       ${res && res.view.outcome !== "pending" ? `<div class="reason-note">${res.view.outcome === "accepted" ? gapSvg : warnSvg}<span><b>${res.label}</b>: ${mx.operationSummary(res.view)}</span></div>` : ""}
-       ${!act.enabled && act.action === null && blockers.length ? `<div class="reason-note">${warnSvg}<span>Start unavailable: ${blockers.join(" · ")}</span></div>` : ""}
-       ${rearm.available ? `<div class="reason-note">${gapSvg}<span>Rearm resets the Local Agent mission-execution controller. It does <b>not</b> clear the Pixhawk mission, switch vehicle mode or re-upload the original mission — it prepares the controller for another explicitly prepared run.</span></div>` : ""}
-       <div class="reason-note">${gapSvg}<span>${mx.START_HOME_NOTE}</span></div>`, false);
+       ${res && res.view.outcome !== "pending" ? `<div class="reason-note">${res.view.outcome === "accepted" ? gapSvg : warnSvg}<span><b>${esc(res.label)}</b>: ${esc(Array.isArray(res.view.phases) ? mx.transactionSummary(res.view) : mx.operationSummary(res.view))}</span></div>` : ""}
+       ${blockers.length ? `<div class="reason-note">${warnSvg}<span>Start unavailable: ${esc(blockers.join(" · "))}</span></div>` : ""}
+       ${rearm.available ? `<div class="reason-note">${gapSvg}<span>Rearm resets the Local Agent mission-execution controller. It does <b>not</b> clear the Pixhawk mission, switch vehicle mode or re-upload the original mission — it prepares the controller for another explicitly prepared run. It is <b>not</b> a Stop.</span></div>` : ""}
+       <div class="reason-note">${gapSvg}<span>${mx.START_HOME_NOTE}</span></div>
+       ${mxFallbackControls(S)}`, false);
+  }
+
+  // --- Diagnostic fallback: the raw lifecycle writes, COLLAPSED BY DEFAULT --------------------
+  // Deliberately not the normal path and deliberately marked as such. These call the same
+  // orchestrated operator endpoints the Map card uses (so authority is still handled and
+  // verified — there is no second, unmanaged write path), but they are for the case where the
+  // Map surface cannot be used. Everything is derived from Scout's status, as everywhere else.
+  function mxFallbackControls(S) {
+    const act = mx.primaryAction(S);
+    const stop = mx.stopAvailability(S);
+    const btn = (id, label, enabled, reason) =>
+      `<button class="btn ghost" id="${id}" ${enabled && !mxBusy ? "" : "disabled"} title="${escAttr(reason || "")}">${esc(label)}</button>`;
+    return `<details class="mx-fallback">
+      <summary>Diagnostic fallback controls (not the normal path)</summary>
+      <div style="padding:9px 0 2px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${btn("mx-fb-start", "Start", act.action === "start" && act.enabled, act.reason)}
+        ${btn("mx-fb-pause", "Pause", act.action === "pause" && act.enabled, act.reason)}
+        ${btn("mx-fb-resume", "Resume", act.action === "resume" && act.enabled, act.reason)}
+        ${btn("mx-fb-stop", "Stop", stop.enabled, stop.reason)}
+      </div>
+      <div class="reason-note">${warnSvg}<span>Use the Map's <b>Agent Mission</b> card for normal
+        operation. These are the same orchestrated endpoints — authority is still transferred and
+        verified — exposed here only for diagnosis.${stop.supported ? "" : ` ${esc(stop.reason)}`}</span></div>
+    </details>`;
   }
 
   // --- Home: what Start does to it, and what Scout verified ---------------------------------
@@ -424,7 +465,7 @@ export function Agent(root) {
          ${row("Home verification", verified === true ? rp("VERIFIED BY SCOUT", "c") : verified === false ? rp("NOT VERIFIED", "d") : rp("not reported", "u"))}
          ${row("Package Home synchronized", lastHome && lastHome.package_synchronized != null ? (lastHome.package_synchronized ? rp("SYNCHRONIZED", "c") : rp("NOT SYNCHRONIZED", "d")) : rp("not reported", "u"))}
          ${row("Distance to Home (return)", rp2.distanceToHomeM == null ? `<span class="txt-u">—</span>` : rp2.distanceToHomeM.toFixed(1) + " m")}
-         ${row("Home error", lastHome && lastHome.error ? `<span class="txt-d">${lastHome.error}</span>` : `<span class="txt-u">—</span>`)}
+         ${row("Home error", asText(lastHome && lastHome.error) ? `<span class="txt-d">${esc(lastHome.error)}</span>` : `<span class="txt-u">—</span>`)}
        </div>
        <div class="reason-note">${warnSvg}<span><b>Start Mission resets Home to the vehicle's current launch position.</b> Scout sets it, reads it back, verifies it and synchronizes the planning package to it. The Home in the original plan is not retained.</span></div>`, false);
   }
@@ -487,30 +528,30 @@ export function Agent(root) {
       `<div class="rlist" style="padding:8px 13px">
          ${ops.slice(-12).reverse().map((o) => `<div class="ritem">
             <span class="cond mono">${fmtTime(o.requested_at)}</span>
-            <span class="rtx"><b>${String(o.operation || "").toUpperCase()}</b> ${rp(mx.outcomeLabel(o.outcome), MX_TINT[o.outcome] || "u")}${o.resulting_state ? " → " + o.resulting_state : ""}${o.verified_mode ? " · mode " + o.verified_mode : ""}${o.scout_error_code ? ` · <span class="txt-d">${o.scout_error_code}</span>` : ""}${o.continuation_verified === false ? " · " + rp("CONTINUATION NOT VERIFIED", "d") : ""}${o.reconciliation ? ` · reconciled: ${o.reconciliation.resolved}` : ""}</span>
+            <span class="rtx"><b>${String(o.operation || "").toUpperCase()}</b> ${rp(mx.outcomeLabel(o.outcome), MX_TINT[o.outcome] || "u")}${o.resulting_state ? " → " + esc(o.resulting_state) : ""}${o.verified_mode ? " · mode " + esc(o.verified_mode) : ""}${o.scout_error_code ? ` · <span class="txt-d">${esc(o.scout_error_code)}</span>` : ""}${o.continuation_verified === false ? " · " + rp("CONTINUATION NOT VERIFIED", "d") : ""}${o.reconciliation ? ` · reconciled: ${esc(o.reconciliation.resolved)}` : ""}</span>
             <span class="rav mono">${o.operation_id || ""}</span>
           </div>`).join("")}
        </div>`, true);
   }
 
   function wireMissionExecution() {
-    const primary = document.getElementById("mx-primary");
-    if (primary) primary.onclick = () => {
-      const action = primary.dataset.action;
-      if (action === "start") {
-        if (!window.confirm("Start Mission?\n\nScout will hold position, set the CURRENT launch position as Home, verify it, synchronize the planning package and then start AUTO. The originally planned Home is not retained.")) return;
-        mxWrite("Start Mission", (id) => api.startMissionExecution(id, {}));
-      } else if (action === "pause") {
-        mxWrite("Pause Mission", (id) => api.pauseMissionExecution(id));
-      } else if (action === "resume") {
-        mxWrite("Resume Mission", (id) => api.resumeMissionExecution(id));
-      }
-    };
+    const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
     const rearmBtn = document.getElementById("mx-rearm");
     if (rearmBtn) rearmBtn.onclick = () => {
       if (!window.confirm("Rearm the mission controller?\n\nThis resets the Local Agent's mission-execution state only. It does NOT clear the Pixhawk mission, does NOT change vehicle mode and does NOT re-upload the original mission.")) return;
       mxWrite("Rearm controller", (id) => api.rearmMissionExecution(id));
     };
+    // Diagnostic fallback only — the normal path is the Map's Agent Mission card.
+    on("mx-fb-start", () => {
+      if (!window.confirm("Start Mission (diagnostic fallback)?\n\nNormal operation is the Map's Agent Mission card.\n\nControl authority is transferred to the Local Agent and verified first. Scout then holds position, sets the CURRENT launch position as Home, verifies it, synchronizes the planning package and starts AUTO. The originally planned Home is not retained.")) return;
+      mxWrite("Start Mission", (id) => api.startMissionExecution(id, {}));
+    });
+    on("mx-fb-pause", () => mxWrite("Pause Mission", (id) => api.pauseMissionExecution(id)));
+    on("mx-fb-resume", () => mxWrite("Resume Mission", (id) => api.resumeMissionExecution(id)));
+    on("mx-fb-stop", () => {
+      if (!window.confirm("Stop Mission (diagnostic fallback)?\n\nScout ends the run and holds position. This does NOT disarm, clear the Pixhawk mission, delete the planning package or invoke RTL. Authority returns to the operator only after Scout reports STOPPED with a verified LOITER.")) return;
+      mxWrite("Stop Mission", (id) => api.stopMissionExecution(id));
+    });
   }
 
   // ================= Replanning supervisory view (Scout Local Agent /agent/replan/*) =======
@@ -518,9 +559,27 @@ export function Agent(root) {
   // authority (above), replanning FSM state, decision, mission revision, planning-package
   // readiness. Everything here is Scout's word, normalized by lib/replan.js; the frontend
   // never generates an alternate transition or a competing decision.
-  const rp = (label, tint) => `<span class="pill ${tint}">${label}</span>`;
-  const val = (v) => (v === null || v === undefined || v === "" ? `<span class="txt-u">—</span>` : String(v));
+  const rp = (label, tint) => `<span class="pill ${tint}">${esc(label)}</span>`;
+  // val() is the single display formatter for every Scout-supplied field on this page. It uses
+  // asText, NOT String(): Scout legitimately sends structured values (a policy `{value, source}`,
+  // an energy calculation, a `{code, message}` error), and String()-ing one renders the literal
+  // text "[object Object]" where the operator expects a value. Nothing is dropped — an object
+  // with no human field is shown as readable key=value pairs.
+  const val = (v) => {
+    const t = asText(v);
+    return t === null ? `<span class="txt-u">—</span>` : esc(t);
+  };
   const shortHash = (h) => (h ? String(h).replace(/^sha256:/, "").slice(0, 12) + "…" : "—");
+  // A record of Scout-supplied values (energy calculation, experiment overrides) as readable
+  // pairs. Each VALUE goes through asText, so a nested object renders its own content instead
+  // of "[object Object]".
+  const pairsText = (obj) => {
+    if (!obj || typeof obj !== "object") return val(obj);
+    const parts = Object.entries(obj)
+      .map(([k, x]) => { const t = asText(x); return t === null ? null : `${k}=${t}`; })
+      .filter(Boolean);
+    return parts.length ? esc(parts.join(", ")) : `<span class="txt-u">—</span>`;
+  };
   const OUTCOME_TINT = { accepted: "c", rejected: "d", unknown: "p", unavailable: "u", unsupported: "u", pending: "p" };
 
   function replanSection(v, { connected, stale }) {
@@ -573,7 +632,7 @@ export function Agent(root) {
          ${row("Boundary supplied", badge(vm.boundary_supplied, "YES", "NO"))}
          ${row("Connector proven safe", pk.connector_proven_safe == null ? rp("unknown", "u") : badge(pk.connector_proven_safe, "PROVEN", "NOT PROVEN"))}
        </div>
-       ${lims.length ? `<div class="reason-note">${warnSvg}<span>Limitations: ${lims.map((l) => l).join(" · ")}</span></div>` : ""}
+       ${lims.length ? `<div class="reason-note">${warnSvg}<span>Limitations: ${esc(lims)}</span></div>` : ""}
        <div style="padding:9px 13px;display:flex;gap:8px;flex-wrap:wrap">
          <button class="btn" id="rp-pkg-put" ${replanBusy ? "disabled" : ""}>Upload approved planning package</button>
          <button class="btn ghost" id="rp-pkg-del" ${replanBusy ? "disabled" : ""}>Clear package</button>
@@ -585,7 +644,7 @@ export function Agent(root) {
     if (!S.present) return card("Replanning decision", availTag(AVAIL.GAP), "idle",
       gapBody("Scout is not reporting a replanning decision."), false);
     const eng = d.energy && typeof d.energy === "object"
-      ? Object.entries(d.energy).map(([k, x]) => `${k}=${x}`).join(", ") : val(d.energy);
+      ? pairsText(d.energy) : val(d.energy);
     return card("Replanning decision", d.simulated ? rp("SIMULATED INPUT", "p") : availTag(AVAIL.LIVE), d.simulated ? "caution" : "ok",
       `<div class="metrics">
          ${row("Decision", `<b>${val(d.decision)}</b>`)}
@@ -656,7 +715,7 @@ export function Agent(root) {
     });
     const stageBadge = stage === replan.STAGE.REAL ? rp("REAL EXECUTION", "d")
       : stage === replan.STAGE.DRY_RUN ? rp("DRY-RUN", "p") : rp("DISABLED", "u");
-    const src = (k) => (scout.sources && scout.sources[k]) ? `<span class="cond">${scout.sources[k]}</span>` : "";
+    const src = (k) => (scout.sources && asText(scout.sources[k])) ? `<span class="cond">${esc(scout.sources[k])}</span>` : "";
     return card("Execution configuration", stageBadge, stage === replan.STAGE.REAL ? "caution" : "ok",
       `<div class="metrics">
          ${row("Autonomous execution", `${scout.autonomous_execution_enabled ? "ENABLED" : "DISABLED"} ${src("autonomous_execution_enabled")}`)}
@@ -684,7 +743,7 @@ export function Agent(root) {
          ${row("Injection state", active ? rp("SIMULATED", "p") : "none")}
          ${row("Created", val(scout && (scout.created_at || scout.created)))}
          ${row("Expires", val(scout && (scout.expires_at || scout.expiry)))}
-         ${row("Overrides", scout && scout.overrides ? Object.entries(scout.overrides).map(([k, x]) => `${k}=${x}`).join(", ") : (active ? "(applied)" : "—"))}
+         ${row("Overrides", scout && scout.overrides ? pairsText(scout.overrides) : (active ? "(applied)" : "—"))}
        </div>
        <div style="padding:8px 13px;display:grid;grid-template-columns:1fr 1fr;gap:6px 10px">
          <label class="cond" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="rp-exp-force"> Force safe return</label>
@@ -706,7 +765,7 @@ export function Agent(root) {
       `<div class="rlist" style="padding:8px 13px">
          ${S.transitions.slice(-12).map((tr) => `<div class="ritem">
             <span class="cond mono">${fmtTime(tr.timestamp)}</span>
-            <span class="rtx"><b>${val(tr.from)}</b> → <b>${val(tr.to)}</b>${tr.reason ? " · " + tr.reason : ""}</span>
+            <span class="rtx"><b>${val(tr.from)}</b> → <b>${val(tr.to)}</b>${asText(tr.reason) ? " · " + esc(tr.reason) : ""}</span>
             <span class="rav mono">${tr.transitionId || ""}</span>
             ${tr.simulated ? rp("SIM", "p") : ""}
           </div>`).join("")}
@@ -820,7 +879,7 @@ export function Agent(root) {
       : ["pending", "p"];
     return `<div class="agent-last-action">
       <span class="k">Latest action</span>
-      <span class="v"><span class="ctl-type mono">${d.command_type || "—"}</span> ${pill(verb[0], verb[1])}${d.command_source ? `<span class="src-chip">${d.command_source}</span>` : ""}</span>
+      <span class="v"><span class="ctl-type mono">${esc(d.command_type) || "—"}</span> ${pill(verb[0], verb[1])}${d.command_source ? `<span class="src-chip">${esc(d.command_source)}</span>` : ""}</span>
     </div>`;
   }
 
