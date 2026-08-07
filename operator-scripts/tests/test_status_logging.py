@@ -100,13 +100,37 @@ class BoundedStatusLines(StatusLoggingBase):
         self.post_capture(packet(2, ts=1000, name="Scout", mission="EXECUTING"))
         lines = self.post_capture(packet(2, ts=1001, name="Scout", mission="PAUSED"))
         self.assertEqual(len(lines), 1)
-        self.assertIn("mission=PAUSED", lines[0])
+        self.assertIn("agent_mission=PAUSED", lines[0])
 
     def test_communication_state_transition_logs(self):
         self.post_capture(packet(2, ts=1000, name="Scout", comm="CONNECTED"))
         lines = self.post_capture(packet(2, ts=1001, name="Scout", comm="PARTITIONED"))
         self.assertEqual(len(lines), 1)
-        self.assertIn("comm=PARTITIONED", lines[0])
+        self.assertIn("agent_comm=PARTITIONED", lines[0])
+
+    def test_the_two_comm_verdicts_are_named_apart_and_both_reported(self):
+        """The vehicle's SELF-REPORTED comm state and the operator's ARRIVAL-AGE derived one are
+        different facts, and a packet that arrives while self-reporting PARTITIONED shows both.
+
+        This is the console contradiction that read as a bug: `comm=PARTITIONED` printed beside a
+        UI that had correctly recovered to CONNECTED. The operator's verdict is the one the UI
+        renders, and the log must not present the vehicle's as if it were ours."""
+        lines = self.post_capture(packet(2, ts=1000, name="Scout", comm="PARTITIONED"))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("agent_comm=PARTITIONED", lines[0])   # the vehicle's own assessment
+        self.assertIn("link=CONNECTED", lines[0])           # the operator's, from arrival age
+        # No unqualified `comm=` / `mission=` may survive: those are what invited the misreading.
+        self.assertNotIn(" comm=", lines[0])
+        self.assertNotIn(" mission=", lines[0])
+
+    def test_the_mission_field_is_the_supervisory_state_not_the_lifecycle(self):
+        """`agent_mission` is payload.mission.mission_state — the SUPERVISORY agent's decision
+        state. Scout's mission-execution lifecycle (port 8090, /agent/mission_execution/status)
+        never reaches this log line, so an agent_mission=IDLE beside a RUNNING mission-execution
+        card is two different things agreeing, not a stale value."""
+        lines = self.post_capture(packet(2, ts=1000, name="Scout", mission="IDLE"))
+        self.assertIn("agent_mission=IDLE", lines[0])
+        self.assertNotIn("mission_execution", lines[0])
 
     def test_identity_resolution_change_logs(self):
         """The same canonical vehicle suddenly identifying itself differently is exactly the

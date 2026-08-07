@@ -91,7 +91,8 @@ test("the inspector order is Status → Vehicle Commands → Agent Mission → V
 
 test("the vehicle header is first and the secondary information stays last", () => {
   assert.ok(inspector.indexOf('class="idcard"') < at("Status"), "vehicle header is first");
-  for (const later of ["Agent status", "Communication · transitions", "Recent events"]) {
+  for (const later of ["Supervisory agent · decision state", "Communication · transitions",
+    "Recent events"]) {
     assert.ok(at(later) > at("Vehicle readiness"), `${later} is secondary information`);
   }
 });
@@ -224,7 +225,7 @@ test("RUNNING and PAUSED show MODE · WP as the one line, and drop the identity 
   assert.equal(running.chip, "RUNNING");
   assert.equal(running.headline, "AUTO · WP 4 / 41");
   assert.deepEqual(running.rows, []);
-  assert.deepEqual(running.buttons.map((b) => b.label), ["Pause", "Stop Mission"]);
+  assert.deepEqual(running.buttons.map((b) => b.label), ["Pause Mission", "Stop Mission"]);
 
   const paused = missionCardView(S({ state: "PAUSED", mode: "LOITER", can_start: false,
     can_resume: true, can_stop: true, sequence: { current: 4, count: 41 } }));
@@ -238,7 +239,7 @@ test("the card variants stay STATE-driven, never click-driven", () => {
   // The same assertion the lifecycle model carries, restated at the card level: a RUNNING
   // mission's primary control is Pause and can never read Resume.
   const running = missionCardView(S({ state: "RUNNING", can_pause: true, can_stop: true }));
-  assert.equal(running.buttons[0].label, "Pause");
+  assert.equal(running.buttons[0].label, "Pause Mission");
   assert.equal(running.buttons.some((b) => /resume/i.test(b.label)), false);
   // Busy disables every button without changing a single label.
   const busy = missionCardView(S({ state: "RUNNING", can_pause: true, can_stop: true }),
