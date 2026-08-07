@@ -24,6 +24,7 @@ import { AVAIL, availSlot, availTag } from "../lib/availability.js";
 import { createAuthorityController } from "../lib/authority.js";
 import { canonicalVehicleId } from "../lib/selection.js";
 import * as replan from "../lib/replan.js";
+import { readinessLabel, READINESS_STATE } from "../lib/mission-publish.js";
 import * as mx from "../lib/mission-execution.js";
 import { asText, esc, escAttr } from "../lib/format.js";
 
@@ -82,6 +83,7 @@ export function Agent(root) {
   // clears it, so no Scout's replan state can leak onto another's panel). All read-only from
   // Scout except explicit operator writes; `replanMsg` holds the last write's outcome pill.
   let replanStatus = null, replanReadiness = null, replanConfig = null, replanExperiment = null;
+  let publishState = null;
   let replanMsg = null, replanBusy = false, replanForVid = null;
 
   // Mission-execution lifecycle state, per SELECTED vehicle only. `mxStatus` is Scout's canonical
@@ -108,17 +110,25 @@ export function Agent(root) {
   // so reconnect/poll can never resend a package/config/injection. Results are tagged with the
   // vehicle they were fetched for and dropped if the selection changed meanwhile (isolation).
   function loadReplan(id) {
-    if (id == null) { replanStatus = replanReadiness = replanConfig = replanExperiment = null; return; }
+    if (id == null) {
+      replanStatus = replanReadiness = replanConfig = replanExperiment = publishState = null;
+      return;
+    }
     const forId = id;
     Promise.allSettled([
       api.getReplanStatus(id), api.getReplanReadiness(id),
       api.getReplanConfig(id), api.getReplanExperiment(id),
-    ]).then(([st, rd, cf, ex]) => {
+      // The operator-side publication state. Read-only and cheap: no Scout call, no Pixhawk
+      // download. It is what lets this page distinguish "a sync is owed" from "Scout disagrees"
+      // — the durable record knows the former; Scout's package evidence alone cannot.
+      api.getPublishState(id),
+    ]).then(([st, rd, cf, ex, pb]) => {
       if (forId !== selId) return;                 // selection moved — discard stale fetch
       replanStatus = st.status === "fulfilled" ? st.value : null;
       replanReadiness = rd.status === "fulfilled" ? rd.value : null;
       replanConfig = cf.status === "fulfilled" ? cf.value : null;
       replanExperiment = ex.status === "fulfilled" ? ex.value : null;
+      publishState = pb.status === "fulfilled" ? pb.value : null;
       replanForVid = forId;
       renderDetail();
     });
@@ -616,10 +626,20 @@ export function Agent(root) {
     const vm = rd.vehicle_mission || {}, pk = rd.planning_package || {};
     const badge = (ok, on, off) => rp(ok ? on : off, ok ? "c" : "d");
     const lims = Array.isArray(rd.limitations) ? rd.limitations : [];
+    // THE shared verdict — the same derivation the Map renders (lib/mission-publish.js), so a
+    // package that is merely awaiting a sync, or a Scout that is re-deriving its own readiness,
+    // can never read as a mismatch on one page and as ready on the other.
+    const pubFor = publishState && replanForVid === selId ? publishState : null;
+    const verdict = readinessLabel({ publish: pubFor, readiness: rd });
+    const verdictTone = { READY: "c", VERIFYING: "u", PACKAGE_SYNC_REQUIRED: "p",
+                          SCOUT_UNREACHABLE: "u", REAL_MISMATCH: "d", NO_MISSION: "u" };
+    const syncOwed = verdict.state === READINESS_STATE.PACKAGE_SYNC_REQUIRED;
     return card("Mission / Replanning readiness",
       `${badge(rd.mission_ready, "MISSION READY", "MISSION NOT READY")} ${badge(rd.replanning_ready, "REPLANNING READY", "NOT READY")}`,
       rd.replanning_ready ? "ok" : rd.mission_ready ? "caution" : "idle",
       `<div class="metrics">
+         ${row("Agent package", `${rp(verdict.state.replace(/_/g, " "), verdictTone[verdict.state] || "u")} ${esc(verdict.text)}`)}
+         ${verdict.detail ? row("", `<span class="cond">${esc(verdict.detail)}</span>`) : ""}
          ${row("Vehicle mission", `${vm.mission_id ? `<span class="mono">${vm.mission_id}</span>` : "—"}`)}
          ${row("Pixhawk verified", badge(vm.pixhawk_verified, "VERIFIED", "NOT VERIFIED"))}
          ${row("Readback hash match", vm.readback_reachable ? badge(vm.readback_hash_match, "MATCH", "NO MATCH") : rp("readback unreachable", "u"))}
@@ -634,7 +654,8 @@ export function Agent(root) {
        </div>
        ${lims.length ? `<div class="reason-note">${warnSvg}<span>Limitations: ${esc(lims)}</span></div>` : ""}
        <div style="padding:9px 13px;display:flex;gap:8px;flex-wrap:wrap">
-         <button class="btn" id="rp-pkg-put" ${replanBusy ? "disabled" : ""}>Upload approved planning package</button>
+         <button class="btn${syncOwed ? "" : " ghost"}" id="rp-pkg-sync" ${replanBusy ? "disabled" : ""}
+                 title="Rebuild the approved replan-planning-package-v1 from the active mission record, POST it to Scout and read it back. Sends a package only — it issues no vehicle command and cannot re-upload the Pixhawk mission.">Synchronize Agent package</button>
          <button class="btn ghost" id="rp-pkg-del" ${replanBusy ? "disabled" : ""}>Clear package</button>
        </div>`, true);
   }
@@ -774,7 +795,11 @@ export function Agent(root) {
 
   function wireReplan() {
     const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
-    on("rp-pkg-put", () => replanWrite("Package upload", (id) => api.putReplanPackage(id, {})));
+    // The v1 sync — the SAME endpoint the Plan page's Retry Agent Sync uses, and the same
+    // transaction the publish operation runs. The old button POSTed the pre-v1 package shape
+    // through PUT, which a v1 Scout does not store; that is why an operator could press it and
+    // still be left with the previous mission's package.
+    on("rp-pkg-sync", () => replanWrite("Agent package sync", (id) => api.syncReplanPackage(id, {})));
     on("rp-pkg-del", () => replanWrite("Package clear", (id) => api.deleteReplanPackage(id)));
     on("rp-reset", () => replanWrite("Controller rearm", (id) => api.resetReplanController(id)));
     on("rp-stage-disabled", () => replanWrite("Config: disable", (id) => api.patchReplanConfig(id, replan.stagePatch(replan.STAGE.DISABLED))));
@@ -973,7 +998,7 @@ export function Agent(root) {
     // Isolation: clear the previous vehicle's replan + mission-execution panels immediately (so
     // no stale lifecycle state, operation result or completion claim can be read as this
     // vehicle's), then load this one's.
-    replanStatus = replanReadiness = replanConfig = replanExperiment = null;
+    replanStatus = replanReadiness = replanConfig = replanExperiment = publishState = null;
     replanMsg = null; replanForVid = null;
     mxStatus = null; mxOps = []; mxResult = null; mxForVid = null;
     loadAuthority(id);

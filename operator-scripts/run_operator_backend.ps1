@@ -46,6 +46,42 @@ if (Test-Path $EnvFile) {
     }
 }
 
+# --- Refuse to start on top of an already-running backend ---------------------------
+# WHY THIS CHECK EXISTS. Starting a second backend while one is already listening does not
+# produce two stations - uvicorn fails to bind with WinError 10048 and exits, while the FIRST
+# (older) process keeps serving the port with its own in-memory active mission. The operator
+# then works against a backend they believe they just restarted, and nothing in the UI says
+# otherwise. That is how a station can appear to hold a mission it does not.
+#
+# So: detect the listener, name the process that owns it, and STOP. Nothing is killed
+# automatically - which backend should die is the operator's decision, not this script's.
+# GET /api/diagnostics on the running one reports its pid, start time, mission-store path and
+# active missions, so the two are always distinguishable.
+$portInUse = $null
+try {
+    $portInUse = Get-NetTCPConnection -LocalPort $OperatorBackendPort -State Listen -ErrorAction Stop |
+        Select-Object -First 1
+} catch {
+    # Get-NetTCPConnection missing or blocked - fall through and let uvicorn report the bind
+    # failure itself. A missing diagnostic must never block a legitimate start.
+}
+if ($portInUse) {
+    $ownerPid = $portInUse.OwningProcess
+    $ownerName = try { (Get-Process -Id $ownerPid -ErrorAction Stop).ProcessName } catch { 'unknown' }
+    Write-Host ""
+    Write-Host "[STOP] Port $OperatorBackendPort is ALREADY in use by pid $ownerPid ($ownerName)." -ForegroundColor Red
+    Write-Host "       An operator backend appears to be running already. Starting another one" -ForegroundColor Yellow
+    Write-Host "       would fail to bind (WinError 10048) while THAT process keeps answering" -ForegroundColor Yellow
+    Write-Host "       every request - including with its own, possibly older, active mission." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "       Identify the running backend:" -ForegroundColor Cyan
+    Write-Host "           curl http://127.0.0.1:$OperatorBackendPort/api/diagnostics" -ForegroundColor Cyan
+    Write-Host "       Then either keep using it, or stop it first:" -ForegroundColor Cyan
+    Write-Host "           Stop-Process -Id $ownerPid" -ForegroundColor Cyan
+    Write-Host ""
+    exit 1
+}
+
 # --- Show this PC's LAN addresses so you know what to set on Scout -------------------
 # Scout's OPERATOR_URLS must point at one of these (whichever is on the same network
 # as the vehicle/router). See RUNBOOK.md.

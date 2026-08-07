@@ -27,6 +27,7 @@ import { createTelemetryCache } from "../lib/telemetry-cache.js";
 import { attachMapLayout } from "../lib/map-layout.js";
 import * as mx from "../lib/mission-execution.js";
 import { readinessView, preflightNote } from "../lib/mission-readiness.js";
+import { readinessLabel, READINESS_STATE as PKG_STATE } from "../lib/mission-publish.js";
 import { asText, esc, escAttr } from "../lib/format.js";
 
 const HOME = [56.699893, 13.002148];
@@ -131,6 +132,9 @@ export function Map(root) {
     status: null, result: null, busy: false, forVid: null,
     preflight: null, preflightAt: null, preflightFor: null, preflightReason: null,
     refreshing: false,
+    // The operator-side publication state (active mission, upload status, whether an Agent
+    // package sync is owed). Read on the same one-shot moments as the preflight.
+    publish: null, publishFor: null, syncing: false,
   };
   // Per-vehicle comm state from the previous fleet poll, so a DISCONNECTED → CONNECTED
   // transition can trigger exactly one preflight (task 8's "after reconnect") without any
@@ -942,6 +946,14 @@ export function Map(root) {
     const forId = id;
     mission.refreshing = true;
     if (forId === selId) renderInspector();
+    // The publication state rides along on the SAME one-shot moments. It is read-only and free
+    // (no Scout call, no Pixhawk download), and it is what lets this card say "the Agent package
+    // is owed" instead of the far weaker "the planning package is not consistent" — the durable
+    // record knows a sync is outstanding; Scout's package evidence alone cannot distinguish
+    // that from a genuine disagreement.
+    api.getPublishState(id).then((pb) => {
+      if (forId === selId) { mission.publish = pb; mission.publishFor = forId; }
+    }).catch(() => {});
     api.getMissionExecutionPreflight(id).then((pf) => {
       if (forId !== selId) return;
       mission.preflight = pf;
@@ -1239,6 +1251,37 @@ export function Map(root) {
   // Stop endpoint", and never several failures concatenated. Each of those still exists — as
   // the `title` of the element it belongs to, and in full on the Agent diagnostics page.
   // Authority is not a row here; the Status area above shows it once.
+  // THE AGENT PACKAGE LINE. Derived by the SAME function the Agent page renders from
+  // (lib/mission-publish.js readinessLabel), so the two pages cannot disagree about one
+  // vehicle's package. Its whole job is to keep apart four things the old single "the planning
+  // package is not consistent with the approved mission" collapsed into one:
+  //
+  //   VERIFYING              Scout is re-deriving its own readiness, or the comparison has not
+  //                          completed. Neutral — nothing is wrong and nothing is claimed.
+  //   SCOUT_UNREACHABLE      the question could not be asked. Not a disagreement.
+  //   PACKAGE_SYNC_REQUIRED  the operator backend knows a sync is OWED. The only one with an
+  //                          action attached — and that action sends a package and nothing else.
+  //   REAL_MISMATCH          both sides reported, and they differ. The only true warning.
+  //
+  // Rendered with the same one-line-plus-tooltip discipline as every other note on this card.
+  const SYNC_BTN_TITLE = "Rebuild the approved planning package from the active mission and " +
+    "send it to the Agent. Sends a package only — it issues no vehicle command and cannot " +
+    "re-upload the Pixhawk mission.";
+
+  function agentPackageLine(v, pfFor) {
+    const pubFor = mission.publishFor != null && v && mission.publishFor === v.id;
+    const verdict = readinessLabel({
+      publish: pubFor ? mission.publish : null,
+      readiness: (mission.preflight && pfFor && mission.preflight.readiness) || null,
+      refreshing: mission.refreshing && pfFor,
+    });
+    if (verdict.state === PKG_STATE.NO_MISSION) return "";
+    const retry = verdict.state === PKG_STATE.PACKAGE_SYNC_REQUIRED
+      ? ` <button class="amx-refresh" data-mx-sync="1"${mission.syncing ? " disabled" : ""} title="${escAttr(SYNC_BTN_TITLE)}">Retry Agent Sync</button>`
+      : "";
+    return `<div class="amx-note${verdict.state === PKG_STATE.REAL_MISMATCH ? " warn" : ""}" title="${escAttr(verdict.detail || "")}">${esc(verdict.text)}${retry}</div>`;
+  }
+
   function renderAgentMission(v) {
     // Isolation guard: only render lifecycle state actually fetched for THIS vehicle.
     const forThis = mission.forVid != null && v && mission.forVid === v.id;
@@ -1324,6 +1367,9 @@ export function Map(root) {
         <button class="amx-refresh" data-mx-refresh="1"${mission.refreshing ? " disabled" : ""} title="Re-run the read-only Start preflight once. Writes nothing, commands nothing, and does not change which buttons are offered.">Refresh</button>
       </div>`;
 
+    // ONE Agent-package line, from the shared derivation (see agentPackageLine).
+    const pkgLine = card.present === false ? "" : agentPackageLine(v, pfFor);
+
     // A Start that did not happen reads as ONE compact actionable error; the precondition
     // evidence, Scout's code and the phase detail are the tooltip. Every other transaction keeps
     // the one-word outcome line.
@@ -1338,7 +1384,7 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${progress}${buttons}${blocker}${home}${info}${resultNote}</div>`;
+    return `<div class="amx">${head}${rows}${progress}${buttons}${blocker}${home}${pkgLine}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation
@@ -1499,6 +1545,27 @@ export function Map(root) {
     // polling it costs the operator nothing.
     box.querySelectorAll("button[data-mx-refresh]").forEach((btn) => {
       btn.onclick = () => refreshPreflight(v.id, "manual");
+    });
+    // Retry Agent Sync. Calls the package-sync endpoint ONLY — that route builds and sends a
+    // planning package and contains no code that can command the vehicle, so this can never
+    // re-upload the mission the flight controller already carries.
+    box.querySelectorAll("button[data-mx-sync]").forEach((btn) => {
+      btn.onclick = () => retryPackageSync(v.id);
+    });
+  }
+
+  /** Re-send ONLY the Agent planning package for `id`, then re-read the publication state and
+   *  the one-shot preflight so the card shows the new verdict rather than the old one. */
+  function retryPackageSync(id) {
+    if (id == null || mission.syncing) return;
+    mission.syncing = true;
+    renderInspector();
+    api.syncReplanPackage(id, {}).catch((e) => {
+      logQuiet("planning-package sync", e);
+    }).finally(() => {
+      mission.syncing = false;
+      if (id === selId) refreshPreflight(id, "mission");
+      renderInspector();
     });
   }
 

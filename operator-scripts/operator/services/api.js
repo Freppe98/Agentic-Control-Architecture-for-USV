@@ -285,6 +285,27 @@ export async function validateFleet(fleetPlan) {
  *  Returns { ok, status, data } where data = { mission, command }. */
 export function finalizeMission(body) { return postJSON("/api/missions/finalize", body); }
 
+/** Complete the publication of a vehicle's active planned mission and return the phase-by-phase
+ *  evidence: Pixhawk read-back verification, the persisted active record, the planning-package
+ *  build, the POST to Scout and Scout's package READ-BACK. `data.final.agent_ready` is true only
+ *  when the mission id, route hash and route waypoint count agree across all three copies.
+ *
+ *  RESUMABLE, not blocking: the Pixhawk write is the queued MISSION_UPLOAD command, so while
+ *  that is in flight this answers 202 with `state:"UPLOAD_IN_PROGRESS"`. Call it again when the
+ *  command verifies. IDEMPOTENT: re-running it after READY re-proves everything and creates no
+ *  new mission id. It issues NO vehicle command. */
+export function publishMission(id, body = {}) { return postJSON(`/api/vehicles/${id}/missions/publish`, body); }
+
+/** The vehicle's publication state WITHOUT running anything — active mission, upload status,
+ *  whether a package sync is owed, and the last publish attempt. Makes no Scout call and no
+ *  Pixhawk download, so Map/Agent may read it on an ordinary refresh. */
+export function getPublishState(id) { return getReplan(`/api/vehicles/${id}/missions/publish`); }
+
+/** Which backend process is answering: pid, start time, mission-store path, active missions and
+ *  the last publish. Exists because a second backend that fails to bind (WinError 10048) leaves
+ *  an OLDER one serving 8210 with its own active mission, and nothing else distinguishes them. */
+export function getDiagnostics() { return getJSON("/api/diagnostics"); }
+
 /** The immutable original mission record (revision 0) for a mission id. */
 export function getOriginalMission(missionId) { return getJSON(`/api/missions/original/${missionId}`); }
 

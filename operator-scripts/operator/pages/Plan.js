@@ -24,6 +24,7 @@ import { commState, noTelem } from "../lib/ui.js";
 import * as P from "../lib/planning.js";
 import * as FP from "../lib/fleet-plan.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
+import { publishView, phaseText, OUTCOME } from "../lib/mission-publish.js";
 import { hasPendingOfType } from "../lib/command.js";
 import { missionLockState, lockMessage } from "../lib/mission-lock.js";
 import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
@@ -553,7 +554,10 @@ export function Plan(root) {
       case "pattern": return P.canGenerate(model);
       case "preview": return P.hasRoute(model) && !P.isOutdated(model);
       case "validate": return !!(model.validation && model.validation.ok);
-      case "finish": return model.upload.phase === "uploaded";
+      // Finish is done only when the whole publication is — flight controller, Operator record
+      // AND the Agent planning package. A verified Pixhawk upload alone is not a published
+      // mission; the step stays open while the package sync is still owed.
+      case "finish": return model.upload.phase === "published";
       default: return false;
     }
   }
@@ -1035,6 +1039,9 @@ export function Plan(root) {
     const uploadInfo = renderUploadStatus();
     b.className = "ov plan-banner " + cls;
     b.innerHTML = `<span class="pl-state">${st}</span><span class="pl-msg">${P.PLAN_STATE_LABEL[st] || ""}${extra}</span>${uploadInfo}`;
+    // Re-bound on every render because the banner's HTML is replaced wholesale. The retry
+    // action calls the package-sync endpoint only — it cannot re-upload the mission.
+    bind("pl-retry-sync", doRetrySync);
   }
   const FLEET_STATE_LABEL = {
     NOT_STARTED: "Select vehicles, draw the shared area, then generate the fleet plan.",
@@ -1157,7 +1164,9 @@ export function Plan(root) {
       `An immutable original mission record (revision 0) is stored, then the mission is ` +
       `uploaded through the verified path. This OVERWRITES the mission on the flight ` +
       `controller and is confirmed only by read-back verification. It does NOT start the mission.`)) return;
-    model = { ...model, upload: { phase: "uploading", cmdId: null, missionId: null, revision: 0, error: null, at: Date.now(), result: null } };
+    model = { ...model, upload: { phase: "uploading", cmdId: null, missionId: null, revision: 0,
+      error: null, at: Date.now(), result: null,
+      publish: null, publishing: false, syncing: false, publishError: null } };
     renderAll();
     // Finalize: store the immutable original mission record (revision 0) AND create the
     // unchanged, read-back-verified MISSION_UPLOAD command in one call.
@@ -1200,7 +1209,11 @@ export function Plan(root) {
     const v = fleet.find((x) => x.id === model.vehicleId);
     const stg = missionUploadStage(cmd, (v && v.mission_upload) || null);
     if (stg.state === "done") {
-      model = { ...model, upload: { ...model.upload, phase: "uploaded", result: {
+      // The Pixhawk write is verified — which is TWO of the three writes a published mission
+      // needs, not all of them. The mission is not "uploaded" until the Agent planning package
+      // on Scout has been sent AND read back matching, so the page moves to `publishing` and
+      // runs the backend publish transaction rather than declaring success here.
+      model = { ...model, upload: { ...model.upload, phase: "publishing", result: {
         cmdId: cmd.id, hash: (cmd.params && cmd.params.expected_route_content_hash) || null,
         waypoints: (cmd.params && cmd.params.expected_route_waypoint_count) || model.generated.metrics.waypoint_count,
         vehicleId: model.vehicleId,
@@ -1208,11 +1221,61 @@ export function Plan(root) {
         revision: model.upload.revision != null ? model.upload.revision : 0,
       } } };
       renderAll();
+      doPublish();
     } else if (stg.state === "failed") {
       model = { ...model, upload: { ...model.upload, phase: "error", error: stg.reason || "Upload was not verified by read-back." } };
       renderAll();
     }
   }
+
+  // ═══════════════ PUBLISH (Pixhawk verified → Operator record → Scout package) ═══════════
+  // ONE backend transaction (mission_publish.py) completes the publication and reports every
+  // phase. The page does not orchestrate the steps and does not decide readiness — it renders
+  // the transaction's own verdict, and it never shows a final success before that verdict says
+  // agent_ready. `publishing` is the in-flight guard: a duplicate click or a second command
+  // poll arriving mid-publish must not issue a second transaction (the backend also serializes
+  // per vehicle and answers BUSY, so this guard is convenience, not the safety property).
+  async function doPublish() {
+    if (model.upload.publishing || model.vehicleId == null) return;
+    model = { ...model, upload: { ...model.upload, publishing: true, publishError: null } };
+    renderAll();
+    let res;
+    try {
+      res = await api.publishMission(model.vehicleId, {});
+    } catch (e) {
+      model = { ...model, upload: { ...model.upload, publishing: false,
+        publishError: "The publish request did not reach the operator backend. The mission on the flight controller is unaffected; retry the Agent sync when the backend is reachable." } };
+      renderAll();
+      return;
+    }
+    const env = res && res.data ? res.data : null;
+    model = { ...model, upload: { ...model.upload, publishing: false, publish: env,
+      phase: env && env.final && env.final.agent_ready ? "published" : "publishing" } };
+    renderAll();
+  }
+
+  // The RETRY action. It calls the package-sync endpoint ONLY — that route sends a planning
+  // package and cannot upload a mission, so a retry can never rewrite the flight controller.
+  async function doRetrySync() {
+    if (model.upload.syncing || model.vehicleId == null) return;
+    model = { ...model, upload: { ...model.upload, syncing: true, publishError: null } };
+    renderAll();
+    let res;
+    try {
+      res = await api.syncReplanPackage(model.vehicleId, {});
+    } catch (e) {
+      model = { ...model, upload: { ...model.upload, syncing: false,
+        publishError: "The Agent sync request did not reach the operator backend." } };
+      renderAll();
+      return;
+    }
+    const env = res && res.data && res.data.publish ? res.data.publish : null;
+    model = { ...model, upload: { ...model.upload, syncing: false,
+      publish: env || model.upload.publish,
+      phase: env && env.final && env.final.agent_ready ? "published" : "publishing" } };
+    renderAll();
+  }
+
   function renderUploadStatus() {
     const u = model.upload;
     if (u.phase === "uploading") {
@@ -1225,12 +1288,44 @@ export function Plan(root) {
       return `<span class="pl-upl">${esc(lock.label || "Queued")}…</span>`;
     }
     if (u.phase === "error") return `<span class="pl-upl bad">Upload failed — ${esc(u.error || "not verified")}. Plan preserved.</span>`;
-    if (u.phase === "uploaded" && u.result) {
-      const h = u.result.hash ? String(u.result.hash).replace(/^sha256:/, "").slice(0, 12) : "—";
-      const mid = u.result.missionId ? `${esc(u.result.missionId)} · rev ${u.result.revision} · ` : "";
-      return `<span class="pl-upl ok">Uploaded &amp; verified · ${mid}${u.result.waypoints} wp · hash ${h} · <a href="#/map" class="pl-link">Open on Map</a></span>`;
-    }
+    if (u.phase === "publishing" || u.phase === "published") return renderPublishStatus();
     return "";
+  }
+
+  /** The multi-stage publication line. Three endings, kept distinct on purpose: a mission that
+   *  is on the flight controller but whose Agent package is owed is NEITHER a success NOR a
+   *  failure, and rendering it as either is what hid this whole class of defect. */
+  function renderPublishStatus() {
+    const u = model.upload;
+    const r = u.result || {};
+    const h = r.hash ? String(r.hash).replace(/^sha256:/, "").slice(0, 12) : "—";
+    const mid = r.missionId ? `${esc(r.missionId)} · rev ${r.revision} · ` : "";
+    const facts = `${mid}${r.waypoints != null ? r.waypoints + " wp · " : ""}hash ${h}`;
+
+    if (u.syncing) return `<span class="pl-upl">${esc(phaseText("SYNCING_SCOUT_PACKAGE"))}</span>`;
+    if (u.publishing || !u.publish) {
+      // While the transaction is in flight the page names the step it is provably on: the
+      // Pixhawk write is verified by the time we get here, so the remaining work is the record
+      // and the Agent package.
+      return `<span class="pl-upl">${esc(u.publishing ? phaseText("SYNCING_SCOUT_PACKAGE") : phaseText("VERIFYING_PIXHAWK"))}</span>`;
+    }
+    const view = publishView(u.publish);
+    if (!view) return `<span class="pl-upl">${esc(phaseText(null))}</span>`;
+    const err = u.publishError ? ` <span class="pl-upl bad">${esc(u.publishError)}</span>` : "";
+
+    if (view.kind === OUTCOME.OK) {
+      return `<span class="pl-upl ok">${esc(view.headline)} · ${facts} · <a href="#/map" class="pl-link">Open on Map</a></span>`;
+    }
+    if (view.kind === OUTCOME.PROGRESS) {
+      return `<span class="pl-upl">${esc(view.headline)}</span>${err}`;
+    }
+    if (view.kind === OUTCOME.PARTIAL) {
+      return `<span class="pl-upl warn">${esc(view.headline)} · ${facts}`
+        + `${view.detail ? " — " + esc(view.detail) : ""} `
+        + `<button class="pl-link" id="pl-retry-sync"${u.syncing ? " disabled" : ""}>Retry Agent Sync</button></span>${err}`;
+    }
+    return `<span class="pl-upl bad">${esc(view.headline)}`
+      + `${view.detail ? " — " + esc(view.detail) : ""}. Plan preserved.</span>${err}`;
   }
 
   // ═══════════════ DRAFTS ═══════════════
@@ -1405,7 +1500,8 @@ export function Plan(root) {
   function beforeUnload(e) {
     const fleetWork = planMode === "fleet" && (FP.hasFleetPlan(fleetModel) || FP.selectedCount(fleetModel) > 0)
       && !FP.fleetReady(fleetModel, model);
-    if ((P.hasUnsavedWork(model) && model.upload.phase !== "uploaded") || fleetWork) { e.preventDefault(); e.returnValue = ""; }
+    const published = model.upload.phase === "published";
+    if ((P.hasUnsavedWork(model) && !published) || fleetWork) { e.preventDefault(); e.returnValue = ""; }
   }
   window.addEventListener("beforeunload", beforeUnload);
 

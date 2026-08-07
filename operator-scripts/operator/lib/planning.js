@@ -21,7 +21,8 @@ export const PLAN_STATES = {
   ROUTE_GENERATED: "ROUTE_GENERATED", // a current route exists, not yet validated OK
   VALID: "VALID",                     // current route + validation passed
   UPLOADING: "UPLOADING",             // upload command in flight
-  UPLOADED: "UPLOADED",               // upload verified
+  PUBLISHING: "PUBLISHING",           // FC verified; Operator record + Agent package in progress
+  UPLOADED: "UPLOADED",               // published: FC, Operator record and Agent package agree
   ERROR: "ERROR",                     // terminal upload failure
 };
 
@@ -54,7 +55,10 @@ export function emptyModel() {
     generated: null,               // backend generate result (operator-survey-plan-v1 package)
     generatedRevision: null,       // inputRevision at the moment of generation
     validation: null,              // backend validate result
-    upload: { phase: "idle", cmdId: null, error: null, at: 0, result: null },
+    // `publish` holds the backend publish envelope once the flight-controller write is verified;
+    // `publishing`/`syncing` are the in-flight guards that stop a duplicate transaction.
+    upload: { phase: "idle", cmdId: null, error: null, at: 0, result: null,
+              publish: null, publishing: false, syncing: false, publishError: null },
     _zoneSeq: 0,
   };
 }
@@ -185,11 +189,14 @@ export function canGenerate(model) {
 }
 
 /** Upload is allowed only with a vehicle selected, a CURRENT (not outdated) generated route,
- *  and a passing validation. */
+ *  and a passing validation — and while no publication of this plan is already running.
+ *  PUBLISHING blocks it as firmly as UPLOADING: a second Upload pressed while the Agent package
+ *  is being synchronized would queue a new mission on top of an in-flight publish transaction. */
 export function canUpload(model) {
+  const phase = model.upload.phase;
   return model.vehicleId != null && hasRoute(model) && !isOutdated(model)
          && !!(model.validation && model.validation.ok)
-         && model.upload.phase !== "uploading";
+         && phase !== "uploading" && phase !== "publishing";
 }
 
 /** Derive the single planning state from the model. Never stored — always computed, so
@@ -197,7 +204,12 @@ export function canUpload(model) {
 export function planState(model) {
   const up = model.upload || {};
   if (up.phase === "uploading") return PLAN_STATES.UPLOADING;
-  if (up.phase === "uploaded") return PLAN_STATES.UPLOADED;
+  // PUBLISHING is the window between the flight controller's verified read-back and the Agent
+  // planning package being sent AND read back matching. It is its own state because the page
+  // must not present a mission as UPLOADED while Scout may still hold the previous package —
+  // that gap is exactly what produced silent mission/package mismatches at Start.
+  if (up.phase === "publishing") return PLAN_STATES.PUBLISHING;
+  if (up.phase === "published" || up.phase === "uploaded") return PLAN_STATES.UPLOADED;
   if (up.phase === "error") return PLAN_STATES.ERROR;
   if (!hasBoundary(model)) return PLAN_STATES.EMPTY;
   if (!hasRoute(model)) {
@@ -219,7 +231,8 @@ export const PLAN_STATE_LABEL = {
   ROUTE_GENERATED: "Route generated — validate it before uploading.",
   VALID: "Validated — ready to finish & upload.",
   UPLOADING: "Uploading the mission to the vehicle…",
-  UPLOADED: "Mission uploaded and verified.",
+  PUBLISHING: "Mission verified on the flight controller — completing publication…",
+  UPLOADED: "Mission uploaded and Agent package synchronized.",
   ERROR: "Upload failed — the plan is preserved; review and retry.",
 };
 
