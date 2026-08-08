@@ -17,6 +17,7 @@ import uuid
 import mission_contract
 import mission_lifecycle
 import mission_publish
+import mission_reconcile
 import planning
 import fleet_planning
 import replan_package
@@ -4782,6 +4783,76 @@ def _normalize_scout_package(scout, legacy_geometry=None):
     }
 
 
+# ── Startup / reconnect reconciliation ────────────────────────────────────────────────
+# The verdict is RUNTIME EVIDENCE and is deliberately NOT persisted: it describes a comparison
+# between the durable record and live Scout/Pixhawk state at one instant, and a restored copy of
+# it would be a fabricated observation of a vehicle nobody has spoken to yet. What IS persisted
+# is the thing reconciliation repairs — approved mission identity, its verified upload status and
+# its package synchronization state. The verdict is recomputed from fresh evidence every time.
+#
+# Keyed per vehicle. One vehicle's reconciliation can never read, write or select another
+# vehicle's records: mission_reconcile filters the candidate list by vehicle id and re-checks
+# ownership on every record it considers.
+_reconciliation_by_vehicle = {}      # {vid: verdict dict} — in-memory, never persisted
+
+
+def _reconcile_deps():
+    """The operator-backend facts reconciliation runs on. Built per call so a test that swaps a
+    store sees the swap. Note what is NOT here: no command queue, no MISSION_UPLOAD, no Scout
+    write. Reconciliation cannot reach the vehicle even by accident."""
+    return mission_reconcile.Deps(
+        vehicle_records=lambda v: [r for r in original_missions.values()
+                                   if r.get("vehicle_id") == v],
+        active_mission_id=lambda v: active_original_by_vehicle.get(v),
+        set_active=lambda v, mid: active_original_by_vehicle.__setitem__(v, mid),
+        persist=_save_mission_store,
+    )
+
+
+def _reconcile_vehicle_mission(vid, readback, package_evidence, package_reachable):
+    """Run reconciliation for one vehicle and remember its verdict. Every state CHANGE is put on
+    the operator event log — silently re-pointing which mission a vehicle is flying would be the
+    same class of dishonesty as the mismatch this repairs."""
+    verdict = mission_reconcile.reconcile(
+        _reconcile_deps(), vid, readback=readback,
+        package_evidence=package_evidence, package_reachable=package_reachable)
+    previous = _reconciliation_by_vehicle.get(vid)
+    _reconciliation_by_vehicle[vid] = verdict
+    for action in verdict.get("actions") or []:
+        _append_event(
+            severity="caution" if action["action"] == mission_reconcile.ACTION_REBIND else "info",
+            etype="mission-reconcile", source="operator-backend",
+            vehicle_id=vid, vehicle=name_of(vid),
+            message=f"Mission reconciliation: {action['action']} — {action.get('detail') or ''}".strip(),
+            detail=action)
+    if previous is None or previous.get("outcome") != verdict.get("outcome"):
+        print(f"[MISSION RECONCILE] {vehicle_slug(vid)} -> {verdict['outcome']} "
+              f"({verdict['reason']}); active={verdict.get('active_mission_id')}")
+    return verdict
+
+
+def reconciliation_for(vid):
+    """The last reconciliation verdict for a vehicle, or a RECONCILING placeholder when none has
+    been computed yet in this process. Never invents a verdict: 'no evidence has arrived since
+    this backend started' is exactly what a fresh station should say, and it is the honest answer
+    that keeps a startup from rendering as a mismatch."""
+    verdict = _reconciliation_by_vehicle.get(vid)
+    if verdict is not None:
+        return verdict
+    return {
+        "outcome": mission_reconcile.RECONCILING,
+        "conclusive": False,
+        "reason": "NO_EVIDENCE_YET",
+        "detail": "No mission evidence has been read from this vehicle since the station "
+                  "started, so the approved mission has not been reconciled yet.",
+        "generated_at": None, "actions": [], "rebound": False,
+        "active_mission_id": active_original_by_vehicle.get(vid),
+        "active_route_hash": (original_missions.get(active_original_by_vehicle.get(vid)) or {})
+                             .get("route_hash"),
+        "evidence": {},
+    }
+
+
 def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_TTL_S):
     """The combined readiness summary (task Section 3). Keeps the Vehicle mission and the Scout
     planning package as two DISTINCT operations, never letting a successful Pixhawk upload hide
@@ -4808,11 +4879,37 @@ def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_
     # A. Vehicle mission — the immutable revision-0 record + a BOUNDED Pixhawk read-back.
     # Display paths go through the age-labelled cache rather than forcing a fresh mission
     # download on every refresh; max_readback_age_s=0 forces a live one (see _pixhawk_readback).
-    mission_id = active_original_by_vehicle.get(vid)
-    rec = original_missions.get(mission_id) if mission_id else None
     flask_base = vehicle_api_base(vid)
     readback = (_pixhawk_readback(vid, flask_base, now, max_age_s=max_readback_age_s)
                 if flask_base else None)
+
+    # B. Scout planning package — live status + package pull (never fabricated).
+    # Read BEFORE the comparisons below, because reconciliation needs both halves of the
+    # evidence and its result decides WHICH record the comparisons are made against.
+    status = scout_replan.get_status(base)
+    pkg = scout_replan.get_planning_package(base)
+    scout_reachable = bool(status.get("reachable") and status.get("supported"))
+    consistency = (_scout_field(status, "package_consistency")
+                   or _scout_field(pkg, "consistency", "package_consistency"))
+    geometry = (_scout_field(status, "geometry_validation")
+                or _scout_field(pkg, "geometry_validation") or {})
+    if not isinstance(geometry, dict):
+        geometry = {}
+    # Scout's package evidence, read through ONE normalizer that understands both the v1
+    # nested response and the pre-v1 flat one (see _normalize_scout_package).
+    ev = _normalize_scout_package(pkg.get("scout"), geometry)
+
+    # ── Reconciliation ────────────────────────────────────────────────────────────────────
+    # Re-identify which APPROVED record this vehicle is actually carrying, from the evidence
+    # just gathered, and repair the operator's own durable bookkeeping when it can be PROVEN
+    # wrong. This is what stops a restored active pointer at a superseded record from reporting
+    # a package mismatch against a mission the store already holds. It performs no vehicle
+    # command and no mission upload (mission_reconcile.py), and it decides nothing at all when
+    # the evidence is incomplete.
+    reconciliation = _reconcile_vehicle_mission(vid, readback, ev, scout_reachable)
+
+    mission_id = active_original_by_vehicle.get(vid)
+    rec = original_missions.get(mission_id) if mission_id else None
 
     record_hash = rec.get("route_hash") if rec else None
     upload_status = rec.get("upload_status") if rec else None
@@ -4839,19 +4936,6 @@ def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_
         "boundary_supplied": boundary_supplied,
     }
 
-    # B. Scout planning package — live status + package pull (never fabricated).
-    status = scout_replan.get_status(base)
-    pkg = scout_replan.get_planning_package(base)
-    scout_reachable = bool(status.get("reachable") and status.get("supported"))
-    consistency = (_scout_field(status, "package_consistency")
-                   or _scout_field(pkg, "consistency", "package_consistency"))
-    geometry = (_scout_field(status, "geometry_validation")
-                or _scout_field(pkg, "geometry_validation") or {})
-    if not isinstance(geometry, dict):
-        geometry = {}
-    # Scout's package evidence, read through ONE normalizer that understands both the v1
-    # nested response and the pre-v1 flat one (see _normalize_scout_package).
-    ev = _normalize_scout_package(pkg.get("scout"), geometry)
     package_mission_id = ev["mission_id"] or _scout_field(status, "mission_id")
     package_hash = ev["route_hash"] or _scout_field(status, "route_content_hash")
     stored_flag = ev["stored"]
@@ -4937,6 +5021,10 @@ def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_
         "ok": True, "vehicle_id": vehicle_slug(vid), "generated_at": now.isoformat(),
         "mission_ready": mission_ready, "replanning_ready": replanning_ready,
         "vehicle_mission": vehicle_mission, "planning_package": planning_package,
+        # What the operator's own bookkeeping was reconciled to, and on what evidence. Carried
+        # so the UI can say "still establishing which mission this is" instead of "mismatch"
+        # while the comparison is genuinely incomplete.
+        "reconciliation": reconciliation,
         "limitations": limitations,
     }
 
@@ -5347,6 +5435,10 @@ def publish_mission_state(vehicle_id: str):
         "package_synced_at": rec.get("package_synced_at") if rec else None,
         "publishing": mission_publish.is_publishing(vid),
         "last_publish": last,
+        # The last reconciliation verdict, or an honest "no evidence yet" when this backend has
+        # not read the vehicle since it started. Read-only: this route still makes no Scout call
+        # and no Pixhawk download — it reports the verdict the readiness path computed.
+        "reconciliation": reconciliation_for(vid),
     }
 
 

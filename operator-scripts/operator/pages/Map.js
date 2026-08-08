@@ -1279,10 +1279,15 @@ export function Map(root) {
   //
   //   VERIFYING              Scout is re-deriving its own readiness, or the comparison has not
   //                          completed. Neutral — nothing is wrong and nothing is claimed.
+  //   RECONCILING            the backend has not yet established WHICH approved mission the
+  //                          flight controller carries. Neutral, and specifically not a
+  //                          mismatch: there is nothing yet to disagree with.
   //   SCOUT_UNREACHABLE      the question could not be asked. Not a disagreement.
   //   PACKAGE_SYNC_REQUIRED  the operator backend knows a sync is OWED. The only one with an
   //                          action attached — and that action sends a package and nothing else.
-  //   REAL_MISMATCH          both sides reported, and they differ. The only true warning.
+  //   REAL_MISMATCH          both sides reported, and the ROUTE CONTENT differs. A true warning.
+  //   UNAPPROVED_MISSION     the flight controller carries a route no approved record matches.
+  //                          A warning, and one no package sync can close.
   //
   // Rendered with the same one-line-plus-tooltip discipline as every other note on this card.
   const SYNC_BTN_TITLE = "Rebuild the approved planning package from the active mission and " +
@@ -1300,7 +1305,9 @@ export function Map(root) {
     const retry = verdict.state === PKG_STATE.PACKAGE_SYNC_REQUIRED
       ? ` <button class="amx-refresh" data-mx-sync="1"${mission.syncing ? " disabled" : ""} title="${escAttr(SYNC_BTN_TITLE)}">Retry Agent Sync</button>`
       : "";
-    return `<div class="amx-note${verdict.state === PKG_STATE.REAL_MISMATCH ? " warn" : ""}" title="${escAttr(verdict.detail || "")}">${esc(verdict.text)}${retry}</div>`;
+    const warn = verdict.state === PKG_STATE.REAL_MISMATCH
+              || verdict.state === PKG_STATE.UNAPPROVED_MISSION;
+    return `<div class="amx-note${warn ? " warn" : ""}" title="${escAttr(verdict.detail || "")}">${esc(verdict.text)}${retry}</div>`;
   }
 
   function renderAgentMission(v) {

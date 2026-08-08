@@ -185,11 +185,89 @@ test("an owed sync is PACKAGE_SYNC_REQUIRED, and carries the specific reason", (
   assert.equal(v.detail, "SCOUT_UNREACHABLE");
 });
 
-test("a PROVEN id disagreement is a real mismatch", () => {
+test("a PROVEN id disagreement over an UNPROVEN route is a real mismatch", () => {
   const v = readinessLabel({
-    publish: pub(), readiness: pkg({ mission_id: "msn-previous", mission_id_match: false }) });
+    publish: pub(), readiness: pkg({ mission_id: "msn-previous", mission_id_match: false,
+                                     hash_match: false }) });
   assert.equal(v.state, READINESS_STATE.REAL_MISMATCH);
   assert.match(v.detail, /different mission/);
+});
+
+test("differing mission ids over a PROVEN-identical route is a rebind, not a mismatch", () => {
+  // Record identity is not content identity. `hash_match:true` means the package route, the
+  // approved route and the route on the flight controller are the same canonical bytes; the
+  // only thing that differs is the label. Calling that a content mismatch is what sent the
+  // operator to Plan → Finish & upload to fix a bookkeeping problem.
+  const v = readinessLabel({
+    publish: pub(), readiness: pkg({ mission_id: "msn-previous", mission_id_match: false,
+                                     hash_match: true }) });
+  assert.equal(v.state, READINESS_STATE.PACKAGE_SYNC_REQUIRED);
+  assert.notEqual(v.state, READINESS_STATE.REAL_MISMATCH);
+  assert.match(v.detail, /same canonical route/);
+  assert.match(v.detail, /No mission upload/);
+});
+
+// ── Reconciliation: no verdict before the evidence ────────────────────────────────────────
+const reconciling = (over = {}) => ({ outcome: "RECONCILING", conclusive: false,
+                                      reason: "NO_READBACK", detail: "…", ...over });
+
+test("an inconclusive reconciliation reads RECONCILING, never a mismatch", () => {
+  const v = readinessLabel({
+    publish: pub({ reconciliation: reconciling() }),
+    readiness: pkg({ mission_id: "msn-previous", mission_id_match: false, hash_match: false,
+                     hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.RECONCILING);
+  assert.notEqual(v.state, READINESS_STATE.REAL_MISMATCH);
+});
+
+test("a fresh backend that has read nothing yet is RECONCILING, not a mismatch", () => {
+  const v = readinessLabel({
+    publish: pub({ reconciliation: reconciling({ reason: "NO_EVIDENCE_YET" }) }),
+    readiness: pkg({ hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.RECONCILING);
+});
+
+test("a settled flight controller with an unread package still reports the package state", () => {
+  // `pixhawk_settled` means the operator/flight-controller half IS decided; only the Agent
+  // half is open. That must not be swallowed by the reconciling banner.
+  const v = readinessLabel({
+    publish: pub({ package_sync_state: "REQUIRED", package_sync_error: "SCOUT_UNREACHABLE",
+                   reconciliation: reconciling({ reason: "PACKAGE_UNREACHABLE",
+                                                 pixhawk_settled: true }) }),
+    readiness: pkg({ mission_id: null, mission_id_match: false, hash_match: false }) });
+  assert.equal(v.state, READINESS_STATE.PACKAGE_SYNC_REQUIRED);
+});
+
+test("a conclusive reconciliation does not suppress a genuine mismatch", () => {
+  const v = readinessLabel({
+    publish: pub({ reconciliation: { outcome: "MISMATCH", conclusive: true,
+                                     reason: "NO_APPROVED_MATCH", detail: "…" } }),
+    readiness: pkg({ hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.REAL_MISMATCH);
+});
+
+test("a route no approved record carries reads UNAPPROVED_MISSION", () => {
+  const v = readinessLabel({
+    publish: pub({ reconciliation: { outcome: "UNAPPROVED_MISSION", conclusive: true,
+                                     reason: "NO_APPROVED_RECORD",
+                                     detail: "It will not be adopted automatically." } }),
+    readiness: pkg({ hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.UNAPPROVED_MISSION);
+  assert.match(v.detail, /not be adopted/);
+});
+
+test("the readiness body's reconciliation is read too, not only the publish body's", () => {
+  const v = readinessLabel({
+    publish: pub(),
+    readiness: { ...pkg({ hash_match: false, hash_mismatch: true }),
+                 reconciliation: reconciling() } });
+  assert.equal(v.state, READINESS_STATE.RECONCILING);
+});
+
+test("a backend that reports no reconciliation at all keeps the previous behaviour", () => {
+  const v = readinessLabel({
+    publish: pub(), readiness: pkg({ hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.REAL_MISMATCH);
 });
 
 test("a PROVEN hash disagreement is a real mismatch, and outranks an owed sync", () => {
@@ -221,6 +299,7 @@ test("every readiness state has operator-facing text, and none of it says 'not c
     assert.ok(READINESS_TEXT[s].length > 0);
   }
   assert.doesNotMatch(READINESS_TEXT.VERIFYING, /not consistent|mismatch/i);
+  assert.doesNotMatch(READINESS_TEXT.RECONCILING, /not consistent|mismatch/i);
   assert.doesNotMatch(READINESS_TEXT.SCOUT_UNREACHABLE, /mismatch/i);
   assert.doesNotMatch(READINESS_TEXT.PACKAGE_SYNC_REQUIRED, /mismatch/i);
 });

@@ -433,7 +433,12 @@ class ReplanReadinessTests(unittest.TestCase):
         self.assertFalse(body["replanning_ready"])    # … but the package is not (not hidden)
 
     def test_not_ready_when_pixhawk_not_verified(self):
+        # A queued upload that has NOT reached the flight controller: the read-back reports a
+        # different route, so nothing proves the approved mission is on board.
         rec = self._seed(upload_status="QUEUED", mission_id="msn-unverified")
+        self.pixhawk.body = dict(self.pixhawk.body,
+                                 route_content_hash="sha256:something-else-entirely")
+        main._pixhawk_readback_cache.clear()
         self.fake.set("GET", "/agent/replan/status",
                       FakeResp({"package_consistency": "PLANNING_PACKAGE_CONSISTENT",
                                 "mission_id": rec["mission_id"],
@@ -445,6 +450,23 @@ class ReplanReadinessTests(unittest.TestCase):
         body = r.json()
         self.assertFalse(body["mission_ready"])
         self.assertFalse(body["replanning_ready"])
+        self.assertEqual(main.original_missions["msn-unverified"]["upload_status"], "QUEUED")
+
+    def test_a_queued_record_the_flight_controller_actually_carries_is_re_verified(self):
+        # The companion case, and the reason the assertion above had to be made specific: when
+        # a LIVE complete read-back reports the record's exact canonical route, that IS the
+        # read-back proof — fresher than the historical upload's. It is how a mission whose
+        # MISSION_UPLOAD result landed after a restart (the in-memory command queue that would
+        # have projected it having died with the process) recovers WITHOUT a re-upload.
+        rec = self._seed(upload_status="QUEUED", mission_id="msn-requeued")
+        self.fake.set("GET", "/agent/replan/planning_package",
+                      FakeResp({"stored": True, "mission_id": rec["mission_id"],
+                                "route_content_hash": rec["route_hash"]}))
+        body = self.client.get(f"/api/vehicles/{SCOUT_VID}/replan/readiness").json()
+        self.assertTrue(body["mission_ready"])
+        self.assertEqual(main.original_missions["msn-requeued"]["upload_status"], "VERIFIED")
+        self.assertEqual(main.original_missions["msn-requeued"]["verified_by"],
+                         "RECONCILED_READBACK")
 
     def test_hash_mismatch_blocks_and_is_listed(self):
         rec = self._seed(mission_id="msn-hashmm")

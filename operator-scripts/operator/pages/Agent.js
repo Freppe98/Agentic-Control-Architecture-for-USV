@@ -754,8 +754,9 @@ export function Agent(root) {
     // can never read as a mismatch on one page and as ready on the other.
     const pubFor = publishState && replanForVid === selId ? publishState : null;
     const verdict = readinessLabel({ publish: pubFor, readiness: rd });
-    const verdictTone = { READY: "c", VERIFYING: "u", PACKAGE_SYNC_REQUIRED: "p",
-                          SCOUT_UNREACHABLE: "u", REAL_MISMATCH: "d", NO_MISSION: "u" };
+    const verdictTone = { READY: "c", VERIFYING: "u", RECONCILING: "u",
+                          PACKAGE_SYNC_REQUIRED: "p", SCOUT_UNREACHABLE: "u",
+                          REAL_MISMATCH: "d", UNAPPROVED_MISSION: "d", NO_MISSION: "u" };
     const syncOwed = verdict.state === READINESS_STATE.PACKAGE_SYNC_REQUIRED;
     return card("Mission / Replanning readiness",
       `${badge(rd.mission_ready, "MISSION READY", "MISSION NOT READY")} ${badge(rd.replanning_ready, "REPLANNING READY", "NOT READY")}`,

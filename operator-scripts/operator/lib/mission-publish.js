@@ -188,20 +188,43 @@ export function nextPublishAttempt(env, attempt, { maxAttempts, delayMs } = PUBL
 export const READINESS_STATE = {
   READY: "READY",
   VERIFYING: "VERIFYING",
+  RECONCILING: "RECONCILING",
   PACKAGE_SYNC_REQUIRED: "PACKAGE_SYNC_REQUIRED",
   SCOUT_UNREACHABLE: "SCOUT_UNREACHABLE",
   REAL_MISMATCH: "REAL_MISMATCH",
+  UNAPPROVED_MISSION: "UNAPPROVED_MISSION",
   NO_MISSION: "NO_MISSION",
 };
 
 export const READINESS_TEXT = {
   READY: "Agent package synchronized",
   VERIFYING: "Verifying Agent readiness…",
+  RECONCILING: "Establishing which approved mission this vehicle is carrying…",
   PACKAGE_SYNC_REQUIRED: "Agent package synchronization required",
   SCOUT_UNREACHABLE: "Agent unreachable — package state unknown",
   REAL_MISMATCH: "Agent package does not match the approved mission",
+  UNAPPROVED_MISSION: "The flight controller carries a mission this station never approved",
   NO_MISSION: "No active mission for this vehicle",
 };
+
+// The backend reconciliation outcomes (mission_reconcile.py), verbatim.
+export const RECONCILE = {
+  RECONCILING: "RECONCILING",
+  SYNCHRONIZED: "SYNCHRONIZED",
+  PACKAGE_SYNC_REQUIRED: "PACKAGE_SYNC_REQUIRED",
+  UNAPPROVED_MISSION: "UNAPPROVED_MISSION",
+  MISMATCH: "MISMATCH",
+};
+
+/** The reconciliation verdict carried by either the publish state or the readiness body,
+ *  whichever reported one. Null when neither did — an older backend, which must keep the
+ *  previous behaviour rather than being treated as "reconciling forever". */
+function reconcileOf(publish, readiness) {
+  for (const src of [readiness, publish]) {
+    if (isObj(src) && isObj(src.reconciliation)) return src.reconciliation;
+  }
+  return null;
+}
 
 // Scout's own transient readiness state. It means Scout is RE-DERIVING its verdict, which is not
 // a claim about the package at all — presenting it as a mismatch is the specific lie this
@@ -217,15 +240,23 @@ export const SCOUT_REFRESHING = "REPLANNING_READINESS_REFRESHING";
  *   1. no active mission            — nothing to be ready or unready about
  *   2. Scout is REFRESHING          — a re-derivation in flight is never a mismatch
  *   3. Scout is unreachable         — an unasked question is never a disagreement
- *   4. a PROVEN disagreement        — id/hash reported and different. This is the only
- *                                     REAL_MISMATCH, and it outranks an owed sync because it
- *                                     is a stronger, evidenced statement
- *   5. a sync is owed               — the backend durably recorded PACKAGE_SYNC_REQUIRED
- *   6. all three identities proven  — READY
- *   7. otherwise                    — VERIFYING: the comparison could not be completed. NOT a
+ *   4. reconciliation is INCONCLUSIVE — the backend has not yet been able to establish which
+ *                                     approved mission the flight controller is carrying (no
+ *                                     read-back since startup, an unreachable or partial one).
+ *                                     A comparison made against a possibly-superseded record is
+ *                                     not evidence of a mismatch, so this outranks step 5
+ *   5. a PROVEN disagreement        — the CONTENT hashes differ, or the ids differ AND the
+ *                                     content could not be proven equal. Mission ids alone
+ *                                     never make a mismatch: a record label is not a route
+ *   6. a sync is owed               — recorded PACKAGE_SYNC_REQUIRED, or the same canonical
+ *                                     route under a different package mission id (a rebind,
+ *                                     which the package-only sync closes without a re-upload)
+ *   7. all three identities proven  — READY
+ *   8. otherwise                    — VERIFYING: the comparison could not be completed. NOT a
  *                                     mismatch, and never rendered as one
  *
- * @param opts.publish   GET .../missions/publish body (record + package_sync_state), or null
+ * @param opts.publish   GET .../missions/publish body (record + package_sync_state + the
+ *                       reconciliation verdict), or null
  * @param opts.readiness GET .../replan/readiness body, or null
  * @param opts.refreshing  true while the station has a readiness read in flight
  */
@@ -234,6 +265,7 @@ export function readinessLabel({ publish = null, readiness = null, refreshing = 
   const rd = isObj(readiness) ? readiness : {};
   const pkg = isObj(rd.planning_package) ? rd.planning_package : {};
   const vm = isObj(rd.vehicle_mission) ? rd.vehicle_mission : {};
+  const rec = reconcileOf(pub, rd);
   const missionId = str(pub.mission_id) || str(vm.mission_id);
   const make = (state, detail) => ({ state, text: READINESS_TEXT[state], detail: detail || null });
 
@@ -249,17 +281,40 @@ export function readinessLabel({ publish = null, readiness = null, refreshing = 
       "The package state could not be read, so it is neither confirmed nor contradicted.");
   }
 
+  // A route the operator never approved is its OWN answer, and a much more useful one than a
+  // package complaint: nothing here can be repaired by synchronizing a package.
+  if (rec && str(rec.outcome) === RECONCILE.UNAPPROVED_MISSION) {
+    return make(READINESS_STATE.UNAPPROVED_MISSION, str(rec.detail));
+  }
+  // The backend could not establish which approved mission is on the flight controller. Any
+  // comparison against the restored pointer is a comparison against a guess, so it is reported
+  // as the unfinished reconciliation it is — this is the specific step that stops a fresh
+  // start, or a vehicle whose read-back has not arrived, from rendering as a mismatch.
+  if (rec && str(rec.outcome) === RECONCILE.RECONCILING && rec.pixhawk_settled !== true) {
+    return make(READINESS_STATE.RECONCILING, str(rec.detail));
+  }
+
   // A proven disagreement needs BOTH sides reported. `mission_id_match:false` with a null
   // package mission id is an unread comparison, not a mismatch — hence the explicit id check.
   const idReported = str(pkg.mission_id) != null;
   const idDisagrees = idReported && pkg.mission_id_match === false;
   const hashDisagrees = pkg.hash_mismatch === true;
-  if (idDisagrees || hashDisagrees) {
+  // The CONTENT chain — package route == approved route == the route on the flight controller —
+  // proven equal. When it is, differing mission ids are two labels on one identical route, which
+  // is a rebind the package-only sync closes. Calling that a content mismatch is precisely the
+  // record-identity/content-identity conflation this station must not make.
+  const contentProven = pkg.hash_match === true;
+  if (hashDisagrees || (idDisagrees && !contentProven)) {
     return make(READINESS_STATE.REAL_MISMATCH,
       hashDisagrees ? "The stored package route hash is not the approved route's hash."
         : "The stored package belongs to a different mission.");
   }
 
+  if (idDisagrees && contentProven) {
+    return make(READINESS_STATE.PACKAGE_SYNC_REQUIRED,
+      "The Agent package carries the same canonical route under a different mission id — "
+      + "synchronizing the package rebinds it. No mission upload is involved.");
+  }
   if (str(pub.package_sync_state) === "REQUIRED") {
     return make(READINESS_STATE.PACKAGE_SYNC_REQUIRED, str(pub.package_sync_error));
   }
