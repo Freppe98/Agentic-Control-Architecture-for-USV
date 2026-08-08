@@ -14,13 +14,21 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  lifecycleControls, stopAvailability, normalizeStatus, interpretTransaction,
-  transactionSummary, outcomeLabel, OUTCOME, STATES, STOPPED_STATES,
+  lifecycleControls, stopAvailability, pauseAvailability, resumeAvailability, missionCardView,
+  normalizeStatus, interpretTransaction, transactionSummary, outcomeLabel, startFailure,
+  OUTCOME, STATES, STOPPED_STATES,
 } from "../operator/lib/mission-execution.js";
 import { deploymentReadiness } from "../operator/lib/home.js";
+import { handoffGate } from "../operator/lib/authority.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, p), "utf8");
+
+// The page sources the surface guards read. Declared here rather than beside section H because
+// the button-mapping sections above also assert against the Map's wiring.
+const mapSrc = read("../operator/pages/Map.js");
+const agentSrc = read("../operator/pages/Agent.js");
+const apiSrc = read("../operator/services/api.js");
 
 const envelope = (over = {}) => ({
   ok: true, supported: true, reachable: true,
@@ -59,7 +67,8 @@ test("RUNNING offers Pause and Stop — and NEVER labels the primary button Resu
   const ctl = lifecycleControls(S({ state: "RUNNING", can_start: false, can_pause: true,
     can_stop: true }));
   assert.deepEqual(actions(ctl), ["pause", "stop"]);
-  assert.equal(labels(ctl)[0], "Pause");
+  assert.equal(labels(ctl)[0], "Pause Mission");
+  assert.equal(byAction(ctl, "pause").enabled, true);
   // The load-bearing assertion: Resume is only meaningful AFTER a Pause. A running mission
   // whose button says "Resume" invites an operator to press it believing it is stopped.
   assert.equal(labels(ctl).some((l) => /resume/i.test(l)), false, labels(ctl));
@@ -131,6 +140,191 @@ test("COMPLETED_HOLD without a verified final LOITER says so instead of showing 
     return_completion: { final_loiter_verified: false } }));
   assert.equal(ctl.complete, false);
   assert.match(ctl.notice, /NOT verified/);
+});
+
+// ── A2. The hold controls: an ABSENT can_* is silence, not a refusal ────────────────────
+//
+// THE DEFECT THIS SECTION PINS. `can_pause` / `can_resume` were read with a strict `=== true`,
+// so a Scout whose status carries no such key — which is every Scout that reports its lifecycle
+// state without the optional capability flags — collapsed "said nothing" into "said no". On the
+// Map that rendered a RUNNING mission with a Pause button disabled by the *fabricated* reason
+// "Scout reports can_pause=false", beside an unsupported Stop: two dead buttons and no way to
+// hold the vehicle. The state is the authority for WHICH control exists; the flag only gates it
+// when Scout actually sends one.
+test("RUNNING with NO can_pause key still offers an ENABLED Pause Mission", () => {
+  const ctl = lifecycleControls(normalizeStatus({
+    ok: true, supported: true, reachable: true,
+    scout: { state: "RUNNING", mode: "AUTO", mission_id: "msn-329c2faff137",
+      mission_execution_enabled: true, active_operation_id: null },
+  }));
+  const pause = byAction(ctl, "pause");
+  assert.ok(pause, "a running mission must always carry a Pause control");
+  assert.equal(pause.label, "Pause Mission");
+  assert.equal(pause.enabled, true);
+  assert.equal(pause.reason, null, "Scout said nothing — no reason may be invented for it");
+});
+
+test("PAUSED with NO can_resume key still offers an ENABLED Resume Mission", () => {
+  const ctl = lifecycleControls(normalizeStatus({
+    ok: true, supported: true, reachable: true,
+    scout: { state: "PAUSED", mode: "LOITER", mission_execution_enabled: true },
+  }));
+  const resume = byAction(ctl, "resume");
+  assert.equal(resume.label, "Resume Mission");
+  assert.equal(resume.enabled, true);
+  assert.equal(resume.reason, null);
+});
+
+test("an EXPLICIT can_pause:false is still honoured, with Scout's own answer as the reason", () => {
+  // The other half of the tri-state: Scout HAS refused, so the station does not talk it into a
+  // button that would come back 409. It is shown, disabled, saying exactly what Scout said.
+  const ctl = lifecycleControls(S({ state: "RUNNING", can_start: false, can_pause: false }));
+  const pause = byAction(ctl, "pause");
+  assert.equal(pause.enabled, false);
+  assert.match(pause.reason, /can_pause=false/);
+  assert.match(pause.reason, /RUNNING/);
+});
+
+test("can_pause tri-state: true / false / absent are three distinct answers", () => {
+  assert.equal(normalizeStatus({ scout: { state: "RUNNING", can_pause: true } }).canPause, true);
+  assert.equal(normalizeStatus({ scout: { state: "RUNNING", can_pause: false } }).canPause, false);
+  assert.equal(normalizeStatus({ scout: { state: "RUNNING" } }).canPause, null);
+  assert.equal(normalizeStatus({ scout: { state: "RUNNING" } }).pauseReported, false);
+  assert.equal(normalizeStatus({ scout: { state: "PAUSED" } }).canResume, null);
+});
+
+test("Pause is offered only where a run exists, Resume only after a pause", () => {
+  for (const state of ["RUNNING", "RETURNING_HOME"]) {
+    assert.equal(pauseAvailability(S({ state })).available, true, state);
+    assert.equal(resumeAvailability(S({ state })).available, false, state);
+  }
+  assert.equal(resumeAvailability(S({ state: "PAUSED" })).available, true);
+  assert.equal(pauseAvailability(S({ state: "PAUSED" })).available, false);
+  for (const state of ["READY", "NOT_STARTED", "COMPLETED_HOLD", "FAILED", "STOPPED"]) {
+    assert.equal(pauseAvailability(S({ state })).available, false, state);
+    assert.equal(resumeAvailability(S({ state })).available, false, state);
+  }
+});
+
+test("an unreadable status offers no hold control and claims nothing about the run", () => {
+  for (const av of [pauseAvailability(normalizeStatus({ supported: false })),
+    resumeAvailability(normalizeStatus({ reachable: false, scout: {} }))]) {
+    assert.equal(av.available, false);
+    assert.equal(av.enabled, false);
+    assert.match(av.reason, /unavailable/i);
+  }
+});
+
+// ── A3. The card only moves when the AUTHORITATIVE status moves ─────────────────────────
+//
+// The one rule the whole card rests on: an accepted Pause does not make the button say Resume.
+// Scout's next status does. Optimism here would tell an operator the vehicle is holding at a
+// moment when the LOITER may not have been verified at all.
+test("an ACCEPTED pause does not turn the button into Resume — only a PAUSED status does", () => {
+  const accepted = interpretTransaction({ status: 200, data: {
+    outcome: "accepted", operation: "pause",
+    phases: [{ phase: "verify", status: "ok", verified: true, observed_state: "PAUSED",
+      observed_mode: "LOITER" }],
+    authority: { before: "LOCAL_AGENT", after: "LOCAL_AGENT", required: "LOCAL_AGENT" },
+  } });
+  assert.equal(accepted.outcome, OUTCOME.ACCEPTED);
+
+  // Status still says RUNNING (the next poll has not landed): the control is STILL Pause.
+  const stillRunning = lifecycleControls(S({ state: "RUNNING", can_start: false,
+    can_pause: true }));
+  assert.equal(byAction(stillRunning, "pause").label, "Pause Mission");
+  assert.equal(actions(stillRunning).includes("resume"), false);
+
+  // Only once Scout's canonical status reports PAUSED does Resume appear.
+  const paused = lifecycleControls(S({ state: "PAUSED", can_start: false, can_resume: true }));
+  assert.equal(byAction(paused, "resume").label, "Resume Mission");
+  assert.equal(actions(paused).includes("pause"), false);
+});
+
+test("an ACCEPTED resume does not turn the button back into Pause — only a RUNNING status does", () => {
+  const paused = lifecycleControls(S({ state: "PAUSED", can_start: false, can_resume: true }));
+  assert.deepEqual(actions(paused), ["resume", "stop"]);
+  const running = lifecycleControls(S({ state: "RUNNING", can_start: false, can_pause: true }));
+  assert.deepEqual(actions(running), ["pause", "stop"]);
+});
+
+test("a pause that Scout ACCEPTED but did not verify is not reported as a clean hold", () => {
+  // mission_lifecycle._verify_state re-reads canonical status and answers `withheld` when the
+  // vehicle is not where the operation says it should be. The operator has to SEE that:
+  // "accepted" is Scout taking the request, not proof that a LOITER was reached.
+  const view = interpretTransaction({ status: 200, data: {
+    outcome: "accepted", operation: "pause",
+    phases: [{ phase: "verification", status: "withheld", verified: false,
+      observed_state: "RUNNING", observed_mode: "AUTO",
+      detail: "Scout accepted the pause but reports RUNNING in mode AUTO, not PAUSED in LOITER" }],
+    authority: {},
+  } });
+  assert.equal(view.verified, false);
+  assert.match(transactionSummary(view), /not PAUSED in LOITER/);
+  assert.notEqual(transactionSummary(view), "Accepted");
+});
+
+test("a VERIFIED pause reports the hold plainly, with no false alarm attached", () => {
+  const view = interpretTransaction({ status: 200, data: {
+    outcome: "accepted", operation: "pause",
+    phases: [{ phase: "verification", status: "ok", verified: true, observed_state: "PAUSED",
+      observed_mode: "LOITER", detail: "Scout reports PAUSED in mode LOITER — verified" }],
+    authority: {} } });
+  assert.equal(view.verified, true);
+  assert.doesNotMatch(transactionSummary(view), /NOT be verified/i);
+});
+
+test("the Map's result line calls an unverified acceptance what it is", () => {
+  assert.match(mapSrc, /res\.view\.outcome === "accepted" && res\.view\.verified === false/);
+  assert.match(mapSrc, /accepted — resulting state NOT verified/);
+});
+
+test("a FAILED pause/resume leaves the operator a usable error, never a silent no-op", () => {
+  const rejected = interpretTransaction({ status: 409, data: {
+    outcome: "rejected", operation: "pause", error_code: "REPLANNING_ACTIVE",
+    error: "The replanning controller owns the vehicle", phases: [], authority: {} } });
+  assert.equal(rejected.outcome, OUTCOME.REJECTED);
+  assert.match(transactionSummary(rejected), /REPLANNING_ACTIVE|replanning controller/i);
+
+  const failed = interpretTransaction({ status: 200, data: {
+    outcome: "failed", operation: "resume",
+    error: { code: "AUTO_NOT_VERIFIED", message: "mode never read back as AUTO" },
+    phases: [], authority: {} } });
+  assert.equal(failed.outcome, OUTCOME.FAILED);
+  assert.match(transactionSummary(failed), /AUTO_NOT_VERIFIED/);
+  assert.match(transactionSummary(failed), /mode never read back as AUTO/);
+  assert.doesNotMatch(transactionSummary(failed), /\[object Object\]/);
+
+  const unavailable = interpretTransaction({ status: 503, data: {
+    outcome: "unavailable", operation: "pause", error: "Scout Local Agent unreachable" } });
+  assert.equal(unavailable.outcome, OUTCOME.UNAVAILABLE);
+  assert.match(outcomeLabel(unavailable.outcome), /unavailable/i);
+  // A failed operation is never dressed up as a start failure banner on another operation.
+  assert.equal(startFailure(null), null);
+});
+
+// ── A4. Take Control stays reachable for the whole of a LOCAL_AGENT run ──────────────────
+test("Take Control remains available while the Local Agent owns the mission", () => {
+  for (const phase of [undefined, "confirmed"]) {
+    const gate = handoffGate({ available: true, reachable: true, value: "LOCAL_AGENT",
+      hasControl: false, phase }, { stale: false });
+    assert.equal(gate.canTake, true, "the operator must always be able to take the wheel back");
+    assert.equal(gate.hasControl, false, "…without that enabling the Pixhawk command buttons");
+  }
+  // And the vehicle command buttons stay LOCKED throughout — taking control is the only way in.
+  const operator = handoffGate({ available: true, reachable: true, value: "OPERATOR",
+    hasControl: true }, { stale: false });
+  assert.equal(operator.hasControl, true);
+  assert.equal(operator.canTake, false, "nothing to take — the operator already holds it");
+});
+
+test("the Map renders Take Control outside the Agent Mission card, so a run cannot hide it", () => {
+  // It sits in Vehicle Commands, which is rendered before the lifecycle card and is not gated on
+  // any mission-execution state — a RUNNING agent mission can never remove the manual override.
+  assert.match(mapSrc, /\$\{takeControl\(av, stale, canTake\)\}/);
+  assert.ok(mapSrc.indexOf("${takeControl(av, stale, canTake)}")
+    < mapSrc.indexOf('<span class="lbl">Agent Mission</span>'),
+    "Take Control must not live inside the Agent Mission card");
 });
 
 // ── B. Precedence: nothing is offered while Scout owns the moment ───────────────────────
@@ -351,10 +545,6 @@ test("the LOITER safety exemption is untouched by the readiness split", () => {
 });
 
 // ── H. Page surfaces: the Map operates, the Agent page diagnoses ────────────────────────
-const mapSrc = read("../operator/pages/Map.js");
-const agentSrc = read("../operator/pages/Agent.js");
-const apiSrc = read("../operator/services/api.js");
-
 test("the Map page carries the lifecycle controls", () => {
   assert.match(mapSrc, /Agent Mission/);
   assert.match(mapSrc, /function renderAgentMission/);
@@ -425,6 +615,91 @@ test("api.js exposes one endpoint per user intent, all per-vehicle", () => {
   ]) {
     assert.match(apiSrc, new RegExp(`export function ${fn}\\(`), fn);
     assert.match(apiSrc, new RegExp(`/api/vehicles/\\$\\{id\\}${path}`), path);
+  }
+});
+
+// ── H2. The Map CARD renders the same mapping, and nothing optimistic feeds it ──────────
+//
+// missionCardView is what the Map actually draws. These assert the operator-visible result of
+// the mapping, not just the model behind it.
+const cardActions = (card) => card.buttons.map((b) => b.action);
+
+test("the Agent Mission card shows Start when READY and Pause Mission when RUNNING", () => {
+  const ready = missionCardView(S({ state: "READY", can_start: true }),
+    { readiness: { state: "READY", canStart: true } });
+  assert.deepEqual(cardActions(ready), ["start"]);
+  assert.equal(ready.buttons[0].label, "Start Mission");
+
+  const running = missionCardView(S({ state: "RUNNING", can_start: false, can_pause: true,
+    mode: "AUTO" }));
+  assert.equal(cardActions(running).includes("pause"), true);
+  assert.equal(running.buttons.find((b) => b.action === "pause").label, "Pause Mission");
+  assert.equal(running.chip, "RUNNING");
+  assert.equal(running.headline, "AUTO · WP 3 / 22");   // watching, not identifying
+});
+
+test("the Agent Mission card shows Resume Mission once Scout reports PAUSED", () => {
+  const card = missionCardView(S({ state: "PAUSED", can_start: false, can_resume: true,
+    mode: "LOITER" }));
+  assert.equal(cardActions(card).includes("resume"), true);
+  assert.equal(card.buttons.find((b) => b.action === "resume").label, "Resume Mission");
+  assert.equal(cardActions(card).includes("pause"), false);
+  assert.equal(card.headline, "LOITER · WP 3 / 22");
+});
+
+test("the card shows the PHASE and offers no conflicting action mid-transaction", () => {
+  for (const [state, phrase] of [["STARTING_AUTO", /Starting AUTO/i],
+    ["VERIFYING_HOME", /Verifying Home|Home/i], ["PAUSE_REQUESTED", /Pausing|Holding|hold/i],
+    ["RESUME_REQUESTED", /Resuming|Starting AUTO|AUTO/i]]) {
+    const card = missionCardView(S({ state, can_start: false }));
+    assert.equal(card.working, true, state);
+    assert.deepEqual(cardActions(card), [], `${state} must offer no competing action`);
+    assert.match(card.headline, phrase, state);
+  }
+});
+
+test("a lifecycle operation in flight from this station disables every card button", () => {
+  const card = missionCardView(S({ state: "RUNNING", can_pause: true, can_stop: true }),
+    { busy: true });
+  assert.ok(card.buttons.length, "the controls stay visible so the operator sees the state");
+  for (const b of card.buttons) {
+    assert.equal(b.enabled, false, b.action);
+    assert.match(b.reason, /already in progress/i);
+  }
+});
+
+test("the card's FAILED presentation carries the recovery action and the reason", () => {
+  const card = missionCardView(S({ state: "FAILED", can_start: false,
+    last_error: { code: "PROGRESSION_UNCONFIRMED", message: "sequence never advanced" } }));
+  assert.deepEqual(cardActions(card), ["rearm", "take-control"]);
+  assert.match(card.blocker.title, /PROGRESSION_UNCONFIRMED/);
+  assert.match(card.blocker.title, /sequence never advanced/);
+});
+
+test("the Map's card state comes ONLY from the polled status, never from an operation reply", () => {
+  // The single most important wiring rule here: a transaction's own response must not be written
+  // into `mission.status`. It is recorded as `mission.result` (the outcome line) and the card is
+  // re-derived from a fresh authoritative read.
+  assert.match(mapSrc, /mission\.result = \{ label, action, view: mx\.interpretTransaction\(r\)/);
+  const assigns = [...mapSrc.matchAll(/mission\.status\s*=\s*([^;\n]+)/g)].map((m) => m[1].trim());
+  for (const rhs of assigns) {
+    assert.ok(/^st$|^null$|^mission\.preflight/.test(rhs),
+      `mission.status may only be set from the status poll or cleared, not from: ${rhs}`);
+  }
+  // …and every transaction re-reads the authoritative status when it settles.
+  const tx = mapSrc.slice(mapSrc.indexOf("function missionTransaction"),
+    mapSrc.indexOf("function missionTransaction") + 1600);
+  assert.match(tx, /\.finally\(\(\) => \{[\s\S]{0,400}loadMissionStatus\(id\)/);
+});
+
+test("Pause and Resume are the Local Agent's transactions — the Map never shortcuts them", () => {
+  const wiring = mapSrc.slice(mapSrc.indexOf("async function onMissionAction"),
+    mapSrc.indexOf("async function onMissionAction") + 3000);
+  assert.match(wiring, /action === "pause"[\s\S]{0,300}api\.pauseMissionExecution\(id\)/);
+  assert.match(wiring, /action === "resume"[\s\S]{0,300}api\.resumeMissionExecution\(id\)/);
+  // Never a browser-side "just send AUTO" (or LOITER) standing in for the transaction Scout owns.
+  for (const shortcut of ["SET_MODE_AUTO", "SET_MODE_LOITER", "createCommand"]) {
+    assert.doesNotMatch(wiring, new RegExp(shortcut), shortcut);
   }
 });
 

@@ -1422,13 +1422,19 @@ export function Map(root) {
     // evidence, Scout's code and the phase detail are the tooltip. Every other transaction keeps
     // the one-word outcome line.
     const startFail = res && res.action === "start" ? mx.startFailure(res.view) : null;
+    // ACCEPTED BUT NOT VERIFIED is its own outcome on this line. The backend re-reads Scout's
+    // canonical status after an accepted Pause/Resume and can answer "Scout accepted it but
+    // reports RUNNING in AUTO, not PAUSED in LOITER" — which must NOT read as a green "Accepted".
+    // The card's state itself is unaffected either way: it comes from the next authoritative
+    // status poll, never from this line.
+    const unverified = !!res && res.view.outcome === "accepted" && res.view.verified === false;
     const resultNote = startFail
       ? `<div class="amx-result warn" title="${escAttr([startFail.detail, mx.transactionSummary(res.view)].filter(Boolean).join(" — "))}">
            <b>${esc(startFail.title)}</b>: ${esc(startFail.text)}
          </div>`
       : res
-        ? `<div class="amx-result ${res.view.outcome === "accepted" ? "ok" : res.view.outcome === "pending" ? "" : "warn"}" title="${escAttr(res.view.outcome === "pending" ? "" : mx.transactionSummary(res.view))}">
-           <b>${esc(res.label)}</b>: ${esc(res.view.outcome === "pending" ? "sending…" : mx.outcomeLabel(res.view.outcome))}
+        ? `<div class="amx-result ${unverified ? "warn" : res.view.outcome === "accepted" ? "ok" : res.view.outcome === "pending" ? "" : "warn"}" title="${escAttr(res.view.outcome === "pending" ? "" : mx.transactionSummary(res.view))}">
+           <b>${esc(res.label)}</b>: ${esc(res.view.outcome === "pending" ? "sending…" : unverified ? "accepted — resulting state NOT verified" : mx.outcomeLabel(res.view.outcome))}
          </div>`
         : "";
 
@@ -1545,7 +1551,7 @@ export function Map(root) {
         ${renderReadiness(gateCtx, authVal)}
       </div>
       <div class="isec">
-        <div class="sec-title"><span class="lbl">Agent status</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">supervisory · local agent</span></div>
+        <div class="sec-title"><span class="lbl">Supervisory agent · decision state</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">not the mission lifecycle</span></div>
         ${agentCommands(gateCtx, av, stale, v)}
       </div>
       <div class="isec">
@@ -1813,6 +1819,24 @@ export function Map(root) {
     return agentStatusBlock(v) + cmdStatus(MAP_MISSION_TYPES);
   }
 
+  // TWO DIFFERENT THINGS, AND THE UI USED TO GIVE THEM THE SAME NAME.
+  //
+  // This block reports the SUPERVISORY agent's own decision state — the behaviour the Local
+  // Agent broadcasts in its heartbeat (`payload.mission.mission_state`, surfaced as `v.status`):
+  // IDLE / EXECUTING / PAUSED / … . It is the agent's reasoning loop, and it is NOT Scout's
+  // mission-execution lifecycle, which is the Agent Mission card above and comes from a
+  // different source entirely (GET /agent/mission_execution/status, port 8090).
+  //
+  // Labelled "Current agent status", it read as a second, contradicting answer to the question
+  // the Agent Mission card had already answered: the card said the mission was RUNNING while
+  // this row said IDLE, from a supervisory agent that was — correctly — not deciding anything
+  // while Scout's mission controller flew the route. Neither value was wrong; the LABEL was.
+  // Nothing here is forced to follow the lifecycle state, because it does not describe it.
+  const DECISION_STATE_TITLE = "The supervisory agent's own decision state, as reported in its " +
+    "heartbeat (mission_state). This is NOT the mission-execution lifecycle — that is the Agent " +
+    "Mission card above, which reads Scout's mission-execution controller. IDLE here while the " +
+    "mission runs simply means the supervisory loop is not currently deciding anything.";
+
   function agentStatusBlock(v) {
     const connected = commState(v) === "connected";
     const age = v.last_seen_age_s, hasContact = age != null;
@@ -1820,11 +1844,11 @@ export function Map(root) {
     const behavior = (hasContact && raw && !["unknown", "lost"].includes(String(raw).toLowerCase())) ? raw : null;
     const curSlot = behavior
       ? availSlot(connected ? AVAIL.LIVE : AVAIL.LAST_KNOWN, { value: behavior, age: connected ? null : age })
-      : availSlot(AVAIL.GAP, { label: hasContact ? "No data" : "No contact", dev: "agent status approx. from mission_state" });
+      : availSlot(AVAIL.GAP, { label: hasContact ? "No data" : "No contact", dev: "decision state approx. from mission_state" });
     const prevSlot = availSlot(AVAIL.GAP, { label: "Unavailable", dev: "agent must emit a decision/status log for the previous state" });
-    return `<div class="agent-status">
-      <div class="asrow"><span class="k">Current agent status</span><span class="v">${curSlot}</span></div>
-      <div class="asrow"><span class="k">Previous agent status</span><span class="v">${prevSlot}</span></div>
+    return `<div class="agent-status" title="${escAttr(DECISION_STATE_TITLE)}">
+      <div class="asrow"><span class="k">Current decision state</span><span class="v">${curSlot}</span></div>
+      <div class="asrow"><span class="k">Previous decision state</span><span class="v">${prevSlot}</span></div>
     </div>`;
   }
 

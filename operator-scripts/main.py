@@ -3740,8 +3740,20 @@ async def receive_agent_status(request: Request):
             # rejection streak is visible end-to-end without reading every line.
             line += f" recovered_after={recovered_after}"
         log_mission = log_payload.get("mission") if isinstance(log_payload.get("mission"), dict) else {}
-        line += (f" comm={log_payload.get('comm_state', 'UNKNOWN')}"
-                 f" mission={log_mission.get('mission_state', '—')} ({why})")
+        # BOTH of these are the VEHICLE'S OWN WORDS, taken verbatim out of the packet, and the
+        # names say so. Unqualified `comm=` / `mission=` read as the operator's verdict, and that
+        # produced two contradictions that looked like bugs and were not:
+        #   comm=PARTITIONED while the UI showed CONNECTED — the operator's comm state is
+        #     ARRIVAL-AGE derived (build_vehicle_view), so a packet that reaches us proves the
+        #     link is up now even when the payload self-reports a partition it saw earlier.
+        #     `link=` below is that operator-side verdict, so the two are visible side by side.
+        #   mission=IDLE while the Agent Mission card showed RUNNING — this is the SUPERVISORY
+        #     agent's decision state (payload.mission.mission_state), not Scout's mission-
+        #     execution lifecycle (GET /agent/mission_execution/status, port 8090), which this
+        #     log line has never carried and must not be read as.
+        line += (f" agent_comm={log_payload.get('comm_state', 'UNKNOWN')}"
+                 f" link={comms_state_by_id.get(vid, 'UNKNOWN')}"
+                 f" agent_mission={log_mission.get('mission_state', '—')} ({why})")
         print(line)
 
     return {

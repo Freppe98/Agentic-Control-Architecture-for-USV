@@ -302,8 +302,18 @@ export function normalizeStatus(res) {
     mode: str(s.mode),
     authority: str(first(s, "authority_status", "authority")),
     canStart: s.can_start === true,
-    canPause: s.can_pause === true,
-    canResume: s.can_resume === true,
+    // TRI-STATE, exactly like canStop below, and for the same reason: `true` / `false` / `null`
+    // are three different facts and collapsing the third into the second is a lie the operator
+    // acts on. A Scout that reports `can_pause:false` has REFUSED a pause right now; a Scout
+    // whose status simply carries no `can_pause` key has said NOTHING about it — and a strict
+    // `=== true` turned that silence into a Pause button disabled with the fabricated reason
+    // "Scout reports can_pause=false", which is the defect this tri-state removes. When the key
+    // is absent, Scout's own STATE is the authority (see pauseAvailability / resumeAvailability):
+    // RUNNING means the mission is running, so Pause is offered and Scout arbitrates it.
+    canPause: "can_pause" in s ? s.can_pause === true : null,
+    canResume: "can_resume" in s ? s.can_resume === true : null,
+    pauseReported: "can_pause" in s,
+    resumeReported: "can_resume" in s,
     // Stop is the one operation whose SUPPORT is in question, so it is modelled in three
     // values rather than two: true / false / null. PRESENCE of `can_stop` is the support
     // signal — a Scout that has shipped Stop reports it either way; one that has not omits
@@ -565,11 +575,18 @@ export function primaryAction(status) {
         ? `Scout is processing operation ${S.activeOperationId}`
         : "Scout is mid-transaction" };
   }
-  if (S.canPause) {
-    return { action: "pause", label: "Pause Mission", enabled: true, tone: "ok", reason: null };
+  // Pause / Resume come from the SHARED hold derivation (pauseAvailability / resumeAvailability),
+  // so this control and the Map card's buttons answer the same question the same way — including
+  // the rule that an ABSENT can_pause is silence, not a refusal.
+  const pause = pauseAvailability(S);
+  if (pause.available) {
+    return { action: "pause", label: "Pause Mission", enabled: pause.enabled, tone: "ok",
+      reason: pause.reason };
   }
-  if (S.canResume) {
-    return { action: "resume", label: "Resume Mission", enabled: true, tone: "ok", reason: null };
+  const resume = resumeAvailability(S);
+  if (resume.available) {
+    return { action: "resume", label: "Resume Mission", enabled: resume.enabled, tone: "ok",
+      reason: resume.reason };
   }
   // NOT `can_start` alone. Scout's explicit contract decides, and `start_eligible:true` with
   // authority still OPERATOR is an OFFERED Start whose first phase takes agent control.
@@ -715,6 +732,80 @@ export function startGate(status, { connected = true, busy = false, missionId = 
       + "verify. No vehicle write happens before its own proof succeeds." };
 }
 
+// The states each hold control belongs to. PAUSE is offered while the run is under way
+// (RETURNING_HOME included — the mission is still happening and holding it is meaningful);
+// RESUME only after a pause, which is the one thing that makes "Resume" honest.
+export const PAUSABLE_STATES = ["RUNNING", "RETURNING_HOME"];
+export const RESUMABLE_STATES = ["PAUSED"];
+
+/**
+ * Whether PAUSE / RESUME may be offered, and why not — the shared derivation behind both the
+ * Map card's buttons and the Agent page's primary control, so the two can never disagree.
+ *
+ * THE RULE, and why it is not "trust can_pause":
+ *   Scout's STATE is the authority for WHICH hold control exists. RUNNING means there is a run
+ *   to hold; PAUSED means there is a hold to release. Scout's `can_*` flag is the authority for
+ *   whether it will accept that operation RIGHT NOW — but only when Scout actually sends it.
+ *   An ABSENT flag is not a refusal, and treating it as one is what left a RUNNING mission with
+ *   no usable Pause control on the Map. So:
+ *
+ *     flag true    → enabled.
+ *     flag false   → shown, DISABLED, with Scout's own can_* answer as the reason. Scout has
+ *                    refused; the station does not talk it into a button that would 409.
+ *     flag absent  → enabled. The state is the authority, and nothing is fabricated: the backend
+ *                    pause/resume transaction is fail-closed and Scout arbitrates the write.
+ *
+ * Everything Scout owns the moment for still wins first: an unreadable status, the replanning
+ * controller, an active operation id and a mid-transaction state all withhold the control.
+ *
+ * @returns {{ available, enabled, reason, reported }} — `available:false` means "not this state",
+ *   which is what hides the control entirely rather than showing a dead one.
+ */
+function holdAvailability(status, { op, states, canField, flag, reported }) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const state = String(S.state || "").toUpperCase();
+  if (!S.supported || !S.present) {
+    return { available: false, enabled: false, reported: false,
+      reason: `Scout mission-execution status is unavailable — ${op} cannot be offered` };
+  }
+  if (!states.includes(state)) {
+    return { available: false, enabled: false, reported, reason: null };
+  }
+  if (S.replanning.active) {
+    return { available: true, enabled: false, reported,
+      reason: "The replanning controller owns the vehicle" };
+  }
+  if (S.activeOperationId) {
+    return { available: true, enabled: false, reported,
+      reason: `Scout is already processing operation ${S.activeOperationId}` };
+  }
+  if (S.transitional && state !== "RETURNING_HOME") {
+    return { available: true, enabled: false, reported,
+      reason: `Scout is mid-transaction (${stateLabel(state)})` };
+  }
+  if (flag === false) {
+    return { available: true, enabled: false, reported,
+      reason: `Scout reports ${canField}=false in ${state}` };
+  }
+  return { available: true, enabled: true, reported, reason: null };
+}
+
+/** Whether Pause may be offered (see holdAvailability). Pause HOLDS the mission in a verified
+ *  LOITER — it ends nothing, clears nothing and is never a substitute for Stop. */
+export function pauseAvailability(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  return holdAvailability(S, { op: "Pause", states: PAUSABLE_STATES, canField: "can_pause",
+    flag: S.canPause, reported: S.pauseReported === true });
+}
+
+/** Whether Resume may be offered (see holdAvailability). Resume returns the vehicle to AUTO
+ *  through Scout's own transaction; the station never sends AUTO itself to emulate it. */
+export function resumeAvailability(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  return holdAvailability(S, { op: "Resume", states: RESUMABLE_STATES, canField: "can_resume",
+    flag: S.canResume, reported: S.resumeReported === true });
+}
+
 /**
  * Whether Stop can be offered at all, and why not.
  *
@@ -758,16 +849,21 @@ export function stopAvailability(status) {
  * ONLY — never from the last click, never from the previous label:
  *
  *   READY / NOT_STARTED       [ Start Mission ]
- *   RUNNING / RETURNING_HOME  [ Pause ]  [ Stop Mission ]
+ *   RUNNING / RETURNING_HOME  [ Pause Mission ]  [ Stop Mission ]
  *   PAUSED                    [ Resume Mission ]  [ Stop Mission ]
  *   STOPPED / CANCELLED       [ Start Mission ]
  *   FAILED / SUSPENDED        failure shown + [ Rearm Mission Controller ]  [ Take Control ]
  *   COMPLETED_HOLD            completed + final LOITER shown; a fresh Start only AFTER the
  *                             controller has been rearmed for a new execution
  *
- * A RUNNING mission's primary button is "Pause" and never "Resume" — Resume exists only after
- * a Pause, and labelling a live mission's button Resume invites an operator to press it
+ * A RUNNING mission's primary button is "Pause Mission" and never "Resume" — Resume exists only
+ * after a Pause, and labelling a live mission's button Resume invites an operator to press it
  * believing the mission is stopped.
+ *
+ * WHICH control exists comes from the STATE; whether it is ENABLED comes from Scout's `can_*`
+ * flag WHEN SCOUT SENDS ONE (pauseAvailability / resumeAvailability). A Scout that omits the flag
+ * has said nothing, so the control is offered and Scout arbitrates the write — it is not turned
+ * into a dead button carrying a refusal Scout never issued.
  *
  * @param status    normalized (or raw) Scout mission-execution status
  * @param opts.busy an operation is in flight from THIS station — every button is disabled and
@@ -782,6 +878,8 @@ export function lifecycleControls(status, {
   const S = status && status.present !== undefined ? status : normalizeStatus(status);
   const state = String(S.state || "").toUpperCase();
   const stop = stopAvailability(S);
+  const pause = pauseAvailability(S);
+  const resume = resumeAvailability(S);
   const rearm = rearmAvailability(S);
   const failure = (state === "FAILED" || state === "SUSPENDED")
     ? (asText(S.lastError) || `Scout reports ${state}`) : null;
@@ -835,15 +933,15 @@ export function lifecycleControls(status, {
   if (state === "RUNNING" || state === "RETURNING_HOME") {
     out.tone = "ok";
     // NEVER "Resume" here. The mission is running; Resume is meaningful only after a Pause.
-    out.buttons.push(btn("pause", "Pause", { enabled: S.canPause, tone: "ok",
-      reason: S.canPause ? null : "Scout reports can_pause=false" }));
+    out.buttons.push(btn("pause", "Pause Mission", { enabled: pause.enabled, tone: "ok",
+      reason: pause.reason }));
     addStop();
     return out;
   }
   if (state === "PAUSED") {
     out.tone = "caution";
-    out.buttons.push(btn("resume", "Resume Mission", { enabled: S.canResume, tone: "ok",
-      reason: S.canResume ? null : "Scout reports can_resume=false" }));
+    out.buttons.push(btn("resume", "Resume Mission", { enabled: resume.enabled, tone: "ok",
+      reason: resume.reason }));
     addStop();
     return out;
   }
@@ -1471,6 +1569,15 @@ export function transactionSummary(view) {
   }
   if (view.message && view.message !== view.code) parts.push(view.message);
   if (view.resultingState) parts.push(`state ${view.resultingState}`);
+  // ACCEPTED IS NOT VERIFIED. The backend re-reads Scout's canonical status after every accepted
+  // pause / resume (mission_lifecycle._verify_state) and answers `withheld` when the vehicle is
+  // not where the operation says it should be — PAUSED in LOITER, RUNNING in AUTO. That verdict
+  // was computed, returned and parsed here, and then shown to nobody: the operator read a bare
+  // "Accepted" for a Pause whose LOITER had not been confirmed. It is part of the summary now.
+  if (view.verified === false) {
+    parts.push(view.verificationNote
+      || "Scout accepted it, but the resulting state could NOT be verified");
+  }
   if (view.authorityRestored === true) parts.push("authority returned to OPERATOR");
   else if (view.authorityRestored === false && view.authorityNote) parts.push(view.authorityNote);
   if (view.outcome === OUTCOME.UNKNOWN && view.reconciliation) {

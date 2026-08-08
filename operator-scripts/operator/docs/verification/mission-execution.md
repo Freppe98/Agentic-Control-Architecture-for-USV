@@ -33,7 +33,55 @@ Driven headless (Playwright, `npm install --no-save playwright`), Agent page, ve
 | Return completion | ✅ distance, arrival radius, persistence 1/4 s + progress bar, ARRIVAL NOT CONFIRMED, FINAL LOITER NOT VERIFIED, MISSION NOT COMPLETE |
 | Operation trace | ✅ `START ACCEPTED → RUNNING · mode AUTO · CONTINUATION NOT VERIFIED · op-a17`, then `PAUSE ACCEPTED → PAUSED · mode LOITER · op-a18` |
 | No console errors | ✅ |
-| Map / Vehicle pages | ✅ no `PAUSE MISSION` / `RESUME MISSION` buttons; both point at the Agent page's Mission lifecycle card; manual mode commands (AUTO/MANUAL/LOITER/RTL/ARM/DISARM) retained |
+| Vehicle page | ✅ no `PAUSE MISSION` / `RESUME MISSION` buttons; points at the lifecycle card; manual mode commands (AUTO/MANUAL/LOITER/RTL/ARM/DISARM) retained |
+
+> **Superseded for the Map.** This table predates the product decision that made the **Map** the
+> operational surface: normal Start / Pause / Resume / Stop now live in the Map's Agent Mission
+> card and the Agent page keeps the diagnostic depth. The row above applies to the Vehicle page
+> only. See `tests/mission-control.test.mjs` for the pinned state → control mapping.
+
+## The hold controls are STATE-driven; `can_pause` / `can_resume` only gate them
+
+A live bench Start (DISARMED → ARMED/AUTO/LOCAL_AGENT, Agent Mission RUNNING, Home VERIFIED)
+reached RUNNING with no usable hold control on the Map. Cause: `can_pause` / `can_resume` were
+read with a strict `=== true`, so a Scout status that simply does not carry the optional
+capability flag was treated as an explicit refusal — the card rendered `Pause` disabled with the
+**fabricated** reason "Scout reports can_pause=false", beside a `Stop Mission` that is unsupported
+on this Scout. Two dead buttons.
+
+They are now tri-state, exactly like `can_stop`:
+
+| Scout's status | Control | Why |
+| --- | --- | --- |
+| `can_pause: true` | **Pause Mission**, enabled | Scout will accept it |
+| `can_pause: false` | Pause Mission, **disabled**, "Scout reports can_pause=false in RUNNING" | Scout has refused; the station does not talk it into a 409 |
+| *(key absent)* | **Pause Mission**, enabled | Scout said nothing. The STATE is the authority, and the backend transaction is fail-closed |
+
+The same three rows hold for `can_resume` in `PAUSED`. Which control EXISTS still comes from
+Scout's state alone (`RUNNING`/`RETURNING_HOME` → Pause, `PAUSED` → Resume), and an active
+operation id, a mid-transaction state or the replanning overlay still withholds it.
+
+`ACCEPTED` is also no longer shown as a clean result when the backend's post-operation read-back
+(`mission_lifecycle._verify_state`) answered `withheld`: the Map's result line reads
+**"accepted — resulting state NOT verified"** with Scout's observed state/mode in the tooltip.
+That verdict was already computed and parsed; it was simply rendered nowhere.
+
+## Two things the console called by the same name
+
+`[STATUS]` printed `comm=` and `mission=` straight out of the packet, which read as the operator's
+own verdict and produced two contradictions that were not bugs:
+
+* `comm=PARTITIONED` beside a UI showing CONNECTED — the operator's comm state is **arrival-age
+  derived** (`build_vehicle_view`), so a packet reaching us proves the link is up now even when
+  the payload self-reports a partition the vehicle saw earlier.
+* `mission=IDLE` beside an Agent Mission card showing RUNNING — this is the **supervisory agent's
+  decision state** (`payload.mission.mission_state`), not Scout's mission-execution lifecycle
+  (port 8090). A supervisory loop that is not deciding anything while the mission controller flies
+  the route is correct.
+
+The line now reads `agent_comm=… link=… agent_mission=…` (the vehicle's word, the operator's
+verdict, the vehicle's word), and the Map inspector section formerly titled "Agent status" is
+**"Supervisory agent · decision state"**, tagged *not the mission lifecycle*.
 
 ## Verified against the REAL deployed Scout (10.0.2.10:8090)
 
