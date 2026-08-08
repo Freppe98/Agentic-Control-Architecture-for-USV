@@ -486,10 +486,18 @@ export function resumeMissionExecution(id) {
   return postJSON(`/api/vehicles/${id}/mission-execution/resume`, {});
 }
 
-/** STOP — end the run, then return OPERATOR authority only once Scout reports STOPPED with a
- *  verified LOITER. PENDING ON SCOUT: until Scout ships POST /agent/mission_execution/stop this
- *  answers `unsupported` and changes nothing. Stop is never emulated from a LOITER command,
- *  never reported as FAILED, and Rearm is never offered as a substitute. See SCOUT_STOP_API.md. */
+/** STOP — the SAFE ABORT, proxied to Scout's own POST /agent/mission_execution/stop.
+ *
+ *  Scout owns the whole transaction: verified LOITER → verify the active mission identity →
+ *  restore the immutable original mission if a verified revised route is installed → rewind it
+ *  to its start → verify the rewind → reset execution/replan/test state → clear the experiment
+ *  injection → invalidate the runtime Home → return supervisory authority to OPERATOR → re-prove
+ *  the mission evidence. The station reimplements none of it and issues no LOITER, upload,
+ *  rewind, reset, rearm or authority write of its own.
+ *
+ *  This is NOT the legacy raw Pixhawk /nav/stop, which is deliberately not exposed anywhere in
+ *  this app. A successful Stop normally lands at state=NOT_READY with start_eligible=true and
+ *  authority_blocks_start=true — expected, not a failure. */
 export function stopMissionExecution(id) {
   return postJSON(`/api/vehicles/${id}/mission-execution/stop`, {});
 }

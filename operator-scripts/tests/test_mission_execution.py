@@ -249,14 +249,64 @@ class TestRoutes(MissionExecutionTestCase):
             self.assertIn(f"{SCOUT_BASE}/agent/mission_execution/{op}", self.fake.urls("POST"), op)
 
     def test_the_stop_route_reaches_scouts_stop(self):
-        """PENDING ON SCOUT: the route exists and is exercised end to end here; against a real
-        Scout today it 404s and answers `unsupported`. See SCOUT_STOP_API.md."""
-        self.set_status(status_body(state="RUNNING", can_start=False, can_pause=True))
-        self.set_op("stop", FakeResp(op_body("stop", current_state="STOPPED",
+        """POST /api/vehicles/{id}/mission-execution/stop proxies to Scout's own lifecycle Stop —
+        the same per-vehicle base, the same bounded transport, the same outcome model as
+        start / pause / resume / rearm. It is NOT the legacy raw Pixhawk stop."""
+        self.set_status(status_body(state="NOT_READY", mode="LOITER", can_start=False,
+                                    start_eligible=True, authority_blocks_start=True))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
                                              verified_mode="LOITER"), 200))
         r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/stop")
         self.assertEqual(r.status_code, 200)
         self.assertIn(f"{SCOUT_BASE}/agent/mission_execution/stop", self.fake.urls("POST"))
+        self.assertFalse(any("nav/stop" in u for u in self.fake.urls()),
+                         "the legacy raw Pixhawk stop is never called")
+
+    def test_the_stop_proxy_uses_the_same_bounded_timeout_as_the_other_writes(self):
+        """One transport, one timeout budget. A Stop that hangs must answer UNKNOWN (202) and be
+        reconciled by a read — exactly like Start / Pause / Resume / Rearm — never hang the UI
+        and never be resent blindly."""
+        self.assertEqual((scout_replan.CONNECT_TIMEOUT, scout_replan.WRITE_READ_TIMEOUT),
+                         (3.0, 12.0))
+        self.set_status(status_body(state="NOT_READY", mode="LOITER", can_start=False))
+        self.set_op("stop", real_requests.ConnectionError("write timed out"))
+        r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/stop")
+        self.assertEqual(r.status_code, 202)
+        self.assertEqual(r.json()["outcome"], mx.OUTCOME_UNKNOWN)
+        self.assertEqual(len([u for u in self.fake.urls("POST") if u.endswith("/stop")]), 1)
+
+    def test_the_stop_proxy_preserves_scouts_body_and_evidence_verbatim(self):
+        """The Operator adds phases; it never rewrites or summarizes away what Scout said."""
+        evidence = {"hold_verified": True, "original_restored": True,
+                    "active_hash_before": "sha256:revised", "original_hash": "sha256:aaa",
+                    "revised_hash": "sha256:revised", "rewind_verified": True,
+                    "sequence_after": 0, "replan_reset": True, "experiment_cleared": True,
+                    "authority_after": "OPERATOR", "ready_for_start": True,
+                    "outcome": "STOPPED"}
+        self.set_status(status_body(state="NOT_READY", mode="LOITER", can_start=False,
+                                    start_eligible=True, authority_blocks_start=True,
+                                    stop=dict(evidence)))
+        body = op_body("stop", current_state="NOT_READY", verified_mode="LOITER",
+                       stop=dict(evidence))
+        self.set_op("stop", FakeResp(body, 200))
+        d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/stop").json()
+        self.assertEqual(d["scout"], body, "Scout's body is preserved untouched under `scout`")
+        for field in mx.STOP_EVIDENCE_FIELDS:
+            self.assertEqual(d["stop"][field], evidence[field], field)
+
+    def test_a_stop_for_one_vehicle_never_reaches_anothers_local_agent(self):
+        self.set_status(status_body(state="NOT_READY", mode="LOITER"))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY"), 200))
+        self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/stop")
+        self.assertFalse(any(u.startswith(SAR_BASE) for u in self.fake.urls()))
+
+    def test_stop_on_a_vehicle_with_no_local_agent_is_unsupported_not_guessed(self):
+        """Same handling as every other lifecycle write: a handled `supported:false`, and no
+        other vehicle's Local Agent base substituted in."""
+        r = self.client.post(f"/api/vehicles/{NO_LA_VID}/mission-execution/stop")
+        self.assertEqual(r.status_code, 200)
+        self.assertIs(r.json()["supported"], False)
+        self.assertEqual(self.fake.calls, [])
 
     def test_start_forwards_the_active_persisted_mission_id(self):
         self.set_op("start", FakeResp(op_body("start"), 200))

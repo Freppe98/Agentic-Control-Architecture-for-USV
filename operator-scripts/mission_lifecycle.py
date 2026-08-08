@@ -32,10 +32,13 @@ THE RULES IT ENFORCES (each one exists because its opposite is unsafe)
    safe: a definite pre-action refusal AND a canonical status read showing Scout resting in a
    pre-start state with no active operation and no replanning. Unknown, uncertain, running,
    mid-transaction or post-command failures never take authority back. Never guess.
-5. Pause keeps LOCAL_AGENT. Resume re-acquires it only if it was lost. Stop returns OPERATOR
-   only after Scout reports STOPPED with a verified LOITER.
-6. Low-level AUTO / MANUAL / RTL / ARM / DISARM are NEVER used to implement any of this. The
-   only vehicle-facing calls are Scout's own mission-execution transactions.
+5. Pause keeps LOCAL_AGENT. Resume re-acquires it only if it was lost. Stop performs NO
+   authority write at all: Scout returns supervisory authority to OPERATOR inside its own stop
+   transaction, and this layer READS IT BACK and reports whether it could confirm it.
+6. Low-level AUTO / MANUAL / RTL / ARM / DISARM are NEVER used to implement any of this, and
+   neither is the legacy raw Pixhawk stop. The only vehicle-facing calls are Scout's own
+   mission-execution transactions. Stop in particular sends no LOITER, no mission upload, no
+   rewind, no replan reset, no experiment clear and no rearm — Scout does all of it.
 
 WHAT IT IS NOT: a second mission-execution FSM. Every lifecycle fact reported here is Scout's
 own canonical status or the body Scout returned; nothing is inferred, defaulted or rounded up.
@@ -138,6 +141,21 @@ def _text(value):
         parts = [f"{k}={_text(v)}" for k, v in value.items() if _text(v) is not None]
         return " · ".join(parts) or None
     return str(value)
+
+
+def _error_code(value):
+    """Scout's machine error CODE from a structured error, or the string it sent. Distinct from
+    _text, which prefers the human message — the code is the part the operator quotes and acts
+    on, so it must survive on its own."""
+    if isinstance(value, dict):
+        for key in ("code", "error_code", "error"):
+            got = value.get(key)
+            if isinstance(got, str) and got.strip():
+                return got.strip()
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
 
 
 def _phase(name, status, detail=None, **extra):
@@ -306,8 +324,9 @@ def binding_view(summary):
 
     `blocks_new_mission` is the one derived bit, and it is deliberately narrow: a newly uploaded
     mission must NOT be shown as ready while Scout says the PREVIOUS run still owns the vehicle.
-    The Operator does not offer a way out of that — Scout has no Stop, and inventing one here
-    would be a second lifecycle. The operator finishes or explicitly rearms the active run."""
+    Every way out of that is one SCOUT owns — let the run finish, abort it with Scout's own Stop,
+    or explicitly rearm the controller. Nothing here is emulated locally; inventing a fourth
+    remedy would be a second lifecycle."""
     state = summary.get("binding_state")
     code = summary.get("package_conflict_code")
     if not state and not code:
@@ -318,8 +337,8 @@ def binding_view(summary):
     message = None
     if blocks:
         message = ("A new mission was uploaded while another mission is active on this vehicle. "
-                   "Finish the active mission, or explicitly terminate/rearm it, before starting "
-                   "the new one.")
+                   "Finish the active mission, stop it, or rearm the mission controller before "
+                   "starting the new one.")
         detail = _text(conflict.get("message") or conflict.get("detail"))
         if detail:
             message = f"{message} Scout reports: {detail}"
@@ -834,76 +853,167 @@ def _verify_state(base, result, *, expected, expected_mode, operation):
 
 
 # ── STOP ──────────────────────────────────────────────────────────────────────────────────
+# SCOUT OWNS THE WHOLE STOP TRANSACTION. It is a SAFE ABORT, not a raw Pixhawk stop and not a
+# mission deletion: verified LOITER → verify the active mission identity → restore the immutable
+# original mission if a verified revised route is installed → rewind the original to its start →
+# verify the rewind → reset mission-execution / replan / test state → clear the simulated
+# experiment injection → invalidate the prior runtime Home → return supervisory authority to
+# OPERATOR → re-prove the mission evidence.
+#
+# EVERYTHING THIS OPERATOR-SIDE TRANSACTION DOES is: forward the intent with the active persisted
+# mission id, re-read canonical status, and report Scout's own evidence. It sends NO LOITER, NO
+# mission upload, NO rewind, NO replan reset, NO experiment clear, NO rearm and — the change from
+# the previous contract — NO authority write. Scout hands authority back itself; the Operator
+# OBSERVES that hand-off by read-back and says plainly when it cannot confirm it.
 def run_stop(deps, vid, base, vid_slug):
-    """Stop: END the run, then return OPERATOR authority ONLY after Scout reports STOPPED with
-    a verified LOITER.
-
-    Scout does not implement this route yet, so today this reliably answers `unsupported` and
-    changes NOTHING — no authority move, no vehicle command, no fabricated terminal state. The
-    transaction is written against the contract in SCOUT_STOP_API.md so that shipping the Scout
-    side is the only remaining step."""
+    """Stop: ONE Scout transaction, forwarded and evidenced. The Operator reimplements no part
+    of the sequence and writes no authority of its own."""
     env = _envelope("stop", vid_slug)
-    env["authority"]["required"] = AUTHORITY_LOCAL_AGENT
+    # Stop RETURNS authority; it does not require the Operator to hold or take any. The required
+    # value is stated as the END state so the response reads honestly rather than claiming the
+    # Local Agent must keep the wheel through an abort.
+    env["authority"]["required"] = AUTHORITY_OPERATOR
     mission_id = deps.active_mission_id(vid)
     env["mission_id"] = env["requested_mission_id"] = mission_id
     before = deps.get_authority(vid) or {}
     env["authority"]["before"] = env["authority"]["after"] = _authority_value(before)
+    env["stop"] = mx.stop_evidence({})
 
     result = _run_operation(env, base, "stop", lambda b: mx.post_stop(b, mission_id),
                             mission_id=mission_id)
+    # Scout's evidence from the operation body, when it carried any. The verification phase below
+    # replaces it with the canonical status' block whenever that one is reported.
+    if isinstance(result.get("stop"), dict) and result["stop"].get("reported"):
+        env["stop"] = result["stop"]
+
     if result.get("operational_outcome") == mx.OUTCOME_UNSUPPORTED:
         env["supported"] = False
         # Replace the transport's generic "route not implemented" with the operator-facing
         # sentence: what is missing, and — just as importantly — what is NOT an acceptable
         # substitute for it. The generic string invites someone to improvise one.
-        env["error"] = ("This Scout does not implement POST /agent/mission_execution/stop yet. "
-                        "Stop is unavailable — it is not emulated from a low-level LOITER, and "
-                        "Rearm is not a substitute. Pause holds the mission without ending it.")
+        env["error"] = ("This Scout does not implement POST /agent/mission_execution/stop. "
+                        "Stop is unavailable — it is not emulated from a low-level LOITER, the "
+                        "raw Pixhawk stop is not offered, and Rearm is not a substitute. Pause "
+                        "holds the mission without ending it.")
         env["error_code"] = "STOP_NOT_SUPPORTED"
+        env["phases"].append(_phase(PHASE_VERIFY, SKIPPED,
+                                    "Nothing was stopped — there is no evidence to verify",
+                                    verified=None))
         env["phases"].append(_phase(PHASE_RESTORE, SKIPPED,
                                     "No authority change — nothing was stopped", restored=False))
         return env
 
-    env["phases"].append(_return_operator_after_stop(deps, vid, base, result))
+    verify, evidence = _verify_stop(base, result)
+    if evidence.get("reported"):
+        env["stop"] = evidence
+    env["phases"].append(verify)
+    env["phases"].append(_observe_authority_after_stop(deps, vid, result, evidence, verify))
+    env["authority"]["after"] = (env["phases"][-1].get("observed")
+                                 or env["authority"]["after"])
     return env
 
 
-def _return_operator_after_stop(deps, vid, base, result):
-    """The authority half of Stop. The bar is Scout's own terminal evidence: state STOPPED (or
-    CANCELLED) AND a verified final LOITER. Anything short of that — a stop still working its
-    way through STOP_HOLD_REQUESTED, an unknown outcome, a run still going — leaves authority
-    with the Local Agent and says so. Take Control remains the operator's explicit override."""
+def _verify_stop(base, result):
+    """Re-read Scout's CANONICAL status after an accepted Stop and report its own evidence.
+
+    Returns (phase, evidence). This phase VERIFIES; it never repairs. If the rewind was not
+    verified, or the original mission could not be restored, that is reported exactly as Scout
+    stated it — the Operator does not follow it with a Rearm, a Resume, an AUTO, a re-upload or
+    a second Stop, because each of those would be this station inventing a recovery for a vehicle
+    whose state only Scout can describe.
+
+    A successful Stop normally rests in NOT_READY with start_eligible / authority_blocks_start
+    true. That is the EXPECTED landing, not a failure, and is reported as such."""
     outcome = result.get("operational_outcome")
+    empty = mx.stop_evidence({})
     if outcome not in (mx.OUTCOME_ACCEPTED, mx.OUTCOME_UNKNOWN):
-        return _phase(PHASE_RESTORE, SKIPPED,
-                      "The stop was not accepted — authority is unchanged", restored=False)
+        return (_phase(PHASE_VERIFY, SKIPPED,
+                       "The stop was not accepted — there is nothing to verify", verified=None),
+                empty)
 
     summary = mx.summarize_status(mx.get_status(base))
     if not summary.get("present"):
-        return _phase(PHASE_RESTORE, WITHHELD,
-                      "Scout status could not be read after the stop — authority stays with the "
-                      "Local Agent until STOPPED and a verified LOITER are confirmed.",
-                      restored=False)
+        return (_phase(PHASE_VERIFY, WITHHELD,
+                       "Scout accepted the stop but its status could not be read back — the "
+                       "reset is UNCONFIRMED and nothing about it is assumed",
+                       verified=False, observed_state=None, observed_mode=None), empty)
+
+    ev = summary.get("stop") or empty
     state = (summary.get("state") or "").upper()
     mode = (summary.get("mode") or summary.get("verified_mode") or "").upper()
-    loiter_verified = mode == "LOITER"
-    if state not in mx.STOPPED_STATES:
-        return _phase(PHASE_RESTORE, WITHHELD,
-                      f"Scout reports {state or 'no state'} — authority is returned only once "
-                      f"Scout reports STOPPED with a verified LOITER.",
-                      restored=False, observed_state=state or None, observed_mode=mode or None)
-    if not loiter_verified:
-        return _phase(PHASE_RESTORE, WITHHELD,
-                      f"Scout reports {state} but the vehicle mode is {mode or 'unreported'}, "
-                      f"not a verified LOITER — authority stays with the Local Agent.",
-                      restored=False, observed_state=state, observed_mode=mode or None)
+    held = ev.get("hold_verified") is True or mode == "LOITER"
+    proven = [k for k in ("hold_verified", "rewind_verified", "replan_reset",
+                          "experiment_cleared") if ev.get(k) is True]
+    gaps = [k for k in ("hold_verified", "rewind_verified") if ev.get(k) is False]
 
-    restored = acquire_authority(deps, vid, AUTHORITY_OPERATOR)
-    return _phase(PHASE_RESTORE, restored["status"],
-                  (f"Scout reports {state} with a verified LOITER — OPERATOR authority restored."
-                   if restored["status"] == OK else restored.get("detail")),
-                  restored=restored["status"] == OK, observed=restored.get("observed"),
-                  observed_state=state, observed_mode=mode)
+    # SUSPENDED is Scout's documented FAILURE landing for a stop that got past the safe hold.
+    # The vehicle is being held; the reset is incomplete; the operator sees Scout's own code.
+    if state == "SUSPENDED":
+        # Scout's CODE first, then its message. `_text` on a {code, message} prefers the prose,
+        # and the code is the part an operator quotes, searches for and acts on — losing it
+        # turns a specific failure (STOP_REWIND_NOT_VERIFIED) into an anonymous sentence.
+        code = _error_code(summary.get("last_error")) or _text(ev.get("outcome"))
+        message = _text(summary.get("last_error"))
+        why = " — ".join(dict.fromkeys(p for p in (code, message) if p)) \
+            or "the reset did not complete"
+        return (_phase(PHASE_VERIFY, FAILED,
+                       f"Scout reports SUSPENDED after the stop: {why}"
+                       + (" — the vehicle is being HELD in LOITER and the reset is incomplete"
+                          if held else ""),
+                       verified=False, observed_state=state, observed_mode=mode or None,
+                       held_in_loiter=held, scout_error_code=code, stop=ev), ev)
+
+    ok = (ev.get("ready_for_start") is True
+          or mx._is_success_outcome(ev.get("outcome"))
+          or (state in mx.PRE_START_STATES and not gaps))
+    detail = (f"Scout reports {state or 'no state'} in mode {mode or 'unreported'}"
+              + (f" — {', '.join(proven)}" if proven else "")
+              + ("; a NEW Start is eligible (authority is back with the OPERATOR)"
+                 if summary.get("start_eligible") is True else ""))
+    if not ok:
+        detail = (f"Scout accepted the stop but reports {state or 'no state'} in mode "
+                  f"{mode or 'unreported'} — the reset is not confirmed"
+                  + (f" ({', '.join(gaps)} = false)" if gaps else ""))
+    return (_phase(PHASE_VERIFY, OK if ok else WITHHELD, detail,
+                   verified=ok, observed_state=state or None, observed_mode=mode or None,
+                   held_in_loiter=held, start_eligible=summary.get("start_eligible"),
+                   authority_blocks_start=summary.get("authority_blocks_start"), stop=ev), ev)
+
+
+def _observe_authority_after_stop(deps, vid, result, evidence, verify):
+    """OBSERVE — never perform — the authority hand-off Scout's Stop transaction makes itself.
+
+    Scout returns supervisory authority to OPERATOR as one of its own steps, so this phase reads
+    authority back and reports what it found. It issues NO authority write: doing so would be the
+    Operator reimplementing a step of Scout's transaction, and a hand-off this station performed
+    would prove nothing about the one Scout was supposed to make. When the read-back disagrees
+    with Scout's `authority_after`, that disagreement is stated rather than papered over — Take
+    Control remains the operator's explicit manual override."""
+    outcome = result.get("operational_outcome")
+    if outcome not in (mx.OUTCOME_ACCEPTED, mx.OUTCOME_UNKNOWN):
+        return _phase(PHASE_RESTORE, SKIPPED,
+                      "The stop was not accepted — authority is unchanged",
+                      restored=False, observed=_authority_value(deps.get_authority(vid) or {}))
+
+    observed = _authority_value(deps.get_authority(vid) or {})
+    claimed = (evidence.get("authority_after") or "").upper() or None
+    if observed == AUTHORITY_OPERATOR:
+        return _phase(PHASE_RESTORE, OK,
+                      "Scout returned supervisory authority to the OPERATOR as part of its stop "
+                      "transaction; the Operator read it back and confirmed it. The next Start "
+                      "hands authority to the Local Agent again.",
+                      restored=True, observed=observed, claimed=claimed, written=False)
+    if claimed == AUTHORITY_OPERATOR:
+        return _phase(PHASE_RESTORE, WITHHELD,
+                      f"Scout reports it returned authority to OPERATOR, but the read-back says "
+                      f"{observed or 'unknown'}. The Operator does not write authority as part of "
+                      f"a stop — use Take Control explicitly if you need the wheel.",
+                      restored=False, observed=observed, claimed=claimed, written=False)
+    return _phase(PHASE_RESTORE, WITHHELD,
+                  f"Authority reads back as {observed or 'unknown'} after the stop. Scout owns "
+                  f"the hand-off and the Operator does not perform it — use Take Control "
+                  f"explicitly if you need the wheel.",
+                  restored=False, observed=observed, claimed=claimed, written=False)
 
 
 # ── HTTP status for a transaction envelope ────────────────────────────────────────────────

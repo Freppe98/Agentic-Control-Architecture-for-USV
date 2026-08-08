@@ -47,21 +47,23 @@ const envelope = (over = {}) => ({
 const S = (over) => normalizeStatus(envelope(over));
 
 // ── A. Every Scout state is known, and the overlay is not one of them ───────────────────
-test("every Scout mission-execution state, including the pending STOP sequence, is known", () => {
-  // The STOP states are part of the contract the Operator is written against even though Scout
-  // has not shipped the endpoint yet (SCOUT_STOP_API.md); an unknown state would be displayed
-  // raw and flagged, which is the wrong answer for a state we do know the meaning of.
+test("every Scout mission-execution state, including the whole STOP sequence, is known", () => {
+  // A state the build does not recognize is displayed raw and flagged. That is the right answer
+  // for a state we have never heard of and the WRONG one for a step of Scout's own stop
+  // transaction, which the operator must be able to read as progress.
   for (const s of ["NOT_READY", "NOT_STARTED", "READY", "START_REQUESTED",
     "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME", "VERIFYING_HOME",
     "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "RUNNING", "PAUSE_REQUESTED", "PAUSED",
     "RESUME_REQUESTED", "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
+    "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+    "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET",
     "STOPPED", "CANCELLED", "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED",
     "COMPLETED_HOLD", "SUSPENDED", "FAILED"]) {
     assert.ok(STATES.includes(s), s);
     assert.equal(isUnknownState(s), false, s);
     assert.notEqual(stateLabel(s), "Unknown", s);
   }
-  assert.equal(STATES.length, 25);
+  assert.equal(STATES.length, 31);
 });
 
 test("REPLANNING is an effective-state OVERLAY, never a stored state", () => {
@@ -510,10 +512,10 @@ test("Stop is a real, separate operation — never Pause wearing Stop's label", 
   assert.doesNotMatch(vehicleSrc, /Stop Mission/i);     // never a vehicle-page mode command
   // Stop is never implemented as a LOITER command, and Rearm is never routed to it.
   const stopWiring = mapSrc.slice(mapSrc.indexOf("async function onMissionAction"),
-    mapSrc.indexOf("async function onMissionAction") + 3000);
+    mapSrc.indexOf("async function onMissionAction") + 4200);
   assert.doesNotMatch(stopWiring, /SET_MODE_LOITER/);
-  assert.match(stopWiring, /action === "stop"[\s\S]{0,900}api\.stopMissionExecution\(id\)/);
-  assert.match(stopWiring, /action === "rearm"[\s\S]{0,900}api\.rearmMissionExecution\(id\)/);
+  assert.match(stopWiring, /action === "stop"[\s\S]{0,1600}api\.stopMissionExecution\(id\)/);
+  assert.match(stopWiring, /action === "rearm"[\s\S]{0,1600}api\.rearmMissionExecution\(id\)/);
 });
 
 test("the Agent page implements Start as ONE Scout call, not LOITER → Set Home → AUTO", () => {

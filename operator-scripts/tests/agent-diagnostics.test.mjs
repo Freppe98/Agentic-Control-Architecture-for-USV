@@ -22,6 +22,7 @@ import { asText, textOr, esc } from "../operator/lib/format.js";
 import {
   normalizeStatus, startBlockers, transactionSummary, operationSummary, missionCardView,
   primaryAction, startFailure, lifecycleControls, errorText,
+  stopOutcomeView, stopEvidenceDetail,
 } from "../operator/lib/mission-execution.js";
 import { normalizeReplanStatus, triggerLatch, cooldownView } from "../operator/lib/replan.js";
 
@@ -195,4 +196,90 @@ test("a supervisory 'no mission' claim beside a live mission raises the contradi
   assert.match(agentSrc, /const contradiction = claimsNoMission && mxLive/);
   // The note must say which subsystem answers the question, not merely that they differ.
   assert.match(agentSrc, /The mission IS running/);
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// E. Stop Mission evidence — every field readable, none of them "[object Object]"
+//
+// Scout's `stop` block is twelve fields of mixed type: booleans, hashes, a sequence number, an
+// authority name and an outcome word. Two of them (outcome, authority_after) can legitimately
+// arrive STRUCTURED, and a bare `${value}` on one of those is precisely how the literal text
+// "[object Object]" got into the slot where an operator reads the verdict of an abort.
+// ════════════════════════════════════════════════════════════════════════════════════════
+const STOP_FULL = {
+  hold_verified: true, original_restored: true,
+  active_hash_before: "sha256:aaaaaaaaaaaaaaaa", original_hash: "sha256:bbbbbbbbbbbbbbbb",
+  revised_hash: "sha256:cccccccccccccccc", rewind_verified: true, sequence_after: 0,
+  replan_reset: true, experiment_cleared: true, authority_after: "OPERATOR",
+  ready_for_start: true, outcome: "STOPPED",
+};
+
+test("the Agent page renders a Stop Mission evidence section with every documented field", () => {
+  assert.match(agentSrc, /function mxStopCard/);
+  assert.match(agentSrc, /Stop Mission \(Scout safe-abort evidence\)/);
+  for (const label of ["Hold verified", "Original restored", "Active hash before",
+    "Original hash", "Revised hash", "Rewind verified", "Sequence after", "Replan reset",
+    "Experiment cleared", "Authority after", "Ready for Start", "Outcome"]) {
+    assert.ok(agentSrc.includes(`row("${label}"`), `missing Stop evidence row: ${label}`);
+  }
+});
+
+test("the Stop evidence rows never interpolate a Scout value raw", () => {
+  const card = agentSrc.slice(agentSrc.indexOf("function mxStopCard"),
+    agentSrc.indexOf("function mxControlCard"));
+  assert.ok(card.length > 0);
+  // Every value goes through val() (asText), rp()/flag() (fixed labels) or shortHash().
+  assert.doesNotMatch(card, /\$\{e\.(outcome|sequenceAfter|authorityAfter)\}/);
+  assert.doesNotMatch(card, /String\(e\./);
+});
+
+test("a structured outcome / authority renders its own content, never [object Object]", () => {
+  const S = normalizeStatus({ scout: { state: "NOT_READY", mode: "LOITER",
+    stop: { ...STOP_FULL, outcome: { code: "STOPPED", message: "reset complete" },
+      authority_after: { value: "OPERATOR", source: "scout" } } } });
+  assertNoObjectObject(S.stop, "normalized stop evidence");
+  assertNoObjectObject(stopEvidenceDetail(S.stop), "stop evidence detail");
+  assertNoObjectObject(stopOutcomeView(S), "stop outcome view");
+  assert.match(stopEvidenceDetail(S.stop), /STOPPED/);
+});
+
+test("a fully-reported Stop renders every field with no coercion anywhere", () => {
+  const S = normalizeStatus({ scout: { state: "NOT_READY", mode: "LOITER",
+    start_eligible: true, authority_blocks_start: true, stop: STOP_FULL } });
+  assertNoObjectObject(missionCardView(S, {}), "mission card after a stop");
+  assertNoObjectObject(stopOutcomeView(S), "stop outcome");
+  assert.equal(stopOutcomeView(S).ok, true);
+});
+
+test("a failed Stop's evidence and error render readably", () => {
+  const S = normalizeStatus({ scout: { state: "SUSPENDED", mode: "LOITER",
+    last_error: { code: "STOP_RESTORE_HASH_MISMATCH", detail: { expected: "a", got: "b" } },
+    stop: { hold_verified: true, original_restored: false, rewind_verified: false,
+      outcome: "STOP_RESTORE_HASH_MISMATCH" } } });
+  const out = stopOutcomeView(S, null);
+  assertNoObjectObject(out, "failed stop outcome");
+  assert.equal(out.ok, false);
+  assertNoObjectObject(lifecycleControls(S, {}), "controls in SUSPENDED");
+  // Scout's code has readable operator text, and the code itself is always shown alongside it.
+  assert.notEqual(errorText("STOP_RESTORE_HASH_MISMATCH"), "STOP_RESTORE_HASH_MISMATCH");
+  assert.notEqual(errorText("STOP_REWIND_NOT_VERIFIED"), "STOP_REWIND_NOT_VERIFIED");
+  assert.notEqual(errorText("STOP_ACTIVE_MISSION_UNKNOWN"), "STOP_ACTIVE_MISSION_UNKNOWN");
+  assert.notEqual(errorText("STOP_RESTORE_UPLOAD_FAILED"), "STOP_RESTORE_UPLOAD_FAILED");
+});
+
+test("the Stop evidence section is withheld entirely when Scout reports none", () => {
+  const card = agentSrc.slice(agentSrc.indexOf("function mxStopCard"),
+    agentSrc.indexOf("function mxControlCard"));
+  assert.match(card, /if \(!e\.reported && !lastStop\) return "";/);
+});
+
+test("the diagnostics page states the expected NOT_READY landing rather than a fault", () => {
+  const card = agentSrc.slice(agentSrc.indexOf("function mxStopCard"),
+    agentSrc.indexOf("function mxControlCard"));
+  assert.match(card, /NOT_READY/);
+  assert.match(card, /start_eligible=true/);
+  assert.match(card, /authority_blocks_start=true/);
+  assert.match(card, /that is expected/i);
+  // …and it says the station runs no automatic recovery after a failed Stop.
+  assert.match(card, /does not follow this with a Rearm, a Resume, an AUTO or a second Stop/);
 });

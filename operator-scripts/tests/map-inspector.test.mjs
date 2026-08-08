@@ -287,15 +287,15 @@ test("an unavailable Scout status reads STATUS UNAVAILABLE with a short tooltip"
   assert.deepEqual(card.rows, []);
 });
 
-test("an unsupported Stop reads as one short line, with the endpoint detail on hover", () => {
-  const card = missionCardView(S({ state: "RUNNING", can_start: false, can_pause: true }));
-  assert.equal(card.blocker.text, "Stop unavailable on this Scout");
-  assert.match(card.blocker.title, /does not implement POST \/agent\/mission_execution\/stop/);
-  assert.match(card.blocker.title, /not emulated from a LOITER command/);
-  // Stop itself is still SHOWN, disabled — never hidden and never faked.
+test("a Stop Scout refuses right now reads as ONE short line, with its reason on hover", () => {
+  const card = missionCardView(S({ state: "RUNNING", can_start: false, can_pause: true,
+    can_stop: false }));
+  // Stop is still SHOWN, disabled — never hidden, so the operator can see WHY it is unavailable.
   const stop = card.buttons.find((b) => b.action === "stop");
   assert.ok(stop);
   assert.equal(stop.enabled, false);
+  assert.equal(card.blocker.text, "Scout reports can_stop=false in RUNNING");
+  assert.match(card.blocker.title, /can_stop=false/);
 });
 
 test("only ONE blocker is ever shown, even when several things are wrong at once", () => {

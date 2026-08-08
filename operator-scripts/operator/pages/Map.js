@@ -1019,8 +1019,30 @@ export function Map(root) {
       // The authority display is part of the SAME operation, so refresh it here rather than
       // waiting up to 2 s for the next poll to reveal who ended up holding the wheel.
       loadAuthority(id);
+      // A STOP rewrites what the flight controller carries: Scout restores the immutable original
+      // mission when a verified revised route was installed, and rewinds the sequence to its
+      // start. The overlay, the active-waypoint marker and the progress readout must therefore be
+      // re-read from ground truth rather than left showing the revised route at the waypoint the
+      // run had reached. "stop" is a FORCE reason in lib/mission-refresh.js, so this downloads
+      // even when the cached geometry identity looks unchanged.
+      //
+      // The map is deliberately NOT recentred: refreshMission redraws the overlay in place, and
+      // moving the operator's view under them because a mission ended is its own small hazard.
+      if (stopChangedTheVehicleMission(action, mission.result)) {
+        refreshController.refreshMission(id, "stop");
+      }
       renderInspector();
     });
+  }
+
+  /** Whether a finished STOP means the route on the flight controller may have changed. True for
+   *  any accepted (or unconfirmed-but-possibly-applied) stop: Scout restores and rewinds inside
+   *  its own transaction, and the operator does not get to assume it did not. A stop the backend
+   *  BLOCKED, or one Scout does not support, changed nothing and forces no download. */
+  function stopChangedTheVehicleMission(action, result) {
+    if (action !== "stop" || !result || !result.view) return false;
+    const o = result.view.outcome;
+    return o === mx.OUTCOME.ACCEPTED || o === mx.OUTCOME.UNKNOWN || o === mx.OUTCOME.FAILED;
   }
 
   // Command queue + history for the selected vehicle (the reverse/control path). Used
@@ -1329,11 +1351,19 @@ export function Map(root) {
     });
     const rv = readinessView(gate, { refreshing: mission.refreshing && pfFor });
     // A START issued from this station, as distinct from any other transaction — it is the one
-    // with phase-specific operator copy.
+    // with phase-specific operator copy. A STOP likewise: it has its own five-phase progression
+    // (Stopping mission… → Holding position… → Restoring original mission… → Rewinding mission…
+    // → Verifying reset…) and its own completed-state presentation.
     const starting = mission.busy && !!res && res.action === "start";
+    const stopping = mission.busy && !!res && res.action === "stop";
+    // The last completed STOP transaction on this vehicle, so the card can show the abort's own
+    // outcome. Scout's status `stop` block is the primary evidence; this only adds the verdict of
+    // the operation the operator actually pressed.
+    const stopResult = res && res.action === "stop" && res.view.outcome !== "pending"
+      ? res.view : null;
     const card = mx.missionCardView(S, {
       busy: mission.busy, startBlocked: !gate.canStart, startBlockedReason: gate.reason,
-      readiness: rv, starting, preflight: pf,
+      readiness: rv, starting, stopping, stopResult, preflight: pf,
       // Home comes from Scout's own continuously-reported home_status (lib/home.js), which is a
       // better source than the mission-execution status' verified_home block.
       homeVerified: homeStatus(v).verified,
@@ -1392,6 +1422,27 @@ export function Map(root) {
       ? `<div class="amx-note${card.completionNote.tone === "warn" ? " warn" : ""}" title="${escAttr(card.completionNote.title || "")}">${esc(card.completionNote.text)}</div>`
       : "";
 
+    // A FINISHED Stop, in its own block.
+    //
+    // SUCCESS is a short list of PROVEN claims — held in LOITER, original mission restored, reset
+    // to its start, execution/replan test state cleared, operator authority restored, ready for a
+    // new Start. Scout normally lands this in state NOT_READY with start_eligible=true and
+    // authority_blocks_start=true, which is EXPECTED (authority is deliberately back with the
+    // operator) and is deliberately NOT rendered as a mission failure — the Start button above
+    // stays available, because the Start transaction is what hands authority back.
+    //
+    // FAILURE shows Scout's exact code and says what is true of the vehicle: it is being held in
+    // LOITER and the reset is incomplete. Nothing is retried automatically.
+    const stopOut = card.stopOutcome
+      ? `<div class="amx-result ${card.stopOutcome.ok ? "ok" : "warn"}" title="${escAttr(card.stopOutcome.detail || "")}">
+           <b>${esc(card.stopOutcome.title)}</b>${card.stopOutcome.ok
+             ? (card.stopOutcome.lines.length
+                 ? `<div class="amx-stop-lines">${card.stopOutcome.lines.map((l) => `<div>${esc(l)}</div>`).join("")}</div>`
+                 : "")
+             : `: ${esc(card.stopOutcome.text)}${card.stopOutcome.code ? ` <span class="mono">${esc(card.stopOutcome.code)}</span>` : ""}`}
+         </div>`
+      : "";
+
     // A NEW mission uploaded while the previous run still owns the vehicle. Stated in full — it
     // is the one situation where the operator has just done something and nothing appears to
     // have happened, so the short-line discipline would cost more than it saves.
@@ -1435,7 +1486,10 @@ export function Map(root) {
     // The card's state itself is unaffected either way: it comes from the next authoritative
     // status poll, never from this line.
     const unverified = !!res && res.view.outcome === "accepted" && res.view.verified === false;
-    const resultNote = startFail
+    // A Stop whose outcome already has its own block above does not get a second one-word line.
+    const stopHandled = !!card.stopOutcome && !!res && res.action === "stop"
+      && res.view.outcome !== "pending";
+    const resultNote = stopHandled ? "" : startFail
       ? `<div class="amx-result warn" title="${escAttr([startFail.detail, mx.transactionSummary(res.view)].filter(Boolean).join(" — "))}">
            <b>${esc(startFail.title)}</b>: ${esc(startFail.text)}
          </div>`
@@ -1445,7 +1499,7 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${progress}${buttons}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${info}${resultNote}</div>`;
+    return `<div class="amx">${head}${rows}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation
@@ -1454,12 +1508,15 @@ export function Map(root) {
     start: "Start the mission: the operator station transfers control authority to the Local " +
       "Agent and verifies it, then Scout holds position, sets and verifies Home at the launch " +
       "position, synchronizes the planning package and starts AUTO.",
-    pause: "Pause the mission: Scout records the sequence and commands a verified LOITER. " +
-      "Control authority stays with the Local Agent.",
-    resume: "Resume the mission from the paused waypoint. Authority is re-acquired and " +
-      "verified only if it was lost.",
-    stop: "End the mission run. Control authority returns to the operator only after Scout " +
-      "reports STOPPED with a verified LOITER.",
+    pause: "Pause — a TEMPORARY hold. Scout records the execution position and commands a " +
+      "verified LOITER; the mission stays loaded and Resume continues the SAME run from where " +
+      "it stopped. Control authority stays with the Local Agent.",
+    resume: "Resume the mission from the paused waypoint — the same run continues. Authority " +
+      "is re-acquired and verified only if it was lost.",
+    stop: "Stop — a SAFE ABORT, not a mission deletion. Scout holds the vehicle in a verified " +
+      "LOITER, restores the original mission if a revised route is installed, rewinds it to the " +
+      "beginning, clears the execution and replan test state and returns control authority to " +
+      "you, ready for a clean new Start. Nothing is disarmed and no mission is deleted.",
     rearm: "Prepare the Local Agent's mission-execution controller for another run. Issues no " +
       "vehicle command, changes no mode, clears no Pixhawk mission.",
     "take-control": "Take Control — request OPERATOR authority as an explicit manual override.",
@@ -1662,11 +1719,16 @@ export function Map(root) {
     if (action === "stop") {
       const ok = await confirmModal({
         title: "Stop Mission?",
-        bodyHtml: `<p>End the mission run on <b>${esc(vname)}</b>.</p>
-          <p>Scout holds position and settles in STOPPED. This does <b>not</b> disarm the
-          vehicle, clear the Pixhawk mission, delete the planning package or invoke RTL.</p>
-          <p>Control authority returns to you only once Scout reports STOPPED with a verified
-          LOITER.</p>`,
+        bodyHtml: `<p><b>Safe abort</b> of the mission run on <b>${esc(vname)}</b>. This is
+          <b>not</b> a mission deletion.</p>
+          <p>Scout holds the vehicle in a verified <b>LOITER</b>, restores the <b>original
+          mission</b> if a revised route is installed, <b>rewinds it to the beginning</b>, clears
+          the execution and replan test state and returns <b>control authority to you</b> —
+          leaving a clean new Start available.</p>
+          <p>It does <b>not</b> disarm the vehicle, clear the Pixhawk mission, delete the planning
+          package or invoke RTL.</p>
+          <p>To hold the vehicle temporarily and continue the same run afterwards, use
+          <b>Pause</b> instead.</p>`,
         cancelLabel: "Cancel", confirmLabel: "Stop Mission",
       });
       if (!ok) return;

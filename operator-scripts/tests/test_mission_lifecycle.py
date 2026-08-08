@@ -16,8 +16,9 @@ operation — which is only safe if every one of the following holds:
   • authority returns to OPERATOR after a failed Start ONLY on proof: a definite pre-action
     refusal AND a canonical status read showing Scout resting in a pre-start state;
   • Pause keeps LOCAL_AGENT; Resume re-acquires it only if it was lost;
-  • Stop returns OPERATOR only once Scout reports STOPPED with a verified LOITER, and an
-    unsupported Scout Stop changes nothing at all.
+  • Stop is Scout's OWN safe-abort transaction: the Operator forwards one intent, writes no
+    authority of its own, reimplements no step of the sequence, preserves Scout's evidence
+    verbatim, and treats the NOT_READY + start_eligible landing as the expected success it is.
 
 Every Scout HTTP call is mocked by swapping `scout_replan.requests`; the authority proxy is
 mocked at main.read_control_authority / main.apply_control_authority, which are the two seams
@@ -532,11 +533,236 @@ class TestPauseResume(LifecycleTestCase):
         self.assertEqual([u for u in self.fake.urls("POST") if u.endswith("/resume")], [])
 
 
-# ── 6. Stop (pending on Scout — SCOUT_STOP_API.md) ──────────────────────────────────────
+# ── 6. Stop — Scout's own safe-abort transaction, forwarded and evidenced ────────────────
+#
+# The contract this pins, and why each half matters:
+#
+#   Scout owns the WHOLE sequence — verified LOITER, verify the active mission identity, restore
+#   the immutable original mission when a verified revised route is installed, rewind it to its
+#   start, verify the rewind, reset execution/replan/test state, clear the experiment injection,
+#   invalidate the runtime Home, return supervisory authority to OPERATOR, re-prove the evidence.
+#
+#   The OPERATOR forwards ONE intent and re-reads status. It sends no LOITER, no upload, no
+#   rewind, no reset, no rearm and — the change from the previous contract — NO AUTHORITY WRITE.
+#   A hand-off this station performed would prove nothing about the one Scout was supposed to
+#   make, so the authority phase READS IT BACK and reports what it found.
+STOP_OK_EVIDENCE = {
+    "hold_verified": True, "original_restored": True,
+    "active_hash_before": "sha256:revised", "original_hash": "sha256:aaa",
+    "revised_hash": "sha256:revised", "rewind_verified": True, "sequence_after": 0,
+    "replan_reset": True, "experiment_cleared": True, "authority_after": "OPERATOR",
+    "ready_for_start": True, "outcome": "STOPPED",
+}
+
+
+def stopped_status(**over):
+    """Scout's canonical status AFTER a successful stop: the run is over, the vehicle is holding,
+    the original mission is rewound, and authority is deliberately back with the OPERATOR — which
+    is exactly why the state is NOT_READY with start_eligible true and authority_blocks_start
+    true. That combination is the EXPECTED landing, not a failure."""
+    body = status_body(
+        state="NOT_READY", effective_state="NOT_READY", mode="LOITER",
+        can_start=False, can_pause=False, can_resume=False, can_stop=False,
+        start_eligible=True, execution_ready=False, authority_blocks_start=True,
+        authority_status="OPERATOR",
+        sequence={"current": 0, "count": 10, "continuation_verified": None},
+        stop=dict(STOP_OK_EVIDENCE))
+    body.update(over)
+    return body
+
+
 class TestStop(LifecycleTestCase):
+    # -- the proxy itself ------------------------------------------------------------------
+    def test_stop_proxies_to_scouts_stop_route_with_the_active_mission_id(self):
+        self.authority = "LOCAL_AGENT"
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER",
+                                             stop=dict(STOP_OK_EVIDENCE)), 200))
+        r = self.post("stop")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(f"{SCOUT_BASE}/agent/mission_execution/stop", self.fake.urls("POST"))
+        sent = [b for (m, u, b) in self.fake.calls if u.endswith("/mission_execution/stop")][0]
+        self.assertEqual(sent, {"mission_id": MISSION_ID})
+
+    def test_the_operator_reimplements_no_part_of_the_stop_sequence(self):
+        """ONE POST leaves this station. No LOITER, no upload, no rewind, no reset, no rearm, no
+        RTL, no disarm, no planning-package write — and nothing through the command queue."""
+        self.authority = "LOCAL_AGENT"
+        before = len(main.commands)
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER",
+                                             stop=dict(STOP_OK_EVIDENCE)), 200))
+        self.post("stop")
+        self.assertEqual(len(main.commands), before, "no queued command")
+        self.assertEqual(self.fake.urls("POST"),
+                         [f"{SCOUT_BASE}/agent/mission_execution/stop"])
+        for forbidden in ("rtl", "disarm", "loiter", "mission_clear", "mission_upload",
+                          "planning_package", "rearm", "reset", "experiment", "nav/stop"):
+            self.assertFalse(any(forbidden in u for u in self.fake.urls()), forbidden)
+
+    def test_stop_writes_no_authority_of_its_own(self):
+        """Scout returns authority as part of ITS transaction. The Operator observes; it does not
+        perform the hand-off, and it does not 'help' by writing OPERATOR itself."""
+        self.authority = "OPERATOR"        # Scout already handed it back
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER",
+                                             stop=dict(STOP_OK_EVIDENCE)), 200))
+        d = self.post("stop").json()
+        self.assertEqual(self.authority_writes, [], "the Operator writes no authority for a stop")
+        restore = self.phase(d, ml.PHASE_RESTORE)
+        self.assertEqual(restore["status"], ml.OK)
+        self.assertIs(restore["restored"], True)
+        self.assertIs(restore["written"], False)
+        self.assertEqual(restore["observed"], "OPERATOR")
+        self.assertEqual(d["authority"]["after"], "OPERATOR")
+
+    def test_a_disagreeing_authority_readback_is_stated_not_papered_over(self):
+        """Scout claims it returned authority; the read-back says otherwise. The Operator reports
+        the disagreement and STILL writes nothing — Take Control is the explicit override."""
+        self.authority = "LOCAL_AGENT"
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER",
+                                             stop=dict(STOP_OK_EVIDENCE)), 200))
+        d = self.post("stop").json()
+        restore = self.phase(d, ml.PHASE_RESTORE)
+        self.assertEqual(restore["status"], ml.WITHHELD)
+        self.assertIs(restore["restored"], False)
+        self.assertIs(restore["written"], False)
+        self.assertEqual(restore["claimed"], "OPERATOR")
+        self.assertEqual(restore["observed"], "LOCAL_AGENT")
+        self.assertIn("Take Control", restore["detail"])
+        self.assertEqual(self.authority_writes, [])
+        self.assertEqual(self.authority, "LOCAL_AGENT")
+
+    # -- success: NOT_READY + start_eligible is the EXPECTED landing -----------------------
+    def test_a_successful_stop_is_accepted_even_though_scout_rests_in_not_ready(self):
+        self.authority = "OPERATOR"
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER",
+                                             stop=dict(STOP_OK_EVIDENCE)), 200))
+        d = self.post("stop").json()
+        self.assertEqual(d["outcome"], mx.OUTCOME_ACCEPTED)
+        self.assertIs(d["ok"], True)
+        self.assertNotEqual(d.get("resulting_state"), "FAILED")
+        verify = self.phase(d, ml.PHASE_VERIFY)
+        self.assertEqual(verify["status"], ml.OK)
+        self.assertIs(verify["verified"], True)
+        self.assertIs(verify["held_in_loiter"], True)
+        self.assertIs(verify["start_eligible"], True)
+        self.assertIs(verify["authority_blocks_start"], True)
+        self.assertIn("NEW Start is eligible", verify["detail"])
+
+    def test_scouts_stop_evidence_is_preserved_verbatim(self):
+        self.authority = "OPERATOR"
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER"), 200))
+        d = self.post("stop").json()
+        ev = d["stop"]
+        self.assertIs(ev["reported"], True)
+        for field in mx.STOP_EVIDENCE_FIELDS:
+            self.assertEqual(ev[field], STOP_OK_EVIDENCE[field], field)
+
+    def test_evidence_scout_omits_stays_none_rather_than_false(self):
+        """Tri-state: 'Scout could not verify the rewind' and 'Scout said nothing about the
+        rewind' are different facts. Rounding the second into the first reports a failure Scout
+        never claimed."""
+        self.authority = "OPERATOR"
+        self.set_status(stopped_status(stop={"hold_verified": True, "outcome": "STOPPED"}))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER"), 200))
+        ev = self.post("stop").json()["stop"]
+        self.assertIs(ev["hold_verified"], True)
+        self.assertIsNone(ev["rewind_verified"])
+        self.assertIsNone(ev["original_restored"])
+
+    def test_a_scout_that_reports_no_stop_block_produces_no_fabricated_evidence(self):
+        self.authority = "OPERATOR"
+        self.set_status(status_body(state="NOT_READY", mode="LOITER", start_eligible=True,
+                                    authority_blocks_start=True))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
+                                             verified_mode="LOITER"), 200))
+        ev = self.post("stop").json()["stop"]
+        self.assertIs(ev["reported"], False)
+        self.assertTrue(all(ev[f] is None for f in mx.STOP_EVIDENCE_FIELDS))
+
+    # -- failure after the safe hold ------------------------------------------------------
+    def test_a_stop_that_fails_after_the_hold_reports_scouts_exact_code(self):
+        for code in ("STOP_ACTIVE_MISSION_UNKNOWN", "STOP_RESTORE_UPLOAD_FAILED",
+                     "STOP_RESTORE_HASH_MISMATCH", "STOP_REWIND_NOT_VERIFIED"):
+            with self.subTest(code=code):
+                self.fake.calls.clear()
+                self.authority_writes.clear()
+                self.authority = "LOCAL_AGENT"
+                self.set_status(status_body(
+                    state="SUSPENDED", effective_state="SUSPENDED", mode="LOITER",
+                    can_start=False, can_stop=False, last_error={"code": code},
+                    stop={"hold_verified": True, "original_restored": False,
+                          "rewind_verified": False, "outcome": code}))
+                self.set_op("stop", FakeResp(
+                    op_body("stop", accepted=False, current_state="SUSPENDED",
+                            verified_mode="LOITER", error={"code": code, "message": "scout said"}),
+                    200))
+                d = self.post("stop").json()
+                self.assertEqual(d["outcome"], mx.OUTCOME_FAILED)
+                self.assertEqual(d["scout_error_code"], code)
+                self.assertIn(code, mx.STOP_ERROR_CODES)
+                # …and no automatic recovery of any kind was attempted.
+                self.assertEqual(self.authority_writes, [])
+                self.assertEqual(self.fake.urls("POST"),
+                                 [f"{SCOUT_BASE}/agent/mission_execution/stop"])
+
+    def test_a_failed_stop_states_that_the_vehicle_is_held_and_the_reset_incomplete(self):
+        self.authority = "LOCAL_AGENT"
+        self.set_status(status_body(
+            state="SUSPENDED", effective_state="SUSPENDED", mode="LOITER", can_start=False,
+            last_error={"code": "STOP_REWIND_NOT_VERIFIED", "message": "sequence read back as 4"},
+            stop={"hold_verified": True, "rewind_verified": False,
+                  "outcome": "STOP_REWIND_NOT_VERIFIED"}))
+        # Scout accepted the request and reported the failure through its canonical state.
+        self.set_op("stop", FakeResp(op_body("stop", current_state="SUSPENDED",
+                                             verified_mode="LOITER"), 200))
+        d = self.post("stop").json()
+        verify = self.phase(d, ml.PHASE_VERIFY)
+        self.assertEqual(verify["status"], ml.FAILED)
+        self.assertIs(verify["verified"], False)
+        self.assertIs(verify["held_in_loiter"], True)
+        self.assertIn("HELD in LOITER", verify["detail"])
+        self.assertIn("reset is incomplete", verify["detail"])
+        self.assertIn("STOP_REWIND_NOT_VERIFIED", verify["detail"])
+
+    def test_a_failed_stop_never_triggers_a_rearm_resume_auto_or_second_stop(self):
+        self.authority = "LOCAL_AGENT"
+        self.set_status(status_body(
+            state="SUSPENDED", mode="LOITER", can_start=False,
+            last_error={"code": "STOP_RESTORE_UPLOAD_FAILED"},
+            stop={"hold_verified": True, "outcome": "STOP_RESTORE_UPLOAD_FAILED"}))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="SUSPENDED",
+                                             verified_mode="LOITER"), 200))
+        self.post("stop")
+        posts = self.fake.urls("POST")
+        self.assertEqual(posts, [f"{SCOUT_BASE}/agent/mission_execution/stop"],
+                         "exactly one write, and it is the stop the operator asked for")
+
+    # -- mid-transaction and unsupported --------------------------------------------------
+    def test_a_stop_still_working_through_its_sequence_confirms_nothing(self):
+        self.authority = "LOCAL_AGENT"
+        self.set_status(status_body(state="STOP_RESTORING_ORIGINAL", mode="LOITER",
+                                    active_operation_id="op-9"))
+        self.set_op("stop", FakeResp(op_body("stop", current_state="STOP_RESTORING_ORIGINAL"),
+                                     200))
+        d = self.post("stop").json()
+        verify = self.phase(d, ml.PHASE_VERIFY)
+        self.assertEqual(verify["status"], ml.WITHHELD)
+        self.assertIs(verify["verified"], False)
+        self.assertEqual(self.authority_writes, [])
+
     def test_an_unsupported_scout_stop_is_explicit_and_changes_nothing(self):
-        """This is TODAY's behaviour against the real Scout: the route 404s. The operator is
-        told so plainly; nothing is emulated, no authority moves, no state is invented."""
         self.authority = "LOCAL_AGENT"
         self.set_status(status_body(state="RUNNING", can_start=False, can_pause=True))
         self.set_op("stop", FakeResp(None, 404))
@@ -547,68 +773,58 @@ class TestStop(LifecycleTestCase):
         self.assertEqual(d["outcome"], mx.OUTCOME_UNSUPPORTED)
         self.assertEqual(d["error_code"], "STOP_NOT_SUPPORTED")
         self.assertIn("does not implement POST /agent/mission_execution/stop", d["error"])
+        self.assertIn("raw Pixhawk stop is not offered", d["error"])
         self.assertIn("Rearm is not a substitute", d["error"])
-        self.assertIn("Pause holds the mission without ending it", d["error"])
         self.assertEqual(self.authority_writes, [], "an unsupported Stop moves no authority")
         self.assertEqual(self.authority, "LOCAL_AGENT")
         self.assertEqual(self.phase(d, ml.PHASE_RESTORE)["status"], ml.SKIPPED)
 
-    def test_stop_returns_operator_only_after_verified_stopped_and_loiter(self):
-        self.authority = "LOCAL_AGENT"
-        # Stop performs NO preflight read, so its one status GET is the terminal-evidence read.
-        self.set_status(status_body(state="STOPPED", mode="LOITER", can_start=True,
-                                    can_stop=False))
-        self.set_op("stop", FakeResp(op_body("stop", current_state="STOPPED",
-                                             verified_mode="LOITER"), 200))
-        d = self.post("stop").json()
-        restore = self.phase(d, ml.PHASE_RESTORE)
-        self.assertEqual(restore["status"], ml.OK)
-        self.assertIs(restore["restored"], True)
-        self.assertEqual(self.authority, "OPERATOR")
+    def test_an_unknown_stop_is_reconciled_by_reading_status_never_resent(self):
+        self.authority = "OPERATOR"
+        self.set_status(stopped_status())
+        self.set_op("stop", real_requests.ConnectionError("write timed out"))
+        r = self.post("stop")
+        self.assertEqual(r.status_code, 202)
+        d = r.json()
+        self.assertEqual(d["outcome"], mx.OUTCOME_UNKNOWN)
+        self.assertEqual(d["reconciliation"]["resolved"], "stopped")
+        # ONE attempt. A resend could re-run a whole restore/rewind on a vehicle that already did.
+        self.assertEqual(len(self.fake.urls("POST")), 1)
 
-    def test_stop_still_in_its_hold_sequence_does_not_return_authority(self):
-        self.authority = "LOCAL_AGENT"
-        self.set_status(status_body(state="STOP_HOLD_REQUESTED", mode="AUTO"))
-        self.set_op("stop", FakeResp(op_body("stop", current_state="STOP_HOLD_REQUESTED"), 200))
-        d = self.post("stop").json()
-        restore = self.phase(d, ml.PHASE_RESTORE)
-        self.assertEqual(restore["status"], ml.WITHHELD)
-        self.assertIs(restore["restored"], False)
-        self.assertEqual(self.authority, "LOCAL_AGENT")
-
-    def test_stopped_without_a_verified_loiter_does_not_return_authority(self):
-        self.authority = "LOCAL_AGENT"
-        self.set_status(status_body(state="STOPPED", mode="AUTO"))
-        self.set_op("stop", FakeResp(op_body("stop", current_state="STOPPED"), 200))
-        d = self.post("stop").json()
-        restore = self.phase(d, ml.PHASE_RESTORE)
-        self.assertEqual(restore["status"], ml.WITHHELD)
-        self.assertIn("not a verified LOITER", restore["detail"])
-        self.assertEqual(self.authority, "LOCAL_AGENT")
-
-    def test_stop_is_never_reported_as_a_failure(self):
-        self.authority = "LOCAL_AGENT"
-        self.set_status(status_body(state="STOPPED", mode="LOITER"))
-        self.set_op("stop", FakeResp(op_body("stop", current_state="STOPPED",
-                                             verified_mode="LOITER"), 200))
-        d = self.post("stop").json()
-        self.assertEqual(d["outcome"], mx.OUTCOME_ACCEPTED)
-        self.assertNotEqual(d.get("resulting_state"), "FAILED")
-
-    def test_stop_issues_no_disarm_no_rtl_and_no_mission_clear(self):
-        """Stop ENDS the run. It must not disarm, invoke RTL, clear the Pixhawk mission or
-        delete the planning package — and it must not be routed through the command queue."""
-        self.authority = "LOCAL_AGENT"
-        before = len(main.commands)
-        self.set_status(status_body(state="STOPPED", mode="LOITER"))
-        self.set_op("stop", FakeResp(op_body("stop", current_state="STOPPED",
+    # -- the write trace -------------------------------------------------------------------
+    def test_the_write_trace_records_the_stop_evidence(self):
+        self.authority = "OPERATOR"
+        self.set_status(stopped_status())
+        self.set_op("stop", FakeResp(op_body("stop", current_state="NOT_READY",
                                              verified_mode="LOITER"), 200))
         self.post("stop")
-        self.assertEqual(len(main.commands), before, "no queued command")
-        posts = self.fake.urls("POST")
-        self.assertEqual(posts, [f"{SCOUT_BASE}/agent/mission_execution/stop"])
-        for forbidden in ("rtl", "disarm", "mission_clear", "planning_package", "rearm"):
-            self.assertFalse(any(forbidden in u for u in self.fake.urls()), forbidden)
+        e = self.client.get("/api/mission-execution/operations").json()["operations"][-1]
+        self.assertEqual(e["operation"], "stop")
+        self.assertIs(e["stop"]["rewind_verified"], True)
+        self.assertEqual(e["stop"]["authority_after"], "OPERATOR")
+        self.assertEqual(e["stop"]["outcome"], "STOPPED")
+
+
+class TestStopEligibilityAfterStop(LifecycleTestCase):
+    """The landing a successful Stop leaves behind must not read as a broken mission."""
+
+    def test_not_ready_with_start_eligible_and_authority_blocking_is_startable(self):
+        summary = mx.summarize_status({"outcome": mx.OUTCOME_ACCEPTED, "supported": True,
+                                       "reachable": True, "scout": stopped_status()})
+        elig = ml.start_eligibility(summary)
+        self.assertIs(elig["eligible"], True)
+        self.assertIs(elig["deferred_on_authority"], True)
+        self.assertIs(elig["execution_ready"], False)
+        self.assertIn("acquires and verifies", elig["reason"])
+
+    def test_a_start_right_after_a_stop_takes_authority_back_and_runs(self):
+        self.authority = "OPERATOR"
+        self.set_status(stopped_status())
+        self.set_op("start", FakeResp(op_body(), 200))
+        d = self.post("start").json()
+        self.assertEqual(d["outcome"], mx.OUTCOME_ACCEPTED)
+        self.assertIn((SCOUT_VID, "LOCAL_AGENT", "mission-execution"), self.authority_writes)
+        self.assertEqual(self.authority, "LOCAL_AGENT")
 
 
 # ── 7. The write trace records the authority hand-off ───────────────────────────────────

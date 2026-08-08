@@ -111,3 +111,37 @@ test("missionWriteNeedsRefetch: a failure that flags uncertain/partial state DOE
   assert.equal(missionWriteNeedsRefetch("REJECTED", { mission_state_uncertain: true }), true);
   assert.ok(MISSION_WRITE_SUCCESS.has("VERIFIED"));
 });
+
+// ---- "stop" is a FORCE reason: Scout restores and rewinds inside its own transaction ----
+// A Stop can legitimately leave the geometry byte-for-byte identical (a run that was never
+// replanned) while the SEQUENCE has moved back to zero. If the cache were consulted the overlay
+// would keep showing the run's last waypoint as active, so the download must be unconditional.
+test("a completed Stop always forces a fresh mission download", () => {
+  const t = createMissionRefreshTracker();
+  t.noteFetched(1, { route_content_hash: "a", current_seq: 7 }, 1000);
+  assert.deepEqual(t.shouldFetch(1, { reason: "stop", now: 1001 }), { fetch: true, why: "stop" });
+  // …even immediately after a fallback read said the cache was fresh.
+  assert.equal(t.shouldFetch(1, { reason: "fallback", now: 1001 }).fetch, false);
+  assert.equal(t.shouldFetch(1, { reason: "stop", now: 1001 }).fetch, true);
+});
+
+test("a Stop that restored the original mission reports the geometry change", () => {
+  const t = createMissionRefreshTracker();
+  t.noteFetched(1, { route_content_hash: "revised", current_seq: 7 }, 1000);
+  const after = t.noteFetched(1, { route_content_hash: "original", current_seq: 0 }, 2000);
+  assert.deepEqual(after, { geometryChanged: true, progressChanged: true });
+});
+
+test("a Stop on a never-replanned run still reports the rewind as a progress change", () => {
+  const t = createMissionRefreshTracker();
+  t.noteFetched(1, { route_content_hash: "original", current_seq: 7 }, 1000);
+  const after = t.noteFetched(1, { route_content_hash: "original", current_seq: 0 }, 2000);
+  assert.equal(after.geometryChanged, false, "the route is the same route");
+  assert.equal(after.progressChanged, true, "…but the mission was rewound to its start");
+});
+
+test("an in-flight fetch still suppresses a duplicate stop-triggered download", () => {
+  const t = createMissionRefreshTracker();
+  assert.deepEqual(t.shouldFetch(1, { reason: "stop", inFlight: true }),
+    { fetch: false, why: "in-flight" });
+});

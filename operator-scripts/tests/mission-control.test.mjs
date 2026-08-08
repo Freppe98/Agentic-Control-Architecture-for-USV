@@ -16,7 +16,8 @@ import { dirname, join } from "node:path";
 import {
   lifecycleControls, stopAvailability, pauseAvailability, resumeAvailability, missionCardView,
   normalizeStatus, interpretTransaction, transactionSummary, outcomeLabel, startFailure,
-  OUTCOME, STATES, STOPPED_STATES,
+  stopOutcomeView, stopPhase, stopEvidenceDetail, startGate,
+  OUTCOME, STATES, STOPPED_STATES, STOPPABLE_STATES, STOP_TRANSITION_LABELS,
 } from "../operator/lib/mission-execution.js";
 import { deploymentReadiness } from "../operator/lib/home.js";
 import { handoffGate } from "../operator/lib/authority.js";
@@ -107,10 +108,10 @@ test("FAILED shows the failure and offers Rearm plus Take Control", () => {
   assert.equal(ctl.tone, "warn");
 });
 
-test("SUSPENDED shows the failure and offers Rearm plus Take Control", () => {
+test("SUSPENDED shows the failure and offers Rearm, Stop and Take Control", () => {
   const ctl = lifecycleControls(S({ state: "SUSPENDED", can_start: false,
     last_error: "replanning ended in SAFE_HOLD" }));
-  assert.deepEqual(actions(ctl), ["rearm", "take-control"]);
+  assert.deepEqual(actions(ctl), ["rearm", "stop", "take-control"]);
   assert.match(ctl.failure, /SAFE_HOLD/);
 });
 
@@ -400,44 +401,143 @@ test("a structured preflight reason is formatted, never object-coerced", () => {
   assert.match(byAction(ctl, "start").reason, /NO_ACTIVE_MISSION/);
 });
 
-// ── E. Stop: unsupported is EXPLICIT, never faked and never Rearm ───────────────────────
-test("a Scout with no can_stop field reports Stop as UNSUPPORTED with a real reason", () => {
+// ── E. Stop availability: SCOUT'S LIFECYCLE EVIDENCE, never the Pixhawk mode ────────────
+test("Stop is offered in every lifecycle state Scout supports it from", () => {
+  for (const state of STOPPABLE_STATES) {
+    const av = stopAvailability(S({ state, can_start: false }));
+    assert.equal(av.available, true, state);
+    assert.equal(av.enabled, true, `${state} — an absent can_stop is silence, not a refusal`);
+  }
+});
+
+test("an absent can_stop is silence, not a refusal — the state is the authority", () => {
   const av = stopAvailability(S({ state: "RUNNING", can_pause: true }));   // no can_stop key
-  assert.equal(av.supported, false);
-  assert.equal(av.enabled, false);
-  assert.match(av.reason, /does not implement/i);
-  assert.match(av.reason, /Rearm is not a substitute/);
-  assert.match(av.reason, /Pause holds the mission without ending it/);
+  assert.equal(av.available, true);
+  assert.equal(av.enabled, true);
+  assert.equal(av.reported, false, "Scout said nothing about can_stop");
+  assert.equal(av.reason, null);
 });
 
-test("an unsupported Stop is still SHOWN — disabled with the reason, not hidden", () => {
-  const ctl = lifecycleControls(S({ state: "RUNNING", can_start: false, can_pause: true }));
-  const stop = byAction(ctl, "stop");
-  assert.ok(stop, "Stop must remain visible so the operator can see why it is unavailable");
-  assert.equal(stop.enabled, false);
-  assert.match(stop.reason, /does not implement/i);
-  assert.equal(ctl.stop.supported, false);
-});
-
-test("can_stop:false is 'not right now', which is a different message from 'no such endpoint'", () => {
+test("can_stop:false is Scout REFUSING right now — shown, disabled, with its own answer", () => {
   const av = stopAvailability(S({ state: "RUNNING", can_pause: true, can_stop: false }));
-  assert.equal(av.supported, true);
+  assert.equal(av.available, true, "never hidden — the operator must see why");
   assert.equal(av.enabled, false);
+  assert.equal(av.reported, true);
   assert.match(av.reason, /can_stop=false/);
-  assert.doesNotMatch(av.reason, /does not implement/i);
 });
 
 test("can_stop:true enables Stop", () => {
   const av = stopAvailability(S({ state: "RUNNING", can_pause: true, can_stop: true }));
-  assert.equal(av.supported, true);
+  assert.equal(av.available, true);
   assert.equal(av.enabled, true);
   assert.equal(av.reason, null);
 });
 
-test("the STOP sequence states are modelled so none reads as an unknown state", () => {
-  for (const s of ["STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED", "STOPPED"]) {
+test("can_stop:true in a state this build does not list is still honoured", () => {
+  // "…and any other states explicitly supported by Scout". Scout is the authority; this build's
+  // STOPPABLE_STATES list is a floor, not a ceiling.
+  const av = stopAvailability(S({ state: "COMPLETED_HOLD", can_start: false, can_stop: true }));
+  assert.equal(av.available, true);
+  assert.equal(av.enabled, true);
+});
+
+test("Stop is NOT offered from a state Scout gives no stop evidence for", () => {
+  const av = stopAvailability(S({ state: "READY", can_start: true }));
+  assert.equal(av.available, false, "a mission that is not running has nothing to abort");
+});
+
+test("Stop is never derived from the Pixhawk mode alone", () => {
+  // AUTO on the flight controller with the lifecycle resting in READY is NOT a stoppable run.
+  const av = stopAvailability(S({ state: "READY", mode: "AUTO", can_start: true }));
+  assert.equal(av.available, false);
+  // …and a RUNNING lifecycle in MANUAL still is one: the lifecycle decides, not the mode.
+  assert.equal(stopAvailability(S({ state: "RUNNING", mode: "MANUAL" })).available, true);
+});
+
+test("Stop is disabled while another mission-execution operation is in progress", () => {
+  const active = stopAvailability(S({ state: "RUNNING", can_stop: true,
+    active_operation_id: "op-77" }));
+  assert.equal(active.available, true);
+  assert.equal(active.enabled, false);
+  assert.match(active.reason, /op-77/);
+
+  const mid = stopAvailability(S({ state: "PAUSE_REQUESTED", can_stop: true }));
+  assert.equal(mid.enabled, false);
+  assert.match(mid.reason, /mid-transaction/i);
+
+  const busy = stopAvailability(S({ state: "RUNNING", can_stop: true }), { busy: true });
+  assert.equal(busy.enabled, false);
+  assert.match(busy.reason, /already in progress/i);
+});
+
+test("Stop is disabled while Scout reports a package/BUSY conflict on the active run", () => {
+  const av = stopAvailability(S({ state: "RUNNING", can_stop: true,
+    package_conflict: { code: "OPERATION_IN_PROGRESS", execution_state: "RUNNING" } }));
+  assert.equal(av.available, true);
+  assert.equal(av.enabled, false);
+  assert.match(av.reason, /OPERATION_IN_PROGRESS/);
+});
+
+test("Stop is disabled while the replanning controller owns the vehicle", () => {
+  const av = stopAvailability(S({ state: "RUNNING", can_stop: true,
+    replanning: { active: true, fsm_state: "REPLANNING" } }));
+  assert.equal(av.enabled, false);
+  assert.match(av.reason, /replanning controller/i);
+});
+
+test("the whole STOP sequence is modelled so no phase reads as an unknown state", () => {
+  for (const s of ["STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
+    "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+    "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET", "STOPPED"]) {
     assert.ok(STATES.includes(s), s);
   }
+});
+
+// ── E2. The Stop control set: Stop sits BESIDE the current mission control ───────────────
+test("RUNNING offers Pause AND Stop, in that order", () => {
+  const ctl = lifecycleControls(S({ state: "RUNNING", can_start: false, can_pause: true,
+    can_stop: true }));
+  assert.deepEqual(actions(ctl), ["pause", "stop"]);
+  assert.deepEqual(labels(ctl), ["Pause Mission", "Stop Mission"]);
+  assert.equal(byAction(ctl, "stop").enabled, true);
+});
+
+test("PAUSED offers Resume AND Stop, in that order", () => {
+  const ctl = lifecycleControls(S({ state: "PAUSED", can_start: false, can_resume: true,
+    can_stop: true }));
+  assert.deepEqual(actions(ctl), ["resume", "stop"]);
+  assert.deepEqual(labels(ctl), ["Resume Mission", "Stop Mission"]);
+});
+
+test("SUSPENDED after a failed replan offers Rearm AND Stop", () => {
+  const ctl = lifecycleControls(S({ state: "SUSPENDED", can_start: false, can_stop: true,
+    last_error: { code: "REPLAN_FAILED", message: "safe return could not be planned" } }));
+  assert.ok(actions(ctl).includes("rearm"), "Rearm prepares the controller for another run");
+  assert.ok(actions(ctl).includes("stop"), "Stop is the safe abort — a different action");
+  assert.ok(actions(ctl).indexOf("rearm") < actions(ctl).indexOf("stop"));
+  assert.equal(byAction(ctl, "stop").enabled, true);
+});
+
+test("the return phase keeps Pause and Stop — the run is still under way there", () => {
+  for (const state of ["RETURNING_HOME", "HOME_ARRIVAL_PENDING"]) {
+    const ctl = lifecycleControls(S({ state, can_start: false, can_stop: true }));
+    assert.deepEqual(actions(ctl), ["pause", "stop"], state);
+  }
+});
+
+test("Stop is never offered while Scout is inside one of its own write transactions", () => {
+  for (const state of ["STOP_REQUESTED", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+    "SETTING_HOME", "FINAL_HOLD_REQUESTED"]) {
+    const ctl = lifecycleControls(S({ state, can_start: false, can_stop: true }));
+    assert.deepEqual(actions(ctl), [], state);
+  }
+});
+
+test("Stop is never labelled as a mission deletion anywhere the operator can read it", () => {
+  const ctl = lifecycleControls(S({ state: "RUNNING", can_pause: true, can_stop: true }));
+  assert.equal(byAction(ctl, "stop").label, "Stop Mission");
+  const stopCopy = [mapSrc, agentSrc].join("\n");
+  assert.doesNotMatch(stopCopy, /Delete Mission|Destroy Mission|Discard Mission/i);
 });
 
 // ── F. The transaction envelope: `blocked` is not `rejected` ────────────────────────────
@@ -733,4 +833,273 @@ test("a status full of structured values renders no [object Object] anywhere", (
     .join(" ");
   assert.doesNotMatch(rendered, /\[object Object\]/, rendered);
   assert.match(ctl.failure, /PACKAGE_SYNC_FAILED/);
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// K. STOP — the safe abort, end to end
+//
+// Scout owns the whole transaction (verified LOITER → verify the active mission identity →
+// restore the immutable original mission → rewind it to the start → verify the rewind → reset
+// execution/replan/test state → clear the experiment injection → invalidate the runtime Home →
+// return supervisory authority to OPERATOR → re-prove the mission evidence).
+//
+// The station's job is to offer it from the right states, show Scout's own phases while it runs,
+// present the completed result honestly — and NEVER to perform any part of the sequence itself.
+// ════════════════════════════════════════════════════════════════════════════════════════
+const STOP_OK = {
+  hold_verified: true, original_restored: true,
+  active_hash_before: "sha256:revised00000000", original_hash: "sha256:original0000000",
+  revised_hash: "sha256:revised00000000", rewind_verified: true, sequence_after: 0,
+  replan_reset: true, experiment_cleared: true, authority_after: "OPERATOR",
+  ready_for_start: true, outcome: "STOPPED",
+};
+
+// ── K1. In progress: Scout's phases, and no duplicate submission ────────────────────────
+test("a Stop in flight shows Scout's own phases, never an optimistic success", () => {
+  const expected = ["Stopping mission…", "Holding position…", "Restoring original mission…",
+    "Rewinding mission…", "Verifying reset…"];
+  const seen = ["STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_RESTORING_ORIGINAL",
+    "STOP_REWINDING", "STOP_VERIFYING_RESET"].map((s) => STOP_TRANSITION_LABELS[s]);
+  assert.deepEqual(seen, expected);
+
+  for (const state of Object.keys(STOP_TRANSITION_LABELS)) {
+    const card = missionCardView(S({ state, can_start: false }), {});
+    assert.equal(card.working, true, state);
+    assert.equal(card.headline, STOP_TRANSITION_LABELS[state], state);
+    assert.equal(card.stopPhase, state, state);
+    assert.equal(card.stopOutcome, null, `${state}: nothing is claimed before Scout finishes`);
+    assert.deepEqual(card.buttons, [], `${state}: no control may be pressed mid-transaction`);
+  }
+});
+
+test("before Scout has moved, the Stop line is the honest first step, not a placeholder", () => {
+  const card = missionCardView(S({ state: "RUNNING", can_pause: true, can_stop: true }),
+    { busy: true, stopping: true });
+  assert.equal(card.working, true);
+  assert.equal(card.headline, "Stopping mission…");
+  assert.equal(card.stopPhase, "STOP_REQUESTED");
+});
+
+test("with no stop STATE published, the phase is derived from Scout's own evidence", () => {
+  const after = (ev) => stopPhase("RUNNING",
+    normalizeStatus({ scout: { state: "RUNNING", stop: ev } }).stop).text;
+  assert.equal(after({ hold_verified: true }), "Restoring original mission…");
+  assert.equal(after({ hold_verified: true, original_restored: true }), "Rewinding mission…");
+  assert.equal(after({ hold_verified: true, rewind_verified: true }), "Verifying reset…");
+  assert.equal(stopPhase("RUNNING", null).text, "Stopping mission…");
+});
+
+test("a Stop in progress disables every duplicate control", () => {
+  const busy = lifecycleControls(S({ state: "RUNNING", can_pause: true, can_stop: true }),
+    { busy: true });
+  assert.equal(busy.buttons.length > 0, true);
+  assert.equal(busy.buttons.every((b) => b.enabled === false), true);
+  assert.equal(busy.buttons.every((b) => /already in progress/i.test(b.reason)), true);
+  // …and the availability derivation agrees, so the Map and the Agent page cannot disagree.
+  assert.equal(stopAvailability(S({ state: "RUNNING", can_stop: true }), { busy: true }).enabled,
+    false);
+});
+
+// ── K2. Success: NOT_READY + start_eligible is EXPECTED, not a failure ──────────────────
+test("a successful Stop reads as a stop, not as 'Not ready to start'", () => {
+  const s = S({ state: "NOT_READY", can_start: false, mode: "LOITER", mission_id: "msn-1",
+    start_eligible: true, authority_blocks_start: true, execution_ready: false,
+    authority_status: "OPERATOR", stop: STOP_OK });
+  const out = stopOutcomeView(s);
+  assert.equal(out.ok, true);
+  assert.equal(out.title, "Mission stopped");
+  assert.deepEqual(out.lines, [
+    "Vehicle held in LOITER",
+    "Original mission restored",
+    "Original mission reset to start",
+    "Execution and replan test state cleared",
+    "Operator authority restored",
+    "Ready for a new Start",
+  ]);
+});
+
+test("NOT_READY + start_eligible + authority_blocks_start after a Stop STILL offers Start", () => {
+  // Scout's documented landing after a successful Stop. Authority is deliberately back with the
+  // operator, and the Start transaction is what hands it to the Local Agent again — so this must
+  // never read as a broken mission, and Start must stay available.
+  const s = S({ state: "NOT_READY", can_start: false, mode: "LOITER", mission_id: "msn-1",
+    start_eligible: true, authority_blocks_start: true, execution_ready: false,
+    authority_status: "OPERATOR", stop: STOP_OK });
+  const gate = startGate(s, { connected: true });
+  assert.equal(gate.canStart, true, "the Start transaction performs the authority hand-off");
+  assert.equal(gate.authorityWillBeAcquired, true);
+
+  const ctl = lifecycleControls(s, {});
+  assert.deepEqual(actions(ctl), ["start"]);
+  assert.equal(byAction(ctl, "start").enabled, true);
+
+  const card = missionCardView(s, { missionId: "msn-1" });
+  assert.equal(card.stopOutcome.ok, true, "the abort is reported as a success");
+  assert.equal(card.blocker, null, "a completed Stop is not a blocker");
+  assert.notEqual(card.tone, "warn");
+});
+
+test("a Stop with no revised route says so instead of claiming a restore that never happened", () => {
+  const s = S({ state: "NOT_READY", mode: "LOITER", start_eligible: true,
+    stop: { ...STOP_OK, original_restored: false, revised_hash: null } });
+  const out = stopOutcomeView(s);
+  assert.equal(out.ok, true);
+  assert.equal(out.lines.includes("No revised route was installed"), true);
+  assert.equal(out.lines.includes("Original mission restored"), false);
+});
+
+test("evidence Scout did not report is omitted, never guessed", () => {
+  const s = S({ state: "NOT_READY", mode: "LOITER", stop: { hold_verified: true } });
+  assert.deepEqual(stopOutcomeView(s).lines, ["Vehicle held in LOITER"]);
+});
+
+// ── K3. Failure: Scout's exact code, and the LOITER-safe statement ──────────────────────
+for (const code of ["STOP_ACTIVE_MISSION_UNKNOWN", "STOP_RESTORE_UPLOAD_FAILED",
+  "STOP_RESTORE_HASH_MISMATCH", "STOP_REWIND_NOT_VERIFIED"]) {
+  test(`a Stop that failed with ${code} shows the exact code and the LOITER-safe state`, () => {
+    const s = S({ state: "SUSPENDED", mode: "LOITER", can_start: false,
+      last_error: { code, message: "scout detail" },
+      stop: { hold_verified: true, original_restored: false, rewind_verified: false,
+        outcome: code } });
+    const view = interpretTransaction({ status: 200, data: {
+      outcome: "failed", operation: "stop", scout_error_code: code,
+      scout_error_message: "scout detail", phases: [], authority: {} } });
+    const out = stopOutcomeView(s, view);
+    assert.equal(out.ok, false);
+    assert.equal(out.code, code);
+    assert.equal(out.held, true);
+    assert.match(out.text, /held in LOITER/);
+    assert.match(out.text, /reset is incomplete/i);
+    assert.doesNotMatch(out.text, /\[object Object\]/);
+    // Scout's own code is preserved verbatim for the operator, alongside the readable text.
+    assert.match(out.detail, new RegExp(code));
+  });
+}
+
+test("a failed Stop states itself ONCE — the generic blocker does not repeat it", () => {
+  const s = S({ state: "SUSPENDED", mode: "LOITER", can_start: false,
+    last_error: { code: "STOP_REWIND_NOT_VERIFIED", message: "sequence read back as 4" },
+    stop: { hold_verified: true, rewind_verified: false, outcome: "STOP_REWIND_NOT_VERIFIED" } });
+  const card = missionCardView(s, {});
+  assert.equal(card.stopOutcome.ok, false);
+  assert.equal(card.blocker, null, "one failure, one place");
+});
+
+test("a failed Stop offers no automatic recovery — the operator decides", () => {
+  const s = S({ state: "SUSPENDED", mode: "LOITER", can_start: false, can_stop: true,
+    last_error: { code: "STOP_RESTORE_UPLOAD_FAILED" } });
+  const ctl = lifecycleControls(s, {});
+  // Rearm, Stop and Take Control are OFFERED as explicit operator choices. Nothing is auto-run:
+  // the card model returns buttons, and pressing one is the operator's act.
+  assert.deepEqual(actions(ctl), ["rearm", "stop", "take-control"]);
+  assert.equal(ctl.buttons.every((b) => b.action !== "resume"), true, "never an auto-resume");
+});
+
+// ── K4. Evidence rendering: no [object Object], nothing dropped ─────────────────────────
+test("Stop evidence renders as readable text, never [object Object]", () => {
+  const s = S({ state: "NOT_READY", mode: "LOITER", stop: STOP_OK });
+  const detail = stopEvidenceDetail(s.stop);
+  assert.doesNotMatch(detail, /\[object Object\]/);
+  for (const fragment of ["outcome STOPPED", "hold verified yes", "original restored yes",
+    "rewind verified yes", "sequence after 0", "replan reset yes", "experiment cleared yes",
+    "authority OPERATOR", "ready for start yes"]) {
+    assert.equal(detail.includes(fragment), true, `${fragment} missing from: ${detail}`);
+  }
+  assert.equal(stopEvidenceDetail({ reported: false }), null);
+});
+
+test("a hostile stop block (nested objects) still renders readable text", () => {
+  const s = S({ state: "NOT_READY", stop: { outcome: { code: "STOPPED", message: "done" },
+    hold_verified: true, sequence_after: { current: 0 } } });
+  assert.doesNotMatch(stopEvidenceDetail(s.stop), /\[object Object\]/);
+  assert.doesNotMatch(JSON.stringify(stopOutcomeView(s)), /\[object Object\]/);
+});
+
+test("tri-state stop evidence keeps 'not reported' apart from 'false'", () => {
+  const silent = S({ state: "NOT_READY", stop: { outcome: "STOPPED" } });
+  assert.equal(silent.stop.rewindVerified, null, "Scout said nothing");
+  const denied = S({ state: "NOT_READY", stop: { outcome: "STOPPED", rewind_verified: false } });
+  assert.equal(denied.stop.rewindVerified, false, "Scout said no");
+});
+
+test("a Scout that reports no stop block produces no stop presentation at all", () => {
+  const s = S({ state: "RUNNING", can_pause: true, can_stop: true });
+  assert.equal(s.stop.reported, false);
+  assert.equal(stopOutcomeView(s), null);
+  assert.equal(missionCardView(s, {}).stopOutcome, null);
+});
+
+// ── K5. Source guards: the Operator performs NO part of Scout's stop sequence ───────────
+test("Stop never invokes the raw Pixhawk stop anywhere in the app", () => {
+  const libSrc = read("../operator/lib/mission-execution.js");
+  // No CALL to it: the guard reads CODE, with comment lines stripped. A prose mention of what
+  // the app deliberately does not do is fine — and is exactly what these modules carry.
+  const code = (src) => src.split("\n")
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  for (const [name, src] of [["Map", mapSrc], ["Agent", agentSrc], ["api", apiSrc],
+    ["lib", libSrc]]) {
+    assert.doesNotMatch(code(src), /nav\/stop/, `${name} must never call the raw stop`);
+    assert.doesNotMatch(code(src), /navStop|rawStop/i, name);
+  }
+  assert.match(apiSrc, /mission-execution\/stop/, "the only Stop route is the lifecycle one");
+});
+
+test("Stop never independently calls LOITER, rearm, reset or upload from the Operator", () => {
+  // The whole transaction is Scout's. The station sends ONE POST and re-reads status; a second
+  // call sequenced around it would be a competing lifecycle.
+  const start = mapSrc.indexOf('if (action === "stop")');
+  const wiring = mapSrc.slice(start, mapSrc.indexOf('if (action === "rearm")', start));
+  assert.equal(wiring.length > 0, true);
+  assert.match(wiring, /api\.stopMissionExecution\(id\)/);
+  for (const forbidden of [/SET_MODE_LOITER/, /api\.rearmMissionExecution/, /api\.setHome/,
+    /api\.uploadMission/, /api\.createCommand/, /setControlAuthority/, /resetReplan/]) {
+    assert.doesNotMatch(wiring, forbidden, String(forbidden));
+  }
+});
+
+test("a restored original mission forces a fresh Pixhawk read-back, without recentring", () => {
+  // Scout restores the immutable original and rewinds the sequence, so the overlay, the active
+  // waypoint and the progress readout must come from ground truth rather than the cache.
+  const at = mapSrc.indexOf("function stopChangedTheVehicleMission");
+  assert.equal(at > 0, true);
+  assert.match(mapSrc.slice(at, at + 700), /OUTCOME\.ACCEPTED/);
+  const tx = mapSrc.slice(mapSrc.indexOf("function missionTransaction"), at);
+  assert.match(tx, /refreshController\.refreshMission\(id, "stop"\)/);
+  assert.match(tx, /loadMissionStatus\(id\)/);
+  // The map is never recentred by a lifecycle transaction — centring is an explicit operator act.
+  assert.doesNotMatch(tx, /centerMission\(|fitBounds/);
+});
+
+// ── K6. A stop block is EVIDENCE OF THE LAST STOP, not a permanent headline ─────────────
+test("a stale stop block never narrates over a run that has since restarted", () => {
+  // Scout's `stop` evidence persists in its status. Once the operator starts again, "Mission
+  // stopped" beside a RUNNING mission would be the worst kind of stale claim.
+  for (const state of ["RUNNING", "PAUSED", "RETURNING_HOME", "HOME_ARRIVAL_PENDING",
+    "COMPLETED_HOLD", "STARTING_AUTO"]) {
+    const s = S({ state, can_start: false, stop: STOP_OK });
+    assert.equal(stopOutcomeView(s), null, state);
+    assert.equal(missionCardView(s, {}).stopOutcome, null, state);
+  }
+});
+
+test("a SUSPENDED caused by a failed replan is not misread as a failed Stop", () => {
+  // A leftover successful-stop block plus an unrelated SUSPENDED must not produce a stop
+  // failure. Only a STOP_* code, or the stop transaction the operator just ran, does that.
+  const s = S({ state: "SUSPENDED", can_start: false,
+    last_error: { code: "REPLAN_FAILED", message: "safe return could not be planned" },
+    stop: STOP_OK });
+  assert.equal(stopOutcomeView(s), null);
+  // …and the ordinary failure blocker is therefore still shown, from Scout's own last_error.
+  const card = missionCardView(s, {});
+  assert.equal(card.stopOutcome, null);
+  assert.match(card.blocker.title, /REPLAN_FAILED/);
+});
+
+test("a SUSPENDED whose stop evidence carries a STOP_ code IS a failed Stop", () => {
+  const s = S({ state: "SUSPENDED", mode: "LOITER", can_start: false,
+    stop: { hold_verified: true, rewind_verified: false,
+      outcome: "STOP_REWIND_NOT_VERIFIED" } });
+  const out = stopOutcomeView(s);
+  assert.equal(out.ok, false);
+  assert.equal(out.code, "STOP_REWIND_NOT_VERIFIED");
 });

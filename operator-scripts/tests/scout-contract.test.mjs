@@ -130,13 +130,17 @@ test("BOUND does not block anything", () => {
   assert.equal(v.blocksNewMission, false);
 });
 
-test("STALE_MISMATCH blocks a new mission and names the two real remedies", () => {
+test("STALE_MISMATCH blocks a new mission and names the real remedies", () => {
   const v = bindingView(S({ state: "RUNNING",
     binding: { binding_state: BINDING.STALE_MISMATCH, bound_original_mission_id: "msn-old",
       package_mission_id: "msn-new" } }));
   assert.equal(v.blocksNewMission, true);
   assert.equal(v.text, MISSION_REPLACEMENT_BLOCKED_TEXT);
-  assert.match(v.text, /Finish or explicitly terminate\/rearm/);
+  // Each remedy is one Scout OWNS: let the run finish, abort it with Scout's own Stop, or rearm
+  // the controller. None of them is emulated locally.
+  assert.match(v.text, /Finish the active mission/);
+  assert.match(v.text, /stop it/);
+  assert.match(v.text, /rearm the mission controller/);
 });
 
 test("STALE_PACKAGE_DURING_ACTIVE_EXECUTION surfaces a conflict, never a silent switch", () => {
@@ -163,12 +167,23 @@ test("OPERATION_IN_PROGRESS is a conflict too, and Start stays unavailable", () 
   assert.equal(gate.code, START_BLOCK.MISSION_REPLACEMENT_CONFLICT);
 });
 
-test("no Stop is invented for a conflict — only what Scout actually supports is offered", () => {
-  const s = S({ state: "RUNNING", mission_id: "msn-old",
+test("Stop is Scout's own operation — the conflict text never invents a local one", () => {
+  const s = S({ state: "RUNNING", mission_id: "msn-old", can_stop: true,
     binding: { binding_state: BINDING.STALE_MISMATCH } });
   const ctl = lifecycleControls(s, {});
-  assert.equal(ctl.buttons.some((b) => b.action === "stop" && b.enabled), false);
-  assert.equal(MISSION_REPLACEMENT_BLOCKED_TEXT.includes("Stop"), false);
+  // Stop IS offered here — it is exactly the safe abort a stale-mismatch conflict calls for —
+  // and it is a proxy to Scout's endpoint, never an operator-side sequence.
+  assert.equal(ctl.buttons.some((b) => b.action === "stop" && b.enabled), true);
+  assert.doesNotMatch(MISSION_REPLACEMENT_BLOCKED_TEXT, /LOITER|nav\/stop|clear the mission/i);
+});
+
+test("a BUSY/OPERATION_IN_PROGRESS conflict disables Stop rather than racing Scout", () => {
+  const s = S({ state: "RUNNING", mission_id: "msn-old", can_stop: true,
+    package_conflict: { code: PACKAGE_CONFLICT.OPERATION_IN_PROGRESS } });
+  const stop = lifecycleControls(s, {}).buttons.find((b) => b.action === "stop");
+  assert.ok(stop, "the control stays visible so the reason is readable");
+  assert.equal(stop.enabled, false);
+  assert.match(stop.reason, /OPERATION_IN_PROGRESS/);
 });
 
 test("a Scout that reports no binding at all changes nothing", () => {

@@ -5774,6 +5774,13 @@ def _record_lifecycle_transaction(vid, env, *, requested_at):
         "idempotent": env.get("idempotent"),
         "home_result": env.get("home_result"),
         "sequence": env.get("sequence"),
+        # Scout's Stop evidence (hold verified, original restored, hashes, rewind verified,
+        # sequence after, replan/experiment reset, authority after, outcome), preserved on the
+        # trace entry so the Agent page's history renders the real reset rather than re-deriving
+        # one. Null unless Scout actually REPORTED a stop block — an unreported one is recorded
+        # as absent rather than as a row of nulls that reads like evidence.
+        "stop": (env["stop"] if isinstance(env.get("stop"), dict) and env["stop"].get("reported")
+                 else None),
         "continuation_verified": seq.get("continuation_verified"),
         "supported": env.get("supported", True),
         "unknown": env.get("outcome") == scout_mission_execution.OUTCOME_UNKNOWN,
@@ -6031,15 +6038,26 @@ def mission_execution_resume(vehicle_id: str):
 
 @app.post("/api/vehicles/{vehicle_id}/mission-execution/stop")
 def mission_execution_stop(vehicle_id: str):
-    """STOP — end the run, then return OPERATOR authority only after Scout reports STOPPED with
-    a verified LOITER.
+    """STOP — a SAFE ABORT of the mission run, proxied to POST /agent/mission_execution/stop.
 
-    PENDING ON SCOUT. Scout does not implement POST /agent/mission_execution/stop yet, so this
-    answers `unsupported` and changes NOTHING — no authority move, no vehicle command, no
-    fabricated terminal state. Stop is deliberately NOT emulated from a low-level LOITER plus
-    operator-side bookkeeping, is never reported as FAILED, and Rearm is not a substitute for
-    it. It must not disarm, clear the Pixhawk mission, delete the planning package or invoke
-    RTL. See SCOUT_STOP_API.md for the contract this is written against."""
+    This is NOT the legacy raw Pixhawk stop, and the Operator reimplements NONE of the sequence.
+    Scout performs the whole transaction: verified LOITER, verify the active mission identity,
+    restore the immutable original mission if a verified revised route is installed, rewind the
+    original to its start, verify the rewind, reset mission-execution / replan / test state,
+    clear the simulated experiment injection, invalidate the prior runtime Home, return
+    supervisory authority to OPERATOR, and re-prove the mission evidence.
+
+    The Operator forwards the ACTIVE PERSISTED mission id (so Scout can fail closed on a
+    mismatch), re-reads canonical status and preserves Scout's `stop` evidence verbatim. It
+    issues no LOITER, no upload, no rewind, no reset, no rearm and no authority write.
+
+    A successful Stop normally rests at state=NOT_READY with start_eligible=true and
+    authority_blocks_start=true. That is EXPECTED — authority is deliberately back with the
+    OPERATOR — and is never reported as a mission failure; the Start transaction performs the
+    hand-off back to LOCAL_AGENT. A Stop that fails after the safe hold leaves Scout SUSPENDED
+    with its own code (STOP_ACTIVE_MISSION_UNKNOWN / STOP_RESTORE_UPLOAD_FAILED /
+    STOP_RESTORE_HASH_MISMATCH / STOP_REWIND_NOT_VERIFIED), which is surfaced verbatim; the
+    backend never follows it with an automatic Rearm, Resume, AUTO or second Stop."""
     return _lifecycle_transaction(
         vehicle_id, "stop",
         lambda deps, vid, base, slug: mission_lifecycle.run_stop(deps, vid, base, slug))

@@ -30,23 +30,78 @@ export const STATES = [
   "SETTING_HOME", "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO",
   "RUNNING",
   "PAUSE_REQUESTED", "PAUSED", "RESUME_REQUESTED",
-  "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED", "STOPPED", "CANCELLED",
+  "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
+  "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+  "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET",
+  "STOPPED", "CANCELLED",
   "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED", "COMPLETED_HOLD",
   "SUSPENDED", "FAILED",
 ];
 
-// The STOP contract — PENDING ON SCOUT (see SCOUT_STOP_API.md). The states below exist here so
-// the model, the labels and the button mapping are complete the day Scout ships the endpoint.
-// Until then `stopAvailability()` reports UNSUPPORTED and the control is disabled with that
-// reason; Stop is never synthesized from a low-level LOITER plus operator-side state, never
-// shown as FAILED, and Rearm is never offered in its place.
+// ── STOP: Scout's own SAFE-ABORT transaction ───────────────────────────────────────────────
+// Stop is a first-class Scout lifecycle operation, NOT a raw Pixhawk stop and NOT a mission
+// deletion. Scout performs the whole sequence itself:
+//
+//   verified LOITER → verify the active mission identity → restore the immutable ORIGINAL
+//   mission if a verified revised route is installed → rewind the original to its start →
+//   verify the rewind → reset mission-execution / replan / test state → clear the simulated
+//   experiment injection → invalidate the prior runtime Home → return supervisory authority to
+//   OPERATOR → re-prove the mission evidence
+//
+// The station forwards ONE intent and renders Scout's own evidence. It never sends a LOITER, a
+// mission upload, a rewind, a reset or an authority write to emulate any step, and it never
+// offers the legacy raw /nav/stop.
+//
+// A SUCCESSFUL Stop normally comes to rest at state=NOT_READY with start_eligible=true and
+// authority_blocks_start=true. That is the EXPECTED landing — authority is deliberately back
+// with the operator — and must never be presented as a mission failure. Start stays available,
+// because the Start transaction is what hands authority to the Local Agent again.
 export const STOP_IN_TRANSACTION_STATES = [
   "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
+  "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+  "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET",
 ];
-// Terminal "the run was deliberately ended" states. A fresh Start is offered from here.
+// Terminal "the run was deliberately ended" states Scout may REST in. Under the current contract
+// it normally settles in NOT_READY instead, with the verdict in its `stop` evidence block — so
+// nothing here may require STOPPED in order to call a Stop successful.
 export const STOPPED_STATES = ["STOPPED", "CANCELLED"];
 // Resting states a mission has not (or no longer) been started from.
 export const STARTABLE_STATES = ["READY", "NOT_STARTED", ...STOPPED_STATES];
+
+// Scout's structured Stop failure codes. Each is raised AFTER the vehicle is safely holding —
+// Scout reaches a verified LOITER before it restores, rewinds or resets anything — so a Stop
+// that fails with one of these leaves the vehicle HELD and the reset INCOMPLETE.
+export const STOP_ERROR_CODES = [
+  "STOP_ACTIVE_MISSION_UNKNOWN", "STOP_RESTORE_UPLOAD_FAILED", "STOP_RESTORE_HASH_MISMATCH",
+  "STOP_REWIND_NOT_VERIFIED", "STOP_HOLD_NOT_VERIFIED", "STOP_MISSION_ID_MISMATCH",
+];
+
+// The fields of Scout's `stop` evidence block, in the order the operator reads them.
+export const STOP_EVIDENCE_FIELDS = [
+  "hold_verified", "original_restored", "active_hash_before", "original_hash", "revised_hash",
+  "rewind_verified", "sequence_after", "replan_reset", "experiment_cleared", "authority_after",
+  "ready_for_start", "outcome",
+];
+
+// The operator-facing progress line for each step of Scout's stop transaction. Each names the
+// REAL step Scout is performing, so an operator can see exactly where a Stop stalled — never a
+// predicted next state and never a fake percentage.
+export const STOP_TRANSITION_LABELS = {
+  STOP_REQUESTED: "Stopping mission…",
+  STOP_HOLD_REQUESTED: "Holding position…",
+  STOP_HOLD_CONFIRMED: "Position hold verified",
+  STOP_VERIFYING_MISSION: "Verifying active mission…",
+  STOP_RESTORING_ORIGINAL: "Restoring original mission…",
+  STOP_REWINDING: "Rewinding mission…",
+  STOP_VERIFYING_REWIND: "Verifying rewind…",
+  STOP_RESETTING: "Clearing execution and replan state…",
+  STOP_VERIFYING_RESET: "Verifying reset…",
+};
+
+// The generic first line, used while the POST is in flight and Scout has not yet published a
+// state of its own. It is deliberately the same sentence as STOP_REQUESTED: the operator sees
+// one continuous progression, not a placeholder replaced by a different word a moment later.
+export const STOPPING_TEXT = "Stopping mission…";
 
 // An OVERLAY, not a state: Scout reports effective_state=REPLANNING while its stored state is
 // still RUNNING / PAUSED / another live state. The replanning controller owns the vehicle.
@@ -89,9 +144,7 @@ export const TRANSITION_LABELS = {
   STARTING_AUTO: "Starting AUTO…",
   PAUSE_REQUESTED: "Pausing mission…",
   RESUME_REQUESTED: "Resuming mission…",
-  STOP_REQUESTED: "Stopping mission…",
-  STOP_HOLD_REQUESTED: "Requesting stop hold…",
-  STOP_HOLD_CONFIRMED: "Stop hold verified",
+  ...STOP_TRANSITION_LABELS,
   RETURNING_HOME: "Returning to Home",
   HOME_ARRIVAL_PENDING: "Confirming Home arrival…",
   FINAL_HOLD_REQUESTED: "Requesting final hold…",
@@ -130,6 +183,20 @@ export const ERROR_TEXT = {
   MISSION_EXECUTION_DISABLED: "Mission execution is disabled on Scout",
   REPLANNING_ACTIVE: "The replanning controller owns the vehicle",
   ARBITRATION_BUSY: "Another write is in progress on Scout (write arbitration)",
+  // Scout's STOP failure codes. Every one of them is raised AFTER the vehicle is safely
+  // holding, so each reading says what is true of the vehicle as well as what failed.
+  STOP_ACTIVE_MISSION_UNKNOWN:
+    "Scout could not identify the active mission, so it did not restore or rewind anything",
+  STOP_RESTORE_UPLOAD_FAILED:
+    "The original mission could not be uploaded back to the flight controller",
+  STOP_RESTORE_HASH_MISMATCH:
+    "The restored mission did not read back as the approved original route",
+  STOP_REWIND_NOT_VERIFIED:
+    "Scout could not verify that the mission was rewound to its start",
+  STOP_HOLD_NOT_VERIFIED: "The stop hold (LOITER) could not be verified",
+  STOP_MISSION_ID_MISMATCH:
+    "Scout is running a different mission than the one the Stop named",
+  STOP_NOT_SUPPORTED: "This Scout does not implement the Stop lifecycle operation",
   // Codes the OPERATOR raises before Scout is contacted (mission_lifecycle.py). They are
   // deliberately worded as "we did not send this", never as a vehicle failure.
   NO_ACTIVE_MISSION_RECORD: "This vehicle has no active persisted mission record",
@@ -193,11 +260,11 @@ export const PACKAGE_CONFLICT = {
 const ACTIVE_CONFLICT_CODES = new Set(Object.values(PACKAGE_CONFLICT));
 
 // The ONE sentence for a mission uploaded on top of a run that still owns the vehicle. It names
-// the remedy without inventing one: Scout has no Stop, so "finish it or explicitly rearm it" is
-// the whole truth, and the station does not offer a third option it cannot perform.
+// only remedies the station can actually perform through Scout's own lifecycle: let the run
+// finish, abort it with Stop, or rearm the controller. Nothing here is emulated locally.
 export const MISSION_REPLACEMENT_BLOCKED_TEXT =
-  "New mission uploaded while another mission is active. Finish or explicitly terminate/rearm " +
-  "the active mission before starting the new mission.";
+  "New mission uploaded while another mission is active. Finish the active mission, stop it, or " +
+  "rearm the mission controller before starting the new mission.";
 
 /** True when a body actually IS a mission-execution status, not another endpoint's answer. */
 export function isStatusBody(body) {
@@ -286,6 +353,7 @@ export function normalizeStatus(res) {
   const bind = isObj(s.binding) ? s.binding : {};
   const conflict = isObj(s.package_conflict) ? s.package_conflict : {};
   const batt = isObj(s.battery_diagnostics) ? s.battery_diagnostics : {};
+  const stopBlk = isObj(s.stop) ? s.stop : {};
   const state = str(s.state);
   const effective = str(s.effective_state) || state;
 
@@ -314,13 +382,37 @@ export function normalizeStatus(res) {
     canResume: "can_resume" in s ? s.can_resume === true : null,
     pauseReported: "can_pause" in s,
     resumeReported: "can_resume" in s,
-    // Stop is the one operation whose SUPPORT is in question, so it is modelled in three
-    // values rather than two: true / false / null. PRESENCE of `can_stop` is the support
-    // signal — a Scout that has shipped Stop reports it either way; one that has not omits
-    // it, and `null` is what makes the UI say "this Scout version has no Stop" instead of
-    // the untrue "you cannot stop right now". See SCOUT_STOP_API.md.
+    // Tri-state for the SAME reason as canPause / canResume above: `true` / `false` / `null` are
+    // three different facts. `false` is Scout refusing a stop right now and is shown as its own
+    // reason; `null` is Scout saying NOTHING, in which case the lifecycle STATE is the authority
+    // (see stopAvailability) and Scout arbitrates the write. `stopSupported` records only whether
+    // Scout reported the flag at all — it is evidence for the diagnostics page, not a gate.
     canStop: "can_stop" in s ? s.can_stop === true : null,
     stopSupported: "can_stop" in s,
+    // Scout's `stop` EVIDENCE block, verbatim. Booleans stay TRI-STATE (true / false / null):
+    // "Scout could not verify the rewind" and "Scout said nothing about the rewind" are
+    // different facts, and rounding the second into the first reports a failure Scout never
+    // claimed. `reported:false` is what keeps a station that has never seen a Stop from
+    // rendering a fabricated one.
+    // asText, NOT str(): Scout's outcome and authority arrive as bare strings today, but a
+    // structured {code, message} is a legitimate shape for either, and String()-ing one would
+    // put the literal "[object Object]" exactly where the operator reads the verdict of an abort.
+    stop: {
+      reported: Object.keys(stopBlk).length > 0,
+      holdVerified: stopBlk.hold_verified ?? null,
+      originalRestored: stopBlk.original_restored ?? null,
+      activeHashBefore: asText(stopBlk.active_hash_before),
+      originalHash: asText(stopBlk.original_hash),
+      revisedHash: asText(stopBlk.revised_hash),
+      rewindVerified: stopBlk.rewind_verified ?? null,
+      sequenceAfter: stopBlk.sequence_after ?? null,
+      replanReset: stopBlk.replan_reset ?? null,
+      experimentCleared: stopBlk.experiment_cleared ?? null,
+      authorityAfter: asText(stopBlk.authority_after),
+      readyForStart: stopBlk.ready_for_start ?? null,
+      outcome: asText(stopBlk.outcome),
+      raw: Object.keys(stopBlk).length > 0 ? stopBlk : null,
+    },
     // Scout's EXPLICIT Start-eligibility contract. Tri-state on purpose: PRESENCE is what makes
     // it authoritative, and an older Scout that omits the keys must fall back to the can_start
     // reading rather than have a missing field read as `false` and refuse every Start.
@@ -806,40 +898,227 @@ export function resumeAvailability(status) {
     flag: S.canResume, reported: S.resumeReported === true });
 }
 
+// The lifecycle states a Stop is MEANINGFUL from — Scout's own evidence, not the Pixhawk mode.
+// A vehicle sitting in AUTO with no Scout run is not stoppable, and a Scout that is mid-write is
+// not stoppable either; both of those are decided below, from the lifecycle, never from the mode.
+//
+// SUSPENDED is included on purpose: a run suspended by a failed replan still owns the vehicle,
+// and a safe abort is exactly what an operator needs there. FINAL_HOLD_REQUESTED is deliberately
+// NOT here — it is a step inside Scout's own return transaction, where a competing write is
+// unsafe — while RETURNING_HOME and HOME_ARRIVAL_PENDING are, because the run is still under way.
+export const STOPPABLE_STATES = [
+  "RUNNING", "PAUSED", "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "SUSPENDED",
+];
+
+// The return-phase states in which the run is still happening rather than Scout being inside one
+// of its own write transactions. Stop and Pause stay meaningful here.
+const RETURN_PHASE_STOPPABLE = ["RETURNING_HOME", "HOME_ARRIVAL_PENDING"];
+
 /**
- * Whether Stop can be offered at all, and why not.
+ * Whether STOP may be offered, and why not — derived from SCOUT'S LIFECYCLE EVIDENCE.
  *
- * Three distinct answers, because collapsing them would be a lie in either direction:
- *   unsupported — this Scout has no Stop endpoint (`can_stop` absent from its status). The
- *                 control is shown DISABLED with that reason, never hidden and never faked
- *                 from a low-level LOITER plus operator-side state.
- *   supported, not now — Scout has Stop and says `can_stop:false` right now.
- *   supported, enabled — Scout says `can_stop:true`.
+ * The rule mirrors pauseAvailability / resumeAvailability, and for the same reason: Scout's
+ * STATE is the authority for whether there is a run to abort, and Scout's `can_stop` flag is the
+ * authority for whether it will accept the write RIGHT NOW — but only when Scout actually sends
+ * one.
+ *
+ *   state in STOPPABLE_STATES, or can_stop === true    → the control exists
+ *   can_stop === true                                  → enabled
+ *   can_stop === false                                 → shown DISABLED with Scout's own answer
+ *   can_stop absent                                    → enabled; the state is the authority and
+ *                                                        Scout arbitrates the write
+ *
+ * Everything Scout owns the moment for still wins first: an unreadable status, the replanning
+ * controller, an active operation id, a mid-transaction state and a package/BUSY conflict all
+ * withhold the control. `can_stop:true` in a state this build does not list is honoured — that
+ * is what "any other state Scout explicitly supports" means.
+ *
+ * @returns {{ available, enabled, supported, reported, reason }} — `available:false` hides the
+ *   control entirely rather than showing a dead one.
  */
-export function stopAvailability(status) {
+export function stopAvailability(status, { busy = false } = {}) {
   const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const state = String(S.state || "").toUpperCase();
+  const reported = S.stopSupported === true;
+  const no = (reason) => ({ available: false, enabled: false, supported: true, reported, reason });
+  const off = (reason) => ({ available: true, enabled: false, supported: true, reported, reason });
+
   if (!S.supported || !S.present) {
-    return { supported: false, enabled: false,
+    return { available: false, enabled: false, supported: false, reported: false,
       reason: "Scout mission-execution status is unavailable — Stop cannot be offered" };
   }
-  if (S.canStop === null) {
-    return { supported: false, enabled: false,
-      reason: "This Scout does not implement POST /agent/mission_execution/stop yet. Stop is " +
-        "unavailable — it is not emulated from a LOITER command, and Rearm is not a " +
-        "substitute. Pause holds the mission without ending it." };
+  // WHICH control exists: Scout's lifecycle state, or Scout explicitly saying it will take one.
+  if (!STOPPABLE_STATES.includes(state) && S.canStop !== true) return no(null);
+
+  if (busy) return off("An operation is already in progress");
+  if (S.replanning.active) return off("The replanning controller owns the vehicle");
+  if (S.activeOperationId) {
+    return off(`Scout is already processing operation ${S.activeOperationId}`);
   }
-  if (S.replanning.active) {
-    return { supported: true, enabled: false,
-      reason: "The replanning controller owns the vehicle" };
+  // A mid-transaction state is a step INSIDE one of Scout's own writes. The RETURN phase is not
+  // one of those — the mission is simply still under way there, and a safe abort is meaningful.
+  if (S.transitional && !RETURN_PHASE_STOPPABLE.includes(state)) {
+    return off(`Scout is mid-transaction (${stateLabel(state)})`);
   }
-  if (S.activeOperationId || S.transitional) {
-    return { supported: true, enabled: false, reason: "Scout is mid-transaction" };
+  // Scout's own conflict/BUSY verdict on the run that owns the vehicle.
+  const conflict = str(S.binding && S.binding.conflictCode);
+  if (conflict && ACTIVE_CONFLICT_CODES.has(conflict)) {
+    return off(`Scout reports ${conflict} — another mission-execution operation owns the vehicle`);
   }
-  if (S.canStop !== true) {
-    return { supported: true, enabled: false,
-      reason: `Scout reports can_stop=false in ${S.state || "its current state"}` };
+  if (S.canStop === false) {
+    return off(`Scout reports can_stop=false in ${S.state || "its current state"}`);
   }
-  return { supported: true, enabled: true, reason: null };
+  return { available: true, enabled: true, supported: true, reported, reason: null };
+}
+
+/**
+ * The operator-facing PROGRESS line for a Stop in flight, from Scout's own phases when it has
+ * published one and from its `stop` evidence when it has not.
+ *
+ * Nothing here predicts the next state and nothing shows a percentage. Before Scout has moved at
+ * all — the POST is still in flight — the line is the honest generic first step.
+ *
+ * @returns {{ phase, text }}
+ */
+export function stopPhase(state, stopEvidence = null) {
+  const up = String(state || "").toUpperCase();
+  if (STOP_TRANSITION_LABELS[up]) return { phase: up, text: STOP_TRANSITION_LABELS[up] };
+  const ev = isObj(stopEvidence) ? stopEvidence : {};
+  // Scout published no stop STATE, but its evidence says how far the transaction got. Read it
+  // backwards — the last thing proven is the step just completed, so the line names the next one.
+  if (ev.reported) {
+    if (ev.rewindVerified === true) return { phase: "STOP_VERIFYING_RESET", text: "Verifying reset…" };
+    if (ev.originalRestored === true) return { phase: "STOP_REWINDING", text: "Rewinding mission…" };
+    if (ev.holdVerified === true) {
+      return { phase: "STOP_RESTORING_ORIGINAL", text: "Restoring original mission…" };
+    }
+  }
+  return { phase: "STOP_REQUESTED", text: STOPPING_TEXT };
+}
+
+/** True for a state inside Scout's stop transaction. */
+export function isStopTransactionState(state) {
+  return STOP_IN_TRANSACTION_STATES.includes(String(state || "").toUpperCase());
+}
+
+// The success lines a completed Stop shows, in order. Each is a CLAIM about a specific piece of
+// Scout evidence, so a line only appears when Scout actually proved it — a Stop that never had a
+// revised route to restore says "no revised route was installed", not "Original mission restored".
+export const STOP_SUCCESS_TITLE = "Mission stopped";
+
+/**
+ * How a finished Stop reads on the card — success or failure, from Scout's evidence only.
+ *
+ * The load-bearing rule: after a successful Stop, Scout normally reports
+ *
+ *     state = NOT_READY, start_eligible = true, authority_blocks_start = true
+ *
+ * and that is NOT a failure. Authority is deliberately back with the operator, and the Start
+ * button stays available because the Start transaction is what hands it to the Local Agent
+ * again. This function must never render that combination as a problem.
+ *
+ * A FAILED Stop leaves Scout SUSPENDED after the safe hold: the vehicle is being held in LOITER
+ * and the reset is incomplete. Scout's exact code is shown, and no recovery is suggested that
+ * the station would perform automatically — it performs none.
+ *
+ * @param status normalized (or raw) Scout status
+ * @param view   interpretTransaction() output for the stop operation, or null
+ * @returns {{ ok, title, lines, code, text, detail, held }|null}
+ */
+// The resting states a completed Stop can have produced. Outside them the stop presentation is
+// withheld entirely — Scout's `stop` block persists in its status, and narrating "Mission
+// stopped" over a run that has since been RESTARTED would be the worst kind of stale claim.
+const STOP_OUTCOME_STATES = [
+  "NOT_READY", "NOT_STARTED", "READY", "STOPPED", "CANCELLED", "SUSPENDED", "FAILED",
+];
+
+export function stopOutcomeView(status, view = null) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const v = isObj(view) ? view : null;
+  const ev = S.stop || {};
+  const state = String(S.state || "").toUpperCase();
+  const outcome = v ? str(v.outcome) : null;
+  if (!ev.reported && !v) return null;
+  if (outcome === "pending") return null;
+  if (!STOP_OUTCOME_STATES.includes(state)) return null;
+
+  // WHOSE failure is this? A SUSPENDED run is not automatically a failed Stop — a failed replan
+  // lands there too, and a `stop` block left over from an earlier abort must not be read as the
+  // cause. It is a stop failure only when a STOP_* code says so, or when the transaction the
+  // operator just ran was a stop that did not succeed.
+  const code = str(v && v.code) || (v ? null : ev.outcome);
+  const failedCode = code && STOP_ERROR_CODES.includes(String(code).toUpperCase()) ? code : null;
+  const failedTransaction = !!outcome && outcome !== OUTCOME.ACCEPTED;
+  const failed = !!failedCode || failedTransaction;
+  if (!failed && state === "SUSPENDED") return null;   // someone else's SUSPENDED
+
+  if (failed) {
+    const held = ev.holdVerified === true || String(S.mode || "").toUpperCase() === "LOITER";
+    const known = failedCode ? errorText(failedCode) : null;
+    return {
+      ok: false, held, code: failedCode || str(code) || null,
+      title: "Mission stop did not complete",
+      text: [
+        held ? "The vehicle is being held in LOITER." : null,
+        "The reset is incomplete.",
+        known && known !== failedCode ? `${known}.` : null,
+      ].filter(Boolean).join(" "),
+      lines: [],
+      detail: [
+        failedCode || code || null,
+        asText(v && v.message) || asText(S.lastError) || null,
+        ev.reported ? stopEvidenceDetail(ev) : null,
+      ].filter(Boolean).join(" · ") || null,
+    };
+  }
+
+  // SUCCESS. Every line is a proven claim, and each is omitted rather than guessed.
+  const lines = [];
+  if (ev.holdVerified === true || String(S.mode || "").toUpperCase() === "LOITER") {
+    lines.push("Vehicle held in LOITER");
+  }
+  if (ev.originalRestored === true) lines.push("Original mission restored");
+  else if (ev.originalRestored === false) lines.push("No revised route was installed");
+  if (ev.rewindVerified === true) lines.push("Original mission reset to start");
+  if (ev.replanReset === true || ev.experimentCleared === true) {
+    lines.push("Execution and replan test state cleared");
+  }
+  if ((ev.authorityAfter || "").toUpperCase() === "OPERATOR"
+      || (v && v.authorityRestored === true)) {
+    lines.push("Operator authority restored");
+  }
+  if (ev.readyForStart === true || S.startEligible === true) lines.push("Ready for a new Start");
+  return {
+    ok: true, held: true, code: null, title: STOP_SUCCESS_TITLE,
+    text: lines.join(" · ") || "Scout completed the stop transaction.",
+    lines,
+    detail: stopEvidenceDetail(ev),
+  };
+}
+
+/** Scout's stop evidence as ONE readable line for a tooltip. Never "[object Object]": every
+ *  value goes through asText, and the hashes are shortened rather than dropped. */
+export function stopEvidenceDetail(ev) {
+  const e = isObj(ev) ? ev : {};
+  if (!e.reported) return null;
+  const flag = (v) => (v === true ? "yes" : v === false ? "no" : null);
+  const hash = (h) => (h ? String(h).replace(/^sha256:/, "").slice(0, 12) + "…" : null);
+  const parts = [
+    e.outcome ? `outcome ${asText(e.outcome)}` : null,
+    flag(e.holdVerified) ? `hold verified ${flag(e.holdVerified)}` : null,
+    flag(e.originalRestored) ? `original restored ${flag(e.originalRestored)}` : null,
+    hash(e.activeHashBefore) ? `active before ${hash(e.activeHashBefore)}` : null,
+    hash(e.originalHash) ? `original ${hash(e.originalHash)}` : null,
+    hash(e.revisedHash) ? `revised ${hash(e.revisedHash)}` : null,
+    flag(e.rewindVerified) ? `rewind verified ${flag(e.rewindVerified)}` : null,
+    e.sequenceAfter === null || e.sequenceAfter === undefined
+      ? null : `sequence after ${asText(e.sequenceAfter)}`,
+    flag(e.replanReset) ? `replan reset ${flag(e.replanReset)}` : null,
+    flag(e.experimentCleared) ? `experiment cleared ${flag(e.experimentCleared)}` : null,
+    e.authorityAfter ? `authority ${asText(e.authorityAfter)}` : null,
+    flag(e.readyForStart) ? `ready for start ${flag(e.readyForStart)}` : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" · ") : null;
 }
 
 /**
@@ -849,12 +1128,25 @@ export function stopAvailability(status) {
  * ONLY — never from the last click, never from the previous label:
  *
  *   READY / NOT_STARTED       [ Start Mission ]
- *   RUNNING / RETURNING_HOME  [ Pause Mission ]  [ Stop Mission ]
+ *   RUNNING / RETURNING_HOME / HOME_ARRIVAL_PENDING
+ *                             [ Pause Mission ]  [ Stop Mission ]
  *   PAUSED                    [ Resume Mission ]  [ Stop Mission ]
  *   STOPPED / CANCELLED       [ Start Mission ]
- *   FAILED / SUSPENDED        failure shown + [ Rearm Mission Controller ]  [ Take Control ]
+ *   SUSPENDED / FAILED        failure shown + [ Rearm Mission Controller ]  [ Stop Mission ]
+ *                             [ Take Control ]
  *   COMPLETED_HOLD            completed + final LOITER shown; a fresh Start only AFTER the
  *                             controller has been rearmed for a new execution
+ *
+ * STOP SITS DIRECTLY BESIDE THE HOLD CONTROL, always, because the two are the operator's real
+ * choice at that moment and they are NOT interchangeable:
+ *
+ *   Pause  temporary LOITER; the execution position is retained; Resume continues the SAME run.
+ *   Stop   safe abort; LOITER; the original mission is restored if a revised route is installed,
+ *          rewound to its beginning, the execution/replan test state is cleared and supervisory
+ *          authority returns to the operator, ready for a clean new Start.
+ *
+ * Stop is NOT a destructive mission deletion and is never labelled as one: it clears no mission,
+ * deletes no planning package and disarms nothing.
  *
  * A RUNNING mission's primary button is "Pause Mission" and never "Resume" — Resume exists only
  * after a Pause, and labelling a live mission's button Resume invites an operator to press it
@@ -877,7 +1169,7 @@ export function lifecycleControls(status, {
 } = {}) {
   const S = status && status.present !== undefined ? status : normalizeStatus(status);
   const state = String(S.state || "").toUpperCase();
-  const stop = stopAvailability(S);
+  const stop = stopAvailability(S, { busy });
   const pause = pauseAvailability(S);
   const resume = resumeAvailability(S);
   const rearm = rearmAvailability(S);
@@ -907,11 +1199,13 @@ export function lifecycleControls(status, {
       " — mission lifecycle actions stay disabled until Scout hands control back.";
     return out;
   }
-  // RETURNING_HOME is transitional for the purposes of "Scout is moving through a sequence",
-  // but it is NOT a moment in which the operator must be denied control: the mission is still
-  // under way and Pause / Stop remain meaningful there. Every other transitional state is a
-  // step INSIDE one of Scout's own transactions, where a competing command would be unsafe.
-  const inFlight = S.activeOperationId || (S.transitional && state !== "RETURNING_HOME");
+  // The RETURN PHASE (RETURNING_HOME, HOME_ARRIVAL_PENDING) is transitional for the purposes of
+  // "Scout is moving through a sequence", but it is NOT a moment in which the operator must be
+  // denied control: the mission is still under way and Pause / Stop remain meaningful there.
+  // Every other transitional state — including FINAL_HOLD_REQUESTED and the whole stop sequence
+  // — is a step INSIDE one of Scout's own transactions, where a competing command is unsafe.
+  const inFlight = S.activeOperationId
+    || (S.transitional && !RETURN_PHASE_STOPPABLE.includes(state));
   if (inFlight) {
     out.tone = "caution";
     out.notice = S.activeOperationId
@@ -926,11 +1220,16 @@ export function lifecycleControls(status, {
   const addStart = (label = "Start Mission", extraReason = null) => out.buttons.push(
     btn("start", label, { enabled: !startBlocked && !extraReason,
       reason: extraReason || startReason, tone: "ok" }));
-  const addStop = () => out.buttons.push(
-    btn("stop", "Stop Mission", { enabled: stop.enabled, reason: stop.reason, tone: "warn",
-      kind: "secondary" }));
+  // Stop is only ADDED where the state offers it (stopAvailability). It is never hidden when
+  // merely un-pressable: a disabled Stop carrying Scout's own reason is what tells the operator
+  // the abort exists and why it cannot be used this second.
+  const addStop = () => {
+    if (!stop.available) return;
+    out.buttons.push(btn("stop", "Stop Mission",
+      { enabled: stop.enabled, reason: stop.reason, tone: "warn", kind: "secondary" }));
+  };
 
-  if (state === "RUNNING" || state === "RETURNING_HOME") {
+  if (state === "RUNNING" || RETURN_PHASE_STOPPABLE.includes(state)) {
     out.tone = "ok";
     // NEVER "Resume" here. The mission is running; Resume is meaningful only after a Pause.
     out.buttons.push(btn("pause", "Pause Mission", { enabled: pause.enabled, tone: "ok",
@@ -951,6 +1250,12 @@ export function lifecycleControls(status, {
       out.buttons.push(btn("rearm", "Rearm Mission Controller",
         { enabled: rearm.enabled, reason: rearm.reason, tone: "caution", kind: "secondary" }));
     }
+    // A run suspended by a failed replan still owns the vehicle, so the safe abort belongs
+    // beside Rearm. They are NOT the same action and neither substitutes for the other: Rearm
+    // prepares the controller for another run and issues no vehicle command, while Stop holds
+    // the vehicle, restores and rewinds the original mission, clears the execution/replan test
+    // state and hands supervisory authority back to the operator.
+    addStop();
     // Take Control is offered here as an explicit manual override — a failed or suspended run
     // is exactly when an operator may need the wheel back by hand. It is NOT part of any
     // automatic lifecycle transaction.
@@ -1167,6 +1472,7 @@ export function missionCardView(status, {
   busy = false, startBlocked = false, startBlockedReason = null,
   missionId = null, unavailableDetail = null, readiness = null,
   starting = false, homeVerified = null, preflight = null,
+  stopping = false, stopResult = null,
 } = {}) {
   const S = status && status.present !== undefined ? status : normalizeStatus(status);
   const ctl = lifecycleControls(S, { busy, startBlocked, startBlockedReason });
@@ -1188,6 +1494,12 @@ export function missionCardView(status, {
     // Rendered as its own notice: it is neither a broken mission nor a Scout fault, and the two
     // real remedies are Scout's — finish the active run, or explicitly rearm it.
     replacementConflict: null,
+    // How a FINISHED Stop reads (stopOutcomeView): the success lines, or Scout's exact failure
+    // code with the "held in LOITER, reset incomplete" statement. Never a mission failure for
+    // the normal NOT_READY + start_eligible landing.
+    stopOutcome: null,
+    // A Stop in flight: the phase-specific progress line, from Scout's own state/evidence.
+    stopPhase: null,
     // Start is available AND pressing it will take Local Agent control first.
     authorityWillBeAcquired: false,
   };
@@ -1225,9 +1537,17 @@ export function missionCardView(status, {
   // PHASE-SPECIFIC and NEUTRAL — the five phases in lib/mission-readiness.js, each of them
   // Scout's observed step (or, before Scout has moved, the backend's provable first phase).
   // Nothing here is a warning: a Start in progress is the system doing what was asked.
-  if (starting || S.activeOperationId || (S.transitional && state !== "RETURNING_HOME")) {
+  if (starting || stopping || S.activeOperationId
+      || (S.transitional && !RETURN_PHASE_STOPPABLE.includes(state))) {
     out.working = true;
-    if (starting || isStartTransactionState(state)) {
+    // A STOP in flight gets Scout's own phases — Stopping mission… → Holding position… →
+    // Restoring original mission… → Rewinding mission… → Verifying reset… — and never an
+    // optimistic "stopped" before Scout's transaction has actually completed.
+    if (stopping || isStopTransactionState(state)) {
+      const ph = stopPhase(state, S.stop);
+      out.stopPhase = ph.phase;
+      out.headline = ph.text;
+    } else if (starting || isStartTransactionState(state)) {
       const ph = startPhase(state);
       out.startPhase = ph.phase;
       out.headline = ph.text;
@@ -1236,6 +1556,10 @@ export function missionCardView(status, {
     }
     return out;
   }
+  // A COMPLETED Stop, presented from Scout's evidence. Computed before the pre-start branches
+  // below precisely because a successful stop rests in NOT_READY: without this the card would
+  // show the perfectly normal "Not ready to start" and nothing about the abort that just ran.
+  out.stopOutcome = stopOutcomeView(S, stopResult);
 
   // A one-shot preflight refresh (explicit Refresh, a read after an upload/sync/reconnect) is a
   // PASSIVE, INFORMATIONAL verification: a small spinner and nothing else. It never withdraws a
@@ -1328,7 +1652,10 @@ export function missionCardView(status, {
     const btn = (a) => ctl.buttons.find((b) => b.action === a);
     const start = btn("start"), stop = btn("stop");
     const held = ["pause", "resume"].map(btn).find((b) => b && !b.enabled);
-    if (out.replacementConflict) {
+    if (out.stopOutcome && out.stopOutcome.ok === false) {
+      // A failed Stop states itself in full, in its own block. Repeating Scout's last_error as a
+      // second short line here would print the same failure twice.
+    } else if (out.replacementConflict) {
       // Outranks every other blocker: it is the only one that explains why a mission the
       // operator JUST uploaded is not the mission this vehicle is going to fly.
       out.blocker = { text: "Another mission is still active", tone: "warn",
@@ -1342,10 +1669,7 @@ export function missionCardView(status, {
       out.blocker = { text: shortStartBlocker(start.reason), title: asText(rv && rv.detail)
         || asText(start.reason), tone: "warn" };
     } else if (stop && !stop.enabled) {
-      out.blocker = {
-        text: ctl.stop && ctl.stop.supported === false
-          ? "Stop unavailable on this Scout" : firstClause(stop.reason),
-        title: asText(stop.reason), tone: null };
+      out.blocker = { text: firstClause(stop.reason), title: asText(stop.reason), tone: null };
     } else if (held) {
       out.blocker = { text: firstClause(held.reason), title: asText(held.reason), tone: null };
     }

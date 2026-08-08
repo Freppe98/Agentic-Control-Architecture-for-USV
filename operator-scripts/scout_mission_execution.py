@@ -68,31 +68,64 @@ STATES = (
     "SETTING_HOME", "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO",
     "RUNNING",
     "PAUSE_REQUESTED", "PAUSED", "RESUME_REQUESTED",
-    "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED", "STOPPED", "CANCELLED",
+    "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
+    "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+    "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET",
+    "STOPPED", "CANCELLED",
     "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED", "COMPLETED_HOLD",
     "SUSPENDED", "FAILED",
 )
 
-# ── The STOP contract (PENDING ON SCOUT — see SCOUT_STOP_API.md) ──────────────────────────
-# Scout does not implement POST /agent/mission_execution/stop yet. The Operator model, proxy
-# and UI are written against the contract below so that the day Scout ships it, nothing here
-# changes; until then every Stop attempt answers `unsupported` (404) and the UI shows Stop as
-# disabled with that exact reason. Nothing about Stop is ever synthesized from a low-level
-# LOITER plus operator-side state — that would be a second, competing lifecycle.
+# ── The STOP lifecycle operation (Scout owns the WHOLE transaction) ───────────────────────
+# POST /agent/mission_execution/stop is a FIRST-CLASS Scout lifecycle operation. It is NOT a raw
+# Pixhawk stop and it is NOT something this station assembles from parts. Scout performs, in one
+# transaction:
 #
-#   POST /agent/mission_execution/stop  →  STOP_REQUESTED → STOP_HOLD_REQUESTED
-#                                          → STOP_HOLD_CONFIRMED → STOPPED
+#   active mission → verified LOITER → verify active mission identity → restore the immutable
+#   original mission if a verified revised route is installed → rewind the original mission to
+#   its start → verify the rewind → reset mission-execution / replan / test state → clear the
+#   simulated experiment injection → invalidate the prior runtime Home → return supervisory
+#   authority to OPERATOR → re-prove mission evidence
 #
-# Stop ENDS the run and leaves the vehicle in a verified LOITER. It must NOT disarm, clear the
-# Pixhawk mission, delete the planning package, invoke RTL, be reported as FAILED, or be
-# emulated with Rearm.
-STOP_SEQUENCE = ("STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED", "STOPPED")
-STOP_IN_TRANSACTION_STATES = frozenset({
+# The Operator forwards the intent, preserves Scout's evidence verbatim, and re-reads canonical
+# status. It issues NO LOITER, NO mission upload, NO rewind, NO rearm, NO reset and NO authority
+# write of its own — every one of those would be a second lifecycle competing with Scout's.
+#
+# A SUCCESSFUL Stop normally comes to rest at:
+#
+#   state = NOT_READY, start_eligible = true, authority_blocks_start = true, authority = OPERATOR
+#
+# which is NOT a failure and must never be displayed as one: authority is deliberately back with
+# the OPERATOR, and the Operator's own Start transaction is what hands it to LOCAL_AGENT again.
+STOP_SEQUENCE = (
     "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
-})
-# Terminal "the run was deliberately ended" states. CANCELLED is accepted as a synonym so a
-# Scout that names it differently is not displayed as an unrecognized state.
+    "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
+    "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET",
+)
+STOP_IN_TRANSACTION_STATES = frozenset(STOP_SEQUENCE)
+# Terminal "the run was deliberately ended" states Scout may REST in. CANCELLED is accepted as a
+# synonym so a Scout that names it differently is not displayed as an unrecognized state. Under
+# the current contract Scout normally settles in NOT_READY instead, with the outcome carried in
+# the `stop` evidence block — which is why nothing downstream may require STOPPED to call a Stop
+# successful (see stop_evidence / stop_view).
 STOPPED_STATES = frozenset({"STOPPED", "CANCELLED"})
+
+# Scout's structured Stop failure codes. Every one of these is raised AFTER the vehicle is safely
+# holding: Scout reaches a verified LOITER first and only then restores/rewinds/resets, so a Stop
+# that fails here leaves the vehicle held and the reset INCOMPLETE. The operator is shown Scout's
+# exact code; the station never follows one with an automatic Rearm, Resume, AUTO or second Stop.
+STOP_ERROR_CODES = frozenset({
+    "STOP_ACTIVE_MISSION_UNKNOWN", "STOP_RESTORE_UPLOAD_FAILED", "STOP_RESTORE_HASH_MISMATCH",
+    "STOP_REWIND_NOT_VERIFIED", "STOP_HOLD_NOT_VERIFIED", "STOP_MISSION_ID_MISMATCH",
+})
+
+# The fields of Scout's `stop` evidence block, in the order the operator reads them. Kept as one
+# tuple so the backend summary, the write trace and the UI diagnostics cannot drift.
+STOP_EVIDENCE_FIELDS = (
+    "hold_verified", "original_restored", "active_hash_before", "original_hash", "revised_hash",
+    "rewind_verified", "sequence_after", "replan_reset", "experiment_cleared", "authority_after",
+    "ready_for_start", "outcome",
+)
 
 # Scout may report this as `effective_state` while its STORED state is still RUNNING/PAUSED:
 # the replanning controller owns the vehicle for the duration. It is an overlay, not a state.
@@ -212,6 +245,31 @@ def _str_or_none(v):
     return s or None
 
 
+def stop_evidence(body):
+    """Scout's `stop` evidence block, normalized but NEVER invented.
+
+    Returns {reported, hold_verified, original_restored, active_hash_before, original_hash,
+    revised_hash, rewind_verified, sequence_after, replan_reset, experiment_cleared,
+    authority_after, ready_for_start, outcome} — every value Scout's own or None. `reported` is
+    false when Scout carries no `stop` block at all, which is what keeps a station that has
+    never seen a Stop from displaying a fabricated one.
+
+    Booleans stay TRI-STATE (true / false / None): "Scout did not verify the rewind" and "Scout
+    said nothing about the rewind" are different facts, and rounding the second into the first
+    would report a failure Scout never claimed."""
+    blk = body.get("stop") if isinstance(body, dict) else None
+    if not isinstance(blk, dict) or not blk:
+        return {"reported": False, **{f: None for f in STOP_EVIDENCE_FIELDS}}
+    out = {"reported": True}
+    for f in STOP_EVIDENCE_FIELDS:
+        out[f] = blk.get(f)
+    # The hashes, the outcome and the authority are IDENTIFIERS, so they are normalized to text;
+    # the flags and the sequence keep Scout's own type.
+    for f in ("active_hash_before", "original_hash", "revised_hash", "authority_after", "outcome"):
+        out[f] = _str_or_none(out[f])
+    return out
+
+
 # ── Reads ────────────────────────────────────────────────────────────────────────────────
 def is_status_body(body):
     """True when a 2xx body actually IS a mission-execution status (see
@@ -269,17 +327,24 @@ def post_resume(base):
 
 
 def post_stop(base, mission_id=None):
-    """END the mission run: Scout requests a hold, confirms a VERIFIED LOITER, and settles in
-    STOPPED (STOP_REQUESTED -> STOP_HOLD_REQUESTED -> STOP_HOLD_CONFIRMED -> STOPPED).
+    """SAFE ABORT of the mission run — Scout's own first-class lifecycle transaction.
 
-    NOT IMPLEMENTED ON SCOUT YET. Until it is, this route 404s and the whole path answers
-    `unsupported` — which is exactly what the operator is shown. Stop is deliberately NOT
-    emulated from a low-level LOITER plus operator-side bookkeeping: that would be a second
-    lifecycle competing with Scout's own, and the station has exactly one.
+    ONE POST. Scout holds the vehicle in a verified LOITER, verifies the active mission
+    identity, restores the immutable original mission if a verified revised route is installed,
+    rewinds the original to its start, verifies the rewind, resets mission-execution / replan /
+    test state, clears the simulated experiment injection, invalidates the prior runtime Home,
+    returns supervisory authority to OPERATOR and re-proves the mission evidence.
 
-    Stop does NOT disarm, does NOT clear the Pixhawk mission, does NOT delete the planning
-    package, does NOT invoke RTL, is NOT a FAILED outcome, and is NOT Rearm. See
-    SCOUT_STOP_API.md for the contract this is written against."""
+    The Operator reimplements NONE of that. It does not send LOITER, does not upload the
+    original mission, does not rewind the sequence, does not reset the replan controller, does
+    not clear the experiment and does not write authority — the whole transaction is Scout's,
+    and the station's job is to forward the intent and preserve the evidence.
+
+    The mission id the OPERATOR believes is active is sent so Scout can fail closed on a
+    mismatch rather than aborting a run the operator did not mean.
+
+    This is NOT the legacy raw Pixhawk /nav/stop, and Stop is NOT Rearm: Rearm prepares the
+    controller for another run, issues no vehicle command and verifies no hold."""
     body = {"mission_id": mission_id} if mission_id else {}
     return _op("stop", base, body)
 
@@ -341,6 +406,10 @@ def interpret_operation(result):
         "idempotent": body.get("idempotent"),
         "home_result": body.get("home_result") if isinstance(body.get("home_result"), dict) else None,
         "sequence": body.get("sequence") if isinstance(body.get("sequence"), dict) else None,
+        # Scout's Stop evidence, when the operation body carries it. Preserved as its own field
+        # so the write trace and the UI read the SAME structure whether it arrived on the
+        # operation response or on the next canonical status.
+        "stop": stop_evidence(body),
     })
     out["ok"] = operational == OUTCOME_ACCEPTED
     return out
@@ -386,6 +455,12 @@ def summarize_status(result):
         # merely "not right now".
         "can_stop": body.get("can_stop"),
         "stop_supported": "can_stop" in body,
+        # Scout's Stop evidence block, verbatim (see stop_evidence). It is what makes a
+        # successful Stop provable — hold verified, original restored, rewind verified, state
+        # reset, authority back with the OPERATOR — instead of inferred from a resting state.
+        "stop": stop_evidence(body),
+        "stop_reported": isinstance(body.get("stop"), dict) and bool(body.get("stop")),
+        "stop_outcome": stop_evidence(body)["outcome"],
         # Scout's explicit eligibility contract. PRESENCE is what makes it authoritative: a Scout
         # that predates the contract omits the keys entirely, and `None` here is what makes the
         # eligibility rule fall back to the older `can_start` reading rather than treat a missing
@@ -450,7 +525,8 @@ def reconcile(base, operation, *, expected_mission_id=None):
             "supported", "reachable", "state", "effective_state", "active_operation_id",
             "mission_id", "mode", "verified_mode", "sequence", "continuation_verified",
             "return_completion", "final_loiter_verified", "can_start", "can_pause",
-            "can_resume", "can_stop", "stop_supported", "last_error")},
+            "can_resume", "can_stop", "stop_supported", "stop", "stop_outcome",
+            "start_eligible", "authority_blocks_start", "authority_status", "last_error")},
     }
 
     if not summary["present"]:
@@ -531,11 +607,21 @@ def reconcile(base, operation, *, expected_mission_id=None):
         else:
             out["detail"] = f"Scout reports {state} — resume outcome undetermined"
     elif operation == "stop":
-        # STOPPED itself is handled above. Anything else means the stop has not settled: the
-        # run is still live, and authority stays exactly where it is.
-        if state in ("RUNNING", "RETURNING_HOME"):
+        # A SUCCESSFUL Stop normally comes to rest in NOT_READY (authority is deliberately back
+        # with the OPERATOR), NOT in STOPPED — so a reconciling read must resolve from Scout's
+        # own `stop` evidence rather than from the resting state alone. STOPPED / CANCELLED are
+        # handled above and still resolve to "stopped"; SUSPENDED is the documented FAILURE
+        # landing and is resolved by the terminal branch above with Scout's own last_error.
+        ev = summary.get("stop") or {}
+        if ev.get("reported") and (ev.get("ready_for_start") is True
+                                   or _is_success_outcome(ev.get("outcome"))):
+            out["resolved"] = "stopped"
+            out["detail"] = (f"Scout reports {state} with stop evidence "
+                             f"{ev.get('outcome') or 'ready for a new start'}"
+                             + (f" in mode {summary['mode']}" if summary["mode"] else ""))
+        elif state in ("RUNNING", "RETURNING_HOME", "HOME_ARRIVAL_PENDING"):
             out["resolved"] = "running"
-            out["detail"] = "Scout is still RUNNING — the stop did not take effect"
+            out["detail"] = f"Scout is still {state} — the stop did not take effect"
         elif state == "PAUSED":
             out["resolved"] = "paused"
             out["detail"] = "Scout is still PAUSED — the stop did not take effect"
@@ -548,6 +634,14 @@ def reconcile(base, operation, *, expected_mission_id=None):
         else:
             out["detail"] = f"Scout reports {state} — rearm outcome undetermined"
     return out
+
+
+def _is_success_outcome(outcome):
+    """Whether Scout's `stop.outcome` word names a COMPLETED stop. Scout's exact vocabulary is
+    its own, so this matches the words it is documented to use and treats anything else as
+    undecided — never as a failure, and never as a success."""
+    o = (outcome or "").strip().upper()
+    return o in {"STOPPED", "COMPLETE", "COMPLETED", "SUCCESS", "SUCCEEDED", "OK"}
 
 
 def _seq_note(summary):

@@ -36,7 +36,13 @@ export function missionProgress(mission) {
 
 // Reasons that ALWAYS force a fresh download regardless of cache — an explicit operator
 // action or an event that means the on-vehicle mission may have just been rewritten.
-const FORCE_REASONS = new Set(["manual", "select", "command", "replan"]);
+//
+// "stop" is one of them because Scout's Stop transaction restores the immutable ORIGINAL mission
+// when a verified revised route is installed and rewinds it to its start. The geometry identity
+// can legitimately come back UNCHANGED (a stop on a run that was never replanned), so the cache
+// must not be trusted to notice: the sequence moved even when the route did not, and the overlay,
+// the active-waypoint marker and the progress readout all have to be re-read from ground truth.
+const FORCE_REASONS = new Set(["manual", "select", "command", "replan", "stop"]);
 
 const DEFAULT_FALLBACK_MS = 20000; // slow safety refresh (task C.5: every 15–30 s)
 

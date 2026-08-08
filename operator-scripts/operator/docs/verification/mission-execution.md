@@ -46,10 +46,10 @@ A live bench Start (DISARMED → ARMED/AUTO/LOCAL_AGENT, Agent Mission RUNNING, 
 reached RUNNING with no usable hold control on the Map. Cause: `can_pause` / `can_resume` were
 read with a strict `=== true`, so a Scout status that simply does not carry the optional
 capability flag was treated as an explicit refusal — the card rendered `Pause` disabled with the
-**fabricated** reason "Scout reports can_pause=false", beside a `Stop Mission` that is unsupported
-on this Scout. Two dead buttons.
+**fabricated** reason "Scout reports can_pause=false", beside a `Stop Mission` that was disabled
+for the same kind of reason. Two dead buttons.
 
-They are now tri-state, exactly like `can_stop`:
+They are now tri-state, and so is `can_stop`:
 
 | Scout's status | Control | Why |
 | --- | --- | --- |
@@ -60,6 +60,43 @@ They are now tri-state, exactly like `can_stop`:
 The same three rows hold for `can_resume` in `PAUSED`. Which control EXISTS still comes from
 Scout's state alone (`RUNNING`/`RETURNING_HOME` → Pause, `PAUSED` → Resume), and an active
 operation id, a mid-transaction state or the replanning overlay still withholds it.
+
+## Stop Mission — Scout's safe abort, beside the hold control
+
+`POST /agent/mission_execution/stop` is a first-class Scout lifecycle operation, proxied by
+`POST /api/vehicles/{id}/mission-execution/stop`. It is **not** the legacy raw Pixhawk stop (which
+this station does not expose at all) and **not** a mission deletion.
+
+| Scout state | Controls |
+| --- | --- |
+| `RUNNING` / `RETURNING_HOME` / `HOME_ARRIVAL_PENDING` | **Pause Mission** · **Stop Mission** |
+| `PAUSED` | **Resume Mission** · **Stop Mission** |
+| `SUSPENDED` (e.g. after a failed replan) | **Rearm Mission Controller** · **Stop Mission** · Take Control |
+
+Pause and Stop are deliberately different actions: Pause is a temporary LOITER that retains the
+execution position so Resume continues the same run; Stop holds the vehicle, restores the original
+mission if a revised route is installed, rewinds it to the beginning, clears the execution/replan
+test state and returns control authority to the operator, ready for a clean new Start.
+
+While a Stop runs the card shows Scout's own phases — *Stopping mission… → Holding position… →
+Restoring original mission… → Rewinding mission… → Verifying reset…* — every control is disabled,
+and nothing is claimed until Scout's transaction completes.
+
+A successful Stop leaves Scout at `state=NOT_READY`, `start_eligible=true`,
+`authority_blocks_start=true`, `authority=OPERATOR`. **This is expected, not a failure**: authority
+is deliberately back with the operator, and the Start transaction hands it to the Local Agent
+again — so `Start Mission` remains available and the card reads *Mission stopped* with the proven
+claims beneath it.
+
+A Stop that fails after the safe hold leaves `SUSPENDED` with Scout's own code
+(`STOP_ACTIVE_MISSION_UNKNOWN`, `STOP_RESTORE_UPLOAD_FAILED`, `STOP_RESTORE_HASH_MISMATCH`,
+`STOP_REWIND_NOT_VERIFIED`). The card shows the exact code and states that the vehicle is being
+held in LOITER with the reset incomplete. The station runs **no** automatic recovery.
+
+After a successful Stop the station re-reads mission-execution status, re-runs the one-shot
+preflight, refreshes control authority and forces a fresh Pixhawk mission download (`"stop"` is a
+force reason in `lib/mission-refresh.js`) so the overlay, the active waypoint and the progress
+readout return to the original mission at its beginning. The map is **not** recentred.
 
 `ACCEPTED` is also no longer shown as a clean result when the backend's post-operation read-back
 (`mission_lifecycle._verify_state`) answered `withheld`: the Map's result line reads

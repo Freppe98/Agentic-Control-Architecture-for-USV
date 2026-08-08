@@ -1079,6 +1079,12 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .amx-result { font-size:11.5px; line-height:1.5; color:var(--muted); padding-top:8px; border-top:1px solid var(--line); }
 .amx-result.ok { color:var(--connected); }
 .amx-result.warn { color:var(--caution); }
+/* A completed Stop's proven claims — held in LOITER, original restored, rewound to the start,
+   test state cleared, authority returned, ready for a new Start. One short line each: they are
+   separate pieces of Scout evidence and reading them as a paragraph hides which one is missing. */
+.amx-stop-lines { margin-top:4px; display:flex; flex-direction:column; gap:2px; }
+.amx-stop-lines > div { color:var(--muted); }
+.amx-stop-lines > div::before { content:"✓ "; color:var(--connected); }
 
 /* Agent page: the raw lifecycle writes, COLLAPSED BY DEFAULT. Normal Start/Pause/Resume/Stop
    live on the Map's Agent Mission card; this section exists for diagnosis only and is styled to

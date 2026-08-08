@@ -200,17 +200,21 @@ Anything touching `main.py` or the `POST /agent/status` schema is an outward-fac
 
 ---
 
-## Blocked on Scout (Local Agent, port 8090)
+## Delivered with Scout (Local Agent, port 8090)
 
 | Slot | Pages | Owner | Prio | State |
 |---|---|---|---|---|
-| **`POST /agent/mission_execution/stop` + `can_stop` in status** | Map (Agent Mission card), Agent (diagnostics) | Local Agent | **P0** | **Requested — contract written, Operator side complete** |
+| **`POST /agent/mission_execution/stop` + `stop` evidence + `can_stop` in status** | Map (Agent Mission card), Agent (diagnostics) | Local Agent | **P0** | **Shipped both sides** |
 
-Stop is the one normal mission-lifecycle operation the operator cannot perform. The Operator
-model, proxy (`scout_mission_execution.post_stop`), transaction
-(`mission_lifecycle.run_stop`), route (`POST /api/vehicles/{id}/mission-execution/stop`) and UI
-are already implemented against the contract in [`SCOUT_STOP_API.md`](SCOUT_STOP_API.md);
-shipping the Scout side is the only remaining work. Until then the button is visibly disabled
-with the reason "this Scout does not implement stop yet" — Stop is never emulated from a
-low-level LOITER plus operator-side state, never reported as FAILED, and Rearm is never offered
-as a substitute.
+Stop is Scout's own **safe-abort** lifecycle transaction: verified LOITER → verify the active
+mission identity → restore the immutable original mission if a verified revised route is
+installed → rewind it to its start → verify the rewind → reset execution / replan / test state →
+clear the experiment injection → invalidate the runtime Home → return supervisory authority to
+OPERATOR → re-prove the mission evidence.
+
+The Operator side is a **proxy plus evidence**: `scout_mission_execution.post_stop`,
+`mission_lifecycle.run_stop`, `POST /api/vehicles/{id}/mission-execution/stop`, and the Map /
+Agent presentation. It reimplements no step of the sequence, sends no LOITER, upload, rewind,
+reset or rearm, writes no authority of its own, and never exposes the legacy raw Pixhawk stop. A
+successful Stop resting at `NOT_READY` + `start_eligible=true` + `authority_blocks_start=true` is
+the expected landing, not a failure. See [`SCOUT_STOP_API.md`](SCOUT_STOP_API.md).

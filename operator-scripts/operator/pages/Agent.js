@@ -426,7 +426,60 @@ export function Agent(root) {
     return head +
       `<div class="subgrid two">${mxControlCard(S, res, ops)}${mxHomeCard(S, ops)}</div>
        <div class="subgrid two">${mxSequenceCard(S)}${mxReturnCard(S)}</div>
+       ${mxStopCard(S, ops)}
        ${mxOperationsCard(ops)}`;
+  }
+
+  // --- STOP: Scout's safe-abort evidence -----------------------------------------------------
+  // Scout's Stop is ONE transaction it owns end to end — verified LOITER, verify the active
+  // mission identity, restore the immutable original mission when a verified revised route is
+  // installed, rewind the original to its start, verify the rewind, reset execution/replan/test
+  // state, clear the experiment injection, invalidate the runtime Home, hand supervisory
+  // authority back to the OPERATOR and re-prove the mission evidence.
+  //
+  // Every row below is Scout's own `stop` evidence field, rendered through val() — which uses
+  // asText, never String() — so a structured value renders its own content and NEVER the literal
+  // "[object Object]". The card is withheld entirely when Scout reports no stop block: a station
+  // that has never seen a Stop must not display a fabricated one.
+  //
+  // A successful Stop normally leaves state=NOT_READY with start_eligible=true and
+  // authority_blocks_start=true. That is the EXPECTED landing and is labelled as such here, not
+  // as a fault: authority is deliberately back with the operator and the Start transaction is
+  // what hands it to the Local Agent again.
+  function mxStopCard(S, ops) {
+    const e = S.stop || {};
+    const lastStop = ops.slice().reverse().find((o) => String(o.operation || "") === "stop") || null;
+    if (!e.reported && !lastStop) return "";
+    const view = mx.stopOutcomeView(S, null);
+    const failed = view && view.ok === false;
+    // asText everywhere, never String(): Scout's outcome and authority are normally bare words
+    // but a structured {code, message} is a legitimate shape, and coercing one would print
+    // "[object Object]" in the pill that names the verdict of an abort.
+    const cond = failed ? rp(asText(view.code) || asText(S.state) || "FAILED", "d")
+      : e.readyForStart === true ? rp("READY FOR A NEW START", "c")
+      : e.outcome ? rp(asText(e.outcome).toUpperCase(), "u") : rp("reported", "u");
+    const flag = (v, yes, no) => (v === true ? rp(yes, "c") : v === false ? rp(no, "d")
+      : rp("not reported", "u"));
+    return card("Stop Mission (Scout safe-abort evidence)", cond,
+      failed ? "caution" : e.readyForStart === true ? "ok" : "idle",
+      `<div class="metrics">
+         ${row("Hold verified", flag(e.holdVerified, "LOITER VERIFIED", "NOT VERIFIED"))}
+         ${row("Original restored", e.originalRestored === true ? rp("RESTORED", "c") : e.originalRestored === false ? rp("NOT NEEDED — no revised route was installed", "u") : rp("not reported", "u"))}
+         ${row("Active hash before", `<span class="mono">${shortHash(e.activeHashBefore)}</span>`)}
+         ${row("Original hash", `<span class="mono">${shortHash(e.originalHash)}</span>`)}
+         ${row("Revised hash", `<span class="mono">${shortHash(e.revisedHash)}</span>`)}
+         ${row("Rewind verified", flag(e.rewindVerified, "REWOUND TO START", "NOT VERIFIED"))}
+         ${row("Sequence after", val(e.sequenceAfter))}
+         ${row("Replan reset", flag(e.replanReset, "RESET", "NOT RESET"))}
+         ${row("Experiment cleared", flag(e.experimentCleared, "CLEARED", "NOT CLEARED"))}
+         ${row("Authority after", e.authorityAfter ? rp(asText(e.authorityAfter), e.authorityAfter === "OPERATOR" ? "c" : "p") : rp("not reported", "u"))}
+         ${row("Ready for Start", flag(e.readyForStart, "READY", "NOT READY"))}
+         ${row("Outcome", val(e.outcome))}
+       </div>
+       ${failed
+          ? `<div class="reason-note" style="border-left:3px solid var(--disconnected)">${warnSvg}<span><b>${esc(view.title)}: ${esc(view.code || "")}</b> ${esc(view.text)} The operator station issues <b>no</b> automatic recovery — it does not follow this with a Rearm, a Resume, an AUTO or a second Stop. Decide the next action explicitly.</span></div>`
+          : `<div class="reason-note">${gapSvg}<span>Stop is a <b>safe abort</b>, not a mission deletion: it clears no Pixhawk mission, deletes no planning package, disarms nothing and never invokes RTL. A successful Stop normally leaves Scout in <span class="mono">NOT_READY</span> with <span class="mono">start_eligible=true</span> and <span class="mono">authority_blocks_start=true</span> — that is expected, because supervisory authority is back with the <b>operator</b>, and the Start transaction hands it to the Local Agent again.</span></div>`}`,
+      false);
   }
 
   // --- Lifecycle state + evidence. NORMAL CONTROLS ARE NOT HERE ------------------------------
@@ -527,7 +580,7 @@ export function Agent(root) {
          ${row("Package conflict", b.conflictCode ? rp(b.conflictCode, "d") : rp("none", "c"))}
        </div>
        ${view.blocksNewMission
-          ? `<div class="reason-note" style="border-left:3px solid var(--disconnected)">${warnSvg}<span><b>${esc(mx.MISSION_REPLACEMENT_BLOCKED_TEXT)}</b> The newly uploaded mission is <b>not</b> ready and is not being presented as such. The operator station does not offer a Stop — Scout does not implement one — so the run ends by finishing, or by an explicit rearm.</span></div>`
+          ? `<div class="reason-note" style="border-left:3px solid var(--disconnected)">${warnSvg}<span><b>${esc(mx.MISSION_REPLACEMENT_BLOCKED_TEXT)}</b> The newly uploaded mission is <b>not</b> ready and is not being presented as such. The run ends by finishing, by an explicit <b>Stop</b> (Scout's own safe abort), or by an explicit rearm — the operator station emulates none of those locally.</span></div>`
           : ""}`;
   }
 
@@ -569,11 +622,13 @@ export function Agent(root) {
         ${btn("mx-fb-start", "Start", act.action === "start" && act.enabled, act.reason)}
         ${btn("mx-fb-pause", "Pause", act.action === "pause" && act.enabled, act.reason)}
         ${btn("mx-fb-resume", "Resume", act.action === "resume" && act.enabled, act.reason)}
-        ${btn("mx-fb-stop", "Stop", stop.enabled, stop.reason)}
+        ${btn("mx-fb-stop", "Stop", stop.available && stop.enabled, stop.reason)}
       </div>
       <div class="reason-note">${warnSvg}<span>Use the Map's <b>Agent Mission</b> card for normal
         operation. These are the same orchestrated endpoints — authority is still transferred and
-        verified — exposed here only for diagnosis.${stop.supported ? "" : ` ${esc(stop.reason)}`}</span></div>
+        verified — exposed here only for diagnosis. The legacy raw Pixhawk stop is deliberately
+        not exposed anywhere: <b>Stop</b> here is Scout's own mission-execution safe
+        abort.${stop.available || !stop.reason ? "" : ` ${esc(stop.reason)}`}</span></div>
     </details>`;
   }
 
@@ -682,7 +737,7 @@ export function Agent(root) {
     on("mx-fb-pause", () => mxWrite("Pause Mission", (id) => api.pauseMissionExecution(id)));
     on("mx-fb-resume", () => mxWrite("Resume Mission", (id) => api.resumeMissionExecution(id)));
     on("mx-fb-stop", () => {
-      if (!window.confirm("Stop Mission (diagnostic fallback)?\n\nScout ends the run and holds position. This does NOT disarm, clear the Pixhawk mission, delete the planning package or invoke RTL. Authority returns to the operator only after Scout reports STOPPED with a verified LOITER.")) return;
+      if (!window.confirm("Stop Mission (diagnostic fallback)?\n\nSAFE ABORT, not a mission deletion. Scout holds the vehicle in a verified LOITER, restores the original mission if a revised route is installed, rewinds it to the beginning, clears the execution and replan test state and returns supervisory authority to the operator.\n\nIt does NOT disarm, clear the Pixhawk mission, delete the planning package or invoke RTL.")) return;
       mxWrite("Stop Mission", (id) => api.stopMissionExecution(id));
     });
   }
