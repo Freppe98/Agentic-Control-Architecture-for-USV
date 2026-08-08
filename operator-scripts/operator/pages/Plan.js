@@ -24,7 +24,7 @@ import { commState, noTelem } from "../lib/ui.js";
 import * as P from "../lib/planning.js";
 import * as FP from "../lib/fleet-plan.js";
 import { missionUploadStage, UPLOAD_STAGES } from "../lib/mission-upload.js";
-import { publishView, phaseText, OUTCOME } from "../lib/mission-publish.js";
+import { publishView, phaseText, OUTCOME, nextPublishAttempt } from "../lib/mission-publish.js";
 import { hasPendingOfType } from "../lib/command.js";
 import { missionLockState, lockMessage } from "../lib/mission-lock.js";
 import { uploadEligibility, UPLOAD_LEVEL } from "../lib/upload-policy.js";
@@ -1235,29 +1235,51 @@ export function Plan(root) {
   // agent_ready. `publishing` is the in-flight guard: a duplicate click or a second command
   // poll arriving mid-publish must not issue a second transaction (the backend also serializes
   // per vehicle and answers BUSY, so this guard is convenience, not the safety property).
-  async function doPublish() {
+  // The transaction is RESUMABLE, so this carries it to a verdict instead of asking once and
+  // leaving the operator on a progress line. `nextPublishAttempt` (lib/mission-publish.js) owns
+  // the policy: re-invoke only while the transaction itself says it is unfinished, bounded, and
+  // stop the moment it is decided either way. Re-invoking issues NO vehicle command — the
+  // publish route reads the flight controller back and writes Scout's idempotent package slot.
+  let publishTimer = null;
+  function cancelPublishRetry() {
+    if (publishTimer != null) { clearTimeout(publishTimer); publishTimer = null; }
+  }
+  async function doPublish(attempt = 0) {
     if (model.upload.publishing || model.vehicleId == null) return;
+    cancelPublishRetry();
+    const vehicleId = model.vehicleId;
     model = { ...model, upload: { ...model.upload, publishing: true, publishError: null } };
     renderAll();
-    let res;
+    let res = null;
     try {
-      res = await api.publishMission(model.vehicleId, {});
+      res = await api.publishMission(vehicleId, {});
     } catch (e) {
-      model = { ...model, upload: { ...model.upload, publishing: false,
-        publishError: "The publish request did not reach the operator backend. The mission on the flight controller is unaffected; retry the Agent sync when the backend is reachable." } };
-      renderAll();
-      return;
+      res = null;
     }
+    // The operator may have switched vehicles while the transaction ran; a late answer must not
+    // be rendered against — or retried for — a different USV's plan.
+    if (model.vehicleId !== vehicleId) { model = { ...model, upload: { ...model.upload, publishing: false } }; renderAll(); return; }
     const env = res && res.data ? res.data : null;
+    const next = nextPublishAttempt(env, attempt + 1);
     model = { ...model, upload: { ...model.upload, publishing: false, publish: env,
+      publishError: env ? null : (next.retry
+        ? "The publish request did not reach the operator backend — retrying."
+        : "The publish request did not reach the operator backend. The mission on the flight controller is unaffected; retry the Agent sync when the backend is reachable."),
       phase: env && env.final && env.final.agent_ready ? "published" : "publishing" } };
     renderAll();
+    if (next.retry) {
+      publishTimer = setTimeout(() => {
+        publishTimer = null;
+        if (model.vehicleId === vehicleId && model.upload.phase === "publishing") doPublish(attempt + 1);
+      }, next.delayMs);
+    }
   }
 
   // The RETRY action. It calls the package-sync endpoint ONLY — that route sends a planning
   // package and cannot upload a mission, so a retry can never rewrite the flight controller.
   async function doRetrySync() {
     if (model.upload.syncing || model.vehicleId == null) return;
+    cancelPublishRetry();          // an explicit operator action supersedes the automatic carry
     model = { ...model, upload: { ...model.upload, syncing: true, publishError: null } };
     renderAll();
     let res;
@@ -1370,6 +1392,7 @@ export function Plan(root) {
   function vehName(id) { const v = fleet.find((x) => x.id === id); return id == null ? "—" : (v ? (v.name || "USV-" + id) : "USV-" + id); }
   function selectVehicleSideEffects(id) {
     cmds = []; authority = null;
+    cancelPublishRetry();          // never carry one vehicle's publish into another's selection
     if (id != null) { loadCommands(id); loadAuthority(id); }
   }
   function loadCommands(id) { if (id == null) return; api.getCommands(id).then((d) => { if (id === model.vehicleId) { cmds = (d && d.commands) || []; syncUploadFromCommands(); renderBanner(); } }).catch(() => {}); }

@@ -1792,6 +1792,19 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     }
     metrics["route_quality"] = route_quality
 
+    # The approved Home corridor, derived from the connector segments THIS generation just
+    # produced and validated. Emitted for the Plan/Map overlay and, later, for the Scout package
+    # — from the same function, so what the operator sees drawn is what Scout is sent. A refusal
+    # is normal and is reported with its reason rather than as a warning the operator must clear.
+    home_corridor, home_corridor_meta = home_corridor_ring(
+        segments=segments, navigable_geometry=navigable_boundary,
+        no_go_zones=zones, planning_home=home)
+    if home_corridor is None and home is not None:
+        warnings.append(
+            "No approved Home corridor could be derived: "
+            f"{home_corridor_meta['reason']}. If the launch Home ends up outside the approved "
+            "navigable area, the agent cannot prove a safe return and will hold in LOITER.")
+
     input_revision = _input_revision(inp)
     planning_inputs = {
         "boundary": boundary,
@@ -1822,6 +1835,12 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "generation_algorithm": GENERATION_ALGORITHM,
         "intersections": intersections,
         "navigable_boundary": navigable_boundary,
+        # The approved Home corridor for the Plan/Map overlay: a single implicitly-closed
+        # [[lng, lat], ...] ring, or None when none is proven (with the reason in
+        # `home_corridor_meta`). Drawn distinctly from the survey boundary, the no-go zones and
+        # the route — it is approved TRANSIT geometry, not survey area.
+        "home_corridor": home_corridor,
+        "home_corridor_meta": home_corridor_meta,
         "warnings": warnings,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "input_revision": input_revision,
@@ -1869,6 +1888,202 @@ def _navigable_rings_deg(boundary, clearance):
         deg = transform(to_deg.transform, poly)
         rings.append([[round(x, 7), round(y, 7)] for x, y in deg.exterior.coords])
     return rings
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# APPROVED HOME CORRIDOR (replan-planning-package-v1 `home_corridor`)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# WHAT SCOUT NEEDS IT FOR, AND WHY THE OPERATOR IS THE ONLY PLACE IT CAN COME FROM
+# --------------------------------------------------------------------------------
+# When Scout must prove a safe return, it checks the return path against the operator's
+# approved navigable geometry. A launch/recovery Home frequently sits OUTSIDE the survey
+# polygon — at a jetty, a ramp, the shore — so the last leg of a return leaves the navigable
+# area and Scout cannot prove it. Without proof it fails closed and holds in LOITER, which is
+# the correct behaviour and must be preserved.
+#
+# `home_corridor` is the operator's ANSWER to that: a single approved polygon that covers the
+# connector between the navigable survey area and the launch/Home area, so Scout has approved
+# geometry for the one leg it otherwise cannot verify.
+#
+# THE RULE THAT MAKES IT SAFE: it is DERIVED FROM GEOMETRY THE OPERATOR ALREADY APPROVED, and
+# from nothing else. Specifically, from the transit/connector segments this generator produced
+# and validated against the navigable area and the no-go zones — the same legs the operator saw
+# on the Plan page and uploaded. It is NEVER drawn from a runtime Home coordinate, never widened
+# to reach one, and never emitted "just in case":
+#
+#   • no approved transit geometry            -> no corridor
+#   • the corridor does not contain the planning Home        -> no corridor
+#   • the corridor does not overlap the navigable area       -> no corridor
+#   • the corridor touches a no-go zone                      -> no corridor
+#
+# and an ABSENT corridor is a real, correct answer: Scout then cannot prove a safe return to a
+# Home outside the approved area, and fails closed in LOITER. That is the outcome, not a defect
+# to engineer around. If the runtime Home later falls outside this corridor, the corridor is NOT
+# expanded — the plan is what needs revisiting.
+#
+# `shoreline_clearance_m` is unaffected and remains what it always was: scalar metadata. The
+# corridor is geometry; the clearance number is not, and neither is presented as the other.
+
+# The connector legs that, together, are the approved path between the planning Home and the
+# survey area. Coverage passes are deliberately excluded — they are the survey, not the
+# connector, and buffering them would produce a "corridor" covering the whole site.
+HOME_CORRIDOR_SOURCE_KINDS = (
+    "start_connector", "approach", "survey_entry_connector",
+    "return_connector", "return_approach", "final_home_connector",
+)
+
+# Half-width of the corridor, in metres, measured either side of the approved transit centreline
+# (so the corridor is 2x this wide). It is a fixed, stated number rather than a derived one on
+# purpose: it must be legible on the Plan page and reproducible from the record alone. 6 m gives
+# a small USV room to hold a line under wind and current without the corridor swallowing
+# geometry the operator did not approve.
+HOME_CORRIDOR_HALF_WIDTH_M = 6.0
+
+# Ring simplification tolerance in metres. Buffering produces many near-collinear vertices; this
+# keeps the wire ring small. Well below the half-width, so it cannot round the corridor out to
+# somewhere unapproved.
+HOME_CORRIDOR_SIMPLIFY_M = 0.25
+
+
+def _corridor_lines(segments):
+    """The approved transit centrelines from a record's `segments`, as [[lng,lat],...] lists."""
+    out = []
+    for seg in segments or []:
+        if not isinstance(seg, dict) or seg.get("kind") not in HOME_CORRIDOR_SOURCE_KINDS:
+            continue
+        coords = [c for c in (seg.get("coordinates") or [])
+                  if isinstance(c, (list, tuple)) and len(c) >= 2]
+        if len(coords) >= 2:
+            out.append([(float(c[0]), float(c[1])) for c in coords])
+    return out
+
+
+def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_home,
+                       half_width_m=HOME_CORRIDOR_HALF_WIDTH_M):
+    """Derive the approved Home corridor from already-approved planning geometry.
+
+    Returns `(ring, meta)`. `ring` is a single implicitly-closed `[[lng, lat], ...]` polygon ring
+    with at least 3 distinct vertices, or None when no corridor can be PROVEN — in which case
+    `meta["reason"]` names which requirement failed. Refusing is a normal outcome (see the note
+    above): Scout then fails closed rather than returning through unapproved water.
+
+    Pure and deterministic: the same record always yields the same ring.
+    """
+    meta = {"available": False, "reason": None, "half_width_m": half_width_m,
+            "source_segment_kinds": [], "vertex_count": 0,
+            "contains_planning_home": None, "overlaps_navigable": None,
+            "clears_no_go_zones": None}
+    if not PLANNING_AVAILABLE:
+        meta["reason"] = ("the geometry stack (shapely/pyproj) is not installed, so no corridor "
+                          "can be derived or checked")
+        return None, meta
+
+    home = _point_of(planning_home)
+    if home is None:
+        meta["reason"] = "the mission has no planning home to build a corridor around"
+        return None, meta
+
+    lines = _corridor_lines(segments)
+    if not lines:
+        meta["reason"] = ("the mission has no approved transit/connector segments — there is no "
+                          "operator-approved path between Home and the survey area to buffer")
+        return None, meta
+    meta["source_segment_kinds"] = sorted({
+        s.get("kind") for s in (segments or [])
+        if isinstance(s, dict) and s.get("kind") in HOME_CORRIDOR_SOURCE_KINDS})
+
+    nav_rings = [r for r in (navigable_geometry or [])
+                 if isinstance(r, list) and len(r) >= 3]
+    if not nav_rings:
+        meta["reason"] = "the mission carries no navigable geometry to anchor a corridor to"
+        return None, meta
+
+    # ONE projection for everything, taken from the navigable area, so metres mean metres and
+    # every check below happens in the same frame the generator validated the connectors in.
+    to_proj, to_deg = _utm_for(nav_rings[0])
+
+    def proj_line(coords):
+        return LineString([to_proj.transform(x, y) for x, y in coords])
+
+    def proj_poly(ring):
+        return Polygon([to_proj.transform(c[0], c[1]) for c in ring]).buffer(0)
+
+    try:
+        # ROUND caps, deliberately. A flat cap ends the corridor exactly ON the transit
+        # endpoint, which puts the planning Home precisely on the boundary — geometrically
+        # "contained" by a hair, and pushed outside by any later simplification or by a runtime
+        # Home a metre away. A round cap extends the approved half-width around the endpoint,
+        # which is also the honest shape: the Home AREA is what needs covering, not a point.
+        corridor = unary_union([proj_line(c) for c in lines]).buffer(
+            abs(half_width_m), join_style=2, cap_style=1)
+    except Exception as exc:                                  # pragma: no cover - defensive
+        meta["reason"] = f"the approved transit geometry could not be buffered ({exc})"
+        return None, meta
+    if corridor.is_empty:
+        meta["reason"] = "buffering the approved transit geometry produced an empty corridor"
+        return None, meta
+    if isinstance(corridor, MultiPolygon):
+        # Disconnected transit legs would need MORE than one corridor, and the wire contract is
+        # ONE ring. Emitting only the largest piece would ship a corridor that silently omits an
+        # approved leg, so this refuses instead.
+        meta["reason"] = ("the approved transit geometry is not contiguous — it would need more "
+                          "than one corridor, and the contract carries a single ring")
+        return None, meta
+
+    # SIMPLIFY FIRST, THEN CHECK. The ring that goes on the wire must be the exact geometry every
+    # requirement below was proven against — validating the un-simplified buffer and shipping the
+    # simplified one would ship a corridor nothing ever checked. (That is not hypothetical: the
+    # simplification pulls the boundary in by up to the tolerance, which is enough to move a Home
+    # sitting near a cap from inside to outside.)
+    simplified = corridor.simplify(HOME_CORRIDOR_SIMPLIFY_M, preserve_topology=True)
+    if simplified.is_empty or isinstance(simplified, MultiPolygon) or not simplified.is_valid:
+        simplified = corridor
+    # The wire ring is the EXTERIOR ring only, so the exterior is what must be checked: a Home
+    # inside an interior hole is not in the corridor the ring describes.
+    corridor = Polygon(simplified.exterior)
+    if not corridor.is_valid:
+        corridor = corridor.buffer(0)
+    if corridor.is_empty or isinstance(corridor, MultiPolygon):
+        meta["reason"] = "the simplified corridor is not a single valid polygon"
+        return None, meta
+
+    home_pt = Point(*to_proj.transform(home[0], home[1]))
+    meta["contains_planning_home"] = bool(corridor.contains(home_pt))
+    if not meta["contains_planning_home"]:
+        meta["reason"] = ("the corridor derived from the approved transit path does not contain "
+                          "the planning Home")
+        return None, meta
+
+    navigable = unary_union([proj_poly(r) for r in nav_rings])
+    meta["overlaps_navigable"] = bool(corridor.intersection(navigable).area > TOLERANCE)
+    if not meta["overlaps_navigable"]:
+        meta["reason"] = ("the corridor does not overlap the approved navigable area, so it "
+                          "proves no connection to the survey geometry")
+        return None, meta
+
+    zones = [z for z in (no_go_zones or []) if isinstance(z, list) and len(z) >= 3]
+    if zones:
+        blocked = unary_union([proj_poly(z) for z in zones])
+        meta["clears_no_go_zones"] = not corridor.intersects(blocked)
+        if not meta["clears_no_go_zones"]:
+            meta["reason"] = "the corridor would cross a no-go zone"
+            return None, meta
+    else:
+        meta["clears_no_go_zones"] = True
+
+    deg = transform(to_deg.transform, corridor)
+    coords = [[round(x, 7), round(y, 7)] for x, y in deg.exterior.coords]
+    # IMPLICITLY closed on the wire: shapely repeats the first vertex to close the ring, and the
+    # contract does not want that repeat.
+    if len(coords) >= 2 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    distinct = {tuple(c) for c in coords}
+    if len(distinct) < 3:
+        meta["reason"] = "the derived corridor has fewer than 3 distinct vertices"
+        return None, meta
+
+    meta.update(available=True, reason=None, vertex_count=len(coords))
+    return coords, meta
 
 
 def _point_in_any_zone(pt, zones):

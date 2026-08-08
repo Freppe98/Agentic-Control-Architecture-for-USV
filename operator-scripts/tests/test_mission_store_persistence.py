@@ -233,6 +233,88 @@ class MissionStorePersistenceTests(unittest.TestCase):
         self.assertFalse(main._save_mission_store())          # reported, not raised
         self.assertEqual(main.original_missions[rec["mission_id"]], rec)
 
+    # ── restart behaviour, in the shapes the bench run made relevant ───────────────────
+    def test_a_crash_before_the_atomic_replace_leaves_the_previous_snapshot_intact(self):
+        # The write is temp-file + os.replace, so a process that dies mid-write leaves the
+        # PREVIOUS snapshot whole. Simulated by writing a half-finished temp file beside a good
+        # store — the exact on-disk state such a crash produces.
+        self._seed(a_record("msn-committed"))
+        main._save_mission_store()
+        good = main.MISSION_STORE_PATH.read_bytes()
+        (self.tmp / "mission_store.json.tmp").write_text(
+            '{"version": 1, "original_missions": {"msn-half', encoding="utf-8")
+
+        main.original_missions.clear()
+        main.active_original_by_vehicle.clear()
+        status = main._load_mission_store()
+        self.assertNotIn("refused", status)
+        self.assertEqual(main.MISSION_STORE_PATH.read_bytes(), good)
+        self.assertIn("msn-committed", main.original_missions)
+        self.assertEqual(main.active_original_by_vehicle, {2: "msn-committed"})
+
+    def test_a_new_mission_never_overwrites_a_HISTORICAL_immutable_record(self):
+        # Replacing a vehicle's ACTIVE mission moves the pointer. It must not touch, thin or
+        # rewrite the record it replaced — those are immutable, and a vehicle may still be
+        # flying one of them when the operator plans the next.
+        first = a_record("msn-history-1")
+        self._seed(first)
+        main._save_mission_store()
+        frozen = json.loads(json.dumps(first))
+
+        second = a_record("msn-history-2")
+        second["route_waypoints"] = second["route_waypoints"][:4]
+        second["route_hash"] = mission_contract.route_content_hash(second["route_waypoints"])
+        self._seed(second)                                   # replaces usv-2's ACTIVE mission
+        main._save_mission_store()
+
+        main.original_missions.clear()
+        main.active_original_by_vehicle.clear()
+        main._load_mission_store()
+        self.assertEqual(main.active_original_by_vehicle, {2: "msn-history-2"})
+        self.assertEqual(main.original_missions["msn-history-1"], frozen)
+        self.assertNotEqual(main.original_missions["msn-history-1"]["route_hash"],
+                            main.original_missions["msn-history-2"]["route_hash"])
+
+    def test_every_loaded_active_pointer_resolves_to_a_loaded_record_for_that_vehicle(self):
+        # The invariant the whole loader exists to guarantee, asserted as an invariant rather
+        # than case by case: after ANY successful load, no active pointer dangles and none
+        # points at another vehicle's mission.
+        self._seed(a_record("msn-inv-2", vid=2))
+        self._seed(a_record("msn-inv-3", vid=3))
+        main._save_mission_store()
+        main.original_missions.clear()
+        main.active_original_by_vehicle.clear()
+        main._load_mission_store()
+        self.assertTrue(main.active_original_by_vehicle)
+        for vid, mid in main.active_original_by_vehicle.items():
+            self.assertIn(mid, main.original_missions)
+            self.assertEqual(main.original_missions[mid]["vehicle_id"], vid)
+
+    def test_an_owed_package_sync_survives_the_restart(self):
+        # A mission whose Pixhawk upload is VERIFIED but whose Scout package did not land must
+        # come back as OWED. Restoring it as ready is how an unsynced mission gets presented as
+        # startable after a restart.
+        rec = a_record("msn-owed")
+        rec["package_sync_state"] = "REQUIRED"
+        rec["package_sync_error"] = "SCOUT_PACKAGE_POST_FAILED"
+        self._seed(rec)
+        main._save_mission_store()
+        main.original_missions.clear()
+        main.active_original_by_vehicle.clear()
+        main._load_mission_store()
+        restored = main.original_missions["msn-owed"]
+        self.assertEqual(restored["package_sync_state"], "REQUIRED")
+        self.assertEqual(restored["package_sync_error"], "SCOUT_PACKAGE_POST_FAILED")
+        self.assertEqual(restored["upload_status"], "VERIFIED")
+
+    def test_a_record_that_lost_its_immutable_geometry_is_refused_not_repaired(self):
+        # Editing an approved route on disk (by hand, or by a stray writer) must not produce a
+        # station that flies it. The loader recomputes the canonical hash and refuses the file.
+        rec = a_record("msn-edited")
+        rec["route_waypoints"][2]["latitude"] += 0.001      # hash no longer describes the route
+        self._refuses({"version": 1, "original_missions": {"msn-edited": rec},
+                       "active_original_by_vehicle": {"2": "msn-edited"}})
+
 
 if __name__ == "__main__":
     unittest.main()

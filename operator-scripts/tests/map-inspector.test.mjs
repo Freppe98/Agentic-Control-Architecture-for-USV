@@ -314,11 +314,26 @@ test("no blocker is shown while an operation of ours is in flight", () => {
 });
 
 test("the card body carries no paragraph — every long explanation is a title tooltip", () => {
-  const render = sliceOf("function renderAgentMission", 8000);
+  // The bound is an UPPER limit; sliceOf still stops at the function's own closing brace, so
+  // raising it as the card grows keeps the guard reading exactly one function. (It was 8000
+  // until the card gained its completion, replacement-conflict, authority and battery slots.)
+  const render = sliceOf("function renderAgentMission", 14000);
   // Every text slot the card renders must be paired with a title attribute.
   for (const pair of [/class="amx-h" title=/, /class="amx-note\$\{[\s\S]*?\}" title=/,
-    /class="amx-result [\s\S]*?" title=/]) {
+    /class="amx-result [\s\S]*?" title=/,
+    // The slots added for the new Scout contract carry their evidence the same way.
+    /class="amx-note warn" title=/]) {
     assert.match(render, pair, String(pair));
+  }
+  // Every `<div class="amx-note…` opened in this card is followed by a title attribute before
+  // its tag closes. Counted rather than pattern-matched per slot, so a new note cannot be added
+  // without its tooltip. (Scanning up to the tag's `>` avoids tripping over the quotes inside a
+  // `${…}` class expression.)
+  const notes = [...render.matchAll(/<div class="amx-note/g)];
+  assert.ok(notes.length >= 4, `expected several note slots, found ${notes.length}`);
+  for (const m of notes) {
+    const tag = render.slice(m.index, render.indexOf(">", m.index));
+    assert.ok(tag.includes(" title="), `an amx-note without a tooltip: ${tag.slice(0, 80)}`);
   }
   // The old paragraph notes are gone: no notice/failure/blocked/stop essays stacked in the body.
   for (const gone of ["const notice =", "const failure =", "const blockedNote =",

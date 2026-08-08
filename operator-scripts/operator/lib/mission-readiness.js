@@ -132,6 +132,14 @@ export const START_BLOCK = {
   // transaction may be entered. Absent that declaration the Start transaction owns Set Home, so
   // an unverified Home is information (HOME_DURING_START_NOTE), never a blocker.
   HOME_REQUIRED: "HOME_REQUIRED",
+  // Scout's OWN explicit verdict (`start_eligible:false`). Stable and authoritative — it is a
+  // statement about the mission, not a background read that happened to be in flight — so it
+  // belongs in the gate, and it is always shown with Scout's own `start_block_reason`.
+  NOT_ELIGIBLE: "NOT_ELIGIBLE",
+  // A NEW mission was uploaded while the PREVIOUS run still owns the vehicle (Scout reports
+  // binding STALE_MISMATCH or a package conflict). The new mission is not ready and must not
+  // be shown as such; the remedy is Scout's, not an invented Stop.
+  MISSION_REPLACEMENT_CONFLICT: "MISSION_REPLACEMENT_CONFLICT",
 };
 
 export const START_BLOCK_TEXT = {
@@ -145,6 +153,10 @@ export const START_BLOCK_TEXT = {
   REARM_REQUIRED: "Rearm the mission controller before a new run",
   NO_MISSION: "No active mission for this vehicle",
   HOME_REQUIRED: "Scout requires a verified Home before this mission can be started",
+  NOT_ELIGIBLE: "Scout reports the mission is not eligible to start",
+  MISSION_REPLACEMENT_CONFLICT:
+    "New mission uploaded while another mission is active. Finish or explicitly " +
+    "terminate/rearm the active mission before starting the new mission.",
 };
 
 // The Start transaction sets Home to the launch position and verifies it as one of its own

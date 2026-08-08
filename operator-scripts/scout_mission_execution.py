@@ -153,7 +153,41 @@ OPERATIONS = ("start", "pause", "resume", "stop", "rearm")
 STATUS_IDENTIFYING_FIELDS = (
     "state", "effective_state", "execution_state", "mission_execution_enabled",
     "can_start", "can_pause", "can_resume", "can_stop",
+    # Scout's explicit Start-eligibility contract. A Scout that reports these but happens to
+    # omit `state` is still answering with a mission-execution status.
+    "start_eligible", "execution_ready", "authority_blocks_start",
 )
+
+# ── Scout's explicit Start-eligibility contract ───────────────────────────────────────────
+# `can_start` alone was never sufficient and is no longer the operator's input. Scout reports
+# eligibility and the authority question SEPARATELY, because they are separate facts:
+#
+#   start_eligible          the mission, package, Home and lifecycle state permit a Start
+#   authority_blocks_start  ... but authority is not LOCAL_AGENT yet
+#   execution_ready         Scout is ready to run RIGHT NOW, under LOCAL_AGENT
+#   start_block_reason      when start_eligible is false, Scout's own words for why
+#
+# Scout does NOT seize LOCAL_AGENT authority by itself, so `start_eligible:true` with
+# `authority_blocks_start:true` is the NORMAL pre-Start condition — the Operator's Start
+# transaction acquires and verifies authority as its first phase. Presenting that as a broken or
+# unprepared mission (the old AUTHORITY_NOT_LOCAL_AGENT reading) told the operator to go and fix
+# something that the very button they were looking at was going to do for them.
+
+# ── The mission/package binding Scout reports ─────────────────────────────────────────────
+# Whether the package Scout holds is BOUND to the original mission it is executing.
+BINDING_UNBOUND = "UNBOUND"
+BINDING_BOUND = "BOUND"
+BINDING_STALE_MISMATCH = "STALE_MISMATCH"
+BINDING_STATES = frozenset({BINDING_UNBOUND, BINDING_BOUND, BINDING_STALE_MISMATCH})
+
+# Conflict codes Scout raises when a NEW package arrives against a run it cannot replace.
+CONFLICT_STALE_PACKAGE_DURING_ACTIVE_EXECUTION = "STALE_PACKAGE_DURING_ACTIVE_EXECUTION"
+CONFLICT_OPERATION_IN_PROGRESS = "OPERATION_IN_PROGRESS"
+
+# Binding/conflict evidence that means a newly uploaded mission must NOT be presented as ready:
+# the previous run still owns the vehicle and only Scout can end it.
+ACTIVE_CONFLICT_CODES = frozenset({
+    CONFLICT_STALE_PACKAGE_DURING_ACTIVE_EXECUTION, CONFLICT_OPERATION_IN_PROGRESS})
 
 
 def _body(result):
@@ -322,6 +356,11 @@ def summarize_status(result):
     seq = body.get("sequence") if isinstance(body.get("sequence"), dict) else {}
     rc = body.get("return_completion") if isinstance(body.get("return_completion"), dict) else {}
     rp = body.get("replanning") if isinstance(body.get("replanning"), dict) else {}
+    binding = body.get("binding") if isinstance(body.get("binding"), dict) else {}
+    conflict = (body.get("package_conflict")
+                if isinstance(body.get("package_conflict"), dict) else {})
+    batt = (body.get("battery_diagnostics")
+            if isinstance(body.get("battery_diagnostics"), dict) else {})
     state = _str_or_none(body.get("state"))
     effective = _str_or_none(body.get("effective_state")) or state
     return {
@@ -347,6 +386,31 @@ def summarize_status(result):
         # merely "not right now".
         "can_stop": body.get("can_stop"),
         "stop_supported": "can_stop" in body,
+        # Scout's explicit eligibility contract. PRESENCE is what makes it authoritative: a Scout
+        # that predates the contract omits the keys entirely, and `None` here is what makes the
+        # eligibility rule fall back to the older `can_start` reading rather than treat a missing
+        # field as `false` and refuse every Start.
+        "start_eligible": body.get("start_eligible"),
+        "execution_ready": body.get("execution_ready"),
+        "authority_blocks_start": body.get("authority_blocks_start"),
+        "start_block_reason": _str_or_none(body.get("start_block_reason")),
+        "eligibility_reported": "start_eligible" in body,
+        # The mission/package binding, verbatim. `binding_state` is Scout's word; the operator
+        # compares it, never recomputes it.
+        "binding": dict(binding) if binding else None,
+        "binding_state": _str_or_none(binding.get("binding_state")) if binding else None,
+        "bound_original_mission_id": _str_or_none(binding.get("bound_original_mission_id"))
+                                     if binding else None,
+        "package_mission_id": _str_or_none(binding.get("package_mission_id")) if binding else None,
+        "package_route_hash": _str_or_none(binding.get("package_route_hash")) if binding else None,
+        "verified_route_hash": _str_or_none(binding.get("verified_route_hash")) if binding else None,
+        "package_conflict": dict(conflict) if conflict else None,
+        "package_conflict_code": _str_or_none(conflict.get("code")) if conflict else None,
+        # Battery, as Scout DIAGNOSES it. `battery_valid:false` (or a -1 raw) is "unknown", and
+        # the operator must never render it as 0% — see main._battery_view / the UI note.
+        "battery_diagnostics": dict(batt) if batt else None,
+        "battery_percent": batt.get("battery_percent") if batt else None,
+        "battery_valid": batt.get("battery_valid") if batt else None,
         "verified_mode": _str_or_none(body.get("verified_mode")),
         "mission_execution_enabled": body.get("mission_execution_enabled"),
         "sequence": dict(seq) if seq else None,

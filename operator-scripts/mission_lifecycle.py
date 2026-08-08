@@ -207,44 +207,129 @@ def resolve_mission_id(deps, vid, supplied):
 # ── Start eligibility, as Scout reports it (with the ONE authority deferral) ───────────────
 def start_eligibility(summary):
     """Whether Scout's canonical status permits a Start ONCE the Operator has transferred
-    authority. Returns {eligible, deferred_on_authority, reason}.
+    authority. Returns {eligible, deferred_on_authority, execution_ready, reason, source}.
 
-    `can_start` is Scout's word and is honoured as-is when it is true. When it is false, there
-    is exactly ONE reason the Operator may look past: Scout reports authority that is not
-    LOCAL_AGENT, which is the very condition the Start transaction exists to resolve. Every
-    other false — replanning, an active operation, mission execution disabled, a non-startable
-    state — blocks, and blocks with Scout's own reason. Nothing here re-derives Scout's
-    preconditions; it only decides whether to defer to the authority phase."""
+    SCOUT IS THE AUTHORITY ON THIS, and it now says so explicitly. `can_start` alone is no
+    longer the input — it conflated two independent facts and produced the exact misreading
+    this station had to stop making:
+
+        start_eligible=true + authority_blocks_start=true
+
+    is the NORMAL pre-Start condition, not a broken mission. Scout does not seize LOCAL_AGENT
+    authority by itself; the Operator's Start transaction acquires and verifies it as its first
+    phase. Rendering that as AUTHORITY_NOT_LOCAL_AGENT — "not ready" — told the operator to go
+    and fix, by hand, the one thing the button was about to do.
+
+    So the rule is:
+
+        execution_ready=true                      -> eligible now, under LOCAL_AGENT
+        start_eligible=true, authority blocks      -> eligible, DEFERRED to the authority phase
+        start_eligible=true                        -> eligible
+        start_eligible=false                       -> blocked, with SCOUT'S OWN start_block_reason
+        the contract is absent (an older Scout)    -> the previous can_start reading, unchanged
+
+    The three guards ahead of it are not second-guessing Scout; each reads a DIFFERENT Scout
+    field, and a status that says both "start_eligible" and "the replanning controller owns the
+    vehicle" is self-contradictory. We fail closed on a contradiction. Nothing here re-derives
+    Scout's preconditions, and none of the operator-owned evidence gates is affected."""
     if not summary.get("present"):
-        return {"eligible": False, "deferred_on_authority": False,
+        return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+                "source": "status",
                 "reason": "Scout mission-execution status is unavailable — no Start can be "
                           "issued against an unknown lifecycle state"}
     state = (summary.get("state") or "").upper()
     if summary.get("replanning_active"):
-        return {"eligible": False, "deferred_on_authority": False,
+        return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+                "source": "replanning",
                 "reason": "The replanning controller owns the vehicle"}
     if summary.get("active_operation_id"):
-        return {"eligible": False, "deferred_on_authority": False,
+        return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+                "source": "operation",
                 "reason": f"Scout is already processing operation "
                           f"{summary['active_operation_id']}"}
     if summary.get("mission_execution_enabled") is False:
-        return {"eligible": False, "deferred_on_authority": False,
+        return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+                "source": "disabled",
                 "reason": "Mission execution is disabled on Scout"}
+
+    # ── Scout's explicit contract, when it reports one ────────────────────────────────────
+    if summary.get("eligibility_reported"):
+        blocks_authority = summary.get("authority_blocks_start") is True
+        if summary.get("execution_ready") is True:
+            return {"eligible": True, "deferred_on_authority": False, "execution_ready": True,
+                    "source": "scout", "reason": None}
+        if summary.get("start_eligible") is True:
+            if blocks_authority:
+                authority = (summary.get("authority_status") or "").upper() or "not LOCAL_AGENT"
+                return {
+                    "eligible": True, "deferred_on_authority": True, "execution_ready": False,
+                    "source": "scout",
+                    "reason": f"Scout reports the mission is eligible to start while authority "
+                              f"is {authority}. The Start transaction acquires and verifies "
+                              f"LOCAL_AGENT authority first; Scout arbitrates the Start itself."}
+            return {"eligible": True, "deferred_on_authority": False, "execution_ready": False,
+                    "source": "scout", "reason": None}
+        # NOT eligible — and the reason is Scout's, verbatim, not a re-derivation of it.
+        return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+                "source": "scout",
+                "reason": _text(summary.get("start_block_reason"))
+                          or (f"Scout reports the mission is not eligible to start"
+                              + (f" in {state}" if state else ""))}
+
+    # ── An older Scout: the previous reading, unchanged ───────────────────────────────────
     if summary.get("can_start") is True:
-        return {"eligible": True, "deferred_on_authority": False, "reason": None}
+        return {"eligible": True, "deferred_on_authority": False, "execution_ready": False,
+                "source": "can_start", "reason": None}
     if state not in STARTABLE_STATES:
-        return {"eligible": False, "deferred_on_authority": False,
+        return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+                "source": "can_start",
                 "reason": f"Scout is in {state or 'an unreported state'}, which is not a state "
                           f"a mission can be started from"}
     authority = (summary.get("authority_status") or "").upper()
     if authority and authority != AUTHORITY_LOCAL_AGENT:
-        return {"eligible": True, "deferred_on_authority": True,
+        return {"eligible": True, "deferred_on_authority": True, "execution_ready": False,
+                "source": "can_start",
                 "reason": f"Scout reports can_start=false while authority is {authority}; the "
                           f"Start transaction transfers authority to LOCAL_AGENT first and "
                           f"Scout arbitrates the Start itself"}
-    return {"eligible": False, "deferred_on_authority": False,
+    return {"eligible": False, "deferred_on_authority": False, "execution_ready": False,
+            "source": "can_start",
             "reason": "Scout reports can_start=false" +
                       (f" in {state}" if state else "")}
+
+
+# ── Mission/package binding and replacement conflicts (Scout's word, compared not recomputed) ─
+def binding_view(summary):
+    """What Scout says about the binding between the package it holds and the mission it is
+    executing, plus any replacement conflict. Returns {state, conflict_code, blocks_new_mission,
+    message} — or a null view when Scout reports neither.
+
+    `blocks_new_mission` is the one derived bit, and it is deliberately narrow: a newly uploaded
+    mission must NOT be shown as ready while Scout says the PREVIOUS run still owns the vehicle.
+    The Operator does not offer a way out of that — Scout has no Stop, and inventing one here
+    would be a second lifecycle. The operator finishes or explicitly rearms the active run."""
+    state = summary.get("binding_state")
+    code = summary.get("package_conflict_code")
+    if not state and not code:
+        return {"state": None, "conflict_code": None, "blocks_new_mission": False,
+                "message": None, "reported": False}
+    conflict = summary.get("package_conflict") or {}
+    blocks = (code in mx.ACTIVE_CONFLICT_CODES) or state == mx.BINDING_STALE_MISMATCH
+    message = None
+    if blocks:
+        message = ("A new mission was uploaded while another mission is active on this vehicle. "
+                   "Finish the active mission, or explicitly terminate/rearm it, before starting "
+                   "the new one.")
+        detail = _text(conflict.get("message") or conflict.get("detail"))
+        if detail:
+            message = f"{message} Scout reports: {detail}"
+    return {"state": state, "conflict_code": code, "blocks_new_mission": blocks,
+            "message": message, "reported": True,
+            "bound_original_mission_id": summary.get("bound_original_mission_id"),
+            "package_mission_id": summary.get("package_mission_id"),
+            "package_route_hash": summary.get("package_route_hash"),
+            "verified_route_hash": summary.get("verified_route_hash"),
+            "execution_state": _text(conflict.get("execution_state"))}
 
 
 # ── Proof completeness: was there enough evidence to CALL this a verdict? ─────────────────
@@ -367,8 +452,20 @@ def start_preconditions(deps, vid, base, *, mission_id, summary, fresh=False):
                    "Scout does not report replanning readiness for this mission"},
         {"key": "start_eligibility", "label": "Scout Start eligibility",
          "ok": bool(elig["eligible"]), "detail": elig["reason"],
-         "deferred_on_authority": elig["deferred_on_authority"]},
+         "deferred_on_authority": elig["deferred_on_authority"],
+         "execution_ready": elig["execution_ready"], "source": elig["source"]},
     ]
+    # Scout's own binding/replacement verdict. Added as a CHECK rather than folded into
+    # eligibility so the operator sees which of the two refused: a mission that is perfectly
+    # well prepared but cannot start because the PREVIOUS run still owns the vehicle is a
+    # different situation, with a different remedy, from one that is not prepared.
+    binding = binding_view(summary)
+    if binding["blocks_new_mission"]:
+        checks.append({
+            "key": "mission_binding", "label": "Scout mission/package binding",
+            "ok": False,
+            "detail": binding["message"] or f"Scout reports binding {binding['state']}",
+            "binding_state": binding["state"], "conflict_code": binding["conflict_code"]})
     blockers = [f"{c['label']}: {c['detail']}" if c["detail"] else c["label"]
                 for c in checks if not c["ok"]]
     return {
@@ -380,6 +477,7 @@ def start_preconditions(deps, vid, base, *, mission_id, summary, fresh=False):
         "mission_id": mission_id,
         "readiness": rd,
         "start_eligibility": elig,
+        "binding": binding,
         **proof_completeness(rd, summary),
     }
 
@@ -412,6 +510,8 @@ def preflight(deps, vid, base):
             "ok": False, "mission_id": None, "can_start": False,
             "error_code": code, "error": message,
             "checks": [], "blockers": [message],
+            "binding": binding_view(summary),
+            "authority_will_be_acquired": False, "execution_ready": False,
             # A DEFINITE answer the operator owns: there is no active persisted mission record.
             # Nothing was left unread, so this is a complete proof of "not ready".
             "proof_complete": True, "readiness_refreshing": False,
@@ -424,6 +524,11 @@ def preflight(deps, vid, base):
         "error_code": None, "error": None,
         "checks": pre["checks"], "blockers": pre["blockers"],
         "readiness": pre["readiness"], "start_eligibility": pre["start_eligibility"],
+        "binding": pre["binding"],
+        # Surfaced at the top level so the Map card does not have to dig for the ONE distinction
+        # that changes what it says: Start is available, and pressing it will take agent control.
+        "authority_will_be_acquired": bool(pre["start_eligibility"]["deferred_on_authority"]),
+        "execution_ready": bool(pre["start_eligibility"]["execution_ready"]),
         "proof_complete": pre["proof_complete"],
         "readiness_refreshing": pre["readiness_refreshing"],
         "readiness_reason_code": pre["readiness_reason_code"],

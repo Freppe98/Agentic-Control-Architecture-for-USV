@@ -158,6 +158,21 @@ export function normalizeReplanStatus(result) {
       lastError: first(s, "last_error"),
       fallback: first(s, "fallback_state", "fallback"),
     },
+    // ── The safe-return TRIGGER, and whether its generation has been spent ────────────────
+    // Scout no longer retries the same condition when a cooldown expires. A replan attempt —
+    // successful or failed — CONSUMES the trigger generation it ran for, and another attempt
+    // needs an explicitly NEW generation (clear + reapply the injection, rearm the controller,
+    // or a new original mission execution). So "trigger still active" and "another attempt is
+    // coming" are now different facts, and the UI must stop implying the second from the first.
+    trigger: {
+      active: first(s, "trigger_active"),
+      generation: first(s, "trigger_generation"),
+      consumedGeneration: first(s, "consumed_trigger_generation"),
+      consumed: first(s, "trigger_consumed"),
+      terminalReason: first(s, "terminal_reason"),
+      reported: ["trigger_active", "trigger_generation", "consumed_trigger_generation",
+        "trigger_consumed", "terminal_reason"].some((k) => s[k] !== undefined),
+    },
     missionRevision: {
       originalHash: first(s, "original_mission_hash", "original_route_hash"),
       revisedHash: first(s, "revised_mission_hash", "revised_route_hash"),
@@ -179,6 +194,140 @@ export function normalizeReplanStatus(result) {
     transitions: arr(first(s, "transition_history", "transitions"))
       .map(normalizeTransition).filter(Boolean),
   };
+}
+
+/**
+ * THE TRIGGER LATCH: is another automatic attempt actually coming, or is this one spent?
+ *
+ * The distinction is the whole point. A safe-return trigger can remain ACTIVE (the condition
+ * that raised it has not gone away) while the attempt it raised has already run and FAILED. The
+ * cooldown counter keeps ticking, and a UI that shows a cooldown next to an active trigger tells
+ * the operator "it will try again shortly" — which is now false. Scout consumes the trigger
+ * generation on every attempt, success or failure, and will not retry the same condition. Another
+ * attempt requires an explicitly NEW generation: clear and reapply the experiment injection,
+ * rearm the replanning controller, or run a new original mission.
+ *
+ * `consumed` is true when Scout says so outright, or when the consumed generation has caught up
+ * with the current one. A missing generation pair is not evidence either way, so it stays false.
+ *
+ * @param norm normalizeReplanStatus() output
+ * @returns {{ reported, active, consumed, generation, consumedGeneration, attempt,
+ *             terminalReason, willRetryAutomatically, rearmRequired, headline, detail }}
+ */
+export function triggerLatch(norm) {
+  const S = norm || normalizeReplanStatus(null);
+  const t = S.trigger || {};
+  const tx = S.transaction || {};
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const generation = num(t.generation);
+  const consumedGeneration = num(t.consumedGeneration);
+  const active = t.active === true;
+  const consumed = t.consumed === true
+    || (generation !== null && consumedGeneration !== null && consumedGeneration >= generation);
+  // "Another automatic attempt is coming" needs ALL of: a live trigger, an unspent generation,
+  // and a controller that is not sitting in a terminal state. Anything less is not a promise the
+  // station may make on Scout's behalf.
+  const willRetryAutomatically = active && !consumed && !tx.terminal;
+  const rearmRequired = (active && consumed) || (!!tx.terminal && active);
+  const attempt = consumedGeneration !== null ? consumedGeneration
+    : (generation !== null ? generation : null);
+
+  let headline = null;
+  if (active && consumed) {
+    headline = "SAFE RETURN TRIGGER — ACTIVE, generation consumed";
+  } else if (active) {
+    headline = "SAFE RETURN TRIGGER — ACTIVE";
+  } else if (t.reported) {
+    headline = "No safe-return trigger active";
+  }
+  const detail = [
+    attempt !== null ? `Attempt ${attempt} consumed` : null,
+    t.terminalReason ? `Outcome: ${t.terminalReason}` : (tx.fsmState && tx.terminal
+      ? `Outcome: ${tx.fsmState}` : null),
+    rearmRequired ? "Re-arm required for another attempt" : null,
+  ].filter(Boolean).join(" · ") || null;
+
+  return { reported: !!t.reported, active, consumed, generation, consumedGeneration, attempt,
+    terminalReason: t.terminalReason || null, willRetryAutomatically, rearmRequired,
+    headline, detail };
+}
+
+/**
+ * Whether a COOLDOWN may be presented as a countdown to another attempt.
+ *
+ * Scout still reports `cooldown_s`, and it is still a real number — but after the generation is
+ * consumed it no longer counts down to anything. Showing it as a pending retry is the specific
+ * misreading this guard exists to prevent.
+ */
+export function cooldownView(norm) {
+  const S = norm || normalizeReplanStatus(null);
+  const seconds = S.transaction && typeof S.transaction.cooldownS === "number"
+    ? S.transaction.cooldownS : null;
+  const latch = triggerLatch(S);
+  if (seconds === null) return { seconds: null, countsDownToRetry: false, text: null };
+  if (!latch.willRetryAutomatically) {
+    return { seconds, countsDownToRetry: false,
+      text: `${seconds}s (not a pending retry — the trigger generation is consumed)` };
+  }
+  return { seconds, countsDownToRetry: true, text: `${seconds}s until the next attempt` };
+}
+
+// ── The revised-mission signal that wakes the Map overlay ────────────────────────────────
+// When Scout replans and uploads a REVISED mission to the Pixhawk, the Map must show the new
+// return route without the operator pressing Refresh — and without polling the full mission
+// download on a timer, which is expensive over the link.
+//
+// So the signal below is a cheap, stable STRING derived from authoritative lifecycle evidence the
+// station is already reading. It changes exactly when the route on the vehicle can have changed:
+//
+//   revised_mission_hash / revision   Scout's own identity for the revision it produced
+//   readback_result VERIFIED          the revision is confirmed to be ON the flight controller
+//   MONITORING_REVISED / return state the replan FSM has handed back onto a revised route
+//   active_route_hash                 the mission-execution status' current route identity
+//
+// Unchanged evidence yields an unchanged signal, and the refresh tracker then does nothing. When
+// NO evidence is present at all it returns `undefined` — the trigger stays dormant rather than
+// firing on a fabricated value. Manual Refresh is unaffected either way.
+const RETURN_FSM_STATES = new Set(["MONITORING_REVISED", "RESUME_REQUESTED", "VERIFYING_REVISION"]);
+
+export function missionRevisionSignal({ replan = null, missionExecution = null,
+  vehicle = null } = {}) {
+  const parts = [];
+  const push = (label, value) => {
+    if (value === null || value === undefined || value === "") return;
+    parts.push(`${label}:${value}`);
+  };
+
+  if (replan) {
+    const S = replan && replan.missionRevision ? replan : normalizeReplanStatus(replan);
+    const rev = S.missionRevision || {};
+    push("rh", rev.revisedHash);
+    push("rev", rev.revision);
+    // Only a VERIFIED readback means the revision is actually on the flight controller. An
+    // in-flight or failed one is not a reason to redraw.
+    const readback = rev.readbackResult;
+    const outcome = isObj(readback) ? first(readback, "outcome", "result", "state") : readback;
+    if (String(outcome || "").toUpperCase() === "VERIFIED") push("rb", "VERIFIED");
+    const fsm = String((S.transaction && S.transaction.fsmState) || "").toUpperCase();
+    if (RETURN_FSM_STATES.has(fsm)) push("fsm", fsm);
+  }
+
+  if (missionExecution) {
+    const body = isObj(missionExecution.scout) ? missionExecution.scout
+      : (isObj(missionExecution.summary) ? missionExecution.summary : missionExecution);
+    push("ah", first(body, "active_route_hash"));
+    const rp = isObj(body.replanning) ? body.replanning : {};
+    const fsm = String(first(rp, "fsm_state", "state") || "").toUpperCase();
+    if (RETURN_FSM_STATES.has(fsm)) push("mxfsm", fsm);
+  }
+
+  if (vehicle) {
+    const md = isObj(vehicle.mission_data) ? vehicle.mission_data : {};
+    push("v", md.active_revision_id ?? md.active_route_hash ?? md.mission_changed_at
+      ?? vehicle.active_revision_id ?? vehicle.route_hash);
+  }
+
+  return parts.length ? parts.join("|") : undefined;
 }
 
 /** Human label for a scout_replan write outcome (accepted/rejected/unknown/unavailable/

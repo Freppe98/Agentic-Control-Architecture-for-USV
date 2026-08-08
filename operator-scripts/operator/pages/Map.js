@@ -22,6 +22,7 @@ import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSe
 import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
 import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
+import { missionRevisionSignal } from "../lib/replan.js";
 import { missionShowable, nextVisibility, toggleVisibility, toggleButton } from "../lib/mission-visibility.js";
 import { createTelemetryCache } from "../lib/telemetry-cache.js";
 import { attachMapLayout } from "../lib/map-layout.js";
@@ -218,15 +219,30 @@ export function Map(root) {
     missionFallbackMs: 20000,  // full mission re-read at most this often absent a real trigger
   });
 
-  // The mission-revision signal for a vehicle, read off the fleet payload IF the backend
-  // surfaces one (active_revision_id / active_route_hash / mission_changed_at — see main.py's
-  // fleet-payload extension point). None exists today, so this returns undefined and the
-  // "revision" trigger stays dormant until Scout/the backend reports it — no fabricated signal.
-  function missionRevisionSignal(v) {
-    if (!v) return undefined;
-    const md = v.mission_data || {};
-    return md.active_revision_id ?? md.active_route_hash ?? md.mission_changed_at
-      ?? v.active_revision_id ?? v.route_hash ?? undefined;
+  // The mission-revision signal for the SELECTED vehicle, from every authoritative source this
+  // page already reads: Scout's mission-execution status (active route hash, replanning FSM) and
+  // the fleet payload. NO LONGER DORMANT — when the agent replans a safe return and uploads the
+  // revised mission, the active route hash changes and the overlay refetches itself, so the
+  // operator sees the real return route without pressing Refresh.
+  //
+  // The derivation is pure and lives in lib/replan.js (unit-tested); this is only the wiring.
+  // Unchanged evidence produces an unchanged signal and therefore no download, and `undefined`
+  // (no evidence at all) leaves the trigger dormant rather than firing on a fabricated value.
+  function revisionSignalFor(id) {
+    const v = fleet.find((x) => x.id === id) || null;
+    return missionRevisionSignal({
+      vehicle: v,
+      missionExecution: mission.forVid === id ? mission.status : null,
+    });
+  }
+
+  // Ask the refresh controller to reconsider the overlay for a vehicle. The controller itself
+  // decides whether anything is downloaded (it compares the signal against the last one seen),
+  // so calling this on every status read is cheap and cannot start a download loop.
+  function noteRevisionEvidence(id) {
+    if (id == null || id !== selId) return;
+    const sig = revisionSignalFor(id);
+    if (sig !== undefined) refreshController.refreshMission(id, "revision", { revisionSignal: sig });
   }
 
   root.className = "app has-dock";
@@ -919,6 +935,11 @@ export function Map(root) {
       if (forId !== selId) return;                 // selection moved — discard the stale fetch
       mission.status = st;
       mission.forVid = forId;
+      // AUTHORITATIVE lifecycle evidence just arrived. If it says the route on the vehicle can
+      // have changed — a replanned safe return uploaded and verified — the overlay refetches
+      // itself here. The tracker suppresses an unchanged signal, so a steady mission costs
+      // nothing extra.
+      noteRevisionEvidence(forId);
       renderInspector();
     }).catch((e) => {
       if (forId !== selId) return;
@@ -1358,6 +1379,33 @@ export function Map(root) {
       ? `<div class="amx-note${card.home.tone === "warn" ? " warn" : ""}" title="${escAttr(card.home.title || "")}">${esc(card.home.text)}</div>`
       : "";
 
+    // A FINISHED run says so in its own line: "Final LOITER verified" beside the COMPLETED chip,
+    // or the explicit gap when Scout reached COMPLETED_HOLD without verifying the final LOITER.
+    const completion = card.completionNote
+      ? `<div class="amx-note${card.completionNote.tone === "warn" ? " warn" : ""}" title="${escAttr(card.completionNote.title || "")}">${esc(card.completionNote.text)}</div>`
+      : "";
+
+    // A NEW mission uploaded while the previous run still owns the vehicle. Stated in full — it
+    // is the one situation where the operator has just done something and nothing appears to
+    // have happened, so the short-line discipline would cost more than it saves.
+    const conflict = card.replacementConflict
+      ? `<div class="amx-note warn" title="${escAttr(card.replacementConflict.title || "")}">${esc(card.replacementConflict.text)}</div>`
+      : "";
+
+    // Start is available AND pressing it takes agent control first. Said before the press, as
+    // information — never as something to go and arrange by hand.
+    const authorityNote = card.authorityWillBeAcquired && !card.working
+      ? `<div class="amx-note" title="${escAttr(mx.START_ACQUIRES_AUTHORITY_NOTE)}">Start will take Local Agent control</div>`
+      : "";
+
+    // Scout's own battery diagnosis. `battery_valid:false` / a -1 raw is UNKNOWN, and unknown
+    // must never render as 0% — a flat battery is an emergency, a missing reading is a gap.
+    // Shown only when Scout reported diagnostics AND they say the reading is not usable: a known
+    // percentage already has a home in the Status area, and repeating it here would be noise.
+    const batt = mx.batteryView(S);
+    const battery = batt.known || !batt.text ? ""
+      : `<div class="amx-note" title="${escAttr(batt.detail || "")}">${esc(batt.text)}</div>`;
+
     // The one-shot preflight, as INFORMATION, beside the control that re-runs it. Both are muted:
     // this line never gates anything and pressing Refresh never touches the vehicle. Withheld
     // entirely for an unsupported or unreachable Scout — there is nothing there to preflight, and
@@ -1384,7 +1432,7 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${progress}${buttons}${blocker}${home}${pkgLine}${info}${resultNote}</div>`;
+    return `<div class="amx">${head}${rows}${progress}${buttons}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation
@@ -1866,10 +1914,9 @@ export function Map(root) {
     } else if (selId != null) {
       // Mission-revision auto-refresh: when the fleet feed reports a changed mission-revision
       // signal for the SELECTED vehicle, the controller refetches the full mission (and skips
-      // it when the signal is unchanged). Dormant until the backend surfaces such a field —
-      // see missionRevisionSignal / main.py's fleet-payload extension point.
-      const sig = missionRevisionSignal(fleet.find((x) => x.id === selId));
-      if (sig !== undefined) refreshController.refreshMission(selId, "revision", { revisionSignal: sig });
+      // it when the signal is unchanged). Fed by Scout's mission-execution status as well as the
+      // fleet payload — see revisionSignalFor / lib/replan.js missionRevisionSignal.
+      noteRevisionEvidence(selId);
     }
     updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
     updateRibbon({ counts: counts() });

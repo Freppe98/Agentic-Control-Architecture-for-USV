@@ -25,7 +25,10 @@ and `main.requests`. Nothing here touches real networking.
 """
 import json
 import os
+import pathlib
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -305,6 +308,84 @@ class SuccessfulPublishTests(PublishTestCase):
         self.assertTrue(all(u.startswith("http://10.0.3.10:8090") for u in urls))
         self.assertFalse(any(u.startswith("http://10.0.2.10:8090") for u in urls))
 
+    def test_the_normal_upload_creates_AND_syncs_the_package_in_ONE_call(self):
+        # THE bench finding: package synchronization had to be curl'd by hand. It must not be a
+        # step the operator knows about — the single publish transaction that follows a verified
+        # upload builds the package, sends it, reads it back and proves all three identities.
+        rec = self.seed("msn-one-call")
+        self.accept_and_store("msn-one-call")
+        env = self.publish().json()
+
+        # ONE call. No package-sync request was needed to reach READY.
+        self.assertTrue(env["final"]["agent_ready"])
+        self.assertEqual(env["state"], "READY")
+        self.assertEqual(env["operation"], "publish")       # not "package_sync"
+        # The package WAS built and sent within it.
+        self.assertIn("BUILDING_PLANNING_PACKAGE", [p["phase"] for p in env["phases"]])
+        posts = [u for m, u in self.fake.calls if m == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(posts[0].endswith("/agent/replan/planning_package"))
+        # …and the durable record records the sync as done, so a restart does not re-owe it.
+        self.assertEqual(main.original_missions[rec["mission_id"]]["package_sync_state"], "SYNCED")
+
+    def test_the_whole_authoritative_chain_is_proven_in_that_one_transaction(self):
+        # immutable Operator original mission == verified Pixhawk route == Scout planning package
+        self.seed("msn-chain")
+        self.accept_and_store("msn-chain")
+        env = self.publish().json()
+        store, pix, scout = env["operator_store"], env["pixhawk"], env["scout"]
+        self.assertEqual(store["active_mission_id"], "msn-chain")
+        self.assertEqual(store["upload_status"], "VERIFIED")
+        self.assertEqual(store["route_hash"], pix["route_hash"])
+        self.assertEqual(store["route_hash"], scout["package_route_hash"])
+        self.assertEqual(scout["package_mission_id"], "msn-chain")
+        self.assertTrue(pix["hash_match"])
+        self.assertEqual([env["final"]["mission_id_match"], env["final"]["hash_match"],
+                          env["final"]["count_match"]], [True, True, True])
+
+    def test_the_failed_stage_is_named_exactly_and_nothing_later_is_claimed(self):
+        # "surface exact failed stage" — the phase list stops where it stopped, the error names
+        # the cause, and no later phase is reported as ok.
+        self.seed("msn-stage")
+        self.pixhawk.body = dict(self.pixhawk.body, route_content_hash="sha256:something-else")
+        env = self.publish().json()
+        self.assertEqual(env["error"], "PIXHAWK_HASH_MISMATCH")
+        self.assertEqual(env["phase"], "VERIFYING_PIXHAWK")
+        phases = [p["phase"] for p in env["phases"]]
+        self.assertEqual(phases[-1], "VERIFYING_PIXHAWK")
+        for later in ("BUILDING_PLANNING_PACKAGE", "SYNCING_SCOUT_PACKAGE", "READY"):
+            self.assertNotIn(later, phases)
+        self.assertFalse(env["final"]["agent_ready"])
+        # Previous authoritative state is preserved where safe: the record is still there.
+        self.assertIn("msn-stage", main.original_missions)
+
+    def test_the_package_carries_the_approved_home_corridor_when_one_is_proven(self):
+        # The corridor rides on the SAME transaction — there is no second step that adds it, and
+        # no runtime Home is involved in deriving it.
+        rec = self.seed("msn-corridor")
+        sent = {}
+
+        def capture(method, url, **kw):
+            self.fake.calls.append((method, url))
+            if method == "POST":
+                sent["json"] = kw.get("json")
+                return FakeResp({"accepted": True})
+            return stored_package("msn-corridor")
+        self.fake.request = capture
+        self.fake.get = lambda url, **kw: capture("GET", url)
+        self.publish()
+
+        expected, meta = replan_package.build_v1_package(rec, vehicle_id="usv-2")
+        self.assertEqual(sent["json"], expected)
+        if meta["home_corridor_supplied"]:
+            ring = sent["json"]["home_corridor"]
+            self.assertGreaterEqual(len({tuple(p) for p in ring}), 3)
+            self.assertNotEqual(ring[0], ring[-1])            # implicitly closed
+            for lon, lat in ring:                             # [lon, lat] on the wire
+                self.assertTrue(-180 <= lon <= 180 and -90 <= lat <= 90)
+        else:
+            self.assertNotIn("home_corridor", sent["json"])
+
     def test_publish_issues_no_vehicle_command(self):
         self.seed("msn-no-cmd")
         self.accept_and_store("msn-no-cmd")
@@ -527,16 +608,28 @@ class FailureAndRetryTests(PublishTestCase):
         self.assertEqual(phases["VERIFYING_PIXHAWK"], "ok")
 
     def test_package_sync_required_survives_a_backend_restart(self):
+        # The REAL writer is exercised here — that is the point of the test — but it is pointed
+        # at a directory THIS test owns. Restoring the real writer while the module-level path
+        # still resolved to `runtime_data/` is precisely how a single fixture mission ended up
+        # overwriting the station's approved mission store; main.py now also refuses the
+        # production path under a test runner, and this keeps the two tests independent besides.
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="operator-publish-restart-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        real_dir, real_path = main.MISSION_STORE_DIR, main.MISSION_STORE_PATH
         self.seed("msn-restart")
         self.fake.set("POST", "/agent/replan/planning_package",
                       FakeResp({"error": "nope"}, status=400))
+        main.MISSION_STORE_DIR, main.MISSION_STORE_PATH = tmp, tmp / "mission_store.json"
         main._save_mission_store = self._real_save          # exercise the real snapshot
         try:
             self.publish()
-            snapshot = main._mission_store_snapshot()
-            missions, active = main._validate_mission_store(json.loads(json.dumps(snapshot)))
+            # Read what actually landed ON DISK, not just the in-memory snapshot — a restart
+            # restores from the file, so the file is the thing under test.
+            with open(main.MISSION_STORE_PATH, encoding="utf-8") as fh:
+                missions, active = main._validate_mission_store(json.load(fh))
         finally:
             main._save_mission_store = lambda: True
+            main.MISSION_STORE_DIR, main.MISSION_STORE_PATH = real_dir, real_path
         self.assertEqual(active[SCOUT_VID], "msn-restart")
         self.assertEqual(missions["msn-restart"]["package_sync_state"], "REQUIRED")
         self.assertEqual(missions["msn-restart"]["upload_status"], "VERIFIED")

@@ -49,11 +49,19 @@ const COMMS_FROM_MSG = [
   [/lost|disconnect/i, "DISCONNECTED"],
 ];
 
+// `clean` is the page's "is there anything to say here?" filter. It goes through asText, NOT
+// String(): Scout legitimately sends STRUCTURED values — a communication policy as
+// `{value, source}`, a decision as `{code, message}`, an error object — and String()-ing one
+// produced the literal text "[object Object]" in the operator's Current Policy and Last error
+// rows. That is worse than a blank: it occupies the place where a value belongs and tells the
+// operator nothing about a vehicle that may be moving. Formatting it is the fix; hiding or
+// stringifying it is not.
 function clean(v) {
-  if (v === null || v === undefined) return null;
-  const s = String(v).trim();
-  if (s === "" || ["unknown", "none", "n/a", "null", "undefined"].includes(s.toLowerCase())) return null;
-  return s;
+  const s = asText(v);
+  if (s === null) return null;
+  const t = s.trim();
+  if (t === "" || ["unknown", "none", "n/a", "null", "undefined"].includes(t.toLowerCase())) return null;
+  return t;
 }
 function num(v, { max = null } = {}) {
   if (v === null || v === undefined || v === "") return null;
@@ -253,7 +261,10 @@ export function Agent(root) {
     let reasons = decisionReasons(a), reasonsObserved = false;
     if (!reasons) { reasons = observations(v, st, connected, hasContact, hasPos, stale, av); reasonsObserved = true; }
     const confidence = clean(a.decision_confidence);
-    const policyFlags = Array.isArray(a.policy_flags) ? a.policy_flags.filter(Boolean) : [];
+    // A policy flag may arrive as a bare string OR as a structured `{code, message}` / `{value,
+    // source}`. asText renders either; String() would print "[object Object]" as a policy.
+    const policyFlags = Array.isArray(a.policy_flags)
+      ? a.policy_flags.map((f) => asText(f)).filter(Boolean) : [];
     const commPolicy = clean(a.current_policy ?? a.communication_policy);
     const autonomyLevel = clean(a.autonomy_level);
 
@@ -261,6 +272,25 @@ export function Agent(root) {
     const authLabel = authVal
       ? `<span class="txt-${authVal === "OPERATOR" ? "p" : authVal === "RC" ? "d" : "c"}">${authVal === "LOCAL_AGENT" ? "LOCAL_AGENT" : authVal}</span>`
       : availSlot(AVAIL.GAP, { label: stale ? "Unknown (stale)" : !av.reachable ? "Unreachable" : "Unknown" });
+    // THREE INDEPENDENT STATE DOMAINS, NEVER MERGED.
+    // During a real running mission this page simultaneously showed "Current Decision: Hold
+    // Position / Reason: No mission assigned; standing by" while Scout's mission execution was
+    // RUNNING. Both were true of their OWN subsystem and neither was stale — they are simply
+    // different things, and printing them as one narrative said the vehicle had no mission while
+    // it was flying one. So each is now labelled with the subsystem it belongs to:
+    //
+    //   Supervisory decision engine   v.agent_status.* — the comms-degradation reasoning agent.
+    //                                 Its "mission" notion is its OWN; it does not run the survey.
+    //   Mission execution lifecycle   Scout's /agent/mission_execution/status. AUTHORITATIVE for
+    //                                 whether a mission is running, paused, suspended or complete.
+    //   Replanning lifecycle          Scout's /agent/replan/status. Its own FSM and trigger.
+    //
+    // and IDLE in the first is never allowed to read as "there is no mission" when the second
+    // says otherwise.
+    const mxForThis = mxForVid != null && mxForVid === v.id;
+    const mxS = mx.normalizeStatus(mxForThis ? mxStatus : null);
+    const mxLive = mxS.present && ["RUNNING", "PAUSED", "SUSPENDED", "RETURNING_HOME",
+      "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED"].includes(String(mxS.state || "").toUpperCase());
     const situationCard = card("Current Situation",
       connected ? availTag(AVAIL.LIVE) : hasContact ? availTag(AVAIL.LAST_KNOWN) : availTag(AVAIL.GAP),
       connected ? "ok" : hasContact ? "caution" : "idle",
@@ -270,9 +300,13 @@ export function Agent(root) {
             ? availSlot(AVAIL.GAP, { label: connected ? "No data received" : "No" })
             : freshSlot(operatorReachable ? "Yes" : "No"))}
          ${row("Vehicle health", `<span class="sd" style="background:${LVL_COLOR[health.level]};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px"></span>${health.label}`)}
-         ${row("Mission", missionState ? freshSlot(missionState) : availSlot(AVAIL.GAP, { label: hasContact ? "No data received" : "No contact" }))}
+         ${row("Mission execution (Scout)", mxS.present
+            ? `<b>${esc(mxS.state || "—")}</b> <span class="cond">${esc(mx.stateLabel(mxS.state))}</span>`
+            : availSlot(AVAIL.GAP, { label: "Lifecycle status unavailable" }))}
+         ${row("Vehicle mission state (telemetry)", missionState ? freshSlot(missionState) : availSlot(AVAIL.GAP, { label: hasContact ? "No data received" : "No contact" }))}
          ${row("Authority", authLabel)}
-       </div>`, false);
+       </div>
+       <div class="reason-note">${gapSvg}<span>Whether a mission is running is <b>Scout's mission-execution lifecycle</b>, above. The telemetry mission state and the supervisory decision engine below are separate subsystems with their own vocabularies — neither of them decides, or reports, whether this vehicle has a mission.</span></div>`, false);
 
     // ================= Current Decision (+ Reason, Confidence) =================
     const decCond = !agentLive ? availTag(AVAIL.GAP)
@@ -282,18 +316,35 @@ export function Agent(root) {
       ? pill(confidence.toUpperCase(), CONF_TINT[confidence.toUpperCase()] || "u")
       : availSlot(AVAIL.GAP, { label: "Confidence not emitted" });
     const decisionBig = decision
-      ? `<span style="font-size:22px;font-weight:600;color:${stale ? "var(--dim)" : "var(--text)"};letter-spacing:.01em">${decision}</span>${decisionFromBehaviour ? `<span class="cond" style="margin-left:10px">from current_behaviour</span>` : ""}${stale ? availTag(AVAIL.LAST_KNOWN, `LAST KNOWN · ${Math.round(age)}s`) : ""}`
+      ? `<span style="font-size:22px;font-weight:600;color:${stale ? "var(--dim)" : "var(--text)"};letter-spacing:.01em">${esc(decision)}</span>${decisionFromBehaviour ? `<span class="cond" style="margin-left:10px">from current_behaviour</span>` : ""}${stale ? availTag(AVAIL.LAST_KNOWN, `LAST KNOWN · ${Math.round(age)}s`) : ""}`
       : availSlot(AVAIL.GAP, { label: hasContact ? "Not emitted" : "No contact", dev: 'agent must emit current_decision (e.g. "Continue Search")' });
     const reasonHtml = reasons.length
-      ? `<div class="rlist">${reasons.map((r) => `<div class="ritem"><span class="rdot" style="background:${LVL_COLOR[r.level || "ok"]}"></span><span class="rtx">${r.tx}</span>${r.tag ? `<span class="rav">${availTag(r.tag)}</span>` : ""}</div>`).join("")}</div>`
+      ? `<div class="rlist">${reasons.map((r) => `<div class="ritem"><span class="rdot" style="background:${LVL_COLOR[r.level || "ok"]}"></span><span class="rtx">${esc(r.tx)}</span>${r.tag ? `<span class="rav">${availTag(r.tag)}</span>` : ""}</div>`).join("")}</div>`
       : `<div style="padding:6px 13px"><div class="no-telem-box">${gapSvg}${hasContact ? "The agent has not sent a decision reason." : "No contact — no reason available."}</div></div>`;
-    const decisionCard = `<div class="sub full"><div class="sub-head ${decCls}"><span class="hd"></span><span class="nm">Current Decision</span><span class="cond">${decCond}</span></div>
+    // The contradiction guard. When the supervisory engine's stated rationale says there is no
+    // mission WHILE Scout's mission-execution lifecycle says one is live, both lines stay — they
+    // are each their subsystem's truth — but the page says which one answers "is this vehicle
+    // flying a mission?", instead of leaving the operator to pick.
+    const reasonText = reasons.map((r) => r.tx).join(" ");
+    const claimsNoMission = /no mission|standing by|no active mission/i.test(
+      `${reasonText} ${decision || ""}`);
+    const contradiction = claimsNoMission && mxLive
+      ? `<div class="reason-note" style="border-left:3px solid var(--partitioned)">${warnSvg}<span>
+           The <b>supervisory decision engine</b> reports no mission of its own and is standing by,
+           while the <b>mission-execution lifecycle</b> reports <b>${esc(mxS.state)}</b>. These are
+           different subsystems, both current. The mission IS running — Scout's lifecycle above is
+           the authority on that; this card describes the comms/autonomy reasoning agent only.</span></div>`
+      : "";
+
+    const decisionCard = `<div class="sub full"><div class="sub-head ${decCls}"><span class="hd"></span><span class="nm">Supervisory decision engine</span><span class="cond">${decCond}</span></div>
+       <div class="reason-head" style="border-bottom:none;padding-bottom:0"><span class="tag">Scout's autonomy/comms reasoning — independent of the mission-execution and replanning lifecycles</span></div>
        <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 15px 8px;flex-wrap:wrap">
          <div>${decisionBig}</div>
          <div style="display:flex;align-items:center;gap:9px"><span class="k" style="font-family:var(--font-mono);font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)">Confidence</span>${confPill}</div>
        </div>
        <div class="reason-head"><span class="lbl">Reason</span>${reasons.length ? `<span class="tag" style="margin-left:8px">${reasonsObserved ? "operator-derived observations" : "from the agent"}</span>` : ""}</div>
        ${reasonHtml}
+       ${contradiction}
        ${reasons.length && reasonsObserved ? `<div class="reason-note">${gapSvg}Scout did not send a decision reason; these are observations the operator backend can see now — not the agent's stated rationale.</div>` : ""}
      </div>`;
 
@@ -306,7 +357,7 @@ export function Agent(root) {
 
     // ================= Current Policy =================
     const policyBody = policyFlags.length
-      ? `<div class="rlist">${policyFlags.map((f) => `<div class="ritem"><span class="rdot" style="background:var(--connected)"></span><span class="rtx">${f}</span>${stale ? `<span class="rav">${availTag(AVAIL.LAST_KNOWN)}</span>` : ""}</div>`).join("")}</div>
+      ? `<div class="rlist">${policyFlags.map((f) => `<div class="ritem"><span class="rdot" style="background:var(--connected)"></span><span class="rtx">${esc(f)}</span>${stale ? `<span class="rav">${availTag(AVAIL.LAST_KNOWN)}</span>` : ""}</div>`).join("")}</div>
          <div class="metrics" style="border-top:1px solid var(--line)">
            ${row("Reporting policy", commPolicy ? freshSlot(commPolicy) : availSlot(AVAIL.GAP, { label: "No data received" }))}
            ${row("Autonomy level", autonomyLevel ? freshSlot(autonomyLevel) : availSlot(AVAIL.GAP, { label: "No data received" }))}
@@ -361,7 +412,7 @@ export function Agent(root) {
     const ops = forThis ? mxOps : [];
     const res = forThis ? mxResult : null;
 
-    const head = `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Mission execution (Scout Local Agent)</span>
+    const head = `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Mission execution lifecycle (Scout Local Agent)</span>
         <span class="tag">Scout owns the whole transaction — start, pause, resume, replanning handoff, return and final hold. The operator issues no separate LOITER, Set Home or AUTO for Start.</span>
         ${res ? `<span style="margin-left:8px">${rp(res.label + ": " + (res.view.outcome === "pending" ? "sending…" : mx.outcomeLabel(res.view.outcome)), MX_TINT[res.view.outcome] || "u")}</span>` : ""}
       </div>`;
@@ -415,6 +466,9 @@ export function Agent(root) {
          ${row("Active operation id", S.activeOperationId ? `<span class="mono">${S.activeOperationId}</span>` : `<span class="txt-u">none</span>`)}
          ${row("Mission execution enabled", S.missionExecutionEnabled === false ? rp("DISABLED", "d") : S.missionExecutionEnabled === true ? rp("ENABLED", "c") : rp("not reported", "u"))}
        </div>
+       ${mxEligibilityRows(S)}
+       ${mxBindingRows(S)}
+       ${mxBatteryRows(S)}
        <div class="reason-note">${gapSvg}<span><b>Normal mission controls are on the Map page.</b>
          Start, Pause, Resume and Stop live in the Map's <b>Agent Mission</b> card, which runs
          each as one operation including the control-authority hand-off. This page is the
@@ -429,6 +483,75 @@ export function Agent(root) {
        <div class="reason-note">${gapSvg}<span>${mx.START_HOME_NOTE}</span></div>
        ${mxFallbackControls(S)}`, false);
   }
+
+  // --- Scout's EXPLICIT Start-eligibility contract -------------------------------------------
+  // `can_start` alone was never the whole answer. Scout reports eligibility and the authority
+  // question separately, and `start_eligible=true` with `authority_blocks_start=true` is the
+  // NORMAL pre-Start condition of a well-prepared mission — the Start transaction takes agent
+  // control as its first phase. Shown here as two rows so a diagnosis never has to infer which
+  // of the two a `can_start:false` meant.
+  function mxEligibilityRows(S) {
+    if (!S.eligibilityReported) {
+      return `<div class="reason-note">${gapSvg}<span>This Scout does not report the explicit
+        Start-eligibility contract (<span class="mono">start_eligible</span> /
+        <span class="mono">authority_blocks_start</span> / <span class="mono">execution_ready</span>);
+        eligibility falls back to <span class="mono">can_start</span>.</span></div>`;
+    }
+    const elig = mx.startEligibility(S);
+    return `<div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Start eligible (Scout)", S.startEligible === true ? rp("ELIGIBLE", "c") : S.startEligible === false ? rp("NOT ELIGIBLE", "d") : rp("not reported", "u"))}
+         ${row("Execution ready", S.executionReady === true ? rp("READY UNDER LOCAL_AGENT", "c") : S.executionReady === false ? rp("NOT YET", "u") : rp("not reported", "u"))}
+         ${row("Authority blocks start", S.authorityBlocksStart === true ? rp("YES — Start will acquire LOCAL_AGENT", "p") : S.authorityBlocksStart === false ? rp("NO", "c") : rp("not reported", "u"))}
+         ${row("Start block reason", val(S.startBlockReason))}
+       </div>
+       ${elig.deferredOnAuthority
+          ? `<div class="reason-note">${gapSvg}<span>${esc(mx.START_ACQUIRES_AUTHORITY_NOTE)} This is <b>not</b> a defect and <b>not</b> something to arrange by hand — Scout does not seize Local Agent authority itself, so an eligible mission waiting on authority is the normal pre-Start state.</span></div>`
+          : ""}`;
+  }
+
+  // --- The mission/package BINDING and replacement conflicts ---------------------------------
+  // Scout binds the package it holds to the original mission it is executing. A new package that
+  // arrives while a previous run still owns the vehicle is a CONFLICT, not a silent replacement.
+  function mxBindingRows(S) {
+    const b = S.binding || {};
+    if (!b.reported) return "";
+    const view = mx.bindingView(S);
+    const tone = b.state === mx.BINDING.BOUND ? "c"
+      : b.state === mx.BINDING.STALE_MISMATCH ? "d" : "u";
+    return `<div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Binding state", b.state ? rp(b.state, tone) : rp("not reported", "u"))}
+         ${row("Bound original mission", `<span class="mono">${val(b.boundOriginalMissionId)}</span>`)}
+         ${row("Package mission", `<span class="mono">${val(b.packageMissionId)}</span>`)}
+         ${row("Package route hash", `<span class="mono">${shortHash(b.packageRouteHash)}</span>`)}
+         ${row("Verified route hash", `<span class="mono">${shortHash(b.verifiedRouteHash)}</span>`)}
+         ${row("Package conflict", b.conflictCode ? rp(b.conflictCode, "d") : rp("none", "c"))}
+       </div>
+       ${view.blocksNewMission
+          ? `<div class="reason-note" style="border-left:3px solid var(--disconnected)">${warnSvg}<span><b>${esc(mx.MISSION_REPLACEMENT_BLOCKED_TEXT)}</b> The newly uploaded mission is <b>not</b> ready and is not being presented as such. The operator station does not offer a Stop — Scout does not implement one — so the run ends by finishing, or by an explicit rearm.</span></div>`
+          : ""}`;
+  }
+
+  // --- Battery, as Scout DIAGNOSES it ---------------------------------------------------------
+  // `battery_valid:false` / a raw of -1 is Scout saying it does not KNOW. Rendering that as 0%
+  // would turn a telemetry gap into an emergency, so the two never look alike here — and the
+  // station states the reading only; the energy POLICY built on it is Scout's.
+  function mxBatteryRows(S) {
+    const b = S.battery || {};
+    if (!b.reported) return "";
+    const view = mx.batteryView(S);
+    return `<div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Battery (Scout diagnostics)", view.known
+            ? freshSlotSafe(view.text)
+            : `<span class="txt-u">${esc(view.text)}</span>`)}
+         ${row("Battery valid", b.valid ? rp("VALID", "c") : rp("NOT VALID", "u"))}
+         ${row("Raw value", val(b.raw))}
+         ${row("Observed at", val(b.observedAt))}
+         ${row("Telemetry age", b.telemetryAgeS == null ? `<span class="txt-u">—</span>` : `${esc(String(b.telemetryAgeS))} s`)}
+       </div>
+       ${view.known ? "" : `<div class="reason-note">${gapSvg}<span>Scout reports the battery reading is not usable (raw <span class="mono">${esc(String(b.raw))}</span>). It is shown as unavailable rather than as 0% — a flat battery is an emergency, a missing reading is a telemetry gap, and the two must not look alike. Scout's own energy policy is unaffected by this display.</span></div>`}`;
+  }
+
+  const freshSlotSafe = (text) => `<b>${esc(text)}</b>`;
 
   // --- Diagnostic fallback: the raw lifecycle writes, COLLAPSED BY DEFAULT --------------------
   // Deliberately not the normal path and deliberately marked as such. These call the same
@@ -601,11 +724,11 @@ export function Agent(root) {
     const exp = forThis && replanExperiment ? replanExperiment : null;
 
     if (replanStatus && replanStatus.supported === false) {
-      return `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Replanning (Scout Local Agent)</span></div>
+      return `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Replanning lifecycle (Scout Local Agent)</span></div>
         ${gapBody("Replanning not supported by this Scout version.")}`;
     }
 
-    return `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Replanning (Scout Local Agent)</span>
+    return `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Replanning lifecycle (Scout Local Agent)</span>
         <span class="tag">safe-return lifecycle — decision, FSM, mission revision &amp; package shown verbatim from Scout ${S.decision.simulated ? rp("SIMULATED", "p") : ""}</span>
         ${replanMsg ? `<span style="margin-left:8px">${rp(replanMsg.label + ": " + replan.outcomeLabel(replanMsg.outcome) + (replanMsg.code ? " (" + replanMsg.code + ")" : ""), OUTCOME_TINT[replanMsg.outcome] || "u")}</span>` : ""}
       </div>
@@ -640,7 +763,7 @@ export function Agent(root) {
       `<div class="metrics">
          ${row("Agent package", `${rp(verdict.state.replace(/_/g, " "), verdictTone[verdict.state] || "u")} ${esc(verdict.text)}`)}
          ${verdict.detail ? row("", `<span class="cond">${esc(verdict.detail)}</span>`) : ""}
-         ${row("Vehicle mission", `${vm.mission_id ? `<span class="mono">${vm.mission_id}</span>` : "—"}`)}
+         ${row("Vehicle mission", vm.mission_id ? `<span class="mono">${esc(vm.mission_id)}</span>` : `<span class="txt-u">—</span>`)}
          ${row("Pixhawk verified", badge(vm.pixhawk_verified, "VERIFIED", "NOT VERIFIED"))}
          ${row("Readback hash match", vm.readback_reachable ? badge(vm.readback_hash_match, "MATCH", "NO MATCH") : rp("readback unreachable", "u"))}
          ${row("Home valid", badge(vm.home_valid, "VALID" + (vm.home_source ? " · " + vm.home_source : ""), "INVALID"))}
@@ -696,12 +819,38 @@ export function Agent(root) {
          ${row("Authority", val(t.authority))}
          ${row("Authority-blocked recommendation", val(t.authorityBlockedRecommendation))}
          ${row("Fallback", val(t.fallback))}
-         ${row("Last error", t.lastError ? `<span class="txt-d">${t.lastError}</span>` : "—")}
+         ${row("Last error", asText(t.lastError) ? `<span class="txt-d">${esc(t.lastError)}</span>` : `<span class="txt-u">—</span>`)}
        </div>
+       ${triggerLatchBlock(S)}
        <div style="padding:9px 13px">
-         <button class="btn ghost" id="rp-reset" ${replanBusy || t.active ? "disabled" : ""} title="Rearms the Local Agent controller — issues NO vehicle command, does not change mode or the Pixhawk mission">Rearm replanning controller</button>
+         <button class="btn ghost" id="rp-reset" ${replanBusy || t.active ? "disabled" : ""} title="Rearms the Local Agent replanning controller — issues NO vehicle command, does not change mode or the Pixhawk mission. This is the reset that mints a NEW trigger generation.">Rearm replanning controller</button>
          ${t.active ? `<span class="cond" style="margin-left:8px">reset is refused while a transaction is active</span>` : ""}
        </div>`, false);
+  }
+
+  // --- The safe-return trigger LATCH ----------------------------------------------------------
+  // Scout consumes a trigger generation on every replan attempt, successful or failed, and will
+  // NOT retry the same condition when a cooldown expires. So "the trigger is still active" and
+  // "another attempt is coming" are different facts, and this block is where they stop being
+  // conflated: a consumed generation is stated as consumed, the outcome is named, and the
+  // cooldown is explicitly labelled as NOT a pending retry. Another attempt needs a new
+  // generation — clear and reapply the injection, rearm the controller, or run a new mission.
+  function triggerLatchBlock(S) {
+    const latch = replan.triggerLatch(S);
+    if (!latch.reported) return "";
+    const cd = replan.cooldownView(S);
+    const tone = latch.active && latch.consumed ? "d" : latch.active ? "p" : "u";
+    return `<div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Safe-return trigger", `${rp(latch.headline || "—", tone)}`)}
+         ${row("Trigger generation", `${val(latch.generation)}${latch.consumedGeneration != null ? ` · consumed ${esc(String(latch.consumedGeneration))}` : ""}`)}
+         ${row("Generation consumed", latch.consumed ? rp("CONSUMED", "d") : latch.active ? rp("NOT CONSUMED", "c") : rp("n/a", "u"))}
+         ${row("Terminal reason", val(latch.terminalReason))}
+         ${row("Automatic retry", latch.willRetryAutomatically
+            ? rp("ANOTHER ATTEMPT WILL RUN", "p")
+            : rp("NO — re-arm required for another attempt", "d"))}
+         ${row("Cooldown", cd.text ? `${esc(cd.text)}` : `<span class="txt-u">—</span>`)}
+       </div>
+       ${latch.detail ? `<div class="reason-note">${warnSvg}<span>${esc(latch.detail)}. The cooldown timer is not counting down to another automatic attempt — Scout has already spent this trigger generation. Clear and re-apply the experiment injection, rearm the replanning controller, or run a new original mission to arm a new one.</span></div>` : ""}`;
   }
 
   function missionRevisionCard(S) {
@@ -825,10 +974,15 @@ export function Agent(root) {
   // operator-observable bullets, flagged `observed` so the UI labels them as such.
   function decisionReasons(a) {
     const list = a.decision_reasons ?? a.decision_reason;
-    if (Array.isArray(list) && list.length) return list.filter(Boolean).map((tx) => ({ tx: String(tx), level: "ok" }));
-    if (typeof list === "string" && clean(list)) {
-      return clean(list).split(/(?<=\.)\s+/).filter(Boolean).map((tx) => ({ tx, level: "ok" }));
+    // asText, not String(): a reason entry is frequently `{code, message}`, and String() would
+    // put "[object Object]" where the agent's rationale belongs.
+    if (Array.isArray(list) && list.length) {
+      const rows = list.map((tx) => asText(tx)).filter(Boolean)
+        .map((tx) => ({ tx, level: "ok" }));
+      if (rows.length) return rows;
     }
+    const single = clean(list);
+    if (single) return single.split(/(?<=\.)\s+/).filter(Boolean).map((tx) => ({ tx, level: "ok" }));
     return null; // caller renders the "no reason" slot; observed fallback handled inline
   }
 
@@ -928,8 +1082,8 @@ export function Agent(root) {
     const arrow = `<div style="text-align:center;color:var(--dim);font-size:14px;line-height:1;margin:2px 0">↓</div>`;
     return `<div style="padding:14px 15px">${all.map((n, i) =>
       `${i ? arrow : ""}<div style="text-align:center">${n.decision
-        ? `<span style="display:inline-block;padding:5px 14px;border-radius:6px;border:1px solid var(--connected);color:var(--text);font-weight:600;font-family:var(--font-mono);font-size:12px">${n.label}</span>`
-        : pill(n.label, n.tint)}</div>`).join("")}</div>`;
+        ? `<span style="display:inline-block;padding:5px 14px;border-radius:6px;border:1px solid var(--connected);color:var(--text);font-weight:600;font-family:var(--font-mono);font-size:12px">${esc(n.label)}</span>`
+        : pill(esc(n.label), n.tint)}</div>`).join("")}</div>`;
   }
 
   function observedStateCard(v, ctx) {

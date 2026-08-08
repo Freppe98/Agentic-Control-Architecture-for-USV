@@ -317,6 +317,54 @@ V1_FIELDS = (
     "original_execution_order", "immutable", "created_at", "source",
 )
 
+# OPTIONAL wire fields, emitted only when the operator can PROVE them from approved geometry.
+#
+# `home_corridor` is the single implicitly-closed `[[lng, lat], ...]` ring that covers the
+# approved connector between the navigable survey area and the launch/Home area. Scout needs it
+# to prove a safe return to a Home that lies outside the survey polygon.
+#
+# ABSENCE IS A REAL ANSWER AND IS LOAD-BEARING. When the mission carries no approved transit
+# geometry — or when the derived corridor fails any of its checks — the key is OMITTED, Scout
+# cannot prove the last leg of the return, and it fails closed in LOITER. That is the designed
+# outcome. Nothing here invents a corridor to a runtime Home, widens one to reach a Home that
+# fell outside it, or emits an empty ring to make the field "present".
+V1_OPTIONAL_FIELDS = ("home_corridor",)
+
+# Where the optional fields sit in wire order when they ARE present (after the geometry they
+# relate to, before the route).
+V1_FIELD_ORDER = (
+    "package_version", "route_contract_version", "mission_id", "mission_revision",
+    "vehicle_id", "route_hash", "planning_home", "boundary", "navigable_geometry",
+    "no_go_zones", "home_corridor", "shoreline_clearance_m", "route_waypoints", "segments",
+    "original_execution_order", "immutable", "created_at", "source",
+)
+
+
+def derive_home_corridor(record):
+    """(ring, meta) for a record's approved Home corridor — see V1_OPTIONAL_FIELDS.
+
+    The geometry lives in planning.py (which owns shapely/pyproj); it is imported LAZILY so this
+    module stays importable, and the package stays buildable, on a backend without the geometry
+    stack. Without it no corridor can be CHECKED, so none is emitted — the fail-closed direction.
+    """
+    try:
+        import planning
+    except Exception as exc:                                  # pragma: no cover - defensive
+        return None, {"available": False, "reason": f"planning module unavailable ({exc})"}
+    inputs = record.get("planning_inputs") if isinstance(record.get("planning_inputs"), dict) else {}
+    navigable = record.get("navigable_geometry")
+    if navigable is None:
+        navigable = inputs.get("navigable_boundary")
+    zones = record.get("no_go_zones")
+    if zones is None:
+        zones = inputs.get("no_go_zones")
+    return planning.home_corridor_ring(
+        segments=record.get("segments"),
+        navigable_geometry=navigable,
+        no_go_zones=zones,
+        planning_home=inputs.get("planning_home"),
+    )
+
 # The fields every detailed record entry must carry. Preserved verbatim (plus anything else
 # the record holds) — the point of v1 is that this metadata SURVIVES, so a missing one is a
 # hard error rather than a quietly thinner package.
@@ -422,7 +470,7 @@ def _v1_detailed_list(items, required, what, count=None):
     return out
 
 
-def build_v1_package(record, *, vehicle_id=None, source=SOURCE):
+def build_v1_package(record, *, vehicle_id=None, source=SOURCE, home_corridor=None):
     """Build the `replan-planning-package-v1` wire package from an immutable revision-0
     mission record. Returns (package, meta).
 
@@ -509,6 +557,18 @@ def build_v1_package(record, *, vehicle_id=None, source=SOURCE):
     if not isinstance(created_at, str) or not created_at:
         raise PackageError("mission record has no created_at")
 
+    # The approved Home corridor, when — and ONLY when — the record's own approved geometry
+    # proves one. A refusal here is not an error: the key is omitted and Scout fails closed.
+    if home_corridor is None:
+        corridor, corridor_meta = derive_home_corridor(record)
+    else:
+        corridor = home_corridor
+        corridor_meta = {"available": True, "reason": None, "source": "caller"}
+    if corridor is not None:
+        corridor = _positional_ring(corridor, "home_corridor")
+        if len({tuple(p) for p in corridor}) < 3:
+            raise PackageError("home_corridor has fewer than 3 distinct vertices")
+
     package = {
         "package_version": PACKAGE_VERSION_V1,
         "route_contract_version": contract_version,
@@ -520,6 +580,10 @@ def build_v1_package(record, *, vehicle_id=None, source=SOURCE):
         "boundary": boundary,
         "navigable_geometry": navigable_geometry,
         "no_go_zones": no_go_zones,
+        # OMITTED entirely when no corridor is proven — never `null`, never `[]`. An empty ring
+        # would read as "checked, nothing there"; absence reads as "not proven", which is what
+        # makes Scout fail closed instead of returning through unapproved water.
+        **({"home_corridor": corridor} if corridor is not None else {}),
         "shoreline_clearance_m": clearance,
         "route_waypoints": route_waypoints,
         "segments": _v1_detailed_list(record.get("segments"), V1_SEGMENT_FIELDS, "segments"),
@@ -545,12 +609,15 @@ def build_v1_package(record, *, vehicle_id=None, source=SOURCE):
         "no_go_zone_count": len(no_go_zones),
         "boundary_point_count": len(boundary),
         "shoreline_clearance_m": clearance,
-        "limitations": _v1_limitations(no_go_zones),
+        "home_corridor_supplied": corridor is not None,
+        "home_corridor_vertex_count": len(corridor) if corridor is not None else 0,
+        "home_corridor": corridor_meta,
+        "limitations": _v1_limitations(no_go_zones, corridor, corridor_meta),
     }
     return package, meta
 
 
-def _v1_limitations(no_go_zones):
+def _v1_limitations(no_go_zones, corridor=None, corridor_meta=None):
     """What the package does NOT prove, stated by the operator rather than left for Scout to
     discover. Reported alongside every sync so an absent constraint is never read as a
     cleared one."""
@@ -562,4 +629,17 @@ def _v1_limitations(no_go_zones):
                        "geometry Scout can run an onboard clearance check against")
     limitations.append("no survey graph is supplied — Scout cannot re-derive coverage lanes "
                        "from this package, only reuse the approved route and geometry")
+    if corridor is None:
+        reason = (corridor_meta or {}).get("reason")
+        limitations.append(
+            "no approved home_corridor is supplied"
+            + (f" ({reason})" if reason else "")
+            + " — if the runtime launch Home lies outside the approved navigable geometry, "
+              "Scout cannot prove a safe return and will fail closed in LOITER")
+    else:
+        limitations.append(
+            f"home_corridor is the approved transit path buffered to "
+            f"{(corridor_meta or {}).get('half_width_m')} m either side; it proves a connector "
+            f"to the PLANNED Home only. A runtime launch Home outside it is not covered, and "
+            f"the corridor is never widened to reach one")
     return limitations

@@ -811,7 +811,21 @@ def _append_event(*, severity, message, etype, source, vehicle_id=None,
     event_log.append(entry)
     if len(event_log) > MAX_EVENTS:
         del event_log[0:len(event_log) - MAX_EVENTS]
-    print(f"[EVENT] #{entry['id']} {severity or 'unspec'} {source}: {message}")
+    # The console echo must never be able to take down the request that logged the event.
+    # Event messages carry text this backend does not own — Scout's `start_block_reason`, a
+    # publish error, a vehicle name — and the hidden launcher redirects stdout to
+    # logs/operator.log, where Python uses the Windows locale encoding (cp1252 here), not the
+    # console's UTF-8. One unencodable character in that text would raise UnicodeEncodeError
+    # INSIDE the handler and turn a completed transaction into an HTTP 500. Keeping our own
+    # message text ASCII (see the "Mission state:" event below) is the first line of defence;
+    # this is the second, for text that arrives from elsewhere.
+    import sys
+    line = f"[EVENT] #{entry['id']} {severity or 'unspec'} {source}: {message}"
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode(enc, "replace").decode(enc, "replace"))
     return entry
 
 
@@ -2559,9 +2573,68 @@ active_original_by_vehicle = {}   # {vehicle_id: mission_id}  (latest finalized 
 # incompatible file is logged and the station starts with an EMPTY mission store rather than
 # a partially-loaded one. Half a mission store is worse than none — it would present a
 # mission whose geometry may not be what the vehicle is carrying.
-MISSION_STORE_DIR = BASE_DIR / "runtime_data"
+#
+# WHERE THE STORE LIVES — and the interlock that keeps a TEST out of it.
+# ---------------------------------------------------------------------
+# The production store holds the operator's APPROVED, verified missions and which mission each
+# vehicle is actually flying. It is safety-relevant state that cannot be reconstructed, so the
+# only processes permitted to write it are real backends.
+#
+# This was not a hypothetical. A single test module that restored the real `_save_mission_store`
+# and then ran a publish wrote its OWN isolated in-memory store — one seeded fixture mission —
+# straight over `runtime_data/mission_store.json`. The station then insisted, correctly, that
+# the Agent package did not match the approved mission, while Scout and the Pixhawk were flying
+# something else entirely. Isolation had appeared to work only because a FULL `unittest discover`
+# run happens to import `tests/test_planning.py` first, and that module redirects the path at
+# import time; running one module on its own — exactly what the per-feature docs instruct — left
+# the production path live.
+#
+# Isolation that depends on module import ORDER is not isolation. So the path is resolved once,
+# here, in the module that owns the store, and a test process can never resolve it to production:
+#
+#   1. OPERATOR_RUNTIME_DIR — an explicit override, for a deployment that keeps its runtime
+#      state elsewhere and for a test that wants a directory it chose itself.
+#   2. a test runner in the process — `unittest` / `pytest` imported before main. A per-process
+#      temporary directory is used instead, and the substitution is logged loudly. No test can
+#      opt back in, and a NEW test file inherits the guarantee without doing anything.
+#   3. otherwise — the real `runtime_data/` beside this module.
+RUNTIME_DIR_ENV = "OPERATOR_RUNTIME_DIR"
+PRODUCTION_RUNTIME_DIR = BASE_DIR / "runtime_data"
+
+
+def _test_runner_in_process():
+    """True when this interpreter was started by a test runner. Checked against sys.modules
+    rather than a flag a test must remember to set: `python -m unittest ...` has imported
+    `unittest` long before main.py, and a real `uvicorn main:app` has not."""
+    import sys
+    return "unittest" in sys.modules or "pytest" in sys.modules
+
+
+def _resolve_runtime_dir():
+    """(directory, reason) for this process's runtime state. See the note above."""
+    override = (os.environ.get(RUNTIME_DIR_ENV) or "").strip()
+    if override:
+        return Path(override), "env"
+    if _test_runner_in_process():
+        import tempfile
+        return Path(tempfile.mkdtemp(prefix="operator-runtime-test-")), "test"
+    return PRODUCTION_RUNTIME_DIR, "production"
+
+
+MISSION_STORE_DIR, MISSION_STORE_SOURCE = _resolve_runtime_dir()
 MISSION_STORE_PATH = MISSION_STORE_DIR / "mission_store.json"
 MISSION_STORE_VERSION = 1
+
+if MISSION_STORE_SOURCE == "test":
+    print(f"[MISSION STORE] test runner detected — the production store "
+          f"({PRODUCTION_RUNTIME_DIR / 'mission_store.json'}) is NOT reachable from this "
+          f"process; using {MISSION_STORE_PATH}")
+
+
+def is_production_mission_store():
+    """True only when this process resolved the REAL production store. The regression guard in
+    tests/test_mission_store_isolation.py asserts this is false under every test runner."""
+    return Path(MISSION_STORE_PATH).resolve() == (PRODUCTION_RUNTIME_DIR / "mission_store.json").resolve()
 
 
 def _mission_store_snapshot():
@@ -4945,7 +5018,9 @@ def _record_publish_operation(entry):
     sev = "info" if entry.get("agent_ready") else "caution"
     _append_event(severity=sev, etype="mission-publish", source="operator-backend",
                   vehicle_id=parse_vehicle_id(entry.get("vehicle_id")),
-                  message=f"Publish {entry.get('operation')} → {entry.get('state')}"
+                  # ASCII "->" on purpose — this message is echoed to the console/log, and the
+                  # Windows locale encoding a redirected stdout uses cannot encode "→".
+                  message=f"Publish {entry.get('operation')} -> {entry.get('state')}"
                           + (f" ({entry['error']})" if entry.get("error") else ""),
                   detail=entry)
 

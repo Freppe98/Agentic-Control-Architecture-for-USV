@@ -511,7 +511,16 @@ class V1PackageBuildTests(unittest.TestCase):
     def test_exact_package_from_the_real_mission_record(self):
         pkg, meta = replan_package.build_v1_package(real_record())
         # The wire fields, exactly — an EXTRA key is as much a contract break as a missing one.
-        self.assertEqual(tuple(pkg.keys()), replan_package.V1_FIELDS)
+        # `home_corridor` is the one OPTIONAL field: present only when the record's own approved
+        # geometry proves a corridor, so it is excluded here and pinned in its own tests below.
+        # Every REQUIRED field must still be present, in order, and nothing else may appear.
+        self.assertEqual(
+            tuple(k for k in pkg if k not in replan_package.V1_OPTIONAL_FIELDS),
+            replan_package.V1_FIELDS)
+        self.assertLessEqual(set(pkg) - set(replan_package.V1_FIELDS),
+                             set(replan_package.V1_OPTIONAL_FIELDS))
+        # Whatever the key set, the wire ORDER is the declared one.
+        self.assertEqual(list(pkg), [k for k in replan_package.V1_FIELD_ORDER if k in pkg])
         self.assertEqual(pkg["package_version"], "replan-planning-package-v1")
         self.assertEqual(pkg["route_contract_version"], "mission-contract-v1")
         self.assertEqual(pkg["mission_id"], FIXTURE_MISSION_ID)

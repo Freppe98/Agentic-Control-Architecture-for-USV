@@ -180,7 +180,24 @@ function first(obj, ...keys) {
 export const STATUS_IDENTIFYING_FIELDS = [
   "state", "effective_state", "execution_state", "mission_execution_enabled",
   "can_start", "can_pause", "can_resume", "can_stop",
+  "start_eligible", "execution_ready", "authority_blocks_start",
 ];
+
+// Scout's mission/package binding vocabulary, verbatim.
+export const BINDING = { UNBOUND: "UNBOUND", BOUND: "BOUND", STALE_MISMATCH: "STALE_MISMATCH" };
+// Conflict codes raised when a NEW package arrives against a run Scout cannot replace.
+export const PACKAGE_CONFLICT = {
+  STALE_PACKAGE_DURING_ACTIVE_EXECUTION: "STALE_PACKAGE_DURING_ACTIVE_EXECUTION",
+  OPERATION_IN_PROGRESS: "OPERATION_IN_PROGRESS",
+};
+const ACTIVE_CONFLICT_CODES = new Set(Object.values(PACKAGE_CONFLICT));
+
+// The ONE sentence for a mission uploaded on top of a run that still owns the vehicle. It names
+// the remedy without inventing one: Scout has no Stop, so "finish it or explicitly rearm it" is
+// the whole truth, and the station does not offer a third option it cannot perform.
+export const MISSION_REPLACEMENT_BLOCKED_TEXT =
+  "New mission uploaded while another mission is active. Finish or explicitly terminate/rearm " +
+  "the active mission before starting the new mission.";
 
 /** True when a body actually IS a mission-execution status, not another endpoint's answer. */
 export function isStatusBody(body) {
@@ -266,6 +283,9 @@ export function normalizeStatus(res) {
   const rc = isObj(s.return_completion) ? s.return_completion : {};
   const rp = isObj(s.replanning) ? s.replanning : {};
   const ts = isObj(s.timestamps) ? s.timestamps : {};
+  const bind = isObj(s.binding) ? s.binding : {};
+  const conflict = isObj(s.package_conflict) ? s.package_conflict : {};
+  const batt = isObj(s.battery_diagnostics) ? s.battery_diagnostics : {};
   const state = str(s.state);
   const effective = str(s.effective_state) || state;
 
@@ -291,6 +311,36 @@ export function normalizeStatus(res) {
     // the untrue "you cannot stop right now". See SCOUT_STOP_API.md.
     canStop: "can_stop" in s ? s.can_stop === true : null,
     stopSupported: "can_stop" in s,
+    // Scout's EXPLICIT Start-eligibility contract. Tri-state on purpose: PRESENCE is what makes
+    // it authoritative, and an older Scout that omits the keys must fall back to the can_start
+    // reading rather than have a missing field read as `false` and refuse every Start.
+    startEligible: "start_eligible" in s ? s.start_eligible === true : null,
+    executionReady: "execution_ready" in s ? s.execution_ready === true : null,
+    authorityBlocksStart: "authority_blocks_start" in s ? s.authority_blocks_start === true : null,
+    startBlockReason: first(s, "start_block_reason"),
+    eligibilityReported: "start_eligible" in s,
+    binding: {
+      reported: Object.keys(bind).length > 0 || Object.keys(conflict).length > 0,
+      state: str(bind.binding_state),
+      boundOriginalMissionId: str(bind.bound_original_mission_id),
+      packageMissionId: str(bind.package_mission_id),
+      packageRouteHash: str(bind.package_route_hash),
+      verifiedRouteHash: str(bind.verified_route_hash),
+      conflictCode: str(conflict.code),
+      conflictExecutionState: str(conflict.execution_state),
+      conflict: Object.keys(conflict).length > 0 ? conflict : null,
+    },
+    // Battery as Scout DIAGNOSES it. battery_valid:false / a -1 raw is UNKNOWN, and `percent`
+    // stays null so no consumer can render the sentinel as 0%.
+    battery: {
+      reported: Object.keys(batt).length > 0,
+      valid: batt.battery_valid === true,
+      percent: batt.battery_valid === true && typeof batt.battery_percent === "number"
+        && batt.battery_percent >= 0 ? batt.battery_percent : null,
+      raw: batt.battery_raw ?? null,
+      observedAt: str(batt.battery_observed_at),
+      telemetryAgeS: typeof batt.telemetry_age_s === "number" ? batt.telemetry_age_s : null,
+    },
     missionExecutionEnabled: s.mission_execution_enabled,
     lastError: first(s, "last_error"),
     timestamps: { start: str(ts.start), pause: str(ts.pause), resume: str(ts.resume) },
@@ -344,6 +394,140 @@ function replanFsm(S) {
 }
 
 /**
+ * SCOUT'S OWN Start-eligibility verdict, read from the explicit contract when it reports one.
+ *
+ * `can_start` alone is not the input any more, because it conflated two independent facts and
+ * produced the misreading this station had to stop making. Scout does NOT seize LOCAL_AGENT
+ * authority by itself, so
+ *
+ *     start_eligible = true, authority_blocks_start = true
+ *
+ * is the NORMAL pre-Start condition of a perfectly well-prepared mission — the Start transaction
+ * acquires and verifies agent control as its FIRST phase. Presenting it as a broken or unready
+ * mission told the operator to go and fix, by hand, the exact thing the button was about to do.
+ *
+ * @returns {{ eligible, deferredOnAuthority, executionReady, reason, source }}
+ *   eligible            Start may be offered (subject to the stable blockers in startGate)
+ *   deferredOnAuthority Start is available AND pressing it will take agent control first
+ *   executionReady      Scout is ready to run right now, already under LOCAL_AGENT
+ *   source              "scout" (the explicit contract) or "can_start" (an older Scout)
+ */
+export function startEligibility(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const state = String(S.state || "").toUpperCase();
+  const no = (reason, source) => ({ eligible: false, deferredOnAuthority: false,
+    executionReady: false, reason, source });
+
+  // The same three guards, in the same order, as the backend's start_eligibility(). Each reads a
+  // DIFFERENT Scout field, so a status asserting both "eligible" and "the replanning controller
+  // owns the vehicle" is self-contradictory — and a contradiction fails closed.
+  if (!S.present) return no("Scout mission-execution status is unavailable", "status");
+  if (S.replanning.active) return no("The replanning controller owns the vehicle", "replanning");
+  if (S.activeOperationId) {
+    return no(`Scout is already processing operation ${S.activeOperationId}`, "operation");
+  }
+  if (S.missionExecutionEnabled === false) {
+    return no("Mission execution is disabled on Scout (MISSION_EXECUTION_DISABLED)", "disabled");
+  }
+
+  if (S.eligibilityReported) {
+    if (S.executionReady === true) {
+      return { eligible: true, deferredOnAuthority: false, executionReady: true,
+        reason: null, source: "scout" };
+    }
+    if (S.startEligible === true) {
+      return { eligible: true, deferredOnAuthority: S.authorityBlocksStart === true,
+        executionReady: false, reason: null, source: "scout" };
+    }
+    return { eligible: false, deferredOnAuthority: false, executionReady: false,
+      // Scout's own words, verbatim — never a re-derivation of its preconditions.
+      reason: asText(S.startBlockReason)
+        || `Scout reports the mission is not eligible to start${state ? ` in ${state}` : ""}`,
+      source: "scout" };
+  }
+  // An older Scout: the previous reading, with the ONE authority deferral it always had.
+  if (S.canStart) {
+    return { eligible: true, deferredOnAuthority: false, executionReady: false,
+      reason: null, source: "can_start" };
+  }
+  const authority = String(S.authority || "").toUpperCase();
+  if (STARTABLE_STATES.includes(state) || state === "NOT_READY") {
+    if (authority && authority !== "LOCAL_AGENT") {
+      return { eligible: true, deferredOnAuthority: true, executionReady: false,
+        reason: null, source: "can_start" };
+    }
+  }
+  return { eligible: false, deferredOnAuthority: false, executionReady: false,
+    reason: `Scout reports can_start=false${state ? ` in ${state}` : ""}`, source: "can_start" };
+}
+
+/** The label + note for a Start button, given Scout's eligibility. The label never changes —
+ *  an operator looking for "Start Mission" must find "Start Mission" — but when authority will
+ *  be acquired the card SAYS so, because that is a real thing the press is about to do. */
+export const START_ACQUIRES_AUTHORITY_NOTE =
+  "Start will take Local Agent control of this vehicle first, verify it, and then run Scout's " +
+  "own start transaction.";
+
+/**
+ * Scout's mission/package binding, and whether a newly uploaded mission may be shown as ready.
+ *
+ * `blocksNewMission` is deliberately narrow and is the whole point: when Scout reports
+ * STALE_MISMATCH, or a conflict raised because the PREVIOUS run still owns the vehicle, a new
+ * package must NOT quietly render as "ready to start". The station names the situation and the
+ * only two real remedies. It does NOT invent a Stop — Scout has none, and a synthesized one
+ * would be a second lifecycle competing with Scout's.
+ *
+ * @returns {{ reported, state, conflictCode, blocksNewMission, text, detail }}
+ */
+export function bindingView(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const b = S.binding || {};
+  if (!b.reported) {
+    return { reported: false, state: null, conflictCode: null, blocksNewMission: false,
+      text: null, detail: null };
+  }
+  const blocks = b.state === BINDING.STALE_MISMATCH || ACTIVE_CONFLICT_CODES.has(b.conflictCode);
+  const detail = [
+    b.state ? `binding ${b.state}` : null,
+    b.conflictCode || null,
+    b.conflictExecutionState ? `execution ${b.conflictExecutionState}` : null,
+    b.boundOriginalMissionId ? `bound mission ${b.boundOriginalMissionId}` : null,
+    b.packageMissionId ? `package mission ${b.packageMissionId}` : null,
+  ].filter(Boolean).join(" · ");
+  return {
+    reported: true, state: b.state, conflictCode: b.conflictCode,
+    blocksNewMission: blocks,
+    text: blocks ? MISSION_REPLACEMENT_BLOCKED_TEXT : null,
+    detail: detail || null,
+  };
+}
+
+/**
+ * Battery, for display, from Scout's own diagnostics.
+ *
+ * The rule this exists to enforce: a `-1` raw (or `battery_valid:false`) is Scout saying it does
+ * not KNOW, and "unknown" must never render as 0%. A zero-percent battery is an emergency; a
+ * missing reading is a link or sensor gap. The two must not look alike.
+ *
+ * @returns {{ known, percent, text, detail }}
+ */
+export function batteryView(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const b = S.battery || {};
+  if (!b.reported) return { known: false, percent: null, text: null, detail: null };
+  const detail = [
+    b.raw === null || b.raw === undefined ? null : `raw ${b.raw}`,
+    b.observedAt ? `observed ${b.observedAt}` : null,
+    b.telemetryAgeS === null ? null : `telemetry age ${b.telemetryAgeS}s`,
+  ].filter(Boolean).join(" · ") || null;
+  if (!b.valid || b.percent === null) {
+    return { known: false, percent: null,
+      text: "Battery telemetry temporarily unavailable", detail };
+  }
+  return { known: true, percent: b.percent, text: `${b.percent}%`, detail };
+}
+
+/**
  * THE primary lifecycle control, derived EXCLUSIVELY from Scout's status.
  *
  * Returns { action, label, enabled, tone, reason } where `action` is "start" | "pause" |
@@ -387,8 +571,12 @@ export function primaryAction(status) {
   if (S.canResume) {
     return { action: "resume", label: "Resume Mission", enabled: true, tone: "ok", reason: null };
   }
-  if (S.canStart) {
-    return { action: "start", label: "Start Mission", enabled: true, tone: "ok", reason: null };
+  // NOT `can_start` alone. Scout's explicit contract decides, and `start_eligible:true` with
+  // authority still OPERATOR is an OFFERED Start whose first phase takes agent control.
+  const elig = startEligibility(S);
+  if (elig.eligible && !bindingView(S).blocksNewMission) {
+    return { action: "start", label: "Start Mission", enabled: true, tone: "ok",
+      reason: elig.deferredOnAuthority ? START_ACQUIRES_AUTHORITY_NOTE : null };
   }
   if (S.state === "COMPLETED_HOLD") {
     return { action: null, label: "Mission complete", enabled: false, tone: "ok",
@@ -479,6 +667,16 @@ export function startGate(status, { connected = true, busy = false, missionId = 
   if (S.transitional && state !== "RETURNING_HOME") {
     return block(START_BLOCK.OPERATION_ACTIVE, `Scout is mid-transaction (${stateLabel(state)})`);
   }
+  // A NEW mission on top of a run that still owns the vehicle. Scout's own binding/conflict
+  // verdict, and a stable one. It is checked BEFORE the generic "already running" because it is
+  // strictly more specific and more actionable: "the mission is already paused" is true but
+  // silent about the thing the operator just did — uploading a different mission that is not
+  // going to fly until this run ends.
+  const bind = bindingView(S);
+  if (bind.blocksNewMission) {
+    return block(START_BLOCK.MISSION_REPLACEMENT_CONFLICT, null,
+      [MISSION_REPLACEMENT_BLOCKED_TEXT, bind.detail].filter(Boolean).join(" — "));
+  }
   if (RUNNING_STATES.includes(state)) {
     return block(START_BLOCK.ALREADY_RUNNING,
       `The mission is already ${stateLabel(state).toLowerCase()}`);
@@ -497,10 +695,24 @@ export function startGate(status, { connected = true, busy = false, missionId = 
   if (S.home.requiredBeforeStart && !isObj(S.home.verified)) {
     return block(START_BLOCK.HOME_REQUIRED);
   }
-  return { canStart: true, code: null, reason: null,
-    detail: "Start runs one backend transaction: a fresh preflight, the authority hand-off, a " +
-      "fresh mission and package proof, a verified LOITER, Set Home and verify, then AUTO and " +
-      "verify. No vehicle write happens before its own proof succeeds." };
+  // Scout's OWN explicit refusal, last, and only when it actually refused. Note what does NOT
+  // reach here: `authority_blocks_start` is not a blocker at all — it is the normal pre-Start
+  // condition, and the Start transaction resolves it as its first phase.
+  const elig = startEligibility(S);
+  if (!elig.eligible) {
+    return block(START_BLOCK.NOT_ELIGIBLE, asText(elig.reason) || undefined,
+      asText(elig.reason)
+        || "Scout reports the mission is not eligible to start and gave no reason.");
+  }
+  return { canStart: true, code: null,
+    reason: null,
+    // The card can say, before the press, exactly what the press will do about authority.
+    authorityWillBeAcquired: elig.deferredOnAuthority,
+    executionReady: elig.executionReady,
+    detail: (elig.deferredOnAuthority ? START_ACQUIRES_AUTHORITY_NOTE + " " : "")
+      + "Start runs one backend transaction: a fresh preflight, the authority hand-off, a "
+      + "fresh mission and package proof, a verified LOITER, Set Home and verify, then AUTO and "
+      + "verify. No vehicle write happens before its own proof succeeds." };
 }
 
 /**
@@ -711,6 +923,8 @@ export function firstClause(text, max = 44) {
 export function shortStartBlocker(reason) {
   const t = asText(reason);
   if (!t) return "Start preconditions not met";
+  if (/another mission is active|while another mission/i.test(t))
+    return "Another mission is still active";
   if (/no active mission/i.test(t)) return "No active mission";
   if (/disabled/i.test(t)) return "Mission execution disabled on Scout";
   // "Agent is replanning" is NOT derivable from text. The preflight's own wording routinely
@@ -870,6 +1084,14 @@ export function missionCardView(status, {
     headline: null, headlineTitle: asText(ctl.notice), rows: [], blocker: null,
     buttons: ctl.buttons, working: false, startPhase: null, checking: false, checkingText: null,
     home: null, info: null, stop: ctl.stop, complete: ctl.complete,
+    // A finished run's second line and its one next action (see the COMPLETED_HOLD branch).
+    completionNote: null, nextAction: null,
+    // Set when a NEW mission cannot start because the PREVIOUS run still owns the vehicle.
+    // Rendered as its own notice: it is neither a broken mission nor a Scout fault, and the two
+    // real remedies are Scout's — finish the active run, or explicitly rearm it.
+    replacementConflict: null,
+    // Start is available AND pressing it will take Local Agent control first.
+    authorityWillBeAcquired: false,
   };
 
   // Nothing may be claimed about an older or unreachable Scout — and the operator is told so in
@@ -893,6 +1115,14 @@ export function missionCardView(status, {
     out.headline = "Agent is replanning";
     return out;
   }
+  // Scout's binding/conflict verdict, read BEFORE the ordinary pre-start presentation so a newly
+  // uploaded mission can never render as "Ready to start" while the previous run is still live.
+  const bind = bindingView(S);
+  if (bind.blocksNewMission) {
+    out.replacementConflict = { text: bind.text, title: bind.detail || bind.text, tone: "warn" };
+  }
+  const eligibility = startEligibility(S);
+  out.authorityWillBeAcquired = eligibility.eligible && eligibility.deferredOnAuthority;
   // A Start in flight, or any Scout transaction. While the START transaction runs the line is
   // PHASE-SPECIFIC and NEUTRAL — the five phases in lib/mission-readiness.js, each of them
   // Scout's observed step (or, before Scout has moved, the backend's provable first phase).
@@ -916,6 +1146,32 @@ export function missionCardView(status, {
   if (rv && rv.checking) {
     out.checking = true;
     out.checkingText = CHECKING_TEXT;
+  }
+
+  // ── A FINISHED mission reads as finished ────────────────────────────────────────────────
+  // COMPLETED_HOLD is a terminal state, and a run that has ended must never keep presenting as
+  // RUNNING or PAUSED. The completion claim itself is unchanged and still strict: reaching the
+  // last waypoint, or the arrival-persistence bar filling, is NOT completion — only Scout
+  // reporting COMPLETED_HOLD *with* a verified final LOITER is (isComplete). When Scout reports
+  // the state without the LOITER evidence, that gap is stated rather than rounded up.
+  if (state === "COMPLETED_HOLD") {
+    out.chip = "COMPLETED";
+    out.tone = ctl.complete ? "ok" : "caution";
+    out.headline = ctl.complete ? "Mission finished" : "Completed — final LOITER not verified";
+    out.completionNote = ctl.complete
+      ? { text: "Final LOITER verified", tone: null,
+          title: "Scout reports COMPLETED_HOLD and a verified final LOITER — the run is over "
+            + "and the vehicle is holding at Home." }
+      : { text: "Final LOITER NOT verified", tone: "warn",
+          title: "Scout reports COMPLETED_HOLD but could not verify the final LOITER." };
+    const mid = shortMissionId(S.missionId || missionId);
+    if (mid) out.rows.push({ k: "Mission", v: mid, title: S.missionId || missionId, mono: true });
+    if (wp) out.rows.push({ k: "WP", v: wp, title: null });
+    // The next action a finished run actually has. Rearm PREPARES the controller for the next
+    // mission; it is not a Stop and issues no vehicle command.
+    out.nextAction = ctl.buttons.some((b) => b.action === "rearm")
+      ? { action: "rearm", label: "Rearm / prepare next mission" } : null;
+    return out;
   }
 
   if (RUNNING_LIKE_STATES.includes(state)) {
@@ -974,7 +1230,12 @@ export function missionCardView(status, {
     const btn = (a) => ctl.buttons.find((b) => b.action === a);
     const start = btn("start"), stop = btn("stop");
     const held = ["pause", "resume"].map(btn).find((b) => b && !b.enabled);
-    if (ctl.failure) {
+    if (out.replacementConflict) {
+      // Outranks every other blocker: it is the only one that explains why a mission the
+      // operator JUST uploaded is not the mission this vehicle is going to fly.
+      out.blocker = { text: "Another mission is still active", tone: "warn",
+        title: out.replacementConflict.title };
+    } else if (ctl.failure) {
       out.blocker = { text: firstClause(ctl.failure), title: asText(ctl.failure), tone: "warn" };
     } else if (start && !start.enabled) {
       // ONE short line naming a STABLE cause — disconnected, no mission, replanning, already
@@ -1017,7 +1278,20 @@ export function startBlockers(status, { lastErrorCode = null } = {}) {
   const out = [];
   if (!S.supported) { out.push("Mission lifecycle not supported by this Scout version"); return out; }
   if (!S.present) { out.push("Scout mission-execution status is unavailable"); return out; }
-  if (S.canStart) return out;
+  const elig = startEligibility(S);
+  const bind = bindingView(S);
+  if (elig.eligible && !bind.blocksNewMission) {
+    // Eligible. The ONE thing worth saying is what the press will do about authority — stated
+    // as information, never as something the operator has to go and fix first.
+    if (elig.deferredOnAuthority) out.push(START_ACQUIRES_AUTHORITY_NOTE);
+    return out;
+  }
+  if (bind.blocksNewMission) {
+    out.push(MISSION_REPLACEMENT_BLOCKED_TEXT + (bind.detail ? ` (${bind.detail})` : ""));
+  }
+  if (elig.source === "scout" && !elig.eligible && asText(elig.reason)) {
+    out.push(`Scout: ${asText(elig.reason)}`);
+  }
 
   if (S.missionExecutionEnabled === false)
     out.push("Mission execution is disabled on Scout (MISSION_EXECUTION_DISABLED)");

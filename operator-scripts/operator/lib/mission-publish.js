@@ -133,6 +133,57 @@ export function publishView(env) {
     headline: "Mission upload could not be verified", canRetrySync: false };
 }
 
+// ---- Carrying the transaction to a verdict, without a manual step -------------------------
+//
+// The publish transaction is RESUMABLE by design (mission_publish.py): while the queued Pixhawk
+// write is still in flight, or while a read could not be completed, it answers "not finished"
+// rather than failing. The Plan page used to invoke it exactly ONCE, when the upload command
+// reached its verified read-back — so any answer that was merely unfinished left the operator
+// on a progress line that never advanced, and the only way to a published mission was to press
+// Retry Agent Sync (or, during bench testing, to curl the package-sync route by hand).
+//
+// That is the whole reason package synchronization felt like a step the operator had to know
+// about. It is not one. This policy carries the SAME transaction to a verdict on its own:
+//
+//   still resolving   the transaction says so itself — the upload has not finished, a read was
+//                     incomplete, another publish holds the vehicle, or Scout could not be
+//                     reached. Re-invoke, bounded, and stop when the budget is spent.
+//   decided           READY, a proven mismatch, a Scout refusal, or a local block. Re-invoking
+//                     would prove nothing new, so it stops and the operator is shown the
+//                     specific cause (and, where it applies, the one action that can close it).
+//
+// Re-invoking is SAFE and is not a "retry the vehicle write": the publish route issues no
+// vehicle command of any kind — it reads the flight controller back and writes Scout's single,
+// idempotent package slot.
+export const PUBLISH_RETRY = { maxAttempts: 6, delayMs: 2000 };
+
+// States the transaction itself classes as unfinished rather than decided.
+const RESOLVING_STATES = new Set([
+  PUBLISH_STATE.UPLOAD_IN_PROGRESS,   // the queued Pixhawk write has not verified yet
+  PUBLISH_STATE.VERIFYING,            // a read was incomplete — not a mismatch
+  PUBLISH_STATE.BUSY,                 // another publish holds this vehicle
+  PUBLISH_STATE.SCOUT_UNREACHABLE,    // an unasked question, not a disagreement
+]);
+
+/**
+ * Whether to invoke the publish transaction again, and after how long.
+ *
+ * @param env      the last publish envelope, or null when the request itself did not arrive
+ * @param attempt  how many attempts have already been made (1 after the first)
+ * @returns {{ retry: boolean, delayMs: number, reason: string }}
+ */
+export function nextPublishAttempt(env, attempt, { maxAttempts, delayMs } = PUBLISH_RETRY) {
+  const done = (reason) => ({ retry: false, delayMs: 0, reason });
+  const n = Number.isFinite(attempt) ? attempt : 0;
+  if (isObj(env) && isObj(env.final) && env.final.agent_ready === true) return done("ready");
+  // A request that never reached the backend is the same class of problem as an unreachable
+  // Scout — the transaction has not been answered, so asking again is the honest move.
+  const state = isObj(env) ? str(env.state) : null;
+  if (env !== null && state !== null && !RESOLVING_STATES.has(state)) return done("decided");
+  if (n >= maxAttempts) return done("exhausted");
+  return { retry: true, delayMs, reason: state || "no-response" };
+}
+
 // ---- The shared readiness vocabulary (Map + Agent) ----------------------------------------
 export const READINESS_STATE = {
   READY: "READY",
