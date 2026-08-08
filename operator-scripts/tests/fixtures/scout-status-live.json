@@ -1,0 +1,757 @@
+{
+ "message_type": "status",
+ "schema_version": "1.0",
+ "source": "usv-2",
+ "target": "operator",
+ "timestamp": 1786175327.0340831,
+ "payload": {
+  "usv_id": "usv-2",
+  "name": "Scout",
+  "comm_state": "CONNECTED",
+  "groups": [
+   "telemetry",
+   "mavlink",
+   "mission",
+   "communication",
+   "agent",
+   "health",
+   "measurements",
+   "fleet",
+   "events",
+   "transitions"
+  ],
+  "telemetry": {
+   "airspeed": null,
+   "alt": -15.38,
+   "armed": false,
+   "battery": -1,
+   "battery_current": 0.21,
+   "battery_voltage": 23.8,
+   "ekf_ok": true,
+   "gps_fix_type": 3,
+   "gps_satellites": 20,
+   "groundspeed": 0.03,
+   "heading": 135,
+   "lat": 56.6635657,
+   "lng": 12.8814324,
+   "mode": 0,
+   "mode_name": "MANUAL"
+  },
+  "power": {
+   "battery_current_a": 0.21,
+   "battery_remaining_pct": 89,
+   "battery_voltage_v": 23.8,
+   "board_voltage_v": 5.132,
+   "brick_valid": true,
+   "source": "PIXHAWK_BATTERY_MONITOR",
+   "usb_connected": true
+  },
+  "failsafe": {
+   "last_statustext": {
+    "age_s": 30806.02,
+    "severity": 6,
+    "text": "ELRS: Link rate 250Hz, Telemetry rate 38Hz"
+   },
+   "status": "OK",
+   "system_state": "ACTIVE",
+   "system_state_num": 4,
+   "unhealthy_sensors_mask": 0,
+   "unhealthy_sensors_present": false
+  },
+  "imu": {
+   "attitude": {
+    "pitch": 0.032700423151254654,
+    "roll": -0.04870418831706047,
+    "yaw": 2.359149932861328
+   },
+   "clipping": [
+    1,
+    3,
+    0
+   ],
+   "imu_available": true,
+   "imu_health": "OK",
+   "imu_last_seen_s": 0.26,
+   "vibration": {
+    "x": 0.02157549187541008,
+    "y": 0.035399019718170166,
+    "z": 0.017268674448132515
+   }
+  },
+  "freshness": {
+   "attitude_s": 0.26,
+   "battery_s": 0.5,
+   "ekf_s": 0.5,
+   "gps_s": 0.51,
+   "heartbeat_s": 0.2,
+   "mission_s": 0.52,
+   "position_s": 0.52,
+   "sys_status_s": 0.52
+  },
+  "mavlink": {
+   "heartbeat_age_s": 0.2,
+   "mavlink_connected": true,
+   "mavlink_last_msg_age_s": 0.2,
+   "mavlink_msg_rate_hz": 0.31,
+   "measured_at": 1786175326.8,
+   "parser_errors": null,
+   "last_message_age_s": 0.2,
+   "gps_fix_type": 3,
+   "gps_satellites": 20,
+   "vehicle_mode": "MANUAL",
+   "armed": false,
+   "ekf_ok": true
+  },
+  "mission": {
+   "current_mission_id": null,
+   "current_waypoint": 0,
+   "current_waypoint_display": "0 / 15",
+   "mission_active": false,
+   "mission_active_evidence": "ACTIVE_UNKNOWN",
+   "mission_count": 15,
+   "mission_state": "IDLE",
+   "mission_state_num": null,
+   "mode": 0,
+   "pixhawk_readback": {
+    "age_s": 2.483,
+    "count": 15,
+    "current_seq": 0,
+    "mission_valid": true,
+    "observed_at": 1786175324.3114586,
+    "refreshing": false,
+    "route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+    "stale": false
+   },
+   "started_at": null
+  },
+  "communication": {
+   "connectivity": "CONNECTED",
+   "operator_reachable": true,
+   "operator_connected": true,
+   "last_successful_transmission": 1786175325.504211,
+   "buffered_packets": 0,
+   "rtt_ms": 331.1,
+   "packet_loss": null,
+   "bandwidth_estimate_kbps": null,
+   "vpn_status": {
+    "interface": "wg0",
+    "interface_up": true,
+    "status": "RECENT_HANDSHAKE",
+    "last_handshake_age_s": 96.3,
+    "peers": 1
+   },
+   "seq": 302
+  },
+  "service_status": {
+   "local_mission_agent": "online",
+   "vehicle_api": "online",
+   "pixhawk_link": "online",
+   "sensor_service": "online",
+   "gpio_service": "online",
+   "influx": "unknown"
+  },
+  "agent": {
+   "current_communication_state": "CONNECTED",
+   "current_mission_state": "IDLE",
+   "buffer_usage": 0,
+   "last_operator_command": null,
+   "control_authority": "OPERATOR",
+   "home_status": {
+    "distance_from_vehicle_m": 1598.6,
+    "home_position": {
+     "age_s": 65632.872,
+     "altitude": 7.63,
+     "latitude": 56.650388,
+     "longitude": 12.8709758,
+     "source": "pixhawk"
+    },
+    "reachable": true,
+    "ready_for_auto": false,
+    "ready_for_rtl": false,
+    "reason": "Home has not been verified this runtime -- perform Set Home Here before AUTO/RTL/RESUME.",
+    "vehicle_position": {
+     "age_s": 0.519,
+     "latitude": 56.6635657,
+     "longitude": 12.8814324
+    },
+    "verification_distance_m": null,
+    "verification_method": null,
+    "verified": false,
+    "verified_at": null
+   },
+   "mission_upload": {
+    "active": false,
+    "state": "idle",
+    "command_id": null,
+    "command_type": null,
+    "started_at": null,
+    "elapsed_s": null
+   },
+   "mission_operation": {
+    "command_id": "48e81033-d6e8-465c-a057-4fcea71350b3",
+    "command_type": "MISSION_UPLOAD",
+    "state": "COMPLETED",
+    "started_at": 1786108634.3490968,
+    "updated_at": 1786108986.7612803,
+    "elapsed_s": 352.41,
+    "expected_route_waypoint_count": null,
+    "expected_pixhawk_item_count": null,
+    "expected_route_content_hash": null,
+    "observed_route_waypoint_count": 14,
+    "observed_pixhawk_item_count": 15,
+    "observed_route_content_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+    "acknowledgement": "MAV_MISSION_ACCEPTED",
+    "empty_representation": null,
+    "error": null,
+    "diagnostics": {
+     "acknowledgement_type": "MAV_MISSION_ACCEPTED",
+     "baseline_ack_token": "2026-08-07T13:17:14.413254132Z",
+     "baseline_request_int_token": null,
+     "baseline_request_legacy_token": "2026-08-07T12:49:20.034642502Z",
+     "expected_pixhawk_item_count": 15,
+     "expected_route_content_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "expected_route_waypoint_count": 14,
+     "highest_sequence_sent": 14,
+     "items_sent": 15,
+     "last_received_sequence": 14,
+     "operation": "MISSION_UPLOAD",
+     "preconditions": {
+      "armed": true,
+      "armed_loiter_exception_used": true,
+      "groundspeed_age_s": 0.25,
+      "groundspeed_m_s": 0.07,
+      "heartbeat_age_s": 0.69,
+      "mode_age_s": 0.69,
+      "position_age_s": 0.25,
+      "precondition_failure_reason": null,
+      "precondition_result": "ALLOW",
+      "upload_context": "OPERATOR_REPLACEMENT",
+      "verified_mode": "LOITER"
+     },
+     "readback_generation": 44,
+     "request_source": null,
+     "request_target": [
+      255,
+      240
+     ],
+     "request_variant": "MISSION_REQUEST",
+     "requested_sequence": 14,
+     "response_item_variant": "MISSION_ITEM_INT",
+     "stage": "READBACK_VERIFYING",
+     "stale_cached_data_rejected": true,
+     "timeout_stage": null,
+     "transaction_id": 2,
+     "verification": {
+      "exact_hash_match": true,
+      "expected_route_content_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+      "expected_route_waypoint_count": 14,
+      "mismatch_reasons": [],
+      "normalization": null,
+      "note": "route_content_hash matched exactly; 1e-7 coordinate reproducibility preserved",
+      "observed_route_content_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+      "observed_route_waypoint_count": 14,
+      "readback_item_variant": "MISSION_ITEM_INT",
+      "status": "EXACT_MATCH",
+      "transport_normalized": false,
+      "upload_item_variant": "MISSION_ITEM_INT",
+      "verified": true,
+      "waypoint_diffs": []
+     },
+     "verification_mismatch": null
+    }
+   },
+   "current_policy": {
+    "communication_policy": "FULL_REPORTING",
+    "mission_policy": "SUPERVISED_CONTINUATION",
+    "autonomy_level": "ASSISTED",
+    "current_behaviour": "monitoring"
+   },
+   "current_decision": "Hold Position",
+   "decision_reason": "No mission assigned; standing by.",
+   "previous_decision": null,
+   "previous_decision_reason": null,
+   "decision_confidence": "MEDIUM",
+   "decision_confidence_missing_inputs": [
+    "battery_percent"
+   ],
+   "decision_inputs": {
+    "communication_state": "CONNECTED",
+    "operator_reachable": true,
+    "heartbeat_age_s": 0.2,
+    "last_message_age_s": 0.2,
+    "mavlink_connected": true,
+    "battery_percent": null,
+    "gps_fix_type": 3,
+    "gps_satellites": 20,
+    "vehicle_mode": "MANUAL",
+    "armed": false,
+    "ekf_ok": true,
+    "mission_state": "IDLE",
+    "mission_id": null,
+    "mission_active": false,
+    "current_waypoint": 0,
+    "mission_count": 15,
+    "control_authority": "OPERATOR"
+   },
+   "watch_conditions": [
+    {
+     "condition": "Battery < RTL threshold",
+     "metric": "battery_percent",
+     "current_value": null,
+     "threshold": 30,
+     "comparator": "<",
+     "triggered": null
+    },
+    {
+     "condition": "Heartbeat timeout",
+     "metric": "heartbeat_age_s",
+     "current_value": 0.2,
+     "threshold": 3.0,
+     "comparator": ">=",
+     "triggered": false
+    },
+    {
+     "condition": "GPS lost",
+     "metric": "gps_fix_type",
+     "current_value": 3,
+     "threshold": 2,
+     "comparator": "<",
+     "triggered": false
+    },
+    {
+     "condition": "Mission completed",
+     "metric": "mission_active",
+     "current_value": false,
+     "threshold": false,
+     "comparator": "==",
+     "triggered": false
+    },
+    {
+     "condition": "Operator Take Control",
+     "metric": "control_authority",
+     "current_value": "OPERATOR",
+     "threshold": "OPERATOR",
+     "comparator": "==",
+     "triggered": true
+    }
+   ],
+   "decision_timeline": [],
+   "situation": {
+    "communication_state": "CONNECTED",
+    "operator_reachable": true,
+    "mission_state": "IDLE",
+    "control_authority": "OPERATOR",
+    "vehicle_health": {
+     "battery_percent": null,
+     "gps_fix_type": 3,
+     "gps_satellites": 20,
+     "ekf_ok": true,
+     "mavlink_connected": true,
+     "heartbeat_age_s": 0.2,
+     "last_message_age_s": 0.2,
+     "armed": false,
+     "vehicle_mode": "MANUAL"
+    },
+    "autonomy_level": "ASSISTED",
+    "decision_confidence": "MEDIUM"
+   },
+   "replan": {
+    "autonomous_execution_enabled": false,
+    "dry_run": true,
+    "mode": "DRY_RUN",
+    "current_decision": "MONITOR",
+    "reason_codes": [
+     "BATTERY_UNAVAILABLE"
+    ],
+    "snapshot_id": null,
+    "fsm_state": "FAILED",
+    "current_step": "FAILED",
+    "active_transition_id": "61f0adacb74f4cc4bc6a553f4dc17f1a",
+    "revision_number": 4,
+    "strategy": "SAFE_RETURN_HOME",
+    "original_mission_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+    "original_mission_revision": 0,
+    "revised_mission_hash": null,
+    "revised_mission_revision": 4,
+    "replan_operation_id": "61f0adacb74f4cc4bc6a553f4dc17f1a",
+    "original_mission_id": null,
+    "original_route_count": null,
+    "revised_route_count": null,
+    "original_mission_proof": null,
+    "revised_mission_proof": null,
+    "revised_progression": null,
+    "energy": {
+     "battery_percent": null,
+     "battery_valid": false,
+     "safe_return_distance_m": 1598.6,
+     "usable_range_m": 3000.0,
+     "return_cost_percent": 53.29,
+     "reserve_margin_percent": 10.0,
+     "margin_percent": null,
+     "critical_battery_percent": 15.0
+    },
+    "battery_diagnostics": {
+     "battery_percent": null,
+     "battery_valid": false,
+     "battery_raw": -1,
+     "battery_observed_at": 1786175327.032,
+     "telemetry_age_s": 0.2
+    },
+    "authority_status": null,
+    "authority_age_s": null,
+    "authority_blocked": false,
+    "blocked_recommendation": null,
+    "retry_count": 0,
+    "max_retries": 2,
+    "trigger_active": false,
+    "trigger_generation": 0,
+    "consumed_trigger_generation": null,
+    "trigger_consumed": false,
+    "terminal_reason": null,
+    "last_error": {
+     "code": "ORIGINAL_MISSION_ID_MISMATCH",
+     "message": "no bound original mission identity from mission execution; cannot prove what is on the vehicle",
+     "reason_code": "ORIGINAL_MISSION_ID_MISMATCH"
+    },
+    "validation_outcome": null,
+    "upload_outcome": null,
+    "readback_outcome": null,
+    "fallback_enabled": false,
+    "fallback_state": null,
+    "simulated": false,
+    "in_cooldown": false,
+    "running": false,
+    "planning_package": {
+     "stored": true,
+     "usable": true,
+     "package_version": "replan-planning-package-v1",
+     "route_contract_version": "mission-contract-v1",
+     "mission_id": "msn-48614d039d59",
+     "revision": 0,
+     "mission_revision": 0,
+     "immutable": true,
+     "route_waypoint_count": 14,
+     "segment_counts": {
+      "UNSPECIFIED": 14
+     },
+     "has_home": true,
+     "no_go_zones_present": true,
+     "no_go_zone_count": 0,
+     "has_navigable_geometry": true,
+     "has_navigable_boundary": true,
+     "shoreline_clearance_m": 1.0,
+     "has_survey_graph": false,
+     "route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "original_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "source": "OPERATOR_STATION"
+    },
+    "planning_package_consistency": {
+     "state": "PLANNING_PACKAGE_CONSISTENT",
+     "detail": {
+      "package_mission_id": "msn-48614d039d59",
+      "current_mission_id": null,
+      "package_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+      "current_route_hash": null,
+      "hash_checked": false
+     }
+    },
+    "geometry_validation": null,
+    "config": {
+     "values": {
+      "autonomous_execution_enabled": false,
+      "dry_run": true,
+      "critical_battery_percent": 15.0,
+      "reserve_margin_percent": 10.0,
+      "usable_range_m": 3000.0,
+      "energy_persistence_count": 3,
+      "max_transaction_retries": 2,
+      "cooldown_s": 30.0,
+      "rtl_fallback_enabled": false,
+      "connect_gap_max_m": 150.0,
+      "revised_progression_timeout_s": 10.0,
+      "progression_poll_interval_s": 0.4,
+      "progression_min_displacement_m": 1.5,
+      "max_position_age_s": 5.0
+     },
+     "sources": {
+      "autonomous_execution_enabled": "default",
+      "dry_run": "default",
+      "critical_battery_percent": "default",
+      "reserve_margin_percent": "default",
+      "usable_range_m": "default",
+      "energy_persistence_count": "default",
+      "max_transaction_retries": "default",
+      "cooldown_s": "default",
+      "rtl_fallback_enabled": "default",
+      "connect_gap_max_m": "default",
+      "revised_progression_timeout_s": "default",
+      "progression_poll_interval_s": "default",
+      "progression_min_displacement_m": "default",
+      "max_position_age_s": "default"
+     }
+    },
+    "obstacle_execution_enabled": false,
+    "obstacle_note": "Obstacle replanning is groundwork only; not enabled.",
+    "history": [],
+    "last_revision": {
+     "mission_id": null,
+     "parent_revision": 0,
+     "new_revision": 4,
+     "decision_snapshot_id": "6036f2f18b7a43989652c24615485f47",
+     "transition_id": "61f0adacb74f4cc4bc6a553f4dc17f1a",
+     "strategy": "SAFE_RETURN_HOME",
+     "reason_codes": [
+      "SIMULATED_FORCED"
+     ],
+     "original_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "revised_route_hash": null,
+     "created_at": 1786109868.135,
+     "preserved_waypoint_count": 0,
+     "removed_waypoint_count": 0,
+     "inserted_waypoint_count": 0,
+     "revised_waypoint_count": 0,
+     "original_route_count": null,
+     "original_proof": null,
+     "revised_route_count": null,
+     "revised_proof": null,
+     "revised_progression": null,
+     "verified_home": null,
+     "validation_result": null,
+     "upload_operation_result": null,
+     "readback_verification_result": null
+    }
+   },
+   "mission_execution": {
+    "supported": true,
+    "state": "NOT_READY",
+    "effective_state": "NOT_READY",
+    "phase": null,
+    "phase_label": null,
+    "start_snapshot": null,
+    "progression_evidence": null,
+    "recovery": {
+     "prior_state": "PAUSED",
+     "prior_operation_id": null,
+     "prior_mission_id": "msn-70542357f597",
+     "prior_original_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "expected_mode": "LOITER",
+     "reconciled": false,
+     "reason": "MISSION_ID_MISMATCH",
+     "safe_hold": "NONE"
+    },
+    "active_operation_id": null,
+    "mission_id": "msn-48614d039d59",
+    "original_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+    "active_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+    "verified_home": null,
+    "home_verification_distance_m": null,
+    "mode": "MANUAL",
+    "sequence": {
+     "current": 0,
+     "count": 15,
+     "before_pause": null,
+     "at_resume": null,
+     "first_after_resume": null,
+     "continuation_verified": null
+    },
+    "timestamps": {
+     "start": null,
+     "pause": null,
+     "resume": null
+    },
+    "replanning": {
+     "active": false,
+     "fsm_state": "FAILED"
+    },
+    "return_completion": {
+     "distance_to_home_m": 1598.6,
+     "arrival_radius_m": 7.5,
+     "persistence_s": 4.0,
+     "persistence_progress_s": null,
+     "arrival_confirmed": false,
+     "final_loiter_verified": false
+    },
+    "completion": {
+     "candidate": false,
+     "confirmed": false,
+     "final_item_tolerance": 0,
+     "persistence_s": 6.0,
+     "persistence_progress_s": null,
+     "evidence": null,
+     "final_loiter_verified": false
+    },
+    "binding": {
+     "bound_original_mission_id": null,
+     "bound_original_route_hash": null,
+     "package_mission_id": "msn-48614d039d59",
+     "package_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "verified_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+     "binding_state": "UNBOUND"
+    },
+    "package_conflict": null,
+    "execution_ready": false,
+    "start_eligible": true,
+    "start_block_reason": "AUTHORITY_NOT_LOCAL_AGENT",
+    "authority_blocks_start": true,
+    "authority_status": "OPERATOR",
+    "readiness": {
+     "ready": false,
+     "checking": false,
+     "reason": "AUTHORITY_NOT_LOCAL_AGENT",
+     "detail": {
+      "authority": "OPERATOR"
+     },
+     "last_evaluated_at": 1786175323.2806048,
+     "last_verified": {
+      "last_verified_generation": 5,
+      "last_verified_at": 1786175324.361,
+      "last_verified_mission_id": "msn-48614d039d59",
+      "last_verified_route_hash": "sha256:347c101d95f915da9e5138f98dfa883611f33c8da5bcd626dd17e637b07fa1fd",
+      "last_verified_route_count": 14
+     }
+    },
+    "can_start": false,
+    "can_pause": false,
+    "can_resume": false,
+    "mission_execution_enabled": true,
+    "config": {
+     "values": {
+      "mission_execution_enabled": true,
+      "home_verification_tolerance_m": 5.0,
+      "max_position_age_s": 5.0,
+      "home_arrival_radius_m": 7.5,
+      "home_arrival_persistence_s": 4.0,
+      "home_arrival_final_item_tolerance": 1,
+      "mission_complete_final_item_tolerance": 0,
+      "mission_complete_persistence_s": 6.0,
+      "mission_complete_position_radius_m": 15.0,
+      "start_progression_timeout_s": 10.0,
+      "resume_progression_timeout_s": 10.0,
+      "progression_poll_interval_s": 0.4,
+      "progression_min_displacement_m": 1.5,
+      "arm_verify_timeout_s": 6.0,
+      "operation_timeout_s": 60.0,
+      "max_operation_retries": 1,
+      "readiness_poll_interval_s": 5.0,
+      "recovery_retry_interval_s": 5.0
+     },
+     "sources": {
+      "mission_execution_enabled": "default",
+      "home_verification_tolerance_m": "default",
+      "max_position_age_s": "default",
+      "home_arrival_radius_m": "default",
+      "home_arrival_persistence_s": "default",
+      "home_arrival_final_item_tolerance": "default",
+      "mission_complete_final_item_tolerance": "default",
+      "mission_complete_persistence_s": "default",
+      "mission_complete_position_radius_m": "default",
+      "start_progression_timeout_s": "default",
+      "resume_progression_timeout_s": "default",
+      "progression_poll_interval_s": "default",
+      "progression_min_displacement_m": "default",
+      "arm_verify_timeout_s": "default",
+      "operation_timeout_s": "default",
+      "max_operation_retries": "default",
+      "readiness_poll_interval_s": "default",
+      "recovery_retry_interval_s": "default"
+     }
+    },
+    "last_error": null,
+    "history": []
+   },
+   "energy_policy": {
+    "decision": "MONITOR",
+    "reason": "Battery unavailable and no simulated margin supplied; cannot assess return feasibility -- not triggering (unavailable is not 0%).",
+    "reason_codes": [
+     "BATTERY_UNAVAILABLE"
+    ],
+    "triggered_raw": false,
+    "persisted": false,
+    "consecutive_triggers": 0,
+    "persistence_required": 3,
+    "simulated": false,
+    "simulated_fields": [],
+    "inputs": {
+     "battery_percent": null,
+     "battery_valid": false,
+     "safe_return_distance_m": 1598.6,
+     "usable_range_m": 3000.0,
+     "return_cost_percent": 53.29,
+     "reserve_margin_percent": 10.0,
+     "margin_percent": null,
+     "critical_battery_percent": 15.0
+    }
+   },
+   "experiment_injection": {
+    "active": false,
+    "source": "SIMULATED",
+    "injection": null
+   },
+   "last_transition": {
+    "timestamp": 1786175287.87,
+    "type": "communication",
+    "from": "PARTITIONED",
+    "to": "CONNECTED",
+    "reason": "Operator endpoint reachable again after being reachable only via VPN."
+   }
+  },
+  "health": {
+   "cpu_load": 1.37,
+   "disk_usage": 20.0,
+   "docker": {
+    "flask": true,
+    "gpio": true,
+    "influx": null,
+    "sensor": true
+   },
+   "pixhawk": {
+    "battery": -1,
+    "connected": true,
+    "gps_fix": "3D_FIX"
+   },
+   "ram_usage": 34.9,
+   "system": {
+    "estop": null,
+    "leak_detected": null,
+    "leak_sensor": {
+     "available": true,
+     "leak_detected": null,
+     "polarity": "uncalibrated",
+     "signal": "LOW"
+    },
+    "sensors_enabled": false
+   },
+   "temperature": 40.8
+  },
+  "measurements": {
+   "latest": {
+    "conductivity": null,
+    "ph": null,
+    "temperature": null,
+    "turbidity": null
+   },
+   "sampling": {
+    "enabled": false,
+    "interval": 1,
+    "last_sample": null
+   }
+  },
+  "events": [],
+  "transitions": [
+   {
+    "timestamp": 1786175209.11,
+    "type": "communication",
+    "from": "CONNECTED",
+    "to": "PARTITIONED",
+    "reason": "Operator endpoint stopped responding; VPN link still active, continuing mission with reduced reporting."
+   },
+   {
+    "timestamp": 1786175287.87,
+    "type": "communication",
+    "from": "PARTITIONED",
+    "to": "CONNECTED",
+    "reason": "Operator endpoint reachable again after being reachable only via VPN."
+   }
+  ]
+ }
+}

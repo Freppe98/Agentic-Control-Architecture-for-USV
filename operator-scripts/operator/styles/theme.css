@@ -652,6 +652,11 @@ table.mx td.cell { padding:5px 6px; height:48px; text-align:center; vertical-ali
 .mrow .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); min-width:0; }
 .mrow .val { font-family:var(--font-mono); font-size:13px; font-variant-numeric:tabular-nums; color:var(--text); display:flex; align-items:center; gap:9px; min-width:0; overflow-wrap:anywhere; margin-left:auto; }
 .mrow .val .pcw { min-width:34px; text-align:right; }
+/* Supporting evidence beside a diagnostic value ("heartbeat 0.74 s ago", "12 / 20
+   samples", the Set-Home reason). Deliberately quieter than the value it qualifies:
+   it explains the reading without competing with it, and keeps the operator from
+   having to hover a tooltip to learn WHY something is unavailable. */
+.mrow .val .diag-detail { font-size:10.5px; color:var(--dim); letter-spacing:.02em; text-transform:none; }
 .metrics.stale .mrow .val { color:var(--dim); }
 .metrics.stale .mrow .val.keep { color:var(--text); }
 .faults { display:flex; flex-direction:column; gap:7px; padding:11px 13px; }

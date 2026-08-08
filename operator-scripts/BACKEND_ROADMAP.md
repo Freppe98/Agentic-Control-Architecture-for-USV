@@ -123,6 +123,32 @@ Updated 2026-07-12: the operator backend now **consumes** real MAVLink/heartbeat
 
 Until Scout forwards these, the two checks correctly read **Not available** (which never fails the overall System Check). The `battery` / `RC receiver` / `camera` / `mission service` checks likewise stay **Not available** while those subsystems are disabled. The **RC receiver detected/healthy** signal still has no telemetry field — Vehicle.js now separates the three RC concerns (override *policy* = always-available invariant; *receiver detected* = no telem; *override active* = derived from effective authority `== RC`).
 
+**CORRECTION, 2026-08-08 (measured off the wire).** The spellings in the table above were a *proposal*, and Scout's Local Agent does not use them. A captured live `POST /agent/status` (`tests/fixtures/scout-status-live.json`) sends, inside `payload.mavlink`:
+
+`mavlink_connected` · `heartbeat_age_s` · `mavlink_last_msg_age_s` · `last_message_age_s` · `mavlink_msg_rate_hz` · `parser_errors` · `measured_at`
+
+Because `mavlink_evidence()` looked for `connected` / `last_msg_age_s` / `msg_rate_hz`, every field resolved to `None` and the MAVLink row read **NO TELEM against a connected autopilot**. The canonical spellings now live in `vehicle_telemetry.mavlink_block`; the legacy `last_heartbeat` / `last_msg_time` timestamp forms above are still accepted for a pre-update Local Agent. **Do not re-derive Scout's schema from this document — read the fixture.**
+
+### Closed by the same pass (2026-08-08)
+
+Scout was already sending all of these; the operator simply had no field to read them from. Each now has a normalized block on every fleet row (`vehicle_telemetry.py`) and a rendered row (`operator/lib/vehicle-telemetry.js`), documented in `verification/vehicle-telemetry.md`:
+
+| Was | Now |
+|---|---|
+| Battery voltage / current / power source | `payload.power` → `vehicle.power` |
+| Failsafe status | `payload.failsafe` → `vehicle.failsafe` |
+| IMU health | `payload.imu` → `vehicle.imu` |
+| Per-stream MAVLink freshness | `payload.freshness` → `vehicle.freshness` |
+| Pi service status | `payload.service_status` → `vehicle.service_status` (summarized, never dumped) |
+| WireGuard state | `communication.vpn_status` → `vehicle.link.vpn` |
+| RTT (application-level, Scout→Operator→Scout) | `communication.rtt_ms` → `vehicle.link.rtt_ms` |
+| Operator-connected | `communication.operator_connected` → `vehicle.link.operator_connected` |
+| Packet loss | **operator-measured** from `communication.seq` → `vehicle.link.packet_loss` |
+| Leak sensor | `health.system.leak_sensor` → `vehicle.leak_sensor` (currently `UNCALIBRATED`) |
+| Mission presence vs route readback | `mission.mission_count` / `mission.pixhawk_readback` → `vehicle.mission_status` |
+
+Still genuinely absent from Scout: **camera** (no field, service or health entry) and **vehicle firmware version** (the old "Firmware v1.0" row was the *status message* schema version, now labelled as such).
+
 ## Experiment — communication impairment (thesis experiment control)
 The Experiment page injects controlled comms impairment between the Operator Station and Scout (latency/jitter/loss/bandwidth/duplication/reordering via `tc netem`; full disconnect via a firewall rule) so degraded and **asymmetric** links can be reproduced during experiments. The frontend is done and honest: it issues a structured request and renders **only** the state the API confirms — never optimistically "active". There is **no backend implementation in this repo**, and by design the browser never runs `tc`/firewall/shell commands. This impairment is a **comms-link experiment, not a Pixhawk command**, so there is deliberately no OPERATOR/LOCAL_AGENT authority gate on it.
 

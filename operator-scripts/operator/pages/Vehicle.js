@@ -28,6 +28,8 @@ import { classifyMissionWaypoints, missionCounts } from "../lib/mission.js";
 import { commandVerification, commandSource, commandStages } from "../lib/command.js";
 import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId, subscribeSelection }
   from "../lib/selection.js";
+import { esc, escAttr } from "../lib/format.js";
+import * as vt from "../lib/vehicle-telemetry.js";
 
 const MXCOLS = [["battery", "Battery"], ["sensors", "Sensors"], ["gps", "GPS"], ["compass", "Compass"], ["storage", "Storage"], ["cpu", "CPU"], ["network", "Network"]];
 const SEV_ORDER = { ok: 0, caution: 1, warn: 2 };
@@ -75,7 +77,9 @@ const CMD_STATUS_CLS = { QUEUED: "u", SENT: "p", ACCEPTED: "p", EXECUTED: "c", R
 const OUTCOME_CLS = { VERIFIED: "c", EXECUTED: "c", FAILED: "d", REJECTED: "d", EXPIRED: "u", PENDING: "p", QUEUED: "u", SENT: "p", ACCEPTED: "p" };
 const CMD_TERMINAL_V = new Set(["EXECUTED", "REJECTED", "FAILED", "EXPIRED"]);
 const fmtClock = (iso) => { if (!iso) return "—"; const d = new Date(iso); return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour12: false }); };
-const escAttr = (s) => String(s).replace(/"/g, "&quot;");
+// escAttr/esc come from lib/format.js (asText-backed): the local one here was a bare
+// String() + quote-escape, which turns a structured value into "[object Object]" inside
+// a tooltip exactly as it did in the visible rows.
 
 // One detailed command-history row: type + normalized source + verification-aware
 // outcome, the lifecycle stages with timestamps, expected-vs-observed state, and the
@@ -184,12 +188,30 @@ export function Vehicle(root) {
   // ---- derive subsystem severity + display value from live data (feeds the matrix
   // AND the section severities below — one computation, never two slightly different
   // judgements of the same battery/leak/gps reading) ----
+  // Leak sensor → matrix cell. LEAK is a warning, a calibrated "no leak" is OK, and an
+  // UNCALIBRATED / unreported sensor has NO severity at all (sev:null renders "—"):
+  // it is not evidence of health and must not be counted as a nominal subsystem.
+  function leakCell(v) {
+    switch (((v && v.leak_sensor) || {}).state) {
+      case "LEAK": return { sev: "warn", val: "LEAK" };
+      case "NO_LEAK": return { sev: "ok", val: "OK" };
+      case "UNCALIBRATED": return { sev: null, val: "UNCAL" };
+      case "UNAVAILABLE": return { sev: "caution", val: "N/A" };
+      default: return { sev: null };
+    }
+  }
+
   function subsys(v) {
     const h = v.health || {}, comm = commState(v);
     const num = (x) => (x == null ? null : x);
     return {
       battery: v.battery == null ? { sev: null } : { sev: v.battery < 20 ? "warn" : v.battery < 40 ? "caution" : "ok", val: v.battery + "%" },
-      sensors: h.leak_detected === true ? { sev: "warn", val: "LEAK" } : { sev: "ok", val: "OK" },
+      // Sensors used to read `health.leak_detected` and fall through to a flat "OK" —
+      // which claimed a nominal leak sensor from a null. The leak sensor is currently
+      // UNCALIBRATED (readable pin, unknown polarity), and an uncalibrated sensor is not
+      // an OK: it gets its own dim "UNCAL" cell so the matrix never asserts safety it
+      // cannot back up.
+      sensors: leakCell(v),
       gps: v.lat != null && v.lng != null ? { sev: "ok", val: "3D" } : { sev: "caution", val: "NO FIX" },
       compass: v.heading != null ? { sev: "ok", val: pad3(v.heading) + "°" } : { sev: null },
       storage: num(h.disk_usage) == null ? { sev: null } : { sev: h.disk_usage > 90 ? "warn" : h.disk_usage > 75 ? "caution" : "ok", val: h.disk_usage + "%" },
@@ -226,6 +248,31 @@ export function Vehicle(root) {
   const bar = (pct, color) => `<span class="bar" style="width:64px;flex:none"><i style="width:${pct}%;background:${color}"></i></span>`;
   const row = (k, val, extra = "") => `<div class="mrow"><span class="k">${k}</span><span class="val ${extra}">${val}</span></div>`;
   const naRow = (k, reason = "no telem") => `<div class="mrow"><span class="k">${k}</span><span class="val na">${noTelem(reason)}</span></div>`;
+
+  // ---- one diagnostic row from a lib/vehicle-telemetry.js record ----
+  // The record already decided WHAT the value is and WHY it might be missing; this only
+  // decides how that reads on screen. Colour follows the availability state, so a value
+  // that is merely unmeasured never wears a fault colour, and a fault never renders in
+  // the same grey as an absent field. Every interpolated value goes through esc()
+  // (asText-backed), so a structured value can never reach the DOM as "[object Object]".
+  const DIAG_CLS = {
+    [vt.ST.LIVE]: "txt-c",
+    [vt.ST.LAST_KNOWN]: "txt-p",
+    [vt.ST.UNKNOWN]: "txt-p",
+    [vt.ST.FAULT]: "txt-d",
+  };
+  function diagCell(r) {
+    if (!r) return noTelem("no telem");
+    if (r.value == null) return noTelem(r.label || "not reported");
+    const cls = DIAG_CLS[r.state] || "";
+    // `detailTooltipOnly` keeps a LONG breakdown (the per-service list) off the status
+    // line while still one hover away — inline it would be an object dump in prose form.
+    const detail = r.detail && !r.detailTooltipOnly
+      ? `<span class="diag-detail">${esc(r.detail)}</span>` : "";
+    const title = r.detail ? ` title="${escAttr(r.detail)}"` : "";
+    return `<span class="${cls}"${title}>${esc(r.value)}</span>${detail}`;
+  }
+  const diagRow = (k, r) => row(k, diagCell(r), "keep");
   // Full-width, always-live named section (Vehicle Health / Power / Communication /
   // Local Agent / Sensors / System) — a free-text condition label, not a severity
   // derived one, so a section with no bad signal at all can still say "Nominal".
@@ -284,8 +331,11 @@ export function Vehicle(root) {
     const vname = v.name || "USV-" + v.id;
     document.getElementById("dettag").textContent = `${vname} · live diagnostics`;
     const s = subsys(v), ov = overallSev(s), stale = commState(v) !== "connected";
-    const h = v.health || {}, meas = v.measurements || {}, t = v.telemetry || {}, md = v.mission_data || {}, schema = (v.agent && v.agent.schema_version) || "—";
-    const c = v.communication || {};
+    // `schema` is the STATUS MESSAGE schema version from the envelope — it is not, and
+    // never was, vehicle firmware. It used to be rendered under a "Firmware" label, which
+    // told the operator a version number about the wrong thing entirely.
+    const h = v.health || {}, t = v.telemetry || {}, md = v.mission_data || {},
+      schema = (v.agent && v.agent.schema_version) || "—";
 
     // faults for the top-of-page glance
     const faults = MXCOLS.map(([k, l]) => ({ k, l, ...s[k] })).filter((x) => x.sev === "caution" || x.sev === "warn");
@@ -300,8 +350,10 @@ export function Vehicle(root) {
     const authVal = stale ? null : av.value;
     const { canTake, canRelease, hasControl, busy } = handoffGate(av, { stale });
     const authoritySeg = AuthoritySeg(authVal, { phase: av.phase, pending: av.pending });
-    const operatorReachable = c.operator_reachable;
-    const operatorReachCell = operatorReachable != null ? (operatorReachable ? '<span class="txt-c">Yes</span>' : '<span class="txt-p">No</span>') : noTelem("no telem");
+    // Operator connected — the vehicle's own canonical claim that its last status POST
+    // reached us (communication.operator_connected), NOT control authority and NOT
+    // "a browser is open". See lib/vehicle-telemetry.js operatorConnectedRow.
+    const operatorConnCell = diagCell(vt.operatorConnectedRow(v));
     const armed = t.armed;
     const armedCell = stale ? '<span class="txt-u">UNKNOWN</span>'
       : armed == null ? noTelem("no telem")
@@ -310,10 +362,6 @@ export function Vehicle(root) {
     const mav = v.mavlink || {};
     const heartbeatCell = mav.heartbeat_age_s != null
       ? `<span class="txt-${mav.heartbeat_age_s <= 3 ? "c" : mav.heartbeat_age_s <= 10 ? "p" : "d"}">${mav.heartbeat_age_s.toFixed(1)}s ago</span>`
-      : noTelem("no telem");
-    const mavlinkCell = mav.connected === true ? `<span class="txt-c">Connected${mav.msg_rate_hz != null ? `, ${mav.msg_rate_hz} Hz` : ""}</span>`
-      : mav.connected === false ? '<span class="txt-d">Disconnected</span>'
-      : mav.last_msg_age_s != null ? `<span class="txt-${mav.last_msg_age_s <= 3 ? "c" : mav.last_msg_age_s <= 10 ? "p" : "d"}">Last msg ${mav.last_msg_age_s.toFixed(1)}s ago</span>`
       : noTelem("no telem");
     const rcActiveCell = stale || !av.reachable ? noTelem("no telem")
       : av.value === "RC" ? '<span class="txt-d">ACTIVE</span>' : '<span class="txt-c">Inactive</span>';
@@ -342,8 +390,20 @@ export function Vehicle(root) {
     });
     const homeCls = hs.state === "verified" ? "ok" : hs.state === "pending" ? "pending" : hs.state === "unknown" ? "dim" : "warn";
     const homeTxt = hs.state === "verified" ? "Verified" : hs.state === "pending" ? "Setting…" : hs.state === "unknown" ? "Unknown" : "Not verified";
-    const curWpText = !ms ? noTelem("not fetched") : ms.cur == null ? "—" : (ms.home && ms.home.seq === ms.cur ? `Mission start (seq ${ms.cur})` : `WP ${ms.cur} / ${ms.route.length}`);
-    const missionLoadedText = ms ? (ms.counts.total > 0 ? "Yes" : "No") : noTelem("not fetched");
+    // Home verification NOTE: `hs` is the shared homeStatus (lib/home.js) reading the
+    // backend's mirror of agent.home_status.verified. A HOME_POSITION existing on the
+    // Pixhawk is NOT verification — Scout currently reports one ~1.6 km away with
+    // verified:false — so this chip must follow `verified` alone. The reason Scout wrote
+    // is surfaced beside it rather than left in a tooltip nobody hovers.
+    const homeReason = hs.state === "verified" ? null : hs.reason;
+    // Current waypoint / Mission loaded come from Scout's CONTINUOUS mission report
+    // (mission_count / current_waypoint_display), not from the operator's on-demand
+    // readback proxy. Both rows previously said "NOT FETCHED" for a vehicle that was
+    // reporting "0 / 15" every second — the proxy answers a different question (the full
+    // item list, for drawing and hashing the route), which now has its own row below.
+    const curWpCell = diagCell(vt.currentWaypointRow(v, ms));
+    const missionLoadedCell = diagCell(vt.missionLoadedRow(v));
+    const readbackCell = diagCell(vt.missionReadbackRow(v, !!ms));
     const pixhawkCell = mav.heartbeat_age_s != null
       ? (mav.heartbeat_age_s <= 3 ? '<span class="txt-c">Connected</span>' : mav.heartbeat_age_s <= 10 ? '<span class="txt-p">Degraded</span>' : '<span class="txt-d">No heartbeat</span>')
       : mav.connected === true ? '<span class="txt-c">Connected</span>' : mav.connected === false ? '<span class="txt-d">Disconnected</span>' : noTelem("no telem");
@@ -354,14 +414,17 @@ export function Vehicle(root) {
         ${row("Pixhawk", pixhawkCell, "keep")}
         ${row("Heartbeat", heartbeatCell, "keep")}
         ${row("GPS", v.lat != null && v.lng != null ? '<span class="txt-c">3D fix</span>' : '<span class="txt-p">No fix</span>', "keep")}
-        ${naRow("EKF")}
+        ${diagRow("EKF", vt.ekfRow(v))}
         ${row("RC override active", rcActiveCell, "keep")}
         ${row("Armed", armedCell, "keep")}
         ${row("Mode", modeCell, "keep")}
         ${row("Mission", md.mission_state || v.status || noTelem("no telem"), "keep")}
-        ${row("Home verification", `<span class="pxm-chip ${homeCls}">${homeTxt}</span>`, "keep")}
-        ${row("Current waypoint", curWpText, "keep")}
-        ${row("Mission loaded", missionLoadedText, "keep")}`;
+        ${row("Home verification",
+              `<span class="pxm-chip ${homeCls}">${homeTxt}</span>`
+              + (homeReason ? `<span class="diag-detail">${esc(homeReason)}</span>` : ""), "keep")}
+        ${row("Current waypoint", curWpCell, "keep")}
+        ${row("Mission loaded", missionLoadedCell, "keep")}
+        ${row("Route readback", readbackCell, "keep")}`;
 
     // ---- section 2: Control (authority hand-off + command queue) ----
     const controlCond = busy ? "Requesting…"
@@ -415,7 +478,7 @@ export function Vehicle(root) {
     const controlCard = panelCard("Control", controlCond, controlClass,
       `<div class="metrics">
         ${row("Authority", authoritySeg, "keep")}
-        ${row("Operator connected", operatorReachCell, "keep")}
+        ${row("Operator connected", operatorConnCell, "keep")}
         ${row("RC override policy", rcAlwaysCell, "keep")}
       </div>
       <div style="padding:13px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line)">
@@ -439,58 +502,82 @@ export function Vehicle(root) {
       </div>`);
 
     // ---- section 3: Power ----
+    // All four readings come from Scout's canonical `power` block (backend falls back to
+    // the legacy telemetry.battery_* spellings). Every one of these was a hardcoded
+    // NO-TELEM placeholder while Scout reported 23.8 V / 0.2 A / 89 % every second.
+    // Remaining % prefers power.battery_remaining_pct because telemetry.battery carries
+    // MAVLink's -1 "unknown" sentinel.
+    const remaining = vt.batteryRemainingRow(v);
     const powerRows = `
-        ${naRow("Battery voltage")}
-        ${naRow("Battery current")}
-        ${naRow("Power source")}
-        ${row("Remaining %", BatteryBar(v.battery), "keep")}
-        ${naRow("Failsafe status")}`;
+        ${diagRow("Battery voltage", vt.batteryVoltageRow(v))}
+        ${diagRow("Battery current", vt.batteryCurrentRow(v))}
+        ${diagRow("Power source", vt.powerSourceRow(v))}
+        ${row("Remaining %", remaining.value == null ? noTelem(remaining.label || "not reported")
+                                                     : BatteryBar(remaining.pct), "keep")}
+        ${diagRow("Failsafe status", vt.failsafeRow(v))}`;
 
     // ---- section 4: Communication ----
+    // Two DIFFERENT links live in this card and must never be conflated:
+    //   Scout Pi ↔ Operator over 4G/WireGuard — WireGuard, RTT, packet loss, freshness
+    //   Pixhawk ↔ Pi over USB                 — MAVLink
+    // Telemetry freshness (CONNECTED/PARTITIONED/DISCONNECTED) stays ARRIVAL-AGE derived,
+    // which is the thesis's degradation model; the rest are diagnostic inputs to it and
+    // never replace it.
     const commRows = `
-        ${naRow("WireGuard", "no VPN telemetry field")}
+        ${diagRow("WireGuard", vt.wireguardRow(v))}
         ${row("Operator Backend", operatorBackendCell, "keep")}
         ${row("Local Agent", v.online ? '<span class="txt-c">Online</span>' : '<span class="txt-d">Offline</span>', "keep")}
-        ${row("MAVLink", mavlinkCell, "keep")}
+        ${diagRow("MAVLink", vt.mavlinkRow(v))}
         ${row("Telemetry freshness", `<span class="txt-${cls(v)}">${fmtAge(v.last_seen_age_s)}</span> · ${commState(v).toUpperCase()}`, "keep")}
-        ${naRow("Packet loss (future)")}
-        ${naRow("RTT (future)")}`;
+        ${diagRow("Packet loss", vt.packetLossRow(v))}
+        ${diagRow("RTT", vt.rttRow(v))}`;
 
     // ---- section 5: Local Agent (payload.agent.* — forwarded verbatim, same field
     // precedence the Agent page uses, so the two pages never disagree) ----
-    const a = v.agent_status || {};
-    const clean = (val) => (val == null || val === "" ? null : String(val));
-    const behaviour = clean(a.current_behaviour ?? a.behaviour ?? a.behavior);
-    const decision = clean(a.current_decision) || behaviour;
-    const policy = clean(a.current_policy ?? a.communication_policy);
-    const reasonRaw = Array.isArray(a.decision_reasons) ? a.decision_reasons[0] : (a.decision_reasons ?? a.decision_reason);
-    const reason = clean(reasonRaw);
-    const agentLive = behaviour != null || decision != null || reason != null || policy != null;
+    // The previous derivation was `String(a.current_policy)`. Scout's Flask /agent/state
+    // exposes current_policy as the STRING "FULL_REPORTING", but the Local Agent's POST
+    // sends it as an OBJECT ({communication_policy, mission_policy, autonomy_level,
+    // current_behaviour}) — so the operator read the literal text "[object Object]" where
+    // a policy belongs. The SAME object is why Current behaviour said "not emitted":
+    // current_behaviour is nested INSIDE it, not a sibling. Both are resolved in
+    // lib/vehicle-telemetry.js agentRows, which only ever returns strings.
+    const ag = vt.agentRows(v);
+    const agentLive = [ag.behaviour, ag.decision, ag.policy, ag.reason]
+      .some((r) => r.value != null);
     const agentRows = `
-        ${row("Current behaviour", behaviour || noTelem("not emitted"), "keep")}
-        ${row("Current decision", decision || noTelem("not emitted"), "keep")}
-        ${row("Current policy", policy || noTelem("not emitted"), "keep")}
+        ${diagRow("Current behaviour", ag.behaviour)}
+        ${diagRow("Current decision", ag.decision)}
+        ${diagRow("Current policy", ag.policy)}
+        ${diagRow("Autonomy level", ag.autonomy)}
         ${row("Control authority", authoritySeg, "keep")}
-        ${row("Decision reason", reason || noTelem("not emitted"), "keep")}`;
+        ${diagRow("Decision reason", ag.reason)}`;
 
     // ---- section 6: Sensors ----
+    // Leak sensor NOTE: this row must never read "No leak" from the current telemetry.
+    // Scout reports the pin as readable with signal LOW but polarity `uncalibrated` —
+    // nobody has established whether LOW means dry or flooded — so leak_detected is null
+    // and the honest state is UNCALIBRATED. The old row read `health.leak_detected`
+    // (always null here) and printed a generic NO TELEM for a sensor that is plainly
+    // reporting. Camera/sonar likewise name WHY they are unavailable rather than
+    // implying the station is blind.
     const sensorRows = `
         ${row("GPS", v.lat != null ? `${(+v.lat).toFixed(5)}, ${(+v.lng).toFixed(5)}` : noTelem("no telem"), "keep")}
-        ${naRow("GPS satellites")}
+        ${diagRow("GPS satellites", vt.gpsSatellitesRow(v))}
         ${row("Compass", v.heading != null ? pad3(v.heading) + "°" : noTelem("no telem"), "keep")}
-        ${naRow("IMU")}
-        ${naRow("Camera")}
-        ${row("Sonar / bathymetry", meas.bathymetry ? '<span class="txt-c">Logging</span>' : noTelem("no telem"), "keep")}
-        ${row("Leak sensor", h.leak_detected === true ? '<span class="txt-d">LEAK DETECTED</span>' : (h.leak_detected === false ? "No leak" : noTelem("no telem")), "keep")}`;
+        ${diagRow("IMU", vt.imuRow(v))}
+        ${diagRow("Camera", vt.cameraRow(v))}
+        ${diagRow("Sonar / bathymetry", vt.bathymetryRow(v))}
+        ${diagRow("Leak sensor", vt.leakSensorRow(v))}`;
 
     // ---- section 7: System ----
     const sysRows = `
         ${h.cpu_load != null ? row("CPU", `${bar(h.cpu_load, h.cpu_load > 85 ? "var(--disconnected)" : h.cpu_load > 65 ? "var(--partitioned)" : "var(--connected)")}<span class="pcw">${h.cpu_load}%</span>`, "keep") : naRow("CPU")}
         ${h.ram_usage != null ? row("Memory", `${bar(h.ram_usage, h.ram_usage > 90 ? "var(--disconnected)" : h.ram_usage > 75 ? "var(--partitioned)" : "var(--connected)")}<span class="pcw">${h.ram_usage}%</span>`, "keep") : naRow("Memory")}
-        ${naRow("Temperature")}
+        ${diagRow("Temperature", vt.temperatureRow(v))}
         ${h.disk_usage != null ? row("Disk usage", `${bar(h.disk_usage, "var(--connected)")}<span class="pcw">${h.disk_usage}%</span>`, "keep") : naRow("Disk usage")}
-        ${row("Service status", h.flask_status ? "Flask " + h.flask_status : noTelem("no telem"), "keep")}
-        ${row("Firmware", schema === "—" ? noTelem("no telem") : "v" + schema, "keep")}`;
+        ${diagRow("Service status", vt.serviceStatusRow(v))}
+        ${row("Status schema", schema === "—" ? noTelem("not reported") : "v" + schema, "keep")}
+        ${naRow("Firmware", "not reported by this vehicle")}`;
 
     const powerSev = s.battery.sev;
     const commSev = worstSev(s.network.sev, feedAgeS != null && feedAgeS > 12 ? "warn" : null);

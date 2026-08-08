@@ -23,6 +23,7 @@ import replan_package
 import scout_mission_execution
 import scout_replan
 import vehicle_registry
+import vehicle_telemetry
 
 
 @asynccontextmanager
@@ -167,6 +168,33 @@ last_known_telemetry = {}  # {vehicle_id: {lat, lng, heading, groundspeed, batte
 # telemetry: the Agent page shows the LAST KNOWN reasoning (marked stale) when a packet
 # omits the group, never a blank. Only ever updated from a real, non-stale packet.
 last_known_agent = {}      # {vehicle_id: {agent reasoning dict}}
+
+# Last-known GROUP snapshots per vehicle (power, failsafe, imu, freshness, mavlink,
+# communication, health, mission, service_status, measurements, telemetry).
+#
+# MERGE SEMANTICS — deliberately group-level, NOT a blanket deep merge (see
+# vehicle_telemetry.effective_group for the full rationale):
+#   * a group PRESENT in a packet is AUTHORITATIVE and replaces the stored one wholesale,
+#     because Scout emits full group snapshots — deep-merging fields would resurrect a
+#     reading Scout deliberately stopped sending;
+#   * a group ABSENT from a packet is a PARTIAL UPDATE, not a clear: the vehicle's last
+#     snapshot is reused and flagged stale, so a mission-only packet can no longer erase
+#     power/IMU/freshness and a health-only packet can no longer erase telemetry.
+# Strictly per vehicle id: one USV's partial update can never touch another's groups.
+last_known_groups = {}     # {vehicle_id: {group_name: dict}}
+
+# Per-vehicle packet-loss estimators over the Local Agent's `communication.seq`. The
+# RECEIVER has to do this arithmetic — Scout cannot know which of its own sends never
+# arrived (see vehicle_telemetry.PacketLossEstimator for the window/reset semantics).
+packet_loss_by_id = {}     # {vehicle_id: vehicle_telemetry.PacketLossEstimator}
+
+
+def packet_loss_estimator(cid):
+    """This vehicle's own estimator, created on first contact. Never shared."""
+    est = packet_loss_by_id.get(cid)
+    if est is None:
+        est = packet_loss_by_id[cid] = vehicle_telemetry.PacketLossEstimator()
+    return est
 
 # Change-tracking for first-class agent/mission events (P3). We record a decision or a
 # mission-state event ONLY when the value actually changes — never once per status poll
@@ -328,6 +356,21 @@ def never_contacted_row(cid):
         "mavlink": mavlink_evidence({}),
         "measurements": {},
         "events": [],
+        # The SAME canonical blocks a contacted vehicle carries, normalized from an empty
+        # payload so every field is an explicit null. A never-contacted vehicle must have
+        # the same SHAPE as a live one — a consumer that has to branch on "does this key
+        # exist?" is one refactor away from rendering `undefined` at the operator.
+        "power": vehicle_telemetry.power_block({}),
+        "failsafe": vehicle_telemetry.failsafe_block({}),
+        "imu": vehicle_telemetry.imu_block({}),
+        "freshness": vehicle_telemetry.freshness_block({}),
+        "service_status": vehicle_telemetry.service_status_block({}),
+        "leak_sensor": vehicle_telemetry.leak_sensor_block({}),
+        "sampling": vehicle_telemetry.sampling_block({}),
+        "mission_status": vehicle_telemetry.mission_block({}),
+        "agent_summary": vehicle_telemetry.agent_summary({}),
+        "link": vehicle_telemetry.link_block({}, None),
+        "stale_groups": [],
         "agent_status": {},
         "mission_upload": None,
         "fleet_info": {},
@@ -363,35 +406,39 @@ def _age_seconds_from(raw):
 def mavlink_evidence(payload: dict) -> dict:
     """Normalized MAVLink / Pixhawk-heartbeat evidence for the diagnostics page.
 
-    Read STRICTLY from real link fields Scout may forward — never inferred from GPS or
+    Read STRICTLY from real link fields Scout forwards — never inferred from GPS or
     arrival age (a HEARTBEAT is its own MAVLink message; GPS position is not proof of
     one). When Scout exposes none of these, every field is None and the operator
-    diagnostics render NOT AVAILABLE rather than a fabricated PASS. The candidate
-    spellings below are the Scout-side schema this consumer expects (see
-    BACKEND_ROADMAP.md → 'Pixhawk heartbeat / MAVLink evidence')."""
-    comm = payload.get("communication", {}) or {}
-    health = payload.get("health", {}) or {}
-    mav = payload.get("mavlink") or comm.get("mavlink") or health.get("mavlink") or {}
-    if not isinstance(mav, dict):
-        mav = {}
+    diagnostics render NOT AVAILABLE rather than a fabricated PASS.
 
-    heartbeat_age = _first_present(
-        mav.get("heartbeat_age_s"), comm.get("heartbeat_age_s"),
-        health.get("pixhawk_heartbeat_age_s"), health.get("heartbeat_age_s"),
-        _age_seconds_from(_first_present(mav.get("last_heartbeat"), comm.get("last_heartbeat"),
-                                         health.get("last_heartbeat"))),
-    )
-    last_msg_age = _first_present(
-        mav.get("last_msg_age_s"), comm.get("mavlink_last_msg_age_s"),
-        _age_seconds_from(_first_present(mav.get("last_msg_time"), comm.get("mavlink_last_message"))),
-    )
-    return {
-        "connected": _first_present(mav.get("connected"), comm.get("mavlink_connected")),
-        "heartbeat_age_s": round(heartbeat_age, 2) if isinstance(heartbeat_age, (int, float)) else None,
-        "last_msg_age_s": round(last_msg_age, 2) if isinstance(last_msg_age, (int, float)) else None,
-        "msg_rate_hz": _first_present(mav.get("msg_rate_hz"), comm.get("mavlink_msg_rate_hz")),
-        "parser_errors": _first_present(mav.get("parser_errors"), comm.get("mavlink_parser_errors")),
-    }
+    The field spellings now live in vehicle_telemetry.mavlink_block, which is the ONE
+    place they are written down. This wrapper used to read `mav.connected` /
+    `mav.last_msg_age_s` / `mav.msg_rate_hz` — none of which the Local Agent sends; it
+    sends `mavlink_connected`, `mavlink_last_msg_age_s`, `mavlink_msg_rate_hz` — so
+    every field came out None and the MAVLink row said NO TELEM against a connected
+    autopilot. Older `last_heartbeat` / `last_msg_time` timestamp spellings are still
+    accepted here so a pre-update Local Agent keeps working."""
+    block = vehicle_telemetry.mavlink_block(payload if isinstance(payload, dict) else {})
+    if block["heartbeat_age_s"] is None:
+        comm = payload.get("communication", {}) or {}
+        health = payload.get("health", {}) or {}
+        mav = payload.get("mavlink") if isinstance(payload.get("mavlink"), dict) else {}
+        legacy = _age_seconds_from(_first_present(
+            mav.get("last_heartbeat"), comm.get("last_heartbeat"),
+            health.get("last_heartbeat")))
+        if legacy is None:
+            legacy = _first_present(health.get("pixhawk_heartbeat_age_s"),
+                                    health.get("heartbeat_age_s"))
+        if isinstance(legacy, (int, float)):
+            block["heartbeat_age_s"] = round(legacy, 2)
+    if block["last_msg_age_s"] is None:
+        comm = payload.get("communication", {}) or {}
+        mav = payload.get("mavlink") if isinstance(payload.get("mavlink"), dict) else {}
+        legacy = _age_seconds_from(_first_present(mav.get("last_msg_time"),
+                                                  comm.get("mavlink_last_message")))
+        if isinstance(legacy, (int, float)):
+            block["last_msg_age_s"] = round(legacy, 2)
+    return block
 
 
 # --- Vehicle Home (Pixhawk HOME_POSITION / RTL recovery point) ---
@@ -515,19 +562,42 @@ def normalize_agent_message(message: dict, cid=None, received_at=None) -> dict:
         payload = message
         envelope = {}
 
-    telemetry = payload.get("telemetry", {}) or {}
-    mission = payload.get("mission", {}) or {}
-    communication = payload.get("communication", {}) or {}
-    health = payload.get("health", {}) or {}
-    measurements = payload.get("measurements", {}) or {}
-    fleet_info = payload.get("fleet", {}) or {}
-    events = payload.get("events", []) or []
-    agent_reasoning = payload.get("agent", {}) or {}
-
     # Identity comes from the caller (the per-USV record this packet was stored under), so
     # one packet can only ever describe one vehicle. Re-deriving it here is a fallback for
     # direct callers/tests; it never silently defaults to another vehicle.
     usv_id = cid if cid is not None else extract_usv_id(message)
+
+    # PARTIAL-UPDATE PROTECTION. Every group is resolved through effective_group against
+    # THIS vehicle's own last-known snapshots: a group this packet carries wins outright,
+    # a group it omits falls back to the vehicle's previous one and is listed in
+    # `stale_groups`. Without this, a packet carrying only `mission` blanked power, IMU,
+    # freshness and health for one poll and the whole page flickered to "—".
+    def group(name):
+        return vehicle_telemetry.effective_group(last_known_groups, usv_id, payload, name)
+
+    telemetry, _ = group("telemetry")
+    mission, _ = group("mission")
+    communication, _ = group("communication")
+    health, _ = group("health")
+    measurements, _ = group("measurements")
+    fleet_info = payload.get("fleet", {}) or {}
+    events = payload.get("events", []) or []
+    agent_reasoning = payload.get("agent", {}) or {}
+
+    # The payload the canonical block normalizers see: this packet, with any group it
+    # omitted filled in from that vehicle's last-known snapshot. `agent` is deliberately
+    # taken from the existing last_known_agent store rather than a second cache.
+    effective_payload = dict(payload)
+    stale_groups = []
+    for _name in vehicle_telemetry.CARRIED_GROUPS:
+        _value, _stale = group(_name)
+        if _value:
+            effective_payload[_name] = _value
+            if _stale:
+                stale_groups.append(_name)
+    if not agent_reasoning and last_known_agent.get(usv_id):
+        effective_payload["agent"] = last_known_agent[usv_id]
+        stale_groups.append("agent")
 
     comm_state = payload.get("comm_state", "UNKNOWN")
 
@@ -625,12 +695,38 @@ def normalize_agent_message(message: dict, cid=None, received_at=None) -> dict:
         # read-back verification record. Distinct from `lat`/`lng` (the vehicle's own
         # position) — the map plots them as two separate markers.
         "home": home_block(usv_id, payload, telemetry),
-        "mission_data": payload.get("mission", {}) or {},
-        "communication": payload.get("communication", {}) or {},
-        "health": payload.get("health", {}) or {},
-        "mavlink": mavlink_evidence(payload),
-        "measurements": payload.get("measurements", {}) or {},
+        # Groups forwarded verbatim, now resolved through the partial-update guard above
+        # (a packet that omits one keeps this vehicle's last snapshot rather than blanking).
+        "mission_data": mission,
+        "communication": communication,
+        "health": health,
+        "mavlink": mavlink_evidence(effective_payload),
+        "measurements": measurements,
         "events": payload.get("events", []) or [],
+        # --- CANONICAL NORMALIZED BLOCKS (vehicle_telemetry.py) -----------------------
+        # One normalization for every page. Before these existed the Vehicle page had no
+        # backend field to read for power/failsafe/IMU/freshness/services/link
+        # diagnostics, so ~15 rows were hardcoded placeholders while Scout was sending
+        # the data every second. Each block is honest about absence: a field Scout does
+        # not send is null, and 0 survives as 0.
+        "power": vehicle_telemetry.power_block(effective_payload, telemetry),
+        "failsafe": vehicle_telemetry.failsafe_block(effective_payload),
+        "imu": vehicle_telemetry.imu_block(effective_payload),
+        "freshness": vehicle_telemetry.freshness_block(effective_payload),
+        "service_status": vehicle_telemetry.service_status_block(effective_payload),
+        "leak_sensor": vehicle_telemetry.leak_sensor_block(effective_payload),
+        "sampling": vehicle_telemetry.sampling_block(effective_payload),
+        "mission_status": vehicle_telemetry.mission_block(effective_payload),
+        "agent_summary": vehicle_telemetry.agent_summary(effective_payload),
+        # Scout↔Operator link diagnostics (RTT / WireGuard / operator_connected / seq) plus
+        # the OPERATOR-side packet-loss estimate. Diagnostic only: `comm_state` above stays
+        # arrival-age derived, which is the thesis's degradation model.
+        "link": vehicle_telemetry.link_block(
+            effective_payload,
+            packet_loss_estimator(usv_id).estimate(time.time()) if usv_id is not None else None),
+        # Which groups in THIS row came from a previous packet rather than this one, so the
+        # UI can mark them last-known instead of presenting them as current.
+        "stale_groups": stale_groups,
         # Agent reasoning (payload.agent.*) forwarded verbatim for the Agent page:
         # current_behaviour, decision_reason, current_policy, autonomy_level,
         # current_communication_state, current_mission_state, buffer_usage,
@@ -3678,6 +3774,13 @@ async def receive_agent_status(request: Request):
         if isinstance(agent_block, dict) and agent_block:
             last_known_agent[vid] = dict(agent_block)
             rec["last_known_agent"] = last_known_agent[vid]
+        # Remember every OTHER group this packet carried (power, failsafe, imu, freshness,
+        # mavlink, communication, health, mission, service_status, measurements), so a later
+        # partial update that omits one renders that vehicle's last snapshot instead of
+        # wiping the row. Group-level only — a group that IS present replaces its stored
+        # copy wholesale (see last_known_groups for why a deep merge would be wrong).
+        if isinstance(payload, dict):
+            vehicle_telemetry.observe_groups(last_known_groups, vid, payload)
         record_agent_changes(vid, payload, now)
         rec["packets"] = rec.get("packets", 0) + 1
         # The STREAK ends on recovery, but `last_reject` is deliberately NOT cleared: an
@@ -3711,6 +3814,16 @@ async def receive_agent_status(request: Request):
     last_seen_by_id[vid] = now
     record_comms_state(vid, "CONNECTED", now, 0.0)
     ingest_payload_events(vid, incoming, now)
+
+    # Packet-loss measurement is an ARRIVAL fact, so it is recorded here rather than in the
+    # accepted branch: a packet whose payload lost the monotonic snapshot race still
+    # physically arrived, and counting it as lost would overstate the link's badness.
+    # Strictly this vehicle's own estimator — see packet_loss_by_id.
+    arrival_payload = incoming.get("payload", incoming) if isinstance(incoming, dict) else {}
+    if isinstance(arrival_payload, dict):
+        arrival_comm = arrival_payload.get("communication")
+        if isinstance(arrival_comm, dict):
+            packet_loss_estimator(vid).observe(arrival_comm.get("seq"), now.timestamp())
 
     # One compact line per meaningful CHANGE — never the raw payload, and never once per
     # ~1 Hz packet (see status_log_decision / _status_signature above). The full envelope
