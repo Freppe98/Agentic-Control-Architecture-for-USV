@@ -1044,6 +1044,14 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .amx-row .k { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); flex:none; }
 .amx-row .v { font-size:12.5px; color:var(--text); text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .amx-row .v.mono { font-family:var(--font-mono); font-size:11.5px; }
+/* Tone for the two LIVE status rows (Energy, Risk). The card's existing semantic colours only —
+   ok / caution / warn — plus the neutral idle an UNKNOWN or an unreported value must use: a
+   verdict Scout could not reach is a gap in its inputs, not an emergency, and colouring it like
+   one is how an operator learns to ignore the colour that matters. */
+.amx-row .v.ok { color:var(--connected); }
+.amx-row .v.caution { color:var(--caution); }
+.amx-row .v.warn { color:var(--disconnected); }
+.amx-row .v.idle { color:var(--dim); }
 
 /* Active-operation progress: Scout's own transitional step, never a predicted next state. */
 .amx-prog { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--caution); }

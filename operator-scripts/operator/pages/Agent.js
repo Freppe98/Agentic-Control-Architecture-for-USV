@@ -522,6 +522,8 @@ export function Agent(root) {
        ${mxEligibilityRows(S)}
        ${mxBindingRows(S)}
        ${mxBatteryRows(S)}
+       ${mxEnergyRows(S)}
+       ${mxRiskRows(S)}
        <div class="reason-note">${gapSvg}<span><b>Normal mission controls are on the Map page.</b>
          Start, Pause, Resume and Stop live in the Map's <b>Agent Mission</b> card, which runs
          each as one operation including the control-authority hand-off. This page is the
@@ -605,6 +607,86 @@ export function Agent(root) {
   }
 
   const freshSlotSafe = (text) => `<b>${esc(text)}</b>`;
+
+  // --- Energy feasibility, as Scout CONTINUOUSLY evaluates it --------------------------------
+  // The evidence behind the Map card's one-line ENERGY status. Two margins, kept apart on
+  // purpose and never merged into a single "home margin":
+  //
+  //   MISSION MARGIN      can Scout complete the REMAINING operator-planned mission?
+  //   RTL RETURN MARGIN   can Scout abort NOW and reach the current verified Pixhawk/RTL Home?
+  //
+  // Scout's Start gate requires BOTH, which is why both feasibility verdicts are rows of their
+  // own. Every value is Scout's; the station runs no battery, range or reserve model, and a
+  // Scout that reports no energy block gets the honest gap note rather than invented numbers.
+  // Coordinates are deliberately not printed — planned_home / rtl_home identify WHICH home each
+  // margin was measured against, and the Home card above is where a Home is inspected.
+  function mxEnergyRows(S) {
+    const e = S.energy || {};
+    if (!e.reported) {
+      return `<div class="reason-note">${gapSvg}<span>This Scout does not report continuous
+        mission-energy feasibility (<span class="mono">energy_feasibility</span>). No margin,
+        feasibility verdict or reserve is shown, because this Scout reports none — and the
+        operator station computes none of its own.</span></div>`;
+    }
+    const view = mx.energyView(S);
+    const dist = (v) => (typeof v === "number" ? `${Math.round(v)} m` : `<span class="txt-u">—</span>`);
+    const signed = (v) => (typeof v !== "number" ? `<span class="txt-u">—</span>`
+      : `<b class="txt-${v >= 0 ? "c" : "d"}">${v >= 0 ? "+" : ""}${esc(v.toFixed(1))}%</b>`);
+    const pctv = (v) => (typeof v === "number" ? `${esc(v.toFixed(1))}%` : `<span class="txt-u">—</span>`);
+    const feas = (v) => (v === true ? rp("YES", "c") : v === false ? rp("NO", "d")
+      : rp("not reported", "u"));
+    const cond = view.state === mx.ENERGY.FEASIBLE ? rp(view.text, "c")
+      : view.state === mx.ENERGY.INSUFFICIENT || view.state === mx.ENERGY.RTL_INSUFFICIENT
+        ? rp(view.text, "d") : rp(view.text, "u");
+    return `<div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Energy feasibility (Scout)", `${cond}${view.reasonText ? ` <span class="txt-u">${esc(view.reasonText)}</span>` : ""}`)}
+         ${row("Mission margin", signed(e.missionMarginPercent))}
+         ${row("RTL return margin", signed(e.rtlReturnMarginPercent))}
+         ${row("Mission feasible", feas(e.missionFeasible))}
+         ${row("RTL return feasible", feas(e.rtlReturnFeasible))}
+         ${row("Planned completion distance", dist(e.plannedCompletionDistanceM))}
+         ${row("RTL return distance", dist(e.rtlReturnDistanceM))}
+         ${row("Estimated mission energy", pctv(e.estimatedMissionEnergyPercent))}
+         ${row("Estimated RTL return energy", pctv(e.estimatedRtlReturnEnergyPercent))}
+         ${row("Effective battery", e.batteryPercent === null ? `<span class="txt-u">unavailable</span>` : `<b>${esc(String(Math.round(e.batteryPercent)))}%</b>${e.batterySource ? ` <span class="txt-u">${esc(e.batterySource)}</span>` : ""}`)}
+         ${row("Reserve margin", pctv(e.reserveMarginPercent))}
+         ${row("Usable range", dist(e.usableRangeM))}
+         ${row("Remaining waypoints", val(e.remainingWaypointCount))}
+         ${row("Mission geometry", `<span class="mono">${val(e.missionGeometrySource)}</span>`)}
+         ${row("RTL geometry", `<span class="mono">${val(e.rtlReturnGeometrySource)}</span>`)}
+         ${row("Reason (Scout)", val(mx.energyReasonText(e.reason) || e.reason))}
+         ${row("Evaluated at", val(e.evaluatedAt))}
+         ${row("Position age", e.positionAgeS === null ? `<span class="txt-u">—</span>` : `${esc(e.positionAgeS.toFixed(1))} s${e.maxPositionAgeS === null ? "" : ` <span class="txt-u">of ${esc(String(e.maxPositionAgeS))} s allowed</span>`}`)}
+       </div>
+       <div class="reason-note">${gapSvg}<span><b>Mission margin</b> answers whether Scout can
+         complete the remaining planned mission; <b>RTL return margin</b> answers whether it could
+         abort now and reach the current verified RTL Home. They are separate questions and
+         Scout's Start gate requires <b>both</b>. Every figure here is Scout's own evaluation —
+         the operator station computes no feasibility of its own and never overrides Scout's
+         verdict.</span></div>`;
+  }
+
+  // --- Risk: Scout's OWN level, or an honest empty slot ---------------------------------------
+  // The continuous risk model does not exist on Scout yet. This station will never fill the gap
+  // with a locally computed score: a risk level is a claim about the vehicle's situation, and
+  // the only component holding that situation is the agent. Until Scout sends `risk.level` the
+  // slot reads "—" here and on the Map card.
+  function mxRiskRows(S) {
+    const view = mx.riskView(S);
+    if (!view.reported) {
+      return `<div class="reason-note">${gapSvg}<span>This Scout reports no agent risk level
+        (<span class="mono">risk.level</span>). The slot is shown as
+        <span class="mono">—</span> on the Map's Agent Mission card rather than as
+        <span class="mono">LOW</span>: no component of this system has assessed risk, and the
+        operator station does <b>not</b> compute one.</span></div>`;
+    }
+    const tint = { ok: "c", caution: "p", warn: "d", idle: "u" }[view.tone] || "u";
+    return `<div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Agent risk level (Scout)", `${rp(view.text, tint)}${view.known ? "" : ` ${rp("UNRECOGNIZED LEVEL", "p")}`}`)}
+         ${row("Risk score", view.score === null ? `<span class="txt-u">not reported</span>` : `<b>${esc(String(view.score))}</b>`)}
+         ${row("Risk detail", val(view.detail))}
+       </div>`;
+  }
 
   // --- Diagnostic fallback: the raw lifecycle writes, COLLAPSED BY DEFAULT --------------------
   // Deliberately not the normal path and deliberately marked as such. These call the same

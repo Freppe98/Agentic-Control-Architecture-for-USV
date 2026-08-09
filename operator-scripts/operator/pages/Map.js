@@ -1384,6 +1384,27 @@ export function Map(root) {
           `<div class="amx-row"><span class="k">${esc(r.k)}</span><span class="v${r.mono ? " mono" : ""}" title="${escAttr(r.title || "")}">${esc(r.v)}</span></div>`).join("")}</div>`
       : "";
 
+    // The two LIVE statuses Scout re-evaluates continuously, in the card's existing row form —
+    // two lines, no gauge, no graph, no battery-injection control.
+    //
+    //   ENERGY  answers "can the remaining planned mission be completed?" and carries the MISSION
+    //           margin. It is NOT the RTL return margin and neither is ever labelled "Home
+    //           margin" — completing the route and being able to abort back to the verified RTL
+    //           Home are different questions, and Scout's Start gate requires both. When Scout
+    //           says the run is completable but the return is not, this reads RTL INSUFFICIENT
+    //           rather than a reassuring FEASIBLE.
+    //   RISK    is Scout's own level. Nothing here is derived on this station, so until Scout
+    //           reports one it is a quiet "—" — never LOW.
+    //
+    // Both are DISPLAY ONLY: they explain a readiness verdict, they never produce one. The Start
+    // button above still comes from can_start / start_eligible / start_block_reason via the gate.
+    // The full evidence (both margins, both distances, battery, reserve, geometry sources,
+    // evaluation freshness) is the tooltip here and the Agent page's diagnostics rows in full.
+    const live = card.present === false ? "" : `<div class="amx-grid">
+        <div class="amx-row"><span class="k">Energy</span><span class="v ${esc(card.energy.tone)}" title="${escAttr(card.energy.detail || "")}">${esc(card.energy.text)}</span></div>
+        <div class="amx-row"><span class="k">Risk</span><span class="v ${esc(card.risk.tone)}" title="${escAttr(card.risk.detail || "")}">${esc(card.risk.text)}</span></div>
+      </div>`;
+
     // Progress. While the START transaction runs this is PHASE-SPECIFIC and NEUTRAL — "Checking
     // mission readiness…", "Taking agent control…", "Holding position…", "Setting and verifying
     // Home…", "Starting AUTO…" — each one Scout's observed step (or, before Scout has moved, the
@@ -1499,7 +1520,7 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${info}${resultNote}</div>`;
+    return `<div class="amx">${head}${rows}${live}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation
