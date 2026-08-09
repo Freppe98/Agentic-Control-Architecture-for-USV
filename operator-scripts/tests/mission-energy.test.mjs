@@ -434,12 +434,20 @@ test("the Agent page carries the detailed evidence, both margins kept apart", ()
   assert.ok(i > 0, "the Agent page must carry the energy diagnostics block");
   const block = agentSrc.slice(i, agentSrc.indexOf("\n  }", i));
   for (const label of ["Mission margin", "RTL return margin", "Mission feasible",
-    "RTL return feasible", "Planned completion distance", "RTL return distance",
+    "RTL return feasible", "Planned completion distance", "Direct-return distance",
     "Effective battery", "Reserve margin", "Mission geometry", "RTL geometry"]) {
     assert.ok(block.includes(`"${label}"`), label);
   }
-  // Raw coordinates are NOT printed here — the Home card is where a Home is inspected.
-  assert.doesNotMatch(block, /plannedHome|rtlHome/);
+  // The TWO HOMES are named apart and never both called "Home": the mission margin is measured
+  // against the planning package's home, the RTL margin against the Pixhawk's verified safety
+  // Home, and conflating them would let a healthy RTL margin read as proof about a point the
+  // vehicle would never return to.
+  assert.ok(block.includes(`"Planned Mission Home"`));
+  assert.ok(block.includes(`"Verified RTL Home"`));
+  // Only Scout's SOURCE word is printed for each — raw coordinates still are NOT, because the
+  // Home card is where a Home is inspected and RTL verification is Scout's `verified` flag,
+  // never something a coordinate's presence implies.
+  assert.doesNotMatch(block, /latitude|longitude/);
   // The block is withheld entirely for a Scout that reports no energy block.
   assert.match(block, /if \(!e\.reported\)/);
   // …and the risk block never claims a level Scout did not send.

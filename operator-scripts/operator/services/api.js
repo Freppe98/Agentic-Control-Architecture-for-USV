@@ -147,6 +147,21 @@ export async function getMissionScope()         { return null; } // needs named-
 export function getControlAuthority(id) { return getJSON(`/api/control_authority/${id}`); }
 
 /**
+ * Scout's STABILIZED EVIDENCE for a vehicle — the per-signal records its own risk model and
+ * feasibility gate are computed from ({ value, source, observed_at, age_s, state } for battery,
+ * GPS fix, satellites, EKF, heartbeat, mode, armed, position).
+ *
+ * The `state` (FRESH / AGING / STALE / NEVER_OBSERVED) and the `age_s` are SCOUT'S. This station
+ * applies no TTL of its own and computes no age: a second freshness rule here would answer a
+ * different question than the one Scout's assessments were built on, and the operator would be
+ * shown a disagreement as if it were the vehicle's state. A Scout that reports no evidence block
+ * answers supported:false — never a fabricated FRESH.
+ *
+ * Read-only, and NOT on the pushed status packet: it comes from Scout Flask's GET /agent/state.
+ */
+export function getAgentEvidence(id) { return getJSON(`/api/vehicles/${id}/agent/evidence`); }
+
+/**
  * Request a control-authority hand-off (Take Control / Release Control) — a direct
  * proxy to Scout Flask's own POST /agent/control_authority. Returns { ok, status,
  * data }: data is Scout's response verbatim on success, or the backend's error body

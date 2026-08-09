@@ -430,6 +430,9 @@ def summarize_status(result):
                 if isinstance(body.get("package_conflict"), dict) else {})
     batt = (body.get("battery_diagnostics")
             if isinstance(body.get("battery_diagnostics"), dict) else {})
+    nrg = (body.get("energy_feasibility")
+           if isinstance(body.get("energy_feasibility"), dict) else {})
+    rsk = body.get("risk") if isinstance(body.get("risk"), dict) else {}
     state = _str_or_none(body.get("state"))
     effective = _str_or_none(body.get("effective_state")) or state
     return {
@@ -486,6 +489,24 @@ def summarize_status(result):
         "battery_diagnostics": dict(batt) if batt else None,
         "battery_percent": batt.get("battery_percent") if batt else None,
         "battery_valid": batt.get("battery_valid") if batt else None,
+        # ── Scout's two AUTHORITATIVE assessment blocks, carried VERBATIM ──────────────────
+        # Both are Scout's alone: it owns the battery/range/reserve model behind
+        # `energy_feasibility` and the weighting, severity floors and hard overrides behind
+        # `risk`. This summary re-derives NEITHER — it carries the dicts through and lifts only
+        # the two GOVERNING verdicts by name, so the operator's logs and traces can say what
+        # Scout said without a second policy representation growing here.
+        #
+        # `risk_level` is Scout's `risk.level` and ONLY that. It is NOT `weighted_level` and it
+        # is NOT derived from `score`: Scout's governing level is the weighted level raised by
+        # any non-compensatory component floor and then by any hard-feasibility override, so a
+        # weighted LOW under a HIGH component floor governs as HIGH. Reading the score here
+        # would report LOW for a vehicle Scout has assessed as HIGH.
+        "energy_feasibility": dict(nrg) if nrg else None,
+        "energy_mission_feasible": nrg.get("mission_feasible") if nrg else None,
+        "energy_rtl_return_feasible": nrg.get("rtl_return_feasible") if nrg else None,
+        "risk": dict(rsk) if rsk else None,
+        "risk_level": _str_or_none(rsk.get("level")) if rsk else None,
+        "risk_recommendation": _str_or_none(rsk.get("recommendation")) if rsk else None,
         "verified_mode": _str_or_none(body.get("verified_mode")),
         "mission_execution_enabled": body.get("mission_execution_enabled"),
         "sequence": dict(seq) if seq else None,

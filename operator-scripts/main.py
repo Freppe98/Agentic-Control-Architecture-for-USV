@@ -516,6 +516,7 @@ def home_block(vid: int, payload: dict, telemetry: dict):
             "source": "scout", "available": False, "reachable": None, "home_position": None,
             "lat": None, "lng": None, "verified": False, "verified_at": None,
             "verification_method": None, "verification_distance_m": None,
+            "verification_recovery": None,
             "ready_for_auto": False, "ready_for_rtl": False,
             "reason": "Scout does not report Home status yet.", "stale": False,
         }
@@ -532,6 +533,15 @@ def home_block(vid: int, payload: dict, telemetry: dict):
         "verified_at": hs.get("verified_at") if not stale else None,
         "verification_method": hs.get("verification_method"),
         "verification_distance_m": hs.get("verification_distance_m"),
+        # Scout's read-only VERIFICATION RECOVERY evidence, verbatim ({state, reason,
+        # checked_at}) — how the current verification survived a Local Agent restart. It is
+        # PROVENANCE, never a second source of verification: `verified` above is the only
+        # thing that decides verified/unverified, and a RECOVERED recovery state alongside
+        # `verified:false` still reads UNVERIFIED. Passed through rather than summarized so
+        # the diagnostics page can show Scout's own sentence for why recovery was or was not
+        # possible.
+        "verification_recovery": (hs.get("verification_recovery")
+                                  if isinstance(hs.get("verification_recovery"), dict) else None),
         "ready_for_auto": bool(hs.get("ready_for_auto")) and not stale,
         "ready_for_rtl": bool(hs.get("ready_for_rtl")) and not stale,
         "reason": ("Scout has not confirmed Home status recently — treating as unverified."
@@ -3482,6 +3492,81 @@ def get_control_authority(vehicle: str):
         return JSONResponse(status_code=404, content={
             "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle})
     return read_control_authority(vid)
+
+
+# --- Scout's STABILIZED EVIDENCE (direct proxy to Scout Flask GET /agent/state) ---
+# Scout stabilizes each raw MAVLink observation into an evidence record it stands behind:
+#
+#   { value, source, observed_at, age_s, state }   state ∈ FRESH | AGING | STALE | NEVER_OBSERVED
+#
+# and it is Scout's OWN age and Scout's OWN state — the operator station runs no TTL of its
+# own and must not. A second, operator-side freshness rule would answer a different question
+# (how old is this on MY clock, after MY poll interval) and would disagree with the very
+# evidence Scout's risk model and feasibility gate are computed from. Displaying a
+# disagreement as if it were the vehicle's state is exactly the fabrication this station
+# forbids, so this route is a PASS-THROUGH: Scout's evidence dict, verbatim.
+#
+# WHY A SEPARATE READ AT ALL: the evidence block is NOT in the status packet Scout pushes to
+# POST /agent/status (that payload carries telemetry/power/failsafe/imu/freshness/mavlink/
+# health/mission/agent/... and no `evidence`). It exists only on the Flask API's
+# GET /agent/state, port 8080 — the same VEHICLE_API_BASE map as control authority and the
+# Pixhawk mission read-back, never the Local Agent's 8090, which 404s this path.
+#
+# `freshness` (Scout's older per-subsystem seconds map) is carried alongside because it is on
+# the same body and the diagnostics page shows both; it is NOT merged into the evidence
+# records and never substitutes for a missing one.
+def read_agent_evidence(vid: int):
+    """Scout's stabilized evidence + freshness for one vehicle, live. Always a dict, never
+    raises: an unknown vehicle is a 404-shaped body, a vehicle with no Flask route is an
+    honest available:false, and an unreachable Scout is reachable:false with `evidence:None`.
+    NOTHING is defaulted — an absent evidence block stays absent, because a fabricated FRESH
+    is the one answer that would be read as reassurance."""
+    if vid not in known_vehicle_ids():
+        return {"ok": False, "error": "unknown vehicle", "vehicle_id": vid,
+                "available": False, "reachable": False, "evidence": None}
+    base = vehicle_api_base(vid)
+    if base is None:
+        return {
+            "ok": True, "vehicle_id": vehicle_slug(vid), "available": False, "reachable": False,
+            "evidence": None, "freshness": None, "source": "scout",
+            "reason": "No Scout API configured for this vehicle",
+        }
+    try:
+        r = requests.get(f"{base}/agent/state", timeout=3)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+    except requests.RequestException as exc:
+        return {
+            "ok": True, "vehicle_id": vehicle_slug(vid), "available": True, "reachable": False,
+            "evidence": None, "freshness": None, "source": "scout",
+            "reason": "Scout agent-state API unreachable", "detail": str(exc),
+        }
+    if not isinstance(data, dict):
+        data = {}
+    ev = data.get("evidence") if isinstance(data.get("evidence"), dict) else None
+    fr = data.get("freshness") if isinstance(data.get("freshness"), dict) else None
+    return {
+        "ok": True, "vehicle_id": vehicle_slug(vid), "available": True, "reachable": True,
+        "source": "scout",
+        # Verbatim. A Scout that predates stabilized evidence reports none, and `evidence:None`
+        # is what makes the UI read UNKNOWN rather than invent a state for every signal.
+        "evidence": ev,
+        "supported": ev is not None,
+        "freshness": fr,
+        "state_timestamp": data.get("state_timestamp"),
+    }
+
+
+@app.get("/api/vehicles/{vehicle_id}/agent/evidence")
+def get_agent_evidence(vehicle_id: str):
+    """Scout's own stabilized evidence records (value / source / observed_at / age_s / state)
+    for one vehicle. Read-only pass-through of GET /agent/state — the operator station applies
+    no TTL, computes no age and never upgrades a missing record to FRESH."""
+    vid = parse_vehicle_id(vehicle_id)
+    if vid not in known_vehicle_ids():
+        return JSONResponse(status_code=404, content={
+            "ok": False, "error": "unknown vehicle", "vehicle_id": vehicle_id})
+    return read_agent_evidence(vid)
 
 
 # --- Pixhawk mission (direct proxy to Scout Flask, NOT the command queue) ---

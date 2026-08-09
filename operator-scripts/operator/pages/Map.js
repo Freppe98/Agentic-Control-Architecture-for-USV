@@ -1393,16 +1393,31 @@ export function Map(root) {
     //           Home are different questions, and Scout's Start gate requires both. When Scout
     //           says the run is completable but the return is not, this reads RTL INSUFFICIENT
     //           rather than a reassuring FEASIBLE.
-    //   RISK    is Scout's own level. Nothing here is derived on this station, so until Scout
-    //           reports one it is a quiet "—" — never LOW.
+    //   RISK    is Scout's GOVERNING level — `risk.level`, with its non-compensatory component
+    //           floors and any hard-feasibility override ALREADY APPLIED by Scout. It is not the
+    //           weighted level and it is never derived from the score here, so a weighted LOW
+    //           under a HIGH communication floor reads HIGH, which is what it is. Until Scout
+    //           reports a level it is a quiet "—" — never LOW.
+    //   ADVICE  is Scout's advisory recommendation (CONTINUE / CAUTION / HOLD / RETURN), and
+    //           only appears when Scout sends one. It is TEXT: not a button, not a link, and
+    //           nothing on this card acts on it. Risk never triggers a command.
     //
-    // Both are DISPLAY ONLY: they explain a readiness verdict, they never produce one. The Start
-    // button above still comes from can_start / start_eligible / start_block_reason via the gate.
-    // The full evidence (both margins, both distances, battery, reserve, geometry sources,
-    // evaluation freshness) is the tooltip here and the Agent page's diagnostics rows in full.
+    // ENERGY AND RISK ARE SEPARATE READINGS AND MAY DISAGREE. `FEASIBLE +4%` beside `HIGH` is
+    // correct and useful — the run is still completable with reserve, and the margin is tight
+    // enough that Scout's governing risk has risen. Neither line is bent toward the other, and
+    // no operator-side "TIGHT" threshold exists to blur them.
+    //
+    // All three are DISPLAY ONLY: they explain a readiness verdict, they never produce one. The
+    // Start button above still comes from can_start / start_eligible / start_block_reason via the
+    // gate — readiness is not derived from risk, and a HIGH risk does not disable anything Scout
+    // has not itself refused. The full evidence (both margins, both distances, battery, reserve,
+    // geometry sources, the floor, the component breakdown, evaluation freshness) is the tooltip
+    // here and the Agent page's diagnostics rows in full.
+    const rec = card.recommendation || { reported: false };
     const live = card.present === false ? "" : `<div class="amx-grid">
         <div class="amx-row"><span class="k">Energy</span><span class="v ${esc(card.energy.tone)}" title="${escAttr(card.energy.detail || "")}">${esc(card.energy.text)}</span></div>
         <div class="amx-row"><span class="k">Risk</span><span class="v ${esc(card.risk.tone)}" title="${escAttr(card.risk.detail || "")}">${esc(card.risk.text)}</span></div>
+        ${rec.reported ? `<div class="amx-row"><span class="k">Advice</span><span class="v ${esc(rec.tone)}" title="${escAttr(`Scout's advisory recommendation (${rec.code}). Display only — the operator decides.`)}">${esc(rec.text)}</span></div>` : ""}
       </div>`;
 
     // Progress. While the START transaction runs this is PHASE-SPECIFIC and NEUTRAL — "Checking

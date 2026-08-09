@@ -26,6 +26,7 @@ import { canonicalVehicleId } from "../lib/selection.js";
 import * as replan from "../lib/replan.js";
 import { readinessLabel, READINESS_STATE } from "../lib/mission-publish.js";
 import * as mx from "../lib/mission-execution.js";
+import * as ev from "../lib/evidence.js";
 import { asText, esc, escAttr } from "../lib/format.js";
 
 const clockSvg =
@@ -101,6 +102,14 @@ export function Agent(root) {
   // switched vehicles is discarded rather than rendered on the wrong Scout.
   let mxStatus = null, mxOps = [], mxResult = null, mxBusy = false, mxForVid = null;
 
+  // Scout's stabilized evidence for the SELECTED vehicle (GET /agent/state, via the backend
+  // proxy). Same isolation tag as everything else on this page. Read-only, and deliberately NOT
+  // merged into the fleet payload: the evidence block is not on the status packet Scout pushes,
+  // and this station never fills it in from telemetry it happens to have — Scout's records carry
+  // Scout's own observation instants and Scout's own freshness verdicts, which is the whole
+  // point of reading them.
+  let evidenceState = null, evidenceForVid = null;
+
   const authCtl = createAuthorityController(() => renderDetail());
   function loadAuthority(id) {
     if (id == null) return;
@@ -156,6 +165,27 @@ export function Agent(root) {
       const list = ops.status === "fulfilled" ? ops.value : null;
       mxOps = list && Array.isArray(list.operations) ? list.operations : [];
       mxForVid = forId;
+      renderDetail();
+    });
+  }
+
+  // Poll Scout's stabilized evidence for the SELECTED vehicle. READ-ONLY, and at the same cadence
+  // as everything else on this page — deliberately NOT faster because Scout re-evaluates more
+  // often than we ask. Polling harder would not make a single value fresher; the age shown is
+  // Scout's own `age_s`, measured from the vehicle's observation, not from this fetch.
+  function loadEvidence(id) {
+    if (id == null) { evidenceState = null; evidenceForVid = null; return; }
+    const forId = id;
+    api.getAgentEvidence(id).then((r) => {
+      if (forId !== selId) return;                   // selection moved — discard stale fetch
+      evidenceState = r;
+      evidenceForVid = forId;
+      renderDetail();
+    }).catch(() => {
+      if (forId !== selId) return;
+      // A failed read is an honest unreachable, never an empty-but-fine evidence set.
+      evidenceState = { ok: true, available: true, reachable: false, evidence: null };
+      evidenceForVid = forId;
       renderDetail();
     });
   }
@@ -226,8 +256,14 @@ export function Agent(root) {
   function renderDetail() {
     const v = fleet.find((x) => x.id === selId);
     const box = document.getElementById("detail");
+    const count = document.getElementById("acount");
+    // The page has already been unmounted and a read that was in flight has just landed. Every
+    // poller here calls renderDetail() when its fetch resolves, and cleanup() cannot cancel a
+    // request already on the wire — so the honest response is to drop the render, not to throw
+    // into the console on every page change.
+    if (!box || !count) return;
     if (!v) { box.innerHTML = `<div class="empty-state" style="padding:8px 0">No vehicle selected</div>`; return; }
-    document.getElementById("acount").textContent = `${v.name || "USV-" + v.id} · agent reasoning`;
+    count.textContent = `${v.name || "USV-" + v.id} · agent reasoning`;
 
     const st = commState(v), connected = st === "connected";
     const stale = st === "partitioned" || st === "disconnected";
@@ -394,6 +430,7 @@ export function Agent(root) {
       ${missionExecutionSection(v)}
       ${replanSection(v, { connected, stale })}
       <div class="subgrid two">${transitionsCard}${inputsCard}</div>
+      <div class="subgrid two">${evidenceCard(v)}</div>
       ${timelineCard}`;
     wireMissionExecution();
     wireReplan();
@@ -638,54 +675,210 @@ export function Agent(root) {
     const cond = view.state === mx.ENERGY.FEASIBLE ? rp(view.text, "c")
       : view.state === mx.ENERGY.INSUFFICIENT || view.state === mx.ENERGY.RTL_INSUFFICIENT
         ? rp(view.text, "d") : rp(view.text, "u");
+    // The two homes are NEVER labelled the same word. `planned_home` is the mission/planning
+    // package's home — the survey's own reference point — and `rtl_home` is the Pixhawk's
+    // VERIFIED safety Home, the only place an RTL actually goes. Each margin is measured
+    // against its own, and calling both "Home" would let an operator read a healthy RTL margin
+    // as proof about a home the vehicle would never return to.
+    // Only Scout's SOURCE word is printed, never the coordinates: the Home card above is where a
+    // Home is inspected, and a lat/lng here would be a second place to read one from. What these
+    // rows exist to state is WHICH home each margin was measured against, and that RTL
+    // verification is Scout's `verified` flag — never something inferred from a coordinate being
+    // present at all.
+    const homeSrc = (h) => {
+      const src = h && typeof h === "object" && h.source ? String(h.source) : null;
+      if (!src) return `<span class="txt-u">not reported</span>`;
+      return `<span class="mono">${esc(src)}</span>`;
+    };
     return `<div class="metrics" style="border-top:1px solid var(--line)">
          ${row("Energy feasibility (Scout)", `${cond}${view.reasonText ? ` <span class="txt-u">${esc(view.reasonText)}</span>` : ""}`)}
-         ${row("Mission margin", signed(e.missionMarginPercent))}
-         ${row("RTL return margin", signed(e.rtlReturnMarginPercent))}
+         ${e.message ? row("Scout's assessment", `<span class="txt-u">${esc(e.message)}</span>`) : ""}
+       </div>
+       <div class="metrics" style="border-top:1px solid var(--line)">
+         ${row(`<b>MISSION COMPLETION</b>`, `<span class="txt-u">can the remaining planned mission be finished?</span>`)}
          ${row("Mission feasible", feas(e.missionFeasible))}
-         ${row("RTL return feasible", feas(e.rtlReturnFeasible))}
+         ${row("Mission margin", signed(e.missionMarginPercent))}
+         ${row("Remaining waypoints", val(e.remainingWaypointCount))}
          ${row("Planned completion distance", dist(e.plannedCompletionDistanceM))}
-         ${row("RTL return distance", dist(e.rtlReturnDistanceM))}
          ${row("Estimated mission energy", pctv(e.estimatedMissionEnergyPercent))}
+         ${row("Mission geometry", `<span class="mono">${val(e.missionGeometrySource)}</span>`)}
+         ${row("Planned Mission Home", homeSrc(e.plannedHome))}
+       </div>
+       <div class="metrics" style="border-top:1px solid var(--line)">
+         ${row(`<b>RTL RETURN</b>`, `<span class="txt-u">could the vehicle abort now and reach its verified RTL Home?</span>`)}
+         ${row("RTL return feasible", feas(e.rtlReturnFeasible))}
+         ${row("RTL return margin", signed(e.rtlReturnMarginPercent))}
+         ${row("Direct-return distance", dist(e.rtlReturnDistanceM))}
          ${row("Estimated RTL return energy", pctv(e.estimatedRtlReturnEnergyPercent))}
-         ${row("Effective battery", e.batteryPercent === null ? `<span class="txt-u">unavailable</span>` : `<b>${esc(String(Math.round(e.batteryPercent)))}%</b>${e.batterySource ? ` <span class="txt-u">${esc(e.batterySource)}</span>` : ""}`)}
+         ${row("RTL geometry", `<span class="mono">${val(e.rtlReturnGeometrySource)}</span>`)}
+         ${row("Verified RTL Home", homeSrc(e.rtlHome))}
+       </div>
+       <div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Physical battery", pctv(e.physicalBatteryPercent))}
+         ${row("Injected battery (simulated)", e.injectedBatteryPercent === null
+            ? `<span class="txt-u">none</span>`
+            : `${rp("SIMULATED", "p")} <b>${esc(e.injectedBatteryPercent.toFixed(1))}%</b>`)}
+         ${row("Effective battery", e.batteryPercent === null ? `<span class="txt-u">unavailable</span>` : `<b>${esc(String(Math.round(e.batteryPercent)))}%</b>`)}
+         ${row("Battery source", e.batterySource ? `<span class="mono">${esc(e.batterySource)}</span>` : `<span class="txt-u">—</span>`)}
          ${row("Reserve margin", pctv(e.reserveMarginPercent))}
          ${row("Usable range", dist(e.usableRangeM))}
-         ${row("Remaining waypoints", val(e.remainingWaypointCount))}
-         ${row("Mission geometry", `<span class="mono">${val(e.missionGeometrySource)}</span>`)}
-         ${row("RTL geometry", `<span class="mono">${val(e.rtlReturnGeometrySource)}</span>`)}
          ${row("Reason (Scout)", val(mx.energyReasonText(e.reason) || e.reason))}
-         ${row("Evaluated at", val(e.evaluatedAt))}
+         ${row("Evaluated", scoutAge(e.evaluatedAt))}
          ${row("Position age", e.positionAgeS === null ? `<span class="txt-u">—</span>` : `${esc(e.positionAgeS.toFixed(1))} s${e.maxPositionAgeS === null ? "" : ` <span class="txt-u">of ${esc(String(e.maxPositionAgeS))} s allowed</span>`}`)}
        </div>
+       ${e.injectedBatteryPercent !== null
+          ? `<div class="reason-note" style="border-left:3px solid var(--caution)">${warnSvg}<span>The
+             effective battery driving every margin above is a <b>SIMULATED injected value</b>
+             (<span class="mono">battery_source=${esc(e.batterySource || "INJECTED")}</span>), not
+             the physical reading. Scout's feasibility verdicts and its risk assessment are both
+             computed from it.</span></div>`
+          : ""}
        <div class="reason-note">${gapSvg}<span><b>Mission margin</b> answers whether Scout can
          complete the remaining planned mission; <b>RTL return margin</b> answers whether it could
-         abort now and reach the current verified RTL Home. They are separate questions and
-         Scout's Start gate requires <b>both</b>. Every figure here is Scout's own evaluation —
-         the operator station computes no feasibility of its own and never overrides Scout's
-         verdict.</span></div>`;
+         abort now and reach the current <b>verified RTL Home</b> — the Pixhawk safety Home, which
+         is a different point from the <b>Planned Mission Home</b> the planning package carries.
+         They are separate questions and Scout's Start gate requires <b>both</b>. Every figure
+         here is Scout's own evaluation — the operator station computes no feasibility of its own
+         and never overrides Scout's verdict. Feasibility is also <b>not</b> risk: a run can stay
+         feasible with a positive margin while Scout's governing risk level rises because that
+         margin has tightened.</span></div>`;
   }
 
-  // --- Risk: Scout's OWN level, or an honest empty slot ---------------------------------------
-  // The continuous risk model does not exist on Scout yet. This station will never fill the gap
-  // with a locally computed score: a risk level is a claim about the vehicle's situation, and
-  // the only component holding that situation is the agent. Until Scout sends `risk.level` the
-  // slot reads "—" here and on the Map card.
+  // --- Continuous risk: Scout's OWN assessment, explained in full -----------------------------
+  //
+  // This is the EXPLAINABILITY surface for the one word the Map card shows. Every figure below
+  // is Scout's; the station computes no score, no level, no threshold and no floor, and it
+  // reconstructs none of Scout's arithmetic — a second model here would disagree with the first
+  // the moment Scout changed anything, and the operator would have no way to tell which one
+  // they were reading.
+  //
+  // Scout's pipeline, top to bottom, is what these rows walk through:
+  //
+  //     weighted continuous score      →  weighted_score / weighted_level
+  //     + non-compensatory floors      →  component_floor_level / _reason / _source
+  //     + hard feasibility override    →  hard_constraint_violated / hard_override_level
+  //     ────────────────────────────────────────────────────────────────────────────────
+  //     = GOVERNING level              →  risk.level        ← the authoritative one
+  //
+  // The governing level is read from `risk.level` alone. It is shown FIRST and the weighted
+  // score is shown BELOW it, deliberately: a floor is non-compensatory, so a reassuring
+  // weighted LOW can sit under a governing HIGH, and the layout must not invite the reader to
+  // treat the smaller number as the answer.
+  //
+  // RISK IS NOT READINESS. Nothing here disables Start, and Start is not offered because risk
+  // is low — that verdict comes from Scout's own start_eligible / start_block_reason (see
+  // mxEligibilityRows). The two answer different questions and are kept apart on purpose.
   function mxRiskRows(S) {
     const view = mx.riskView(S);
     if (!view.reported) {
-      return `<div class="reason-note">${gapSvg}<span>This Scout reports no agent risk level
-        (<span class="mono">risk.level</span>). The slot is shown as
+      return `<div class="reason-note">${gapSvg}<span>This Scout reports no agent risk
+        assessment (<span class="mono">risk</span>). The slot is shown as
         <span class="mono">—</span> on the Map's Agent Mission card rather than as
         <span class="mono">LOW</span>: no component of this system has assessed risk, and the
         operator station does <b>not</b> compute one.</span></div>`;
     }
     const tint = { ok: "c", caution: "p", warn: "d", idle: "u" }[view.tone] || "u";
+    const rec = mx.recommendationView(S);
+    const num = (v) => (typeof v === "number" ? `<b>${esc(String(v))}</b>` : `<span class="txt-u">—</span>`);
+    const code = (v) => (v ? `<span class="mono">${esc(v)}</span>` : `<span class="txt-u">—</span>`);
+    // WHICH stage Scout's own fields show as producing the governing level. Named, not
+    // recomputed — riskView() only reports the stage whose level matches, and says nothing
+    // when none does.
+    const governedBy = {
+      hard: "hard feasibility override",
+      floor: "component severity floor",
+      weighted: "weighted continuous score",
+    }[view.governedBy] || null;
+
     return `<div class="metrics" style="border-top:1px solid var(--line)">
-         ${row("Agent risk level (Scout)", `${rp(view.text, tint)}${view.known ? "" : ` ${rp("UNRECOGNIZED LEVEL", "p")}`}`)}
-         ${row("Risk score", view.score === null ? `<span class="txt-u">not reported</span>` : `<b>${esc(String(view.score))}</b>`)}
-         ${row("Risk detail", val(view.detail))}
+         ${row("Governing risk level (Scout)", `${rp(view.text, tint)}${view.known ? "" : ` ${rp("UNRECOGNIZED LEVEL", "p")}`}${governedBy ? ` <span class="txt-u">from the ${esc(governedBy)}</span>` : ""}`)}
+         ${row("Recommendation (advisory)", rec.reported
+            ? `${rp(rec.text, { ok: "c", caution: "p", warn: "d", idle: "u" }[rec.tone] || "u")}`
+              // Scout's own code, shown beside the compact word only when the two differ —
+              // "CONTINUE CONTINUE" is noise, "CAUTION CONTINUE_WITH_CAUTION" is evidence.
+              + (rec.code === rec.text ? "" : ` <span class="mono txt-u">${esc(rec.code)}</span>`)
+            : `<span class="txt-u">not reported</span>`)}
+         ${row("Confidence", view.confidence ? rp(view.confidence, "u") : `<span class="txt-u">—</span>`)}
+       </div>
+       <div class="metrics" style="border-top:1px solid var(--line)">
+         ${row("Weighted score", num(view.weightedScore ?? view.score))}
+         ${row("Weighted level", view.weightedLevel ? rp(view.weightedLevel, "u") : `<span class="txt-u">—</span>`)}
+         ${row("Severity floor level", view.floorLevel ? rp(view.floorLevel, "d") : `<span class="txt-c">none active</span>`)}
+         ${row("Severity floor source", code(view.floorSource))}
+         ${row("Severity floor reason", code(view.floorReason))}
+         ${row("Hard constraint violated", view.hardConstraintViolated === true ? rp("YES", "d")
+            : view.hardConstraintViolated === false ? rp("NO", "c") : rp("not reported", "u"))}
+         ${row("Hard override level", view.hardOverrideLevel ? rp(view.hardOverrideLevel, "d") : `<span class="txt-u">—</span>`)}
+         ${row("Dominant component", code(view.dominantComponent))}
+         ${row("Dominant reason", code(view.dominantReason))}
+         ${row("Evaluated", scoutAge(view.evaluatedAt))}
+       </div>
+       ${mxRiskComponentRows(S)}
+       ${view.floorActive && view.weightedLevel
+          && view.weightedLevel.toUpperCase() !== String(view.level).toUpperCase()
+          ? `<div class="reason-note">${gapSvg}<span>The weighted score alone would read
+             <b>${esc(view.weightedLevel)}</b>. A <b>non-compensatory severity floor</b>
+             (<span class="mono">${esc(view.floorReason || view.floorSource || "component")}</span>)
+             raised the governing level to <b>${esc(view.level)}</b>, which is the level shown
+             here and on the Map. One severe component governs regardless of how reassuring the
+             average is — that is the point of the floor, and the operator station displays
+             Scout's result rather than its own average.</span></div>`
+          : ""}
+       <div class="reason-note">${gapSvg}<span>Risk is <b>not</b> readiness. Nothing on this
+         page derives the Start gate from the risk level, and a high risk does not disable a
+         control Scout has not itself refused — Start eligibility comes from Scout's
+         <span class="mono">start_eligible</span> / <span class="mono">start_block_reason</span>
+         above. The recommendation is <b>advisory text</b>: it is never a button and never issues
+         a command.</span></div>`;
+  }
+
+  // Scout's per-component breakdown. Score, weight and weighted contribution are all Scout's own
+  // numbers — the contribution is READ from Scout's `weighted_score`, never multiplied out here,
+  // so this table can never quietly disagree with the total it is explaining.
+  function mxRiskComponentRows(S) {
+    const comps = mx.riskComponents(S);
+    if (!comps.length) return "";
+    // Rounded to 4 decimals, then trailing zeros dropped by RE-PARSING the rounded string rather
+    // than trimming characters off it: a regex that strips trailing zeros turns 100.0000 into
+    // "1", and a component weight is not a place to invent a two-order-of-magnitude error.
+    const n3 = (v) => (typeof v === "number" ? esc(String(Number(v.toFixed(4)))) : "—");
+    const n2 = (v) => (typeof v === "number" ? esc(String(v)) : "—");
+    // Deliberately NOT the key/value `row()` used elsewhere on this page: `.mrow .val` is a flex
+    // row, so a component's three numbers, its reason and its evidence would each become a
+    // sibling flex item and collapse into narrow stacked columns. Each component is one block —
+    // a header line of name + numbers + reason, then its evidence beneath at full width.
+    return `<div style="border-top:1px solid var(--line)">
+         <div class="mrow"><span class="k">component</span>
+           <span class="val"><span class="txt-u">score · weight · contribution</span></span></div>
+         ${comps.map((c) => `
+           <div style="padding:8px 13px;border-bottom:1px solid var(--line)">
+             <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+               <span class="mono" style="font-size:10px;letter-spacing:.07em;color:var(--muted);min-width:104px">${esc(c.name.toUpperCase())}</span>
+               <span class="mono" style="font-variant-numeric:tabular-nums"><b>${n3(c.score)}</b> <span class="txt-u">·</span> ${n2(c.weight)} <span class="txt-u">·</span> ${n3(c.weightedContribution)}</span>
+               ${c.reason ? `<span class="mono txt-u" style="font-size:11px">${esc(c.reason)}</span>` : ""}
+             </div>
+             ${c.evidence ? `<div class="txt-u" style="font-size:11px;margin-top:4px;padding-left:116px;overflow-wrap:anywhere">${pairsText(c.evidence)}</div>` : ""}
+           </div>`).join("")}
        </div>`;
+  }
+
+  // Age of a Scout-supplied instant, computed against Scout's OWN timestamp at render time.
+  // Accepts epoch seconds (what Scout sends today) or an ISO string. This is the age of SCOUT'S
+  // EVALUATION, not of our poll — polling does not create freshness, and an unparseable or
+  // absent instant reads "—" rather than "just now".
+  function scoutAge(at) {
+    if (at === null || at === undefined) return `<span class="txt-u">—</span>`;
+    // Scout sends epoch SECONDS. They reach here as a number from the risk block and as a
+    // numeric string from the energy block (which normalizes through str()), so both spellings
+    // are accepted — otherwise one card would read "4.3 s ago" and its neighbour would print a
+    // bare 1786306481.903 at the operator. An ISO instant still goes through Date.parse.
+    const s = String(at).trim();
+    const ms = typeof at === "number" ? at * 1000
+      : /^\d+(\.\d+)?$/.test(s) ? Number(s) * 1000 : Date.parse(s);
+    if (!Number.isFinite(ms)) return `<span class="mono">${esc(String(at))}</span>`;
+    const age = (Date.now() - ms) / 1000;
+    if (!Number.isFinite(age) || age < 0) return `<span class="mono">${esc(String(at))}</span>`;
+    return `<b>${esc(age < 10 ? age.toFixed(1) : String(Math.round(age)))} s</b> <span class="txt-u">ago</span>`;
   }
 
   // --- Diagnostic fallback: the raw lifecycle writes, COLLAPSED BY DEFAULT --------------------
@@ -1256,6 +1449,67 @@ export function Agent(root) {
        </div>`, false);
   }
 
+  // --- Scout's STABILIZED EVIDENCE (GET /agent/state) ----------------------------------------
+  //
+  // The records Scout's own risk model and energy-feasibility gate are computed from. They are
+  // shown here so an operator reading "governing risk HIGH, navigation floor" can see the
+  // observation behind it — the same value, the same source, the same age Scout used.
+  //
+  // NO OPERATOR TTL. The `state` word and the `age_s` number are both Scout's; this page does
+  // not age anything against its own clock and does not re-derive a state from the age. Polling
+  // does not create freshness: a value fetched a moment ago is as old as the last time the
+  // VEHICLE observed it. And a signal Scout did not report reads UNKNOWN — never FRESH, which is
+  // the one direction this table must never fail in.
+  //
+  // This is deliberately DIFFERENT from the "Observed State · Decision Inputs" card beside it:
+  // that one shows what the operator backend received in Scout's pushed status packet; this one
+  // shows what SCOUT believes it has observed, with Scout's own verdict on whether it is still
+  // usable. When the two disagree, the disagreement is the diagnostic.
+  function evidenceCard(v) {
+    const forThis = evidenceForVid != null && v && evidenceForVid === v.id;
+    const view = ev.normalizeEvidence(forThis ? evidenceState : null);
+
+    if (!forThis || !view.reachable) {
+      return card("Observation evidence (Scout)", rp("unavailable", "u"), "idle",
+        gapBody(`Scout's stabilized evidence could not be read (<span class="mono">GET /agent/state</span>).
+          No freshness state is shown for any signal — an unread evidence set is
+          <b>not</b> a fresh one.`));
+    }
+    if (!view.supported) {
+      return card("Observation evidence (Scout)", rp("not reported", "u"), "idle",
+        gapBody(`This Scout does not report stabilized observation evidence
+          (<span class="mono">evidence</span>). Nothing is inferred from the telemetry this
+          station happens to hold: an operator-side freshness rule would answer a different
+          question than the one Scout's own assessments are built on.`));
+    }
+
+    const worst = ev.worstEvidenceState(view);
+    const tint = { ok: "c", caution: "p", warn: "d", idle: "u" };
+    const cond = worst
+      ? rp(worst, tint[ev.EVIDENCE_TONE[worst] || "idle"] || "u")
+      : rp("no signals", "u");
+    const stateCell = (s) => (s.reported
+      ? rp(s.state, tint[s.tone] || "u") + (s.known ? "" : ` ${rp("UNRECOGNIZED", "p")}`)
+      : rp("UNKNOWN", "u"));
+    const ageCell = (s) => (s.ageS === null
+      ? `<span class="txt-u">—</span>`
+      : `${esc(s.ageS < 10 ? s.ageS.toFixed(2) : String(Math.round(s.ageS)))} s`);
+
+    return card("Observation evidence (Scout)", cond,
+      worst === "STALE" ? "caution" : worst === "AGING" ? "caution" : worst === "FRESH" ? "ok" : "idle",
+      `<div class="metrics">
+         ${view.signals.map((s) => row(esc(s.label),
+            `${stateCell(s)} <span class="txt-u">·</span> ${ageCell(s)}
+             <span class="txt-u">·</span> ${s.valueText === null ? `<span class="txt-u">—</span>` : `<b>${esc(s.valueText)}</b>`}
+             ${s.source ? `<span class="mono txt-u"> ${esc(s.source)}</span>` : ""}`)).join("")}
+       </div>
+       <div class="reason-note">${gapSvg}<span>Each row is <b>Scout's own</b> record: its
+         freshness verdict, its measured age and the MAVLink message it came from. The operator
+         station applies <b>no</b> time-to-live of its own and never converts an age into a state
+         — polling this page more often would not make a single value fresher, because the age is
+         measured from the vehicle's observation, not from the fetch.</span></div>`, false);
+  }
+
   function recentTimelineCard(vEvents) {
     if (!vEvents.length)
       return card("Recent Timeline", "—", "idle",
@@ -1293,9 +1547,11 @@ export function Agent(root) {
     replanStatus = replanReadiness = replanConfig = replanExperiment = publishState = null;
     replanMsg = null; replanForVid = null;
     mxStatus = null; mxOps = []; mxResult = null; mxForVid = null;
+    evidenceState = null; evidenceForVid = null;
     loadAuthority(id);
     loadReplan(id);
     loadMissionExecution(id);
+    loadEvidence(id);
   }
 
   function onFleet(data) {
@@ -1305,6 +1561,7 @@ export function Agent(root) {
       loadAuthority(selId);
       loadReplan(selId);
       loadMissionExecution(selId);
+      loadEvidence(selId);
     }
     document.getElementById("veh-list").innerHTML = vehicleRows(fleet, selId);
     document.querySelectorAll("#veh-list .vrow").forEach((el) => (el.onclick = () => { select(canonicalVehicleId(el.dataset.id)); onFleet(fleet); }));
@@ -1325,11 +1582,15 @@ export function Agent(root) {
   // the write is the one that decides the button, and paced faster than the replan poll because
   // Start/Pause/Resume move through several transitional states.
   const mxId = setInterval(() => { if (!mxBusy) loadMissionExecution(selId); }, 2000);
+  // Stabilized-evidence poll, at the SAME cadence as the lifecycle status. Not faster: Scout
+  // re-evaluates its evidence more often than this, and asking more often would change nothing
+  // about the age displayed — that age is Scout's, measured from the vehicle's own observation.
+  const evidenceId = setInterval(() => loadEvidence(selId), 2000);
   loadEvents();
   const clockId = setInterval(() => updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) }), 1000);
   updateRibbon({ clock: new Date().toLocaleTimeString([], { hour12: false }) });
 
-  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(eventsId); clearInterval(replanId); clearInterval(mxId); authCtl.dispose(); };
+  return function cleanup() { stopFleet(); clearInterval(clockId); clearInterval(authorityId); clearInterval(eventsId); clearInterval(replanId); clearInterval(mxId); clearInterval(evidenceId); authCtl.dispose(); };
 }
 
 function titleCase(s) {

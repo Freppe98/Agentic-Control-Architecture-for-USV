@@ -334,11 +334,25 @@ export const ENERGY_CHECKING_REASONS = ["POSITION_STALE"];
 
 // ── RISK: Scout's own authoritative agent risk level ───────────────────────────────────────
 //
-// The continuous risk model does not exist on Scout yet. This slot is prepared for it and is
-// deliberately EMPTY until Scout reports one: the operator station computes no risk score, from
-// energy or anything else, and showing LOW because nothing looked wrong would be a claim no
-// component of this system has made. When Scout starts sending `risk.level`, riskView() picks it
-// up with no further change.
+// Scout runs the continuous risk model and this station DISPLAYS it. Nothing here computes a
+// score, a level, a threshold or a floor, and nothing infers one from energy, comms or anything
+// else — a risk level is a claim about the vehicle's situation, and the only component holding
+// that situation is the agent. A Scout that reports no risk block reads "—", never LOW.
+//
+// SCOUT'S PIPELINE, and why only ONE of its outputs may be displayed as THE level:
+//
+//   weighted continuous score        →  risk.weighted_score / risk.weighted_level
+//   + non-compensatory floors        →  risk.component_floor_level / _reason / _source
+//   + hard feasibility override      →  risk.hard_constraint_violated / risk.hard_override_level
+//   ────────────────────────────────────────────────────────────────────────────────────────
+//   = GOVERNING level                →  risk.level          ← the only authoritative one
+//
+// The floors are NON-COMPENSATORY on purpose: a single severe component raises the governing
+// level regardless of how reassuring the weighted average is. Scout's own worked example —
+// score 0.2375, weighted_level LOW, component_floor_level HIGH
+// (COMMUNICATION_DISCONNECTED_NO_AUTONOMOUS_EXECUTION), level HIGH — is exactly the case a
+// station that rendered the score would get backwards, so `risk.level` is read directly and the
+// score is never mapped to a level here. See riskView().
 export const RISK_LEVELS = ["LOW", "ELEVATED", "HIGH", "CRITICAL", "UNKNOWN"];
 
 // Existing card tones only (ok / caution / warn / idle) — no new colour vocabulary. HIGH and
@@ -346,6 +360,28 @@ export const RISK_LEVELS = ["LOW", "ELEVATED", "HIGH", "CRITICAL", "UNKNOWN"];
 // three semantic colours can honestly support.
 export const RISK_TONE = {
   LOW: "ok", ELEVATED: "caution", HIGH: "warn", CRITICAL: "warn", UNKNOWN: "idle",
+};
+
+// Scout's risk COMPONENTS, in the order the operator reads them. Fixed here so the breakdown
+// cannot silently reorder between polls; a component Scout adds that is not in this list is
+// still displayed, appended after these (see riskComponents).
+export const RISK_COMPONENTS = ["energy", "communication", "navigation", "health", "mission"];
+
+// ── Scout's ADVISORY recommendation → the operator's compact word ──────────────────────────
+// DISPLAY ONLY, and deliberately inert. It is not a button, it does not enable or disable a
+// control, and it never produces a command: the recommendation is Scout's advice to a human,
+// and turning advice into an affordance would make the risk model a control path it was never
+// designed or authorised to be. A recommendation this build does not recognise is shown exactly
+// as Scout sent it.
+export const RECOMMENDATION_TEXT = {
+  CONTINUE: "CONTINUE",
+  CONTINUE_WITH_CAUTION: "CAUTION",
+  HOLD_RECOMMENDED: "HOLD",
+  RETURN_RECOMMENDED: "RETURN",
+};
+export const RECOMMENDATION_TONE = {
+  CONTINUE: "ok", CONTINUE_WITH_CAUTION: "caution", HOLD_RECOMMENDED: "warn",
+  RETURN_RECOMMENDED: "warn",
 };
 
 // Scout's mission/package binding vocabulary, verbatim.
@@ -554,6 +590,10 @@ export function normalizeStatus(res) {
       // literal "[object Object]" exactly where the energy verdict goes.
       status: asText(nrg.status),
       reason: asText(nrg.reason),
+      // Scout's own sentence about the verdict ("mission margin 17.27%, RTL return margin
+      // 78.92% -- both positive at effective battery 89% (PHYSICAL)."). Shown as-is where
+      // there is room for it; it is Scout's words, never reassembled from the numbers here.
+      message: asText(nrg.message),
       // Percentages, through pct(): a negative is this fleet's "unknown" sentinel, never a level.
       batteryPercent: pct(nrg.battery_percent),
       batterySource: str(nrg.battery_source),
@@ -581,13 +621,41 @@ export function normalizeStatus(res) {
       positionAgeS: num(nrg.position_age_s),
       maxPositionAgeS: num(nrg.max_position_age_s),
     },
-    // Scout's OWN risk verdict. The station reads it and never derives one — see RISK_LEVELS.
-    // Both field spellings are accepted so a Scout that ships `risk_level` needs no code change.
+    // Scout's OWN risk verdict, in full. The station reads every field and derives NONE of
+    // them — see RISK_LEVELS for the pipeline these fields come out of.
+    //
+    // `level` is the GOVERNING level and is read from `risk.level` alone. `weightedLevel` and
+    // `score` are the pre-floor inputs: they are kept so the Agent page can EXPLAIN how the
+    // governing level was reached, and they are never substituted for it. Both spellings of
+    // level/score are accepted so an older Scout that ships `risk_level` needs no code change.
     risk: {
       reported: Object.keys(rsk).length > 0,
       level: asText(first(rsk, "level", "risk_level")),
       score: num(first(rsk, "score", "risk_score")),
+      weightedScore: num(rsk.weighted_score),
+      weightedLevel: asText(rsk.weighted_level),
+      // The non-compensatory severity floor. `component_floor_level` present means ONE
+      // component was severe enough to raise the governing level on its own, whatever the
+      // weighted average said. Null is "no floor was active", not "no floor exists".
+      floorLevel: asText(rsk.component_floor_level),
+      floorReason: asText(rsk.component_floor_reason),
+      floorSource: asText(rsk.component_floor_source),
+      // The hard feasibility override — Scout's mission/RTL feasibility gate outranking the
+      // continuous model entirely. TRI-STATE: false is "Scout checked and no hard constraint
+      // is violated"; null is "Scout said nothing", and the two must not look alike.
+      hardConstraintViolated: bool3(rsk.hard_constraint_violated),
+      hardOverrideLevel: asText(rsk.hard_override_level),
+      confidence: asText(rsk.confidence),
+      recommendation: asText(rsk.recommendation),
+      dominantComponent: asText(rsk.dominant_component),
+      dominantReason: asText(rsk.dominant_reason),
+      feasibilityStatus: asText(rsk.feasibility_status),
+      // Scout's own evaluation instant. Kept RAW (its epoch seconds, or whatever Scout sends)
+      // because the age shown to the operator is computed against it at render time and must
+      // never be confused with the age of our poll — polling creates no freshness.
+      evaluatedAt: rsk.evaluated_at ?? null,
       components: isObj(rsk.components) ? rsk.components : null,
+      weights: isObj(rsk.weights) ? rsk.weights : null,
       reason: asText(first(rsk, "reason", "detail", "summary")),
     },
     missionExecutionEnabled: s.mission_execution_enabled,
@@ -879,41 +947,151 @@ export function energyView(status) {
 }
 
 /**
- * THE compact RISK status — Scout's own level, or nothing.
+ * THE compact RISK status — Scout's GOVERNING level, or nothing.
  *
- * There is no operator-side risk model and there must not be one: a risk level is a claim about
- * the vehicle's situation, and the only component that can make it is the agent that holds the
- * situation. Until Scout reports `risk.level` this reads "—", quietly. It never reads LOW.
+ * `risk.level` is read directly and is the only field that decides what is displayed. It is NOT
+ * derived from `risk.score`, and it is NOT `risk.weighted_level`: Scout's governing level is the
+ * weighted level raised by any non-compensatory component floor and then by any hard-feasibility
+ * override, so the two disagree exactly when it matters most. Scout's own worked example —
+ *
+ *     score 0.2375 · weighted_level LOW · component_floor_level HIGH
+ *     (COMMUNICATION_DISCONNECTED_NO_AUTONOMOUS_EXECUTION) · level HIGH
+ *
+ * — must display HIGH. A station that rendered the score would show LOW for a vehicle whose own
+ * agent has assessed it as HIGH, which is the single worst direction this reading can fail in.
+ *
+ * There is no operator-side risk model and there must not be one. When Scout reports no risk
+ * block this reads "—", quietly; it never reads LOW.
  *
  * A level this build does not recognise is displayed AS SENT with a neutral tone and
  * `known:false`, never bucketed into a level the operator would act on.
  *
- * @returns {{ reported, level, known, text, tone, score, detail }}
+ * The returned view also carries the EXPLANATION fields (weighted score/level, the floor, the
+ * hard override, confidence, the dominant component) so the Agent page can show how the
+ * governing level was reached. They are evidence for a human; nothing consumes them as a gate.
+ *
+ * @returns {{ reported, level, known, text, tone, score, weightedScore, weightedLevel,
+ *             floorLevel, floorReason, floorSource, floorActive, hardConstraintViolated,
+ *             hardOverrideLevel, confidence, dominantComponent, dominantReason, evaluatedAt,
+ *             governedBy, detail }}
  */
 export function riskView(status) {
   const S = status && status.present !== undefined ? status : normalizeStatus(status);
   const r = S.risk || {};
   const score = r.score ?? null;
+  const explain = {
+    score,
+    weightedScore: r.weightedScore ?? null,
+    weightedLevel: r.weightedLevel || null,
+    floorLevel: r.floorLevel || null,
+    floorReason: r.floorReason || null,
+    floorSource: r.floorSource || null,
+    floorActive: !!r.floorLevel,
+    hardConstraintViolated: r.hardConstraintViolated ?? null,
+    hardOverrideLevel: r.hardOverrideLevel || null,
+    confidence: r.confidence || null,
+    dominantComponent: r.dominantComponent || null,
+    dominantReason: r.dominantReason || null,
+    evaluatedAt: r.evaluatedAt ?? null,
+  };
   if (!r.reported || !r.level) {
-    return { reported: r.reported === true, level: null, known: false, text: "—", tone: "idle",
-      score,
+    return { ...explain, reported: r.reported === true, level: null, known: false, text: "—",
+      tone: "idle", governedBy: null,
       detail: r.reported === true
-        ? "Scout reported a risk block but no level — nothing is claimed about risk."
+        ? "Scout reported a risk block but no governing level — nothing is claimed about risk."
         : "This Scout does not report an agent risk level yet. The operator station never "
           + "computes one." };
   }
   const level = r.level.toUpperCase();
   const known = RISK_LEVELS.includes(level);
+
+  // WHICH stage of Scout's pipeline produced the governing level. Reported, not recomputed:
+  // this only names the stage whose level Scout's own fields show matching the governing one,
+  // and stays null when they do not — it never re-runs the floor or the override logic.
+  const eq = (v) => !!v && String(v).toUpperCase() === level;
+  const governedBy = r.hardConstraintViolated === true && eq(r.hardOverrideLevel) ? "hard"
+    : eq(r.floorLevel) ? "floor"
+      : eq(r.weightedLevel) ? "weighted" : null;
+
+  // The tooltip. Deliberately a short line and NOT the components object: dumping the nested
+  // per-component evidence here produced a multi-kilobyte hover on live Scout, which is not a
+  // tooltip anyone reads. The breakdown belongs on the Agent page (see riskComponents).
+  const detail = [
+    known ? null : "Risk level not recognised by this build — shown exactly as Scout sent it",
+    r.hardConstraintViolated === true
+      ? `hard constraint violated${r.hardOverrideLevel ? ` → ${r.hardOverrideLevel}` : ""}` : null,
+    r.floorLevel
+      ? `severity floor ${r.floorLevel}${r.floorReason ? ` (${r.floorReason})` : ""}` : null,
+    r.weightedLevel || r.weightedScore !== null
+      ? `weighted ${r.weightedLevel || "—"}${r.weightedScore === null ? "" : ` ${r.weightedScore}`}`
+      : score === null ? null : `score ${score}`,
+    r.dominantComponent
+      ? `dominant ${r.dominantComponent}${r.dominantReason ? ` (${r.dominantReason})` : ""}` : null,
+    r.confidence ? `confidence ${r.confidence}` : null,
+    r.reason || null,
+  ].filter(Boolean).join(" · ") || `Scout reports risk level ${level}.`;
+
+  return { ...explain, reported: true, level, known, text: level,
+    tone: known ? RISK_TONE[level] : "idle", governedBy, detail };
+}
+
+/**
+ * Scout's ADVISORY recommendation, mapped to the operator's compact word.
+ *
+ * DISPLAY ONLY. This never becomes a button, never enables or disables a control and never
+ * produces a command — see RECOMMENDATION_TEXT. An unrecognised recommendation is shown exactly
+ * as Scout sent it, with a neutral tone, rather than being bucketed into one of the four.
+ *
+ * @returns {{ reported, code, text, tone, known }}
+ */
+export function recommendationView(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const code = (S.risk && S.risk.recommendation) || null;
+  if (!code) return { reported: false, code: null, text: "—", tone: "idle", known: false };
+  const up = code.toUpperCase();
+  const known = Object.prototype.hasOwnProperty.call(RECOMMENDATION_TEXT, up);
   return {
-    reported: true, level, known, text: level,
-    tone: known ? RISK_TONE[level] : "idle", score,
-    detail: [
-      known ? null : "Risk level not recognised by this build — shown exactly as Scout sent it",
-      score === null ? null : `score ${score}`,
-      r.reason || null,
-      r.components ? asText(r.components) : null,
-    ].filter(Boolean).join(" · ") || `Scout reports risk level ${level}.`,
+    reported: true, code: up, known,
+    text: known ? RECOMMENDATION_TEXT[up] : up,
+    tone: known ? RECOMMENDATION_TONE[up] : "idle",
   };
+}
+
+/**
+ * Scout's per-component risk breakdown, as a stable ordered list for the diagnostics table.
+ *
+ * PURE PRESENTATION of Scout's own numbers. `weightedContribution` is read from Scout's
+ * `weighted_score` field and is NOT computed as score × weight here: recomputing it would be a
+ * second model quietly disagreeing with the first whenever Scout changes how a component
+ * contributes. When Scout omits it, the cell stays null and reads "—".
+ *
+ * RISK_COMPONENTS fixes the order so the table cannot reshuffle between polls; a component Scout
+ * adds later is appended after the known ones rather than dropped.
+ *
+ * @returns {Array<{ name, score, weight, weightedContribution, reason, evidence }>}
+ */
+export function riskComponents(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const comps = (S.risk && S.risk.components) || null;
+  if (!isObj(comps)) return [];
+  const weights = (S.risk && S.risk.weights) || null;
+  const names = [
+    ...RISK_COMPONENTS.filter((n) => n in comps),
+    ...Object.keys(comps).filter((n) => !RISK_COMPONENTS.includes(n)),
+  ];
+  return names.map((name) => {
+    const c = isObj(comps[name]) ? comps[name] : {};
+    return {
+      name: asText(c.name) || name,
+      score: num(c.score),
+      // Scout reports the weight on the component AND in a top-level `weights` map. The
+      // component's own value wins; the map is the fallback for a Scout that only sends one.
+      weight: num(c.weight) ?? (isObj(weights) ? num(weights[name]) : null),
+      weightedContribution: num(c.weighted_score),
+      reason: asText(c.reason),
+      evidence: isObj(c.evidence) ? c.evidence : null,
+    };
+  });
 }
 
 /**
@@ -1811,14 +1989,25 @@ export function missionCardView(status, {
     // The two COMPACT LIVE STATUSES, both of them Scout's own verdict and neither of them
     // computed here. ENERGY answers "can the remaining planned mission be completed?" and carries
     // the MISSION margin — but it reads RTL INSUFFICIENT when Scout can complete the run and not
-    // return from it, because Scout's Start gate requires both. RISK is Scout's authoritative
-    // level; until Scout reports one it is a quiet "—" and never a reassuring LOW.
+    // return from it, because Scout's Start gate requires both. RISK is Scout's GOVERNING
+    // level (`risk.level`, floors and hard overrides already applied); until Scout reports one
+    // it is a quiet "—" and never a reassuring LOW.
+    //
+    // THE TWO ARE INDEPENDENT AND ARE MEANT TO BE READ TOGETHER. Feasibility answers "can this
+    // be finished with reserve intact?"; risk answers "how close are we to conditions we do not
+    // want?". `ENERGY FEASIBLE +4%` beside `RISK HIGH` is not a contradiction to be smoothed
+    // over — it is the honest reading of a run that Scout can still complete while its energy
+    // margin has tightened enough to raise the governing level. Neither line is ever restated in
+    // the other's terms, and no third "TIGHT" verdict is invented on this station to bridge them.
     //
     // Set unconditionally, BEFORE the unsupported / unavailable / replanning / in-flight returns
     // below, so every path leaves the card with a defined, honest reading rather than an absent
     // field a renderer would have to guess at.
     energy: energyView(S),
     risk: riskView(S),
+    // Scout's advisory word (CONTINUE / CAUTION / HOLD / RETURN). Display only — it is not a
+    // button, it gates nothing, and it produces no command.
+    recommendation: recommendationView(S),
   };
 
   // Nothing may be claimed about an older or unreachable Scout — and the operator is told so in
