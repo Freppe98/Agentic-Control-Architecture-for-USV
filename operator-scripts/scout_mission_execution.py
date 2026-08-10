@@ -357,43 +357,129 @@ def post_rearm(base):
     return _op("rearm", base, {})
 
 
-# ── Read-only binding reproof (task: full-refresh Section 11/12) ──────────────────────────
-# NOT YET IMPLEMENTED BY ANY DEPLOYED SCOUT. This is the operator-side CLIENT for a proposed
-# read-only Local Agent operation that closes the one gap a pure GET refresh cannot: Scout's
-# `binding_state`/`verified_route_hash` are Scout's own internal accounting (see
-# `summarize_status` / `binding_view` in mission_lifecycle.py) and nothing in this station
-# writes them — only a mission-publish package POST has ever given Scout a reason to move them.
-# A vehicle that already carries the approved route (proved by a fresh Pixhawk read-back and a
-# matching stored package) can therefore be stuck UNBOUND after a restart even though nothing is
-# actually wrong, and nothing short of re-uploading the (unchanged) mission has recovered it.
+# ── Read-only binding reproof (Scout's FINAL contract) ─────────────────────────────────────
+# POST /agent/mission_execution/reprove_binding closes the one gap a pure GET refresh cannot:
+# Scout's `binding_state`/`verified_route_hash` are Scout's own internal accounting (see
+# `summarize_status` / `binding_view` in mission_lifecycle.py) and nothing in this station writes
+# them — only a mission-publish package POST, or a LIVE mission execution binding its identity,
+# has ever given Scout a reason to move them.
 #
-# POST /agent/mission_execution/reprove is the proposed remedy: Scout re-evaluates its OWN
-# binding from ITS current package plus a fresh Pixhawk proof and, ONLY if that proof is
-# conclusive, restores `verified_route_hash`/`binding_state` from it — issuing NO vehicle
-# command of any kind (no LOITER, no mission write, no mode change). See
-# mission_full_refresh.py for the full contract this station expects of it and the exact
-# rebind rule (Section 12): current package usable + package route hash valid + current
-# Pixhawk route hash proven + expected identities match + lifecycle state allows binding: only
-# then may Scout restore the binding, and only from evidence gathered in that call, never from
-# a previously persisted flag.
+# THE SEMANTIC CORRECTION THIS CONTRACT MADE PRECISE — read this before touching binding_state
+# anywhere in this station: `binding_state == BOUND` means a LIVE mission execution currently
+# owns/binds the original mission identity. It is NOT "the route is proven" and it is NOT a
+# precondition for Start. A completely healthy, verified, READY mission BEFORE Start correctly
+# reports `binding_state == UNBOUND` while `verified_route_hash`, `state == READY`,
+# `start_eligible` and `can_start` all say the route is proven and the mission may run. Binding
+# only becomes meaningful — and BOUND — once a run is actually RUNNING and owns that identity.
+# A station that reads idle UNBOUND as a failure, or requires BOUND for Start, is reproducing
+# exactly the bug this contract exists to correct.
 #
-# An older/unmodified Scout 404s this route today, which the shared transport already reports
-# as `outcome="unsupported"` — the SAME honest "an older Scout" handling every other route in
-# this module gets, never a fabricated success. Full Refresh treats that outcome as "no
-# read-only reproof is available" and reports Scout's CURRENT binding_state exactly as
+# Scout re-evaluates its OWN binding from ITS current package plus a fresh Pixhawk proof and,
+# only if that proof is conclusive, restores `verified_route_hash` from it — issuing NO vehicle
+# command of any kind (no LOITER, no mission write, no mode change). It reports one of the
+# outcomes in REPROVE_OUTCOMES below, verbatim, in the response body's `outcome` field; see
+# `interpret_reprove_binding` for how this station narrows that into REPROVE_SUCCESS_OUTCOMES /
+# REPROVE_INCONCLUSIVE_OUTCOMES and mission_full_refresh.py for the full contract this station
+# expects of it (current package usable + package route hash valid + current Pixhawk route hash
+# proven + expected identities match + lifecycle state allows binding).
+#
+# An older/unmodified Scout 404s this route, which the shared transport already reports as
+# `outcome="unsupported"` — the SAME honest "an older Scout" handling every other route in this
+# module gets, never a fabricated success. Full Refresh treats that as "no read-only reproof is
+# available" and reports Scout's CURRENT binding_state exactly as
 # GET /agent/mission_execution/status shows it — it never sets binding_state=BOUND itself.
-def post_reprove(base, mission_id=None):
+
+# Scout's own reprove-outcome vocabulary, verbatim (task Section 3). BUSY is carried on the
+# HTTP transport as a definite 409 refusal; every other outcome arrives in the response body.
+REPROVE_REPROVED = "REPROVED"
+REPROVE_ALREADY_PROVEN = "ALREADY_PROVEN"
+REPROVE_EVIDENCE_UNAVAILABLE = "EVIDENCE_UNAVAILABLE"
+REPROVE_PACKAGE_MISMATCH = "PACKAGE_MISMATCH"
+REPROVE_PIXHAWK_MISMATCH = "PIXHAWK_MISMATCH"
+REPROVE_MISSION_ID_MISMATCH = "MISSION_ID_MISMATCH"
+REPROVE_LIFECYCLE_NOT_REPROVABLE = "LIFECYCLE_NOT_REPROVABLE"
+REPROVE_NO_CURRENT_PACKAGE = "NO_CURRENT_PACKAGE"
+REPROVE_NO_CURRENT_MISSION = "NO_CURRENT_MISSION"
+REPROVE_BUSY = "BUSY"
+REPROVE_INTERNAL_ERROR = "INTERNAL_ERROR"
+REPROVE_OUTCOMES = frozenset({
+    REPROVE_REPROVED, REPROVE_ALREADY_PROVEN, REPROVE_EVIDENCE_UNAVAILABLE,
+    REPROVE_PACKAGE_MISMATCH, REPROVE_PIXHAWK_MISMATCH, REPROVE_MISSION_ID_MISMATCH,
+    REPROVE_LIFECYCLE_NOT_REPROVABLE, REPROVE_NO_CURRENT_PACKAGE, REPROVE_NO_CURRENT_MISSION,
+    REPROVE_BUSY, REPROVE_INTERNAL_ERROR,
+})
+# REPROVED and ALREADY_PROVEN are the two outcomes Full Refresh continues to final readiness
+# evaluation from (task Section 10) — a genuinely re-proved route, or an idempotent no-op
+# re-affirmation of proof that was already current. Neither one implies or requires BOUND.
+REPROVE_SUCCESS_OUTCOMES = frozenset({REPROVE_REPROVED, REPROVE_ALREADY_PROVEN})
+# Outcomes that mean Scout could not reach a conclusive verdict AT ALL this round — missing
+# evidence, contention, or an internal fault — as distinct from a verdict Scout DID reach and
+# reported (a mismatch, or a lifecycle state that cannot be re-proved). A conclusive mismatch is
+# never re-labelled EVIDENCE_UNAVAILABLE, and an inconclusive round is never re-labelled a
+# mismatch — see task Section 10.
+REPROVE_INCONCLUSIVE_OUTCOMES = frozenset({
+    REPROVE_EVIDENCE_UNAVAILABLE, REPROVE_NO_CURRENT_PACKAGE, REPROVE_NO_CURRENT_MISSION,
+    REPROVE_BUSY, REPROVE_INTERNAL_ERROR,
+})
+# Outcomes that are a DEFINITE mismatch Scout itself proved — fail-closed, and reported
+# explicitly (never silently repaired, never weakened). PACKAGE_MISMATCH is additionally
+# reclassified by the Operator's own three-way reconciliation before it reaches the operator
+# (task Section 9) — Scout only sees package vs Pixhawk, not the approved/Pixhawk/package triple.
+REPROVE_DEFINITE_MISMATCH_OUTCOMES = frozenset({
+    REPROVE_PACKAGE_MISMATCH, REPROVE_PIXHAWK_MISMATCH, REPROVE_MISSION_ID_MISMATCH,
+})
+
+
+def post_reprove_binding(base, mission_id=None):
     """Ask Scout to RE-EVALUATE (never fabricate) mission-execution binding from its current
     package and a fresh Pixhawk proof, with NO vehicle command of any kind. `mission_id` is the
-    operator's active persisted mission, sent so Scout can decline to bind against a route the
-    operator does not currently approve — the same discipline `post_start`/`post_stop` use.
+    operator's active persisted mission, sent as an EXPECTED identity constraint only — Scout
+    independently proves current state and does not treat this id as proof.
 
-    Returns the normal scout_replan.write() three-outcome result. `unsupported` (404) means this
-    Scout has not implemented the route yet; the caller must treat that exactly like any other
-    older-Scout gap and fall back to observing binding_state as Scout currently reports it,
-    never inventing BOUND locally."""
+    Returns the normal scout_replan.write() three-outcome transport result (`scout` carries
+    Scout's body verbatim). `unsupported` (404) means this Scout has not implemented the route
+    yet; the caller must treat that exactly like any other older-Scout gap and fall back to
+    observing binding_state as Scout currently reports it, never inventing BOUND locally. Pass
+    the raw result to `interpret_reprove_binding` to narrow it into Scout's own outcome word."""
     body = {"mission_id": mission_id} if mission_id else {}
-    return _op("reprove", base, body)
+    return _op("reprove_binding", base, body)
+
+
+def interpret_reprove_binding(result):
+    """Narrow a transport result from `post_reprove_binding` into Scout's own reprove-outcome
+    vocabulary (REPROVE_OUTCOMES) — never fabricated, never rounded up. Adds to the transport
+    result:
+
+      reprove_outcome     one of REPROVE_OUTCOMES, Scout's own word from the response body, or
+                          None when Scout never told us one (unsupported / unreachable / a
+                          transport failure whose verdict never arrived).
+      reprove_supported   False only for a definite 404 (an older Scout) — every other gap is
+                          reported through reprove_outcome / the transport outcome instead, never
+                          conflated with "this Scout does not implement the route".
+      reprove_success     True for REPROVED / ALREADY_PROVEN (REPROVE_SUCCESS_OUTCOMES).
+      reprove_inconclusive True when Scout could not reach a verdict this round at all
+                          (REPROVE_INCONCLUSIVE_OUTCOMES) — missing evidence, contention, or an
+                          internal fault, distinct from a mismatch Scout DID prove.
+      reprove_fail_closed True for a definite mismatch Scout itself proved
+                          (REPROVE_DEFINITE_MISMATCH_OUTCOMES).
+    """
+    out = dict(result or {})
+    body = _body(out)
+    transport = out.get("outcome")
+    raw = _str_or_none(body.get("outcome"))
+    reprove_outcome = raw.upper() if raw and raw.upper() in REPROVE_OUTCOMES else None
+    # BUSY is a definite 409 refusal on the transport (task Section 3): the HTTP status is the
+    # authoritative signal for it, whether or not Scout also echoes it in the body.
+    if out.get("http_status") == 409:
+        reprove_outcome = REPROVE_BUSY
+    out.update({
+        "reprove_outcome": reprove_outcome,
+        "reprove_supported": transport != scout_replan.OUTCOME_UNSUPPORTED,
+        "reprove_success": reprove_outcome in REPROVE_SUCCESS_OUTCOMES,
+        "reprove_inconclusive": reprove_outcome in REPROVE_INCONCLUSIVE_OUTCOMES,
+        "reprove_fail_closed": reprove_outcome in REPROVE_DEFINITE_MISMATCH_OUTCOMES,
+    })
+    return out
 
 
 # ── Operation-result interpretation (the HTTP-200-is-not-success rule) ────────────────────

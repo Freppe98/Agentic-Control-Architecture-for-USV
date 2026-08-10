@@ -38,7 +38,7 @@ def approved_record(*, route_hash=HASH_A, count=5, **over):
 def preflight_result(*, can_start=True, proof_complete=True, mission_id=MISSION_ID,
                       pixhawk_hash=HASH_A, pixhawk_reachable=True, pixhawk_partial=False,
                       package_hash=HASH_A, package_reachable=True, package_consistent=True,
-                      binding_state="BOUND", verified_route_hash=HASH_A, blockers=None):
+                      binding_state="UNBOUND", verified_route_hash=HASH_A, blockers=None):
     readiness = {
         "vehicle_mission": {
             "readback_hash": pixhawk_hash, "readback_reachable": pixhawk_reachable,
@@ -64,6 +64,13 @@ def preflight_result(*, can_start=True, proof_complete=True, mission_id=MISSION_
         "summary": {"binding_state": binding_state, "present": True},
         "authority": {"authority": "OPERATOR"},
     }
+
+
+def reprove_body(scout_outcome, *, http_status=200):
+    """A raw transport result carrying Scout's own reprove-outcome WORD in the body — the shape
+    `deps.reprove()` returns and `scout_mission_execution.interpret_reprove_binding` narrows."""
+    return {"outcome": scout_replan.OUTCOME_ACCEPTED, "http_status": http_status,
+            "scout": {"accepted": True, "outcome": scout_outcome}}
 
 
 class FakeDeps:
@@ -181,17 +188,24 @@ class RunFullRefreshTests(unittest.TestCase):
         # NOTHING was contacted — no reprove, no preflight, no reads of any kind.
         self.assertEqual(deps.calls, [])
 
-    def test_healthy_current_mission_reaches_matched_and_bound(self):
-        # The central regression scenario (task Section 21), the HEALTHY end state: approved,
-        # Pixhawk and package all carry H, and (having reproved) Scout now reports BOUND.
+    def test_healthy_idle_mission_reaches_matched_and_ready_with_binding_unbound(self):
+        # THE CORRECTED CENTRAL REGRESSION (task Sections 1, 17): approved, Pixhawk and package
+        # all carry H, Scout REPROVES the route (outcome REPROVED), and the mission is IDLE — so
+        # Scout correctly reports binding UNBOUND. THIS IS THE HEALTHY END STATE, not a failure:
+        # BOUND means a LIVE execution owns the mission identity, which is not true before Start.
         deps = FakeDeps(mission_record=approved_record(),
-                        reprove={"outcome": scout_replan.OUTCOME_ACCEPTED},
-                        preflight=preflight_result(binding_state="BOUND"))
+                        reprove=reprove_body("REPROVED"),
+                        preflight=preflight_result(binding_state="UNBOUND"))
         out = run(deps)
         self.assertTrue(out["ok"])
         self.assertEqual(out["mission"]["reconciliation"], fr.MATCHED)
-        self.assertEqual(out["binding"]["binding_state"], "BOUND")
+        self.assertEqual(out["binding"]["binding_state"], "UNBOUND")
+        self.assertEqual(out["binding"]["reproof_outcome"], "REPROVED")
+        self.assertTrue(out["binding"]["reproof_success"])
+        self.assertFalse(out["binding"]["reproof_inconclusive"])
+        self.assertFalse(out["binding"]["reproof_fail_closed"])
         self.assertTrue(out["binding"]["reproof_supported"])
+        self.assertIsNotNone(out["binding"]["verified_route_hash"])
         self.assertEqual(out["readiness"]["can_start"], True)
         self.assertEqual(out["stages"][-1]["stage"], fr.STAGE_COMPLETE)
         stage_names = [s["stage"] for s in out["stages"]]
@@ -201,6 +215,31 @@ class RunFullRefreshTests(unittest.TestCase):
             fr.STAGE_REPROVING_AGENT_BINDING, fr.STAGE_READING_HOME, fr.STAGE_READING_EVIDENCE,
             fr.STAGE_EVALUATING_FEASIBILITY, fr.STAGE_EVALUATING_RISK,
             fr.STAGE_VERIFYING_FINAL_READINESS, fr.STAGE_COMPLETE])
+
+    def test_repeated_refresh_already_proven_is_idempotent_and_still_healthy(self):
+        # Task Section 18: a second refresh, Scout answers ALREADY_PROVEN — a no-op/idempotent
+        # healthy result, not a downgrade from the first REPROVED.
+        deps = FakeDeps(mission_record=approved_record(),
+                        reprove=reprove_body("ALREADY_PROVEN"),
+                        preflight=preflight_result(binding_state="UNBOUND"))
+        out = run(deps)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["binding"]["reproof_outcome"], "ALREADY_PROVEN")
+        self.assertTrue(out["binding"]["reproof_success"])
+        self.assertEqual(out["readiness"]["can_start"], True)
+
+    def test_running_mission_keeps_binding_bound_and_is_not_reset(self):
+        # Task Sections 7, 19 — the ACTIVE EXECUTION rule: a RUNNING mission's binding is
+        # EXPECTED to be BOUND, Scout's reprove answers ALREADY_PROVEN, and Full Refresh must not
+        # collapse, rewind or reinterpret that as anything other than a healthy active result.
+        deps = FakeDeps(mission_record=approved_record(),
+                        reprove=reprove_body("ALREADY_PROVEN"),
+                        preflight=preflight_result(binding_state="BOUND"))
+        out = run(deps)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["binding"]["binding_state"], "BOUND")
+        self.assertEqual(out["binding"]["reproof_outcome"], "ALREADY_PROVEN")
+        self.assertTrue(out["binding"]["reproof_success"])
 
     def test_reprove_is_attempted_before_the_fresh_proof_is_read(self):
         # Ordering matters: if reprove ran AFTER preflight, a real Scout's rebind would only show
@@ -221,6 +260,7 @@ class RunFullRefreshTests(unittest.TestCase):
         out = run(deps)
         self.assertEqual(out["binding"]["binding_state"], "UNBOUND")
         self.assertFalse(out["binding"]["reproof_supported"])
+        self.assertIsNone(out["binding"]["reproof_outcome"])
         self.assertIsNone(out["binding"]["verified_route_hash"])
         self.assertEqual(out["readiness"]["can_start"], False)
         # Still a COMPLETE, coherent refresh — Full Refresh succeeded at TELLING the operator
@@ -236,7 +276,77 @@ class RunFullRefreshTests(unittest.TestCase):
                                 preflight=preflight_result(binding_state="UNBOUND"))
                 out = run(deps)
                 self.assertEqual(out["binding"]["binding_state"], "UNBOUND")
-                self.assertEqual(out["binding"]["reproof_outcome"], outcome)
+                # No Scout body carried a recognized outcome word for these transport failures —
+                # the SCOUT outcome stays honestly None; the raw transport verdict is preserved
+                # under its own field so diagnostics do not lose it.
+                self.assertIsNone(out["binding"]["reproof_outcome"])
+                self.assertEqual(out["binding"]["reproof_transport_outcome"], outcome)
+
+    def test_reprove_definite_mismatch_outcomes_are_fail_closed_but_do_not_alone_fail_the_refresh(self):
+        # Task Section 10: PACKAGE_MISMATCH / PIXHAWK_MISMATCH / MISSION_ID_MISMATCH are
+        # CONCLUSIVE verdicts Scout itself proved — exactly like the Operator's own
+        # PIXHAWK_MISMATCH reconciliation, a definite answer does not by itself make the refresh
+        # incomplete. Start stays blocked via Scout's own can_start, read from a fresh status.
+        for scout_outcome in ("PACKAGE_MISMATCH", "PIXHAWK_MISMATCH", "MISSION_ID_MISMATCH"):
+            with self.subTest(scout_outcome=scout_outcome):
+                deps = FakeDeps(mission_record=approved_record(),
+                                reprove=reprove_body(scout_outcome),
+                                preflight=preflight_result(binding_state="UNBOUND",
+                                                            can_start=False))
+                out = run(deps)
+                self.assertEqual(out["binding"]["reproof_outcome"], scout_outcome)
+                self.assertTrue(out["binding"]["reproof_fail_closed"])
+                self.assertFalse(out["binding"]["reproof_success"])
+                self.assertFalse(out["binding"]["reproof_inconclusive"])
+                self.assertEqual(out["readiness"]["can_start"], False)
+                # The refresh itself still ran to a complete, conclusive answer.
+                self.assertTrue(out["ok"])
+
+    def test_reprove_inconclusive_outcomes_make_the_refresh_incomplete(self):
+        # Task Section 10: EVIDENCE_UNAVAILABLE / NO_CURRENT_PACKAGE / NO_CURRENT_MISSION / BUSY /
+        # INTERNAL_ERROR mean Scout reached NO verdict this round — an unread input, exactly like
+        # an unreachable Pixhawk or package, so the refresh is reported INCOMPLETE (`ok:false`)
+        # even though the OPERATOR's own three-way reconciliation is otherwise MATCHED.
+        for scout_outcome in ("EVIDENCE_UNAVAILABLE", "NO_CURRENT_PACKAGE", "NO_CURRENT_MISSION",
+                              "INTERNAL_ERROR"):
+            with self.subTest(scout_outcome=scout_outcome):
+                deps = FakeDeps(mission_record=approved_record(),
+                                reprove=reprove_body(scout_outcome),
+                                preflight=preflight_result(binding_state="UNBOUND"))
+                out = run(deps)
+                self.assertEqual(out["binding"]["reproof_outcome"], scout_outcome)
+                self.assertTrue(out["binding"]["reproof_inconclusive"])
+                self.assertFalse(out["binding"]["reproof_success"])
+                self.assertFalse(out["binding"]["reproof_fail_closed"])
+                self.assertEqual(out["mission"]["reconciliation"], fr.MATCHED)
+                self.assertFalse(out["ok"])
+
+    def test_reprove_busy_is_a_definite_409_and_makes_the_refresh_incomplete(self):
+        # Task Section 3/24: BUSY is carried on the transport as a definite HTTP 409, whether or
+        # not Scout also echoes it in the body. Handled cleanly — no exception, no retry storm —
+        # and the refresh is reported incomplete rather than a false success or a crash.
+        deps = FakeDeps(mission_record=approved_record(),
+                        reprove={"outcome": scout_replan.OUTCOME_REJECTED, "http_status": 409,
+                                 "scout": {}},
+                        preflight=preflight_result(binding_state="UNBOUND"))
+        out = run(deps)
+        self.assertEqual(out["binding"]["reproof_outcome"], "BUSY")
+        self.assertTrue(out["binding"]["reproof_inconclusive"])
+        self.assertFalse(out["ok"])
+
+    def test_reprove_lifecycle_not_reprovable_neither_mutates_nor_fails_the_refresh(self):
+        # Task Section 10: LIFECYCLE_NOT_REPROVABLE may be entirely legitimate (SUSPENDED/FAILED/
+        # RUNNING/etc.) — nothing is mutated (this module has no write path besides the reprove
+        # POST itself) and it does not, by itself, mark the refresh incomplete.
+        deps = FakeDeps(mission_record=approved_record(),
+                        reprove=reprove_body("LIFECYCLE_NOT_REPROVABLE"),
+                        preflight=preflight_result(binding_state="BOUND"))
+        out = run(deps)
+        self.assertEqual(out["binding"]["reproof_outcome"], "LIFECYCLE_NOT_REPROVABLE")
+        self.assertFalse(out["binding"]["reproof_success"])
+        self.assertFalse(out["binding"]["reproof_inconclusive"])
+        self.assertFalse(out["binding"]["reproof_fail_closed"])
+        self.assertTrue(out["ok"])
 
     def test_pixhawk_mismatch_is_definite_and_fails_the_readiness_gate_not_the_refresh(self):
         deps = FakeDeps(mission_record=approved_record(route_hash=HASH_A),
@@ -296,8 +406,8 @@ class RunFullRefreshTests(unittest.TestCase):
     def test_result_is_read_only_by_construction(self):
         # The Deps interface mission_full_refresh is built against has exactly ONE call that can
         # reach Scout with a write (`reprove`, and that route's own contract forbids commanding
-        # the vehicle — see scout_mission_execution.post_reprove). Every other Deps method is a
-        # read. This test proves the module calls nothing outside that fixed vocabulary.
+        # the vehicle — see scout_mission_execution.post_reprove_binding). Every other Deps method
+        # is a read. This test proves the module calls nothing outside that fixed vocabulary.
         deps = FakeDeps(mission_record=approved_record())
         run(deps)
         allowed = {"reprove", "preflight", "replan_status", "home", "agent_state", "record"}

@@ -346,9 +346,10 @@ test("no blocker is shown while an operation of ours is in flight", () => {
 test("the card body carries no paragraph — every long explanation is a title tooltip", () => {
   // The bound is an UPPER limit; sliceOf still stops at the function's own closing brace, so
   // raising it as the card grows keeps the guard reading exactly one function. (It was 8000
-  // until the card gained its completion, replacement-conflict, authority and battery slots, and
-  // 14000 until the ENERGY/RISK/ADVICE live rows gained their contract commentary.)
-  const render = sliceOf("function renderAgentMission", 17000);
+  // until the card gained its completion, replacement-conflict, authority and battery slots,
+  // 14000 until the ENERGY/RISK/ADVICE live rows gained their contract commentary, and 17000
+  // until the Full Refresh note gained its reprove-outcome headline mapping.)
+  const render = sliceOf("function renderAgentMission", 20000);
   // Every text slot the card renders must be paired with a title attribute.
   for (const pair of [/class="amx-h" title=/, /class="amx-note\$\{[\s\S]*?\}" title=/,
     /class="amx-result [\s\S]*?" title=/,
@@ -394,6 +395,35 @@ test("firstClause and shortMissionId shorten without inventing", () => {
   assert.equal(shortMissionId("msn-04fcc4a91f137"), "msn-04fcc4…f137");
   assert.equal(shortMissionId("msn-short"), "msn-short");
   assert.equal(shortMissionId(null), null);
+});
+
+// ── Full Refresh note: reprove-outcome wording (task Sections 12/13) ────────────────────
+// binding_state=BOUND means a LIVE execution owns the mission identity — it is NOT a route-proof
+// signal, so the note's headline must never call a healthy idle UNBOUND a failure, and must
+// summarize Scout's own reprove-outcome word the way the task specifies, never the generic
+// "binding failed" the old implementation would have shown.
+test("the Full Refresh note never says 'binding failed' for a healthy idle mission", () => {
+  const render = sliceOf("function renderAgentMission", 20000);
+  assert.doesNotMatch(render, /[Bb]inding failed/);
+  assert.doesNotMatch(render, /UNBOUND.*fail/i);
+});
+
+test("the Full Refresh note headline covers REPROVED, ALREADY_PROVEN, and the fail-closed / " +
+  "incomplete outcomes", () => {
+  const render = sliceOf("function renderAgentMission", 20000);
+  // Successful idle proof and its idempotent repeat (task Section 13).
+  assert.match(render, /route verified and ready/);
+  assert.match(render, /current proof already valid/);
+  // A genuine mismatch — reclassified through the Operator's own reconciliation (Section 9),
+  // never Scout's raw PACKAGE_MISMATCH word displayed as the final system classification.
+  assert.match(render, /planning package synchronization required/);
+  assert.match(render, /flight-controller route does not match the approved mission/);
+  assert.match(render, /MISSION_ID_MISMATCH/);
+  // Inconclusive rounds (BUSY, EVIDENCE_UNAVAILABLE, …) read as incomplete, never a mismatch.
+  assert.match(render, /already in progress on Scout/);
+  assert.match(render, /mission evidence unavailable/);
+  // The raw binding word is diagnostic detail only — kept in the tooltip, not the headline.
+  assert.match(render, /const bindingDetail =/);
 });
 
 // ── F. Safety and gating are untouched by the layout change ─────────────────────────────

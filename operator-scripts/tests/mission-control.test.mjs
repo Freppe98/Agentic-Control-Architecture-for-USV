@@ -946,6 +946,38 @@ test("NOT_READY + start_eligible + authority_blocks_start after a Stop STILL off
   assert.notEqual(card.tone, "warn");
 });
 
+// ── K3. binding_state=UNBOUND before Start is HEALTHY, never a Start blocker ────────────
+// The corrected Scout contract (Full Refresh alignment): binding_state=BOUND means a LIVE
+// execution owns the mission identity — it is NOT a route-proof signal and is NEVER a Start
+// precondition (that would be circular: BOUND only occurs AFTER Start). A completely healthy,
+// verified, READY mission before Start correctly reports binding UNBOUND while
+// verified_route_hash/state/start_eligible/can_start all say the route is proven.
+test("a proven, READY, idle mission offers Start even though binding is UNBOUND", () => {
+  const s = S({ state: "READY", can_start: true, mission_id: "msn-1",
+    start_eligible: true, execution_ready: true, authority_blocks_start: false,
+    binding: { binding_state: "UNBOUND", verified_route_hash: "sha256:aaaa",
+      bound_original_mission_id: null } });
+  assert.equal(s.binding.state, "UNBOUND");
+  const gate = startGate(s, { connected: true });
+  assert.equal(gate.canStart, true, "UNBOUND must never block a proven, eligible Start");
+
+  const ctl = lifecycleControls(s, {});
+  assert.deepEqual(actions(ctl), ["start"]);
+  assert.equal(byAction(ctl, "start").enabled, true);
+});
+
+test("binding BOUND is expected only for a live execution, not a Start precondition", () => {
+  // Start availability never REQUIRES binding_state === "BOUND" — the gate does not read the
+  // binding STATE at all except to check for a blocking conflict (STALE_MISMATCH / an active
+  // replacement conflict code), which UNBOUND is not.
+  const unbound = startGate(S({ state: "READY", can_start: true, start_eligible: true,
+    mission_id: "msn-1", binding: { binding_state: "UNBOUND" } }), { connected: true });
+  const bound = startGate(S({ state: "READY", can_start: true, start_eligible: true,
+    mission_id: "msn-1", binding: { binding_state: "BOUND" } }), { connected: true });
+  assert.equal(unbound.canStart, true);
+  assert.equal(bound.canStart, true);
+});
+
 test("a Stop with no revised route says so instead of claiming a restore that never happened", () => {
   const s = S({ state: "NOT_READY", mode: "LOITER", start_eligible: true,
     stop: { ...STOP_OK, original_restored: false, revised_hash: null } });

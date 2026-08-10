@@ -6202,7 +6202,10 @@ def _record_full_refresh_operation(result):
         "started_at": result.get("started_at"), "completed_at": result.get("completed_at"),
         "duration_s": result.get("duration_s"),
         "reconciliation": mission.get("reconciliation"),
+        # `binding_state` is diagnostic only — UNBOUND is the expected, healthy value for an idle
+        # mission (see mission_full_refresh.py), never treated as this operation's verdict.
         "binding_state": binding.get("binding_state"),
+        "reproof_outcome": binding.get("reproof_outcome"),
         "reproof_supported": binding.get("reproof_supported"),
         "can_start": readiness.get("can_start"),
         "error_code": result.get("error_code"),
@@ -6212,7 +6215,8 @@ def _record_full_refresh_operation(result):
         del full_refresh_operations[:len(full_refresh_operations) - MAX_FULL_REFRESH_OPERATIONS]
     print(f"[FULL_REFRESH] {entry['vehicle_id']} op={entry['operation_id']} "
           f"reconciliation={entry['reconciliation']} binding={entry['binding_state']} "
-          f"can_start={entry['can_start']} ok={entry['ok']} duration={entry['duration_s']}s")
+          f"reprove={entry['reproof_outcome']} can_start={entry['can_start']} ok={entry['ok']} "
+          f"duration={entry['duration_s']}s")
     return entry
 
 
@@ -6257,7 +6261,7 @@ def _full_refresh_deps():
         mission_record=lambda mid: original_missions.get(mid),
         run_preflight=lambda vid, base, *, fresh: mission_lifecycle.preflight(
             _lifecycle_deps(), vid, base, fresh=fresh),
-        reprove=scout_mission_execution.post_reprove,
+        reprove=scout_mission_execution.post_reprove_binding,
         replan_status=scout_replan.get_status,
         home_view=_home_view_for_full_refresh,
         agent_state=_agent_state_for_full_refresh,

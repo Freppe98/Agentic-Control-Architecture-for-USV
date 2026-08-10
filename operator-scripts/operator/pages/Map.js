@@ -1556,30 +1556,60 @@ export function Map(root) {
     // ONE Agent-package line, from the shared derivation (see agentPackageLine).
     const pkgLine = card.present === false ? "" : agentPackageLine(v, pfFor);
 
-    // What the last Full Refresh additionally found: the binding-reproof outcome (Scout's own
-    // word — UNSUPPORTED means this Scout has no read-only reproof route yet, never fabricated
-    // as BOUND) plus energy feasibility / risk, when Scout reports them. One muted line, present
-    // only right after an explicit Full Refresh for THIS vehicle — the ordinary preflight moments
-    // (selection, a mission write, reconnect) do not run it and never show this line.
+    // What the last Full Refresh additionally found: Scout's own reprove-outcome word (REPROVED /
+    // ALREADY_PROVEN / PACKAGE_MISMATCH / … — see scout_mission_execution.REPROVE_OUTCOMES) plus
+    // energy feasibility / risk, when Scout reports them. One muted line, present only right
+    // after an explicit Full Refresh for THIS vehicle — the ordinary preflight moments (selection,
+    // a mission write, reconnect) do not run it and never show this line.
+    //
+    // THE HEADLINE NEVER TREATS AN IDLE UNBOUND AS BROKEN. binding_state == BOUND means a LIVE
+    // execution owns the mission identity — it is NOT a route-proof signal and a
+    // healthy, proven, READY mission correctly reports UNBOUND before Start. The raw binding word
+    // is technical detail, kept in the tooltip only; the visible headline is judged from the
+    // reprove outcome and the (Operator-authoritative) reconciliation instead.
     const frFor = mission.fullRefreshFor != null && v && mission.fullRefreshFor === v.id;
     const fr = frFor ? mission.fullRefresh : null;
     const fullRefreshNote = (() => {
       if (!fr) return "";
       const b = fr.binding || {};
-      const bindingText = b.reproof_supported === false
+      const reconciliation = (fr.mission && fr.mission.reconciliation) || null;
+      const ro = b.reproof_outcome || null;
+      const bindingDetail = b.reproof_supported === false
         ? `binding ${b.binding_state || "UNREPORTED"} (no read-only reproof on this Scout yet)`
         : `binding ${b.binding_state || "UNREPORTED"}`;
+
+      let headline = null;
+      if (reconciliation === "PIXHAWK_MISMATCH" || ro === "PIXHAWK_MISMATCH") {
+        headline = "Refresh complete — the flight-controller route does not match the approved mission.";
+      } else if (ro === "MISSION_ID_MISMATCH") {
+        headline = "Refresh complete — Scout's package identity does not match the approved mission.";
+      } else if (reconciliation === "PACKAGE_SYNC_REQUIRED" || reconciliation === "PACKAGE_INVALID") {
+        headline = "Refresh complete — planning package synchronization required.";
+      } else if (ro === "BUSY") {
+        headline = "Refresh incomplete — a mission-execution operation is already in progress on Scout.";
+      } else if (ro === "LIFECYCLE_NOT_REPROVABLE") {
+        headline = "Refresh complete — binding could not be re-proved in the current lifecycle state.";
+      } else if (fr.ok === false || reconciliation === "EVIDENCE_UNAVAILABLE"
+          || ro === "EVIDENCE_UNAVAILABLE" || ro === "NO_CURRENT_PACKAGE"
+          || ro === "NO_CURRENT_MISSION" || ro === "INTERNAL_ERROR") {
+        headline = "Refresh incomplete — mission evidence unavailable.";
+      } else if (ro === "REPROVED") {
+        headline = "Mission state refreshed — route verified and ready.";
+      } else if (ro === "ALREADY_PROVEN") {
+        headline = "Mission state refreshed — current proof already valid.";
+      }
+
       const ef = fr.energy_feasibility;
       const energy = ef && typeof ef === "object"
         ? (ef.feasible === true ? "FEASIBLE" : ef.feasible === false ? "NOT FEASIBLE"
           : ef.state || ef.status || null)
         : null;
       const risk = fr.risk && typeof fr.risk === "object" ? fr.risk.level : null;
-      const parts = [bindingText, energy ? `energy ${energy}` : null, risk ? `risk ${risk}` : null]
-        .filter(Boolean);
+      const parts = [headline || bindingDetail, energy ? `energy ${energy}` : null,
+        risk ? `risk ${risk}` : null].filter(Boolean);
       if (!parts.length) return "";
       const title = `Full Refresh ${fr.operation_id || ""} · reconciliation ${
-        (fr.mission && fr.mission.reconciliation) || "UNKNOWN"}`;
+        reconciliation || "UNKNOWN"} · ${bindingDetail}`;
       return `<div class="amx-note" title="${escAttr(title)}">${esc(parts.join(" · "))}</div>`;
     })();
 

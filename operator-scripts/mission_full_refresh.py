@@ -14,12 +14,23 @@ therefore stay UNBOUND / MISSION_ROUTE_UNVERIFIED / ROUTE_HASH_STALE after a res
 nothing is actually wrong, and only a redundant re-upload has ever recovered it.
 
 Full Refresh is the missing middle ground: it forces the SAME fresh-evidence proof the Start
-transaction performs (`mission_lifecycle.preflight(fresh=True)`), attempts a genuinely read-only
-Scout binding reproof (`scout_mission_execution.post_reprove` — see that module's docstring for
-the exact contract, and the note below on why it may be `unsupported` today), and reads Home,
-Scout's stabilizing `/agent/state` evidence, energy feasibility and risk — then returns ONE
-coherent snapshot, generated from evidence gathered in this one bounded operation, never a
-mixture of an old package mismatch with a newer Pixhawk hash.
+transaction performs (`mission_lifecycle.preflight(fresh=True)`), calls Scout's read-only
+binding-reproof route (`scout_mission_execution.post_reprove_binding` — see that module's
+docstring for the exact outcome contract), and reads Home, Scout's stabilizing `/agent/state`
+evidence, energy feasibility and risk — then returns ONE coherent snapshot, generated from
+evidence gathered in this one bounded operation, never a mixture of an old package mismatch
+with a newer Pixhawk hash.
+
+THE SEMANTIC CORRECTION THIS MODULE DEPENDS ON — read before touching binding anywhere below:
+`binding_state == BOUND` means a LIVE mission execution currently owns/binds the original
+mission identity. It is NOT a route-proof signal and it is NOT a Start precondition. A
+completely healthy, verified, READY mission BEFORE Start correctly reports
+`binding_state == UNBOUND` while `verified_route_hash`, `state == READY`, `start_eligible` and
+`can_start` all say the route is proven and Start may proceed — that is the expected IDLE
+outcome of a successful refresh, never a failure. Binding only becomes meaningful, and BOUND,
+once a run is actually RUNNING. Full Refresh success is therefore judged from the PROOF
+(`verified_route_hash`, the three-way reconciliation, Scout's `state`/`start_eligible`/
+`can_start`/`start_block_reason`), never from `binding_state`.
 
 WHAT THIS MODULE DELIBERATELY DOES NOT DO
 -------------------------------------------
@@ -27,16 +38,17 @@ WHAT THIS MODULE DELIBERATELY DOES NOT DO
   * change vehicle mode (ARM/DISARM/AUTO/MANUAL/LOITER/RTL) or authority;
   * execute a replan or rewrite a mismatching planning package — a real mismatch is reported as
     PACKAGE_SYNC_REQUIRED / PIXHAWK_MISMATCH, never silently repaired;
-  * fabricate `binding_state = BOUND` locally. Scout remains authoritative: if Scout has not
-    implemented the read-only reproof route yet, binding is reported EXACTLY as Scout's own
-    GET /agent/mission_execution/status shows it right now.
+  * fabricate `binding_state = BOUND` locally, or require it for success. Scout remains
+    authoritative: binding is reported EXACTLY as Scout's own reprove outcome and
+    GET /agent/mission_execution/status show it, whether that is a healthy idle UNBOUND or a
+    live-execution BOUND.
   * recompute energy feasibility or continuous risk — both are read verbatim from Scout's
     `/agent/replan/status` body (`energy_feasibility`, `risk`), never derived here.
 
-The only write this module issues, anywhere, is the speculative POST to Scout's proposed
-read-only reproof route — and that route's own contract (see scout_mission_execution.post_reprove)
-forbids it from ever commanding the vehicle. Every test in tests/test_mission_full_refresh.py
-proves that no OTHER Scout write route is ever called by this module.
+The only write this module issues, anywhere, is the read-only POST to Scout's binding-reproof
+route — and that route's own contract (see scout_mission_execution.post_reprove_binding) forbids
+it from ever commanding the vehicle. Every test in tests/test_mission_full_refresh.py proves
+that no OTHER Scout write route is ever called by this module.
 """
 from __future__ import annotations
 
@@ -44,7 +56,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-import scout_replan
+import scout_mission_execution as mx
 
 # ── Stages (task Section 6), in the order they are appended to the result ─────────────────
 STAGE_STARTING = "STARTING"
@@ -142,7 +154,10 @@ class Deps:
                                     -> mission_lifecycle.preflight(deps, vid, base, fresh=fresh) —
                                        the SAME fresh-evidence proof the Start transaction itself
                                        performs. Issues no write.
-    reprove(base, mission_id)      -> scout_mission_execution.post_reprove(base, mission_id)
+    reprove(base, mission_id)      -> scout_mission_execution.post_reprove_binding(base,
+                                       mission_id) — the RAW transport result; run_full_refresh
+                                       narrows it with scout_mission_execution
+                                       .interpret_reprove_binding.
     replan_status(base)            -> scout_replan.get_status(base) — Scout's canonical replan
                                        status (carries energy_feasibility/risk when Scout reports
                                        them), always a LIVE read.
@@ -285,9 +300,17 @@ def run_full_refresh(deps, vid, base, flask_base, slug):
     # ── Step 5, attempted FIRST (Sections 11/12/21): the read-only binding reproof, so any
     # binding change it causes is what the fresh preflight below observes — never the reverse,
     # which would report a reproof result computed from evidence gathered before it ran. ───────
-    reprove_result = deps.reprove(base, mission_id) or {}
-    reprove_outcome = reprove_result.get("outcome")
-    reprove_supported = reprove_outcome != scout_replan.OUTCOME_UNSUPPORTED
+    reprove_result = mx.interpret_reprove_binding(deps.reprove(base, mission_id) or {})
+    # The TRANSPORT verdict (accepted/rejected/unknown/unavailable/unsupported) — whether the
+    # POST itself landed — distinct from `reprove_scout_outcome`, Scout's own reprove-outcome
+    # WORD (REPROVED / ALREADY_PROVEN / PACKAGE_MISMATCH / … — see scout_mission_execution
+    # .REPROVE_OUTCOMES), which is what task Section 10 actually maps.
+    reprove_transport_outcome = reprove_result.get("outcome")
+    reprove_scout_outcome = reprove_result.get("reprove_outcome")
+    reprove_supported = reprove_result.get("reprove_supported")
+    reprove_success = reprove_result.get("reprove_success")
+    reprove_inconclusive = reprove_result.get("reprove_inconclusive")
+    reprove_fail_closed = reprove_result.get("reprove_fail_closed")
 
     # ── Steps 2-4 (Sections 8-10) + the eligibility/binding checks: the SAME fresh-evidence
     # proof the Start transaction performs — a live Pixhawk read-back, a live planning-package
@@ -345,8 +368,19 @@ def run_full_refresh(deps, vid, base, flask_base, slug):
 
     binding_view = pre.get("binding") or {}
     binding_state = summary.get("binding_state")
+    # `binding_state` is reported EXACTLY as Scout has it and is NEVER a success/failure signal
+    # here — see the module docstring. A healthy idle mission reports UNBOUND; BOUND is expected
+    # only once a run is actually RUNNING and owns the mission identity.
     out["binding"] = {
-        "reproof_attempted": True, "reproof_outcome": reprove_outcome,
+        "reproof_attempted": True,
+        # Scout's own reprove-outcome WORD (REPROVED / ALREADY_PROVEN / PACKAGE_MISMATCH / … or
+        # None when Scout never told us one) — this is what task Section 10 maps, never the bare
+        # transport verdict.
+        "reproof_outcome": reprove_scout_outcome,
+        "reproof_success": bool(reprove_success),
+        "reproof_inconclusive": bool(reprove_inconclusive),
+        "reproof_fail_closed": bool(reprove_fail_closed),
+        "reproof_transport_outcome": reprove_transport_outcome,
         "reproof_supported": reprove_supported,
         "reproof_scout_error_code": reprove_result.get("scout_error_code"),
         "binding_state": binding_state,
@@ -356,17 +390,20 @@ def run_full_refresh(deps, vid, base, flask_base, slug):
         "blocks_new_mission": binding_view.get("blocks_new_mission"),
     }
     _stage(stages, STAGE_REPROVING_AGENT_BINDING,
-          STATUS_OK if reprove_outcome == scout_replan.OUTCOME_ACCEPTED else
-          (STATUS_SKIPPED if not reprove_supported else STATUS_WARNING),
-          (f"Scout accepted the read-only binding reproof; binding is now "
-           f"{binding_state or 'UNREPORTED'}." if reprove_outcome == scout_replan.OUTCOME_ACCEPTED
-           else "This Scout does not implement a read-only binding-reproof route yet — binding "
+          STATUS_OK if reprove_success else
+          (STATUS_SKIPPED if not reprove_supported else
+           STATUS_FAILED if reprove_fail_closed else STATUS_WARNING),
+          (f"Scout {reprove_scout_outcome.lower()} the mission route; binding is currently "
+           f"{binding_state or 'UNREPORTED'} (UNBOUND is the expected, healthy value for an idle "
+           f"mission — BOUND is expected only once a run is RUNNING)."
+           if reprove_success
+           else "This Scout does not implement the read-only binding-reproof route yet — binding "
                 f"is reported exactly as Scout's mission-execution status shows it "
                 f"({binding_state or 'UNREPORTED'}), never fabricated." if not reprove_supported
-           else f"Scout's binding reproof outcome was {reprove_outcome or 'unknown'} — binding "
-                f"is reported exactly as Scout's mission-execution status shows it "
+           else f"Scout's binding reproof outcome was {reprove_scout_outcome or 'unresolved'} — "
+                f"binding is reported exactly as Scout's mission-execution status shows it "
                 f"({binding_state or 'UNREPORTED'}), never fabricated."),
-          binding_state=binding_state, reproof_outcome=reprove_outcome)
+          binding_state=binding_state, reproof_outcome=reprove_scout_outcome)
 
     # ── Step 6 (Section 13): Home — Scout's own home_status, mirrored, read-only. ─────────────
     home = deps.home_view(vid) or {}
@@ -414,16 +451,24 @@ def run_full_refresh(deps, vid, base, flask_base, slug):
     }
 
     # `ok` is "this refresh ran to completion and produced a coherent, evidence-complete
-    # snapshot" — NOT "the mission is Start-ready". A healthy PACKAGE_SYNC_REQUIRED / not-yet-
-    # eligible refresh is a fully successful, complete refresh that correctly reports NOT_READY;
-    # `readiness.can_start` (the SAME field the Start transaction itself gates on) is where Start
-    # eligibility is read, never this `ok`.
+    # snapshot" — NOT "the mission is Start-ready" and NOT "binding_state is BOUND". A healthy
+    # PACKAGE_SYNC_REQUIRED / PIXHAWK_MISMATCH / not-yet-eligible refresh is a fully successful,
+    # complete refresh that correctly reports NOT_READY, and a healthy idle refresh correctly
+    # reports binding UNBOUND; `readiness.can_start` (the SAME field the Start transaction itself
+    # gates on) is where Start eligibility is read, never this `ok` and never binding_state.
+    #
+    # The reprove round only sinks `ok` when Scout could not reach ANY verdict this round
+    # (`reprove_inconclusive` — EVIDENCE_UNAVAILABLE / NO_CURRENT_PACKAGE / NO_CURRENT_MISSION /
+    # BUSY / INTERNAL_ERROR): that is an unread input, exactly like an unreachable Pixhawk or an
+    # unreachable package. A DEFINITE mismatch Scout proved (PACKAGE_MISMATCH / PIXHAWK_MISMATCH /
+    # MISSION_ID_MISMATCH) is a conclusive answer — same as the Operator's own PIXHAWK_MISMATCH
+    # reconciliation above — and does not, by itself, make the refresh incomplete.
     proof_complete = bool(pre.get("proof_complete"))
-    refresh_ok = proof_complete and outcome != EVIDENCE_UNAVAILABLE
+    refresh_ok = proof_complete and outcome != EVIDENCE_UNAVAILABLE and not reprove_inconclusive
     _stage(stages, STAGE_VERIFYING_FINAL_READINESS,
           STATUS_OK if refresh_ok else STATUS_WARNING,
           f"can_start={pre.get('can_start')}, reconciliation={outcome}, "
-          f"proof_complete={proof_complete}")
+          f"proof_complete={proof_complete}, reprove_outcome={reprove_scout_outcome}")
 
     result = _finish(out, stages, started, ok=refresh_ok)
     deps.record_operation(result)
