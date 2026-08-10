@@ -136,6 +136,11 @@ export function Map(root) {
     // The operator-side publication state (active mission, upload status, whether an Agent
     // package sync is owed). Read on the same one-shot moments as the preflight.
     publish: null, publishFor: null, syncing: false,
+    // The last Full Refresh result for this vehicle (see fullRefresh() below) — binding-reproof
+    // outcome, Home, energy feasibility and risk. `publish`/`preflight` above are ALSO updated
+    // from it (same shapes GET .../missions/publish and GET .../mission-execution/preflight
+    // already return), so this only carries what those two do not: the extra evidence.
+    fullRefresh: null, fullRefreshFor: null,
   };
   // Per-vehicle comm state from the previous fleet poll, so a DISCONNECTED → CONNECTED
   // transition can trigger exactly one preflight (task 8's "after reconnect") without any
@@ -991,6 +996,45 @@ export function Map(root) {
     });
   }
 
+  // ---- Agent Mission: FULL REFRESH — the upgraded Refresh button ---------------------------
+  // The ONLY thing the card's Refresh button calls. ONE backend operation
+  // (POST .../mission-execution/full-refresh) that reconstructs the ENTIRE current mission/
+  // readiness evidence graph — a fresh Pixhawk route proof, Scout's planning package, three-way
+  // reconciliation, a read-only Scout binding-reproof attempt, Home, energy feasibility and risk
+  // — instead of the two independent, cheaper GETs refreshPreflight() still fires for the OTHER
+  // one-shot moments (selection, a mission write, a completed transaction, reconnect), which are
+  // deliberately left alone: those fire far more often than an explicit button press, and this
+  // operation is heavier (it forces a live Pixhawk download and a Scout POST) on purpose.
+  //
+  // Writes NOTHING to the vehicle. `mission.publish`/`mission.preflight` are updated from the
+  // SAME shapes the publish-state and preflight GETs already return (see api.js), so
+  // readinessLabel()/preflightNote() need no changes — only where the data now comes from.
+  function fullRefresh(id) {
+    if (id == null || mission.refreshing) return;
+    const forId = id;
+    mission.refreshing = true;
+    if (forId === selId) renderInspector();
+    api.postMissionExecutionFullRefresh(id).then(({ data }) => {
+      if (forId !== selId) return;
+      if (!data) return;   // no body at all — nothing to apply; the previous state stands
+      mission.publish = data.publish || null;
+      mission.publishFor = forId;
+      mission.preflight = data.readiness || null;
+      mission.preflightAt = Date.now();
+      mission.preflightFor = forId;
+      mission.preflightReason = "manual";
+      mission.fullRefresh = data;
+      mission.fullRefreshFor = forId;
+    }).catch((e) => {
+      // A failed request tells us nothing about the vehicle, so the previous note stands
+      // untouched — exactly as it must, since the note is not a gate.
+      logQuiet("mission-execution full-refresh", e);
+    }).finally(() => {
+      mission.refreshing = false;
+      if (forId === selId) renderInspector();
+    });
+  }
+
   // ONE orchestrated transaction per operator intent. The browser does NOT transfer authority
   // itself and does not sequence two calls: the endpoint below performs the authority hand-off,
   // verifies it by read-back and issues the Scout operation as one operation with phases.
@@ -1470,11 +1514,38 @@ export function Map(root) {
     // offering a Refresh that cannot answer is its own small lie.
     const info = card.present === false ? "" : `<div class="amx-info">
         ${card.info ? `<span class="amx-info-t" title="${escAttr(card.info.title || "")}">${esc(card.info.text)}${mission.preflightAt && pfFor ? ` · ${esc(fmtAgo((Date.now() - mission.preflightAt) / 1000))}` : ""}</span>` : `<span class="amx-info-t">Readiness not checked yet</span>`}
-        <button class="amx-refresh" data-mx-refresh="1"${mission.refreshing ? " disabled" : ""} title="Re-run the read-only Start preflight once. Writes nothing, commands nothing, and does not change which buttons are offered.">Refresh</button>
+        <button class="amx-refresh" data-mx-refresh="1"${mission.refreshing ? " disabled" : ""} title="Full Refresh: re-proves the mission route, package, binding, Home, energy and risk from fresh evidence — read-only, writes nothing, commands nothing, and does not change which buttons are offered.">${mission.refreshing ? "Refreshing…" : "Refresh"}</button>
       </div>`;
 
     // ONE Agent-package line, from the shared derivation (see agentPackageLine).
     const pkgLine = card.present === false ? "" : agentPackageLine(v, pfFor);
+
+    // What the last Full Refresh additionally found: the binding-reproof outcome (Scout's own
+    // word — UNSUPPORTED means this Scout has no read-only reproof route yet, never fabricated
+    // as BOUND) plus energy feasibility / risk, when Scout reports them. One muted line, present
+    // only right after an explicit Full Refresh for THIS vehicle — the ordinary preflight moments
+    // (selection, a mission write, reconnect) do not run it and never show this line.
+    const frFor = mission.fullRefreshFor != null && v && mission.fullRefreshFor === v.id;
+    const fr = frFor ? mission.fullRefresh : null;
+    const fullRefreshNote = (() => {
+      if (!fr) return "";
+      const b = fr.binding || {};
+      const bindingText = b.reproof_supported === false
+        ? `binding ${b.binding_state || "UNREPORTED"} (no read-only reproof on this Scout yet)`
+        : `binding ${b.binding_state || "UNREPORTED"}`;
+      const ef = fr.energy_feasibility;
+      const energy = ef && typeof ef === "object"
+        ? (ef.feasible === true ? "FEASIBLE" : ef.feasible === false ? "NOT FEASIBLE"
+          : ef.state || ef.status || null)
+        : null;
+      const risk = fr.risk && typeof fr.risk === "object" ? fr.risk.level : null;
+      const parts = [bindingText, energy ? `energy ${energy}` : null, risk ? `risk ${risk}` : null]
+        .filter(Boolean);
+      if (!parts.length) return "";
+      const title = `Full Refresh ${fr.operation_id || ""} · reconciliation ${
+        (fr.mission && fr.mission.reconciliation) || "UNKNOWN"}`;
+      return `<div class="amx-note" title="${escAttr(title)}">${esc(parts.join(" · "))}</div>`;
+    })();
 
     // A Start that did not happen reads as ONE compact actionable error; the precondition
     // evidence, Scout's code and the phase detail are the tooltip. Every other transaction keeps
@@ -1499,7 +1570,7 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${info}${resultNote}</div>`;
+    return `<div class="amx">${head}${rows}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${fullRefreshNote}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation
@@ -1658,11 +1729,11 @@ export function Map(root) {
     box.querySelectorAll("button[data-mx]").forEach((btn) => {
       btn.onclick = () => onMissionAction(btn.dataset.mx, v);
     });
-    // The EXPLICIT preflight refresh: one read-only backend call, on demand. This is the only
-    // operator-facing way the preflight runs on request, and it exists precisely so that not
-    // polling it costs the operator nothing.
+    // The EXPLICIT Full Refresh: one bounded, read-only backend operation, on demand. This is
+    // the only operator-facing way it runs — it is never polled, and pressing it a second time
+    // while one is already in flight for this vehicle is a no-op (mission.refreshing).
     box.querySelectorAll("button[data-mx-refresh]").forEach((btn) => {
-      btn.onclick = () => refreshPreflight(v.id, "manual");
+      btn.onclick = () => fullRefresh(v.id);
     });
     // Retry Agent Sync. Calls the package-sync endpoint ONLY — that route builds and sends a
     // planning package and contains no code that can command the vehicle, so this can never
@@ -1963,6 +2034,7 @@ export function Map(root) {
       // transaction issued against it) onto another vehicle's card.
       mission.status = mission.preflight = mission.result = null;
       mission.forVid = mission.preflightFor = mission.preflightAt = mission.preflightReason = null;
+      mission.fullRefresh = mission.fullRefreshFor = null;
       loadMissionStatus(id);
       // Initial vehicle selection is one of the allowed one-shot preflight moments.
       refreshPreflight(id, "selection");

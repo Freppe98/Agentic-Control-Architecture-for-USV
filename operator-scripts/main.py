@@ -15,6 +15,7 @@ import time
 import uuid
 
 import mission_contract
+import mission_full_refresh
 import mission_lifecycle
 import mission_publish
 import mission_reconcile
@@ -4932,6 +4933,11 @@ def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_
         # reported rather than implied — a cached read-back is never shown as a live one.
         "readback_age_s": readback.get("evidence_age_s") if readback else None,
         "readback_cached": readback.get("evidence_cached") if readback else None,
+        # Passed through only when Scout's read-back carried them (never fabricated). Additive
+        # fields for mission_full_refresh.py's pixhawk-evidence view — no existing consumer read
+        # these off vehicle_mission before, so nothing here can regress an existing comparison.
+        "readback_route_count": readback.get("route_waypoint_count") if readback else None,
+        "readback_current_seq": readback.get("current_seq") if readback else None,
         "home_valid": home_valid, "home_source": home_source,
         "boundary_supplied": boundary_supplied,
     }
@@ -6084,6 +6090,144 @@ def mission_execution_rearm(vehicle_id: str):
     the Pixhawk mission and does NOT re-upload the original mission — it only prepares the
     controller for another explicitly prepared run. This is not a vehicle reset."""
     return _mission_execution_write(vehicle_id, "rearm", scout_mission_execution.post_rearm)
+
+
+# ── FULL REFRESH — one bounded, single-flight, READ-ONLY operation that reconstructs the
+# entire current mission/readiness evidence graph on demand, without uploading a mission. See
+# mission_full_refresh.py for the full rationale; this is the thin FastAPI adapter over it,
+# following the same shape as _lifecycle_deps/_lifecycle_transaction above. ────────────────────
+MAX_FULL_REFRESH_OPERATIONS = 200
+full_refresh_operations = []   # [ {seq, vehicle_id, operation_id, ok, reconciliation, ...} ]
+_full_refresh_seq = 0
+
+
+def _record_full_refresh_operation(result):
+    """Append ONE Full Refresh transaction to its own trace (diagnostics only — this is a read,
+    never a vehicle write, so it is deliberately NOT folded into mission_execution_operations,
+    whose whole point is auditing writes). One concise log line per explicit operation (task
+    Section 29) — never per ordinary poll, because Full Refresh is never called by one."""
+    global _full_refresh_seq
+    _full_refresh_seq += 1
+    mission = result.get("mission") or {}
+    binding = result.get("binding") or {}
+    readiness = result.get("readiness") or {}
+    entry = {
+        "seq": _full_refresh_seq, "vehicle_id": result.get("vehicle_id"),
+        "operation_id": result.get("operation_id"), "ok": result.get("ok"),
+        "started_at": result.get("started_at"), "completed_at": result.get("completed_at"),
+        "duration_s": result.get("duration_s"),
+        "reconciliation": mission.get("reconciliation"),
+        "binding_state": binding.get("binding_state"),
+        "reproof_supported": binding.get("reproof_supported"),
+        "can_start": readiness.get("can_start"),
+        "error_code": result.get("error_code"),
+    }
+    full_refresh_operations.append(entry)
+    if len(full_refresh_operations) > MAX_FULL_REFRESH_OPERATIONS:
+        del full_refresh_operations[:len(full_refresh_operations) - MAX_FULL_REFRESH_OPERATIONS]
+    print(f"[FULL_REFRESH] {entry['vehicle_id']} op={entry['operation_id']} "
+          f"reconciliation={entry['reconciliation']} binding={entry['binding_state']} "
+          f"can_start={entry['can_start']} ok={entry['ok']} duration={entry['duration_s']}s")
+    return entry
+
+
+def _home_view_for_full_refresh(vid):
+    """The current, read-only Home view for one vehicle (task Section 13) — Scout's own
+    home_status, mirrored via the SAME home_block() every fleet row already uses, fed from this
+    vehicle's own last raw packet only (never another vehicle's, never a blank template unless it
+    has genuinely never reported). No outbound request of any kind: Scout already pushes
+    home_status on every status packet, and reading it back out is the existing read-only Home
+    recovery path — there is no separate GET Home route to call, and none is added here."""
+    rec = current_vehicle_state.get(vid)
+    raw = rec.get("raw_latest") if isinstance(rec, dict) else None
+    return home_block(vid, raw or {}, {})
+
+
+def _agent_state_for_full_refresh(vid, flask_base):
+    """Best-effort, read-only GET of Scout's /agent/state (task Section 14). Never raises and
+    never gates anything downstream: an unreachable or unsupported Scout is reported exactly that
+    way, like every other proxy in this file, and Full Refresh proceeds without it."""
+    if not flask_base:
+        return None
+    try:
+        r = requests.get(f"{flask_base}/agent/state", timeout=8)
+    except requests.RequestException as exc:
+        return {"reachable": False, "supported": True, "error": str(exc)}
+    if r.status_code == 404:
+        return {"reachable": True, "supported": False,
+                "error": "This Scout does not implement /agent/state"}
+    try:
+        body = r.json() if r.content else {}
+    except Exception:
+        body = {}
+    return {"reachable": True, "supported": True,
+            "state": body if isinstance(body, dict) else {}}
+
+
+def _full_refresh_deps():
+    """The operator-backend facts mission_full_refresh runs on. Built per request so a test that
+    swaps a store or a transport sees the swap — same idiom as _lifecycle_deps/_publish_deps."""
+    return mission_full_refresh.Deps(
+        active_mission_id=lambda vid: active_original_by_vehicle.get(vid),
+        mission_record=lambda mid: original_missions.get(mid),
+        run_preflight=lambda vid, base, *, fresh: mission_lifecycle.preflight(
+            _lifecycle_deps(), vid, base, fresh=fresh),
+        reprove=scout_mission_execution.post_reprove,
+        replan_status=scout_replan.get_status,
+        home_view=_home_view_for_full_refresh,
+        agent_state=_agent_state_for_full_refresh,
+        record_operation=_record_full_refresh_operation,
+    )
+
+
+@app.post("/api/vehicles/{vehicle_id}/mission-execution/full-refresh")
+def mission_execution_full_refresh(vehicle_id: str):
+    """FULL REFRESH — one bounded, single-flight, READ-ONLY operation that reconstructs the
+    entire current mission/readiness evidence graph: the approved mission, a fresh Pixhawk route
+    proof, Scout's planning package, three-way reconciliation, a read-only Scout binding-reproof
+    attempt, Home, Scout's /agent/state evidence, energy feasibility and risk — returned as ONE
+    coherent snapshot generated from evidence gathered in this one operation (mission_full_refresh
+    .run_full_refresh).
+
+    Upgrades the EXISTING Agent Mission Refresh button; it is not a second Refresh. Unlike the
+    plain preflight GET (fresh=False, may read Pixhawk evidence through a bounded cache), this
+    forces the SAME live-evidence proof the Start transaction performs, and additionally asks
+    Scout to re-prove mission-execution binding — read-only, no vehicle command of any kind. A
+    vehicle that already carries the exact approved mission can recover from UNBOUND /
+    MISSION_ROUTE_UNVERIFIED / ROUTE_HASH_STALE WITHOUT a mission re-upload; a genuine mismatch is
+    reported honestly (PIXHAWK_MISMATCH / PACKAGE_SYNC_REQUIRED) and never silently repaired.
+
+    POST because it starts a bounded operation (a fresh Pixhawk download, a speculative Scout
+    reprove POST), even though nothing about it writes vehicle state. Single-flight per vehicle: a
+    second concurrent call for the SAME vehicle is rejected with 409 rather than issuing a second,
+    overlapping set of live reads."""
+    target, err = _local_agent_target(vehicle_id, "mission-execution")
+    if err is not None:
+        return err
+    vid, base = target
+    flask_base = vehicle_api_base(vid)
+    try:
+        with mission_full_refresh.vehicle_refresh_lock(vid):
+            result = mission_full_refresh.run_full_refresh(
+                _full_refresh_deps(), vid, base, flask_base, vehicle_slug(vid))
+    except mission_full_refresh.Busy as exc:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "vehicle_id": vehicle_slug(vid), "error": str(exc),
+            "error_code": "FULL_REFRESH_BUSY"})
+    return result
+
+
+@app.get("/api/mission-execution/full-refresh/operations")
+def mission_execution_full_refresh_trace(vehicle_id: Optional[str] = None, limit: int = 200):
+    """The Full Refresh diagnostics trace, newest last, optionally filtered to one vehicle."""
+    items = full_refresh_operations
+    if vehicle_id is not None:
+        vid = parse_vehicle_id(vehicle_id)
+        items = [o for o in items if o["vehicle_id"] == vehicle_slug(vid)]
+    if limit and limit > 0:
+        items = items[-limit:]
+    return {"ok": True, "operations": items, "count": len(full_refresh_operations),
+            "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/api/mission-execution/operations")

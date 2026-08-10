@@ -515,6 +515,20 @@ export function rearmMissionExecution(id) {
   return postJSON(`/api/vehicles/${id}/mission-execution/rearm`, {});
 }
 
+/** FULL REFRESH — the upgraded Agent Mission Refresh operation. ONE bounded, single-flight,
+ *  READ-ONLY call that reconstructs the entire current mission/readiness evidence graph: a fresh
+ *  Pixhawk route proof, Scout's planning package, three-way reconciliation, a read-only Scout
+ *  binding-reproof attempt, Home, Scout's /agent/state evidence, energy feasibility and risk —
+ *  returned as one coherent snapshot. Writes NOTHING to the vehicle. POST because it starts a
+ *  bounded operation; returns { ok, status, data } (non-throwing) so a 409 BUSY (another refresh
+ *  already running for this vehicle) is a normal branch, not a caught exception. `data.publish`
+ *  and `data.readiness` are shaped exactly like the objects getPublishState() and
+ *  getMissionExecutionPreflight() already return, so the existing readinessLabel()/
+ *  preflightNote() rendering needs no changes — only where the data comes from. */
+export function postMissionExecutionFullRefresh(id) {
+  return postJSON(`/api/vehicles/${id}/mission-execution/full-refresh`, {});
+}
+
 /** The mission-execution write trace (start/pause/resume/rearm) with each unknown's
  *  reconciliation verdict, newest last. Optionally filtered to one vehicle. */
 export function getMissionExecutionOperations(id) {

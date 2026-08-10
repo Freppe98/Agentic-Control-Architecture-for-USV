@@ -357,6 +357,45 @@ def post_rearm(base):
     return _op("rearm", base, {})
 
 
+# ── Read-only binding reproof (task: full-refresh Section 11/12) ──────────────────────────
+# NOT YET IMPLEMENTED BY ANY DEPLOYED SCOUT. This is the operator-side CLIENT for a proposed
+# read-only Local Agent operation that closes the one gap a pure GET refresh cannot: Scout's
+# `binding_state`/`verified_route_hash` are Scout's own internal accounting (see
+# `summarize_status` / `binding_view` in mission_lifecycle.py) and nothing in this station
+# writes them — only a mission-publish package POST has ever given Scout a reason to move them.
+# A vehicle that already carries the approved route (proved by a fresh Pixhawk read-back and a
+# matching stored package) can therefore be stuck UNBOUND after a restart even though nothing is
+# actually wrong, and nothing short of re-uploading the (unchanged) mission has recovered it.
+#
+# POST /agent/mission_execution/reprove is the proposed remedy: Scout re-evaluates its OWN
+# binding from ITS current package plus a fresh Pixhawk proof and, ONLY if that proof is
+# conclusive, restores `verified_route_hash`/`binding_state` from it — issuing NO vehicle
+# command of any kind (no LOITER, no mission write, no mode change). See
+# mission_full_refresh.py for the full contract this station expects of it and the exact
+# rebind rule (Section 12): current package usable + package route hash valid + current
+# Pixhawk route hash proven + expected identities match + lifecycle state allows binding: only
+# then may Scout restore the binding, and only from evidence gathered in that call, never from
+# a previously persisted flag.
+#
+# An older/unmodified Scout 404s this route today, which the shared transport already reports
+# as `outcome="unsupported"` — the SAME honest "an older Scout" handling every other route in
+# this module gets, never a fabricated success. Full Refresh treats that outcome as "no
+# read-only reproof is available" and reports Scout's CURRENT binding_state exactly as
+# GET /agent/mission_execution/status shows it — it never sets binding_state=BOUND itself.
+def post_reprove(base, mission_id=None):
+    """Ask Scout to RE-EVALUATE (never fabricate) mission-execution binding from its current
+    package and a fresh Pixhawk proof, with NO vehicle command of any kind. `mission_id` is the
+    operator's active persisted mission, sent so Scout can decline to bind against a route the
+    operator does not currently approve — the same discipline `post_start`/`post_stop` use.
+
+    Returns the normal scout_replan.write() three-outcome result. `unsupported` (404) means this
+    Scout has not implemented the route yet; the caller must treat that exactly like any other
+    older-Scout gap and fall back to observing binding_state as Scout currently reports it,
+    never inventing BOUND locally."""
+    body = {"mission_id": mission_id} if mission_id else {}
+    return _op("reprove", base, body)
+
+
 # ── Operation-result interpretation (the HTTP-200-is-not-success rule) ────────────────────
 def interpret_operation(result):
     """Narrow a transport result into the OPERATIONAL verdict plus the Scout fields the station

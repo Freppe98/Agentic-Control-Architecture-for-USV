@@ -129,12 +129,38 @@ test("the preflight runs only from the allowed one-shot moments", () => {
   assert.match(refresh, /api\.getMissionExecutionPreflight\(id\)/);
   // Exactly one call site for the endpoint in the whole page.
   assert.equal((mapSrc.match(/getMissionExecutionPreflight\(/g) || []).length, 1);
-  // Every caller passes a REASON, and the set of reasons is the allowed set.
+  // Every caller passes a REASON, and the set of reasons is the allowed set. "manual" is NOT
+  // among them any more: the card's Refresh button was upgraded to call fullRefresh() (below)
+  // instead of refreshPreflight(id, "manual") — see the Full Refresh task.
   const reasons = [...mapSrc.matchAll(/refreshPreflight\([^,]+, "([a-z-]+)"\)/g)].map((m) => m[1]);
   assert.deepEqual([...new Set(reasons)].sort(),
-    ["manual", "mission", "reconnect", "selection", "transaction"]);
+    ["mission", "reconnect", "selection", "transaction"]);
   // None of them is inside a setInterval / setTimeout.
   assert.doesNotMatch(mapSrc, /set(Interval|Timeout)\([^)]*refreshPreflight/);
+});
+
+test("the Refresh button calls Full Refresh, and ONLY the button calls it", () => {
+  // The upgraded Refresh button: ONE backend operation, not the two independent GETs
+  // refreshPreflight() still fires for the other one-shot moments.
+  const full = fnBody("fullRefresh");
+  assert.match(full, /api\.postMissionExecutionFullRefresh\(id\)/);
+  assert.doesNotMatch(full, /getMissionExecutionPreflight|getPublishState/);
+  // Exactly one call site for the endpoint in the whole page…
+  assert.equal((mapSrc.match(/postMissionExecutionFullRefresh\(/g) || []).length, 1);
+  // …and it is the button's onclick, not a poll or another transaction's side effect.
+  assert.match(mapSrc, /data-mx-refresh="1"[\s\S]*?btn\.onclick = \(\) => fullRefresh\(v\.id\)/);
+  assert.doesNotMatch(mapSrc, /set(Interval|Timeout)\([^)]*fullRefresh/);
+  // Single-flight: it shares the SAME `mission.refreshing` guard refreshPreflight uses, so a
+  // second press (or a stray refreshPreflight call) while one is in flight is a no-op.
+  assert.match(full, /if \(id == null \|\| mission\.refreshing\) return;/);
+  assert.match(full, /mission\.refreshing = true;/);
+  assert.match(full, /mission\.refreshing = false;/);
+  // Writes nothing to the vehicle: no lifecycle/authority/mission-write call rides along.
+  for (const forbidden of ["startMissionExecution", "pauseMissionExecution",
+    "resumeMissionExecution", "stopMissionExecution", "setControlAuthority", "syncReplanPackage",
+    "publishMission"]) {
+    assert.doesNotMatch(full, new RegExp(forbidden));
+  }
 });
 
 test("a Start click issues EXACTLY ONE backend Start intent", () => {
