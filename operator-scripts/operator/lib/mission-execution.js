@@ -1793,7 +1793,20 @@ export function firstClause(text, max = 44) {
 // different things: `/position/i` reads POSITION_STALE as "Position not usable" (true but vague)
 // and nothing at all distinguishes a mission deficit from an RTL-return deficit. Every string
 // here is <= 44 characters, the card's short-line budget; the full reason is always the tooltip.
+//
+// The package-staleness codes are here for a second reason, and it is a correctness one rather
+// than a brevity one. They are DEFINITIVE: Scout performed the comparison and it failed — it
+// holds a package whose route hash is not the one on the flight controller. The generic
+// `/hash|package|verif/` rule below shortened every one of them to "Mission verification
+// unavailable", which states the opposite (that the check could not be run) and put an UNKNOWN
+// phrasing on the card beside the readiness line's definitive one. Two contradictory sentences
+// about one settled fact is what made a stale package look like a station that had lost its
+// footing at startup.
 export const START_BLOCK_REASON_TEXT = {
+  PLANNING_PACKAGE_MISSING: "Agent planning package missing",
+  PLANNING_PACKAGE_UNUSABLE: "Agent planning package unusable",
+  PLANNING_PACKAGE_STALE: "Agent planning package is stale",
+  ROUTE_HASH_STALE: "Agent planning package is stale",
   INSUFFICIENT_ENERGY_FOR_PLANNED_MISSION: "Insufficient energy for planned mission",
   INSUFFICIENT_ENERGY_FOR_RTL_RETURN: "Insufficient energy for RTL return",
   RTL_HOME_UNAVAILABLE: "RTL Home unavailable",

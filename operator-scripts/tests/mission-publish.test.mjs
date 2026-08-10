@@ -246,6 +246,43 @@ test("a conclusive reconciliation does not suppress a genuine mismatch", () => {
   assert.equal(v.state, READINESS_STATE.REAL_MISMATCH);
 });
 
+test("a settled flight controller with a STALE package is a sync requirement, not a mismatch", () => {
+  // The captured live state (usv-2, 2026-08-09): the approved 22-waypoint route IS on the
+  // flight controller, and Scout is holding the previous mission's 14-waypoint package. The
+  // backend settles that conclusively as PACKAGE_SYNC_REQUIRED. Rendering it as REAL_MISMATCH
+  // withheld the read-only remedy — the Map only offers "Retry Agent Sync" on an owed sync —
+  // so the only visible way out was Plan → Finish & upload, re-writing a flight controller
+  // that was already carrying the approved route.
+  const v = readinessLabel({
+    publish: pub({ package_sync_state: "REQUIRED",
+                   package_sync_error: "PACKAGE_IDENTITY_MISMATCH",
+                   reconciliation: { outcome: "PACKAGE_SYNC_REQUIRED", conclusive: true,
+                                     reason: "PACKAGE_IDENTITY_MISMATCH",
+                                     detail: "The flight controller carries the approved route; "
+                                       + "Scout's planning package does not match it." } }),
+    readiness: pkg({ mission_id: "msn-previous", mission_id_match: false,
+                     hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.PACKAGE_SYNC_REQUIRED);
+  assert.notEqual(v.state, READINESS_STATE.REAL_MISMATCH);
+  assert.match(v.detail, /carries the approved route/);
+});
+
+test("the settled-package verdict never overrides an UNAPPROVED flight controller", () => {
+  // Precedence check: only reconciliation's OWN conclusive package verdict is consumed here.
+  const v = readinessLabel({
+    publish: pub({ reconciliation: { outcome: "UNAPPROVED_MISSION", conclusive: true,
+                                     reason: "NO_APPROVED_RECORD", detail: "…" } }),
+    readiness: pkg({ hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.UNAPPROVED_MISSION);
+});
+
+test("an inconclusive reconciliation still outranks the settled-package verdict", () => {
+  const v = readinessLabel({
+    publish: pub({ package_sync_state: "REQUIRED", reconciliation: reconciling() }),
+    readiness: pkg({ hash_match: false, hash_mismatch: true }) });
+  assert.equal(v.state, READINESS_STATE.RECONCILING);
+});
+
 test("a route no approved record carries reads UNAPPROVED_MISSION", () => {
   const v = readinessLabel({
     publish: pub({ reconciliation: { outcome: "UNAPPROVED_MISSION", conclusive: true,

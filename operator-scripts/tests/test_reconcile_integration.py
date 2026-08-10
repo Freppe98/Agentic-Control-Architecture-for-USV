@@ -435,5 +435,153 @@ class VehicleIsolationTests(ReconcileTestCase):
         self.assertEqual(main.active_original_by_vehicle[SCOUT_VID], "msn-scout-old")
 
 
+class TransientEvidenceRecoveryTests(ReconcileTestCase):
+    """Evidence that was momentarily UNAVAILABLE must not become a permanent verdict.
+
+    A restart reads the flight controller and the Agent at whatever moment it happens to come
+    up, and either can be absent for the first few polls. The rule these tests hold the backend
+    to is that the absence produces no verdict at all, and that the verdict which eventually
+    arrives is derived from the evidence in front of it — never merged with, or blocked by, the
+    inconclusive one that preceded it."""
+
+    def test_an_unreachable_readback_that_comes_back_settles_on_the_fresh_evidence(self):
+        rec = record("msn-a", ONBOARD_WPS, sync="SYNCED")
+        self.restart_with([rec], {SCOUT_VID: "msn-a"})
+        self.agent_holds("msn-a", ONBOARD_HASH)
+        self.pixhawk.reachable = False
+        self.assertEqual(self.readiness()["reconciliation"]["reason"],
+                         mission_reconcile.NO_READBACK)
+
+        self.pixhawk.reachable = True
+        main._pixhawk_readback_cache.clear()          # the next poll pays for a live read-back
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.SYNCHRONIZED)
+        self.assertTrue(rd["reconciliation"]["conclusive"])
+        self.assert_no_vehicle_write()
+
+    def test_an_unreachable_agent_that_comes_back_matching_reads_SYNCHRONIZED(self):
+        rec = record("msn-a", ONBOARD_WPS, sync="SYNCED")
+        self.restart_with([rec], {SCOUT_VID: "msn-a"})
+        self.fake.default = real_requests.ConnectionError("agent down")
+        self.assertEqual(self.readiness()["reconciliation"]["reason"],
+                         mission_reconcile.PACKAGE_UNREACHABLE)
+        # An unasked question left the recorded state alone rather than marking a sync owed.
+        self.assertEqual(main.original_missions["msn-a"]["package_sync_state"], "SYNCED")
+
+        self.fake.default = FakeResp({}, 200)
+        self.agent_holds("msn-a", ONBOARD_HASH)
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.SYNCHRONIZED)
+        self.assert_no_vehicle_write()
+
+    def test_a_package_that_arrives_late_and_matches_clears_the_owed_sync(self):
+        # The startup order that produced the report: the record came back from disk carrying
+        # "a sync is owed", and the Agent had nothing to say yet.
+        rec = record("msn-a", ONBOARD_WPS, sync="REQUIRED")
+        rec["package_sync_error"] = mission_reconcile.PACKAGE_IDENTITY_MISMATCH
+        self.restart_with([rec], {SCOUT_VID: "msn-a"})
+        self.agent_holds(None, None, stored=False)
+        self.assertEqual(self.readiness()["reconciliation"]["reason"],
+                         mission_reconcile.PACKAGE_NOT_STORED)
+
+        self.agent_holds("msn-a", ONBOARD_HASH)
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.SYNCHRONIZED)
+        self.assertEqual(self.publish_state()["package_sync_state"], "SYNCED")
+        self.assertIsNone(self.publish_state()["package_sync_error"])
+        self.assert_no_vehicle_write()
+
+    def test_a_previous_generations_mismatch_cannot_survive_fresh_agreement(self):
+        # Exactly the durable state captured from runtime_data/mission_store.json: REQUIRED with
+        # PACKAGE_IDENTITY_MISMATCH, written by an earlier process against evidence that is no
+        # longer current. The verdict itself is never persisted, so the only thing a restart can
+        # restore is this record — and one poll of agreeing evidence must clear it.
+        rec = record("msn-a", ONBOARD_WPS, sync="REQUIRED")
+        rec["package_sync_error"] = mission_reconcile.PACKAGE_IDENTITY_MISMATCH
+        rec["package_sync_attempted_at"] = "2026-08-09T15:35:54.322963+00:00"
+        self.restart_with([rec], {SCOUT_VID: "msn-a"})
+        self.agent_holds("msn-a", ONBOARD_HASH)
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.SYNCHRONIZED)
+        self.assertTrue(rd["replanning_ready"])
+        self.assertEqual(main.original_missions["msn-a"]["package_sync_state"], "SYNCED")
+        self.assert_no_vehicle_write()
+
+    def test_the_verdict_itself_is_never_written_to_the_durable_record(self):
+        rec = record("msn-a", ONBOARD_WPS, sync="SYNCED")
+        self.restart_with([rec], {SCOUT_VID: "msn-a"})
+        self.agent_holds("msn-a", ONBOARD_HASH)
+        self.readiness()
+        stored = main.original_missions["msn-a"]
+        for banned in ("reconciliation", "outcome", "conclusive", "replanning_ready",
+                       "mission_ready", "ready"):
+            self.assertNotIn(banned, stored,
+                             "a readiness verdict must be re-proved after a restart, not restored")
+
+
+class CapturedStalePackageTests(ReconcileTestCase):
+    """The live state captured from usv-2 on 2026-08-09: the approved 22-waypoint mission is on
+    the flight controller and VERIFIED, and Scout is still holding the PREVIOUS mission's
+    14-waypoint package. Nothing about it is transient and nothing about it is a race — it is a
+    true, current disagreement whose entire extent is Scout's package slot.
+
+    The station must therefore keep saying so, keep failing closed, and keep pointing at the
+    package-only remedy. What it must NOT do is describe it as a mission problem, because the
+    action that reading implies is a re-upload of a flight controller that is already correct."""
+
+    def setUp(self):
+        super().setUp()
+        self.rec = record("msn-25deb0e90e89", ONBOARD_WPS, sync="REQUIRED")
+        self.rec["package_sync_error"] = mission_reconcile.PACKAGE_IDENTITY_MISMATCH
+        self.restart_with([self.rec], {SCOUT_VID: "msn-25deb0e90e89"})
+        self.agent_holds("msn-68380c4ef063", OTHER_HASH, count=len(OTHER_WPS))
+
+    def test_the_verdict_names_the_package_not_the_mission(self):
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.PACKAGE_SYNC_REQUIRED)
+        self.assertEqual(rd["reconciliation"]["reason"],
+                         mission_reconcile.PACKAGE_IDENTITY_MISMATCH)
+        # The operator/flight-controller half is PROVEN, and the verdict says so.
+        self.assertTrue(rd["vehicle_mission"]["readback_hash_match"])
+        self.assertTrue(rd["mission_ready"])
+        self.assertEqual(rd["reconciliation"]["active_mission_id"], "msn-25deb0e90e89")
+
+    def test_it_fails_closed(self):
+        rd = self.readiness()
+        self.assertFalse(rd["replanning_ready"])
+        self.assertTrue(rd["planning_package"]["hash_mismatch"])
+
+    def test_it_survives_a_restart_unchanged_and_writes_nothing(self):
+        self.readiness()
+        self.restart_with([self.rec], {SCOUT_VID: "msn-25deb0e90e89"})
+        main._reconciliation_by_vehicle.clear()
+        main._pixhawk_readback_cache.clear()
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.PACKAGE_SYNC_REQUIRED)
+        self.assertEqual(main.active_original_by_vehicle[SCOUT_VID], "msn-25deb0e90e89")
+        self.assertEqual(set(main.original_missions), {"msn-25deb0e90e89"})
+        self.assert_no_vehicle_write()
+
+    def test_the_approved_record_is_never_re_pointed_at_the_agents_package(self):
+        self.readiness()
+        self.assertEqual(main.active_original_by_vehicle[SCOUT_VID], "msn-25deb0e90e89")
+        self.assertEqual(main.original_missions["msn-25deb0e90e89"]["route_hash"], ONBOARD_HASH)
+
+
+class MissingDurableRecordTests(ReconcileTestCase):
+    """A pointer with nothing behind it fails closed — it is never healed by adoption."""
+
+    def test_an_active_pointer_at_an_absent_record_is_not_adopted_from_the_vehicle(self):
+        self.restart_with([], {SCOUT_VID: "msn-gone"})
+        self.agent_holds("msn-gone", ONBOARD_HASH)
+        rd = self.readiness()
+        self.assertEqual(rd["reconciliation"]["outcome"], mission_reconcile.MISMATCH)
+        self.assertEqual(rd["reconciliation"]["reason"], mission_reconcile.NO_APPROVED_RECORD)
+        self.assertFalse(rd["mission_ready"])
+        self.assertFalse(rd["vehicle_mission"]["record_present"])
+        self.assertEqual(main.original_missions, {})
+        self.assert_no_vehicle_write()
+
+
 if __name__ == "__main__":
     unittest.main()

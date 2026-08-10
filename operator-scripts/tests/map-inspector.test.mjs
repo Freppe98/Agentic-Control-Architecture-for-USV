@@ -275,6 +275,35 @@ test("a blocked Start shows a concise line and keeps the full reason for the too
   assert.equal(card.blocker.title, full, "the detail is preserved for the title tooltip");
 });
 
+test("a DEFINITIVE stale package is never shortened to 'verification unavailable'", () => {
+  // ROUTE_HASH_STALE is Scout's answer AFTER it made the comparison: the package it holds is
+  // not the route on the flight controller. The generic /hash|package|verif/ rule shortened it
+  // to "Mission verification unavailable" — a sentence that says the check could not be run —
+  // and printed it beside the readiness line's definitive one. Captured live on usv-2
+  // (2026-08-09) with the Agent holding the PREVIOUS mission's package.
+  for (const code of ["ROUTE_HASH_STALE", "PLANNING_PACKAGE_STALE"]) {
+    const text = shortStartBlocker(code);
+    assert.equal(text, "Agent planning package is stale", code);
+    assert.doesNotMatch(text, /unavailable|unknown|could not/i, code);
+    assert.ok(text.length <= 44, text);
+  }
+  assert.equal(shortStartBlocker("PLANNING_PACKAGE_MISSING"), "Agent planning package missing");
+  assert.equal(shortStartBlocker("PLANNING_PACKAGE_UNUSABLE"), "Agent planning package unusable");
+});
+
+test("evidence that genuinely could not be obtained still reads as unavailable", () => {
+  // The other half of the same rule: the wording is reserved for it, not abolished.
+  assert.equal(shortStartBlocker("The Pixhawk readback could not be verified"),
+               "Mission verification unavailable");
+});
+
+test("a stale-package blocker keeps Scout's own code in the tooltip", () => {
+  const card = missionCardView(S({ state: "READY", can_start: true }),
+    { startBlocked: true, startBlockedReason: "ROUTE_HASH_STALE" });
+  assert.equal(card.blocker.text, "Agent planning package is stale");
+  assert.equal(card.blocker.title, "ROUTE_HASH_STALE");
+});
+
 test("an unavailable Scout status reads STATUS UNAVAILABLE with a short tooltip", () => {
   const card = missionCardView(normalizeStatus({ reachable: false, scout: {} }), {
     unavailableDetail: "Mission lifecycle status could not be read from Scout Local Agent " +

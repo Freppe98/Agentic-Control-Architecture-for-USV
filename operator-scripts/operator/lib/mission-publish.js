@@ -245,6 +245,11 @@ export const SCOUT_REFRESHING = "REPLANNING_READINESS_REFRESHING";
  *                                     read-back since startup, an unreachable or partial one).
  *                                     A comparison made against a possibly-superseded record is
  *                                     not evidence of a mismatch, so this outranks step 5
+ *   4b. reconciliation settled it   — the flight controller PROVABLY carries the approved route
+ *                                     and only Scout's package disagrees. A definitive finding,
+ *                                     but the definitive finding is "a sync is owed", not "the
+ *                                     mission is wrong" — so it outranks step 5, which cannot
+ *                                     tell a differing package from an unproven read-back
  *   5. a PROVEN disagreement        — the CONTENT hashes differ, or the ids differ AND the
  *                                     content could not be proven equal. Mission ids alone
  *                                     never make a mismatch: a record label is not a route
@@ -292,6 +297,21 @@ export function readinessLabel({ publish = null, readiness = null, refreshing = 
   // start, or a vehicle whose read-back has not arrived, from rendering as a mismatch.
   if (rec && str(rec.outcome) === RECONCILE.RECONCILING && rec.pixhawk_settled !== true) {
     return make(READINESS_STATE.RECONCILING, str(rec.detail));
+  }
+  // The backend settled the operator/flight-controller half CONCLUSIVELY — the route on the
+  // flight controller IS the approved route — and located the whole disagreement in Scout's
+  // stored package. That is precisely the disagreement a package-only sync closes, and it is
+  // the ONE state that carries that action.
+  //
+  // The hash comparisons below cannot make this distinction and must not be asked to: the
+  // backend hands them `hash_match:false` both when the package route differs AND when the
+  // flight-controller half was never proven, because `hash_match` is the whole three-way chain
+  // (package == record == flight controller). Only reconciliation knows which link failed.
+  // Reading a stale package as REAL_MISMATCH is what withheld the read-only remedy on the Map
+  // and sent the operator to Plan → Finish & upload — re-writing a flight controller that was
+  // already carrying the approved route — to repair a package.
+  if (rec && str(rec.outcome) === RECONCILE.PACKAGE_SYNC_REQUIRED) {
+    return make(READINESS_STATE.PACKAGE_SYNC_REQUIRED, str(rec.detail) || str(rec.reason));
   }
 
   // A proven disagreement needs BOTH sides reported. `mission_id_match:false` with a null
