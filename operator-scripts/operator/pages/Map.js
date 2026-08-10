@@ -1428,6 +1428,42 @@ export function Map(root) {
           `<div class="amx-row"><span class="k">${esc(r.k)}</span><span class="v${r.mono ? " mono" : ""}" title="${escAttr(r.title || "")}">${esc(r.v)}</span></div>`).join("")}</div>`
       : "";
 
+    // The two LIVE statuses Scout re-evaluates continuously, in the card's existing row form —
+    // two lines, no gauge, no graph, no battery-injection control.
+    //
+    //   ENERGY  answers "can the remaining planned mission be completed?" and carries the MISSION
+    //           margin. It is NOT the RTL return margin and neither is ever labelled "Home
+    //           margin" — completing the route and being able to abort back to the verified RTL
+    //           Home are different questions, and Scout's Start gate requires both. When Scout
+    //           says the run is completable but the return is not, this reads RTL INSUFFICIENT
+    //           rather than a reassuring FEASIBLE.
+    //   RISK    is Scout's GOVERNING level — `risk.level`, with its non-compensatory component
+    //           floors and any hard-feasibility override ALREADY APPLIED by Scout. It is not the
+    //           weighted level and it is never derived from the score here, so a weighted LOW
+    //           under a HIGH communication floor reads HIGH, which is what it is. Until Scout
+    //           reports a level it is a quiet "—" — never LOW.
+    //   ADVICE  is Scout's advisory recommendation (CONTINUE / CAUTION / HOLD / RETURN), and
+    //           only appears when Scout sends one. It is TEXT: not a button, not a link, and
+    //           nothing on this card acts on it. Risk never triggers a command.
+    //
+    // ENERGY AND RISK ARE SEPARATE READINGS AND MAY DISAGREE. `FEASIBLE +4%` beside `HIGH` is
+    // correct and useful — the run is still completable with reserve, and the margin is tight
+    // enough that Scout's governing risk has risen. Neither line is bent toward the other, and
+    // no operator-side "TIGHT" threshold exists to blur them.
+    //
+    // All three are DISPLAY ONLY: they explain a readiness verdict, they never produce one. The
+    // Start button above still comes from can_start / start_eligible / start_block_reason via the
+    // gate — readiness is not derived from risk, and a HIGH risk does not disable anything Scout
+    // has not itself refused. The full evidence (both margins, both distances, battery, reserve,
+    // geometry sources, the floor, the component breakdown, evaluation freshness) is the tooltip
+    // here and the Agent page's diagnostics rows in full.
+    const rec = card.recommendation || { reported: false };
+    const live = card.present === false ? "" : `<div class="amx-grid">
+        <div class="amx-row"><span class="k">Energy</span><span class="v ${esc(card.energy.tone)}" title="${escAttr(card.energy.detail || "")}">${esc(card.energy.text)}</span></div>
+        <div class="amx-row"><span class="k">Risk</span><span class="v ${esc(card.risk.tone)}" title="${escAttr(card.risk.detail || "")}">${esc(card.risk.text)}</span></div>
+        ${rec.reported ? `<div class="amx-row"><span class="k">Advice</span><span class="v ${esc(rec.tone)}" title="${escAttr(`Scout's advisory recommendation (${rec.code}). Display only — the operator decides.`)}">${esc(rec.text)}</span></div>` : ""}
+      </div>`;
+
     // Progress. While the START transaction runs this is PHASE-SPECIFIC and NEUTRAL — "Checking
     // mission readiness…", "Taking agent control…", "Holding position…", "Setting and verifying
     // Home…", "Starting AUTO…" — each one Scout's observed step (or, before Scout has moved, the
@@ -1570,7 +1606,7 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${fullRefreshNote}${info}${resultNote}</div>`;
+    return `<div class="amx">${head}${rows}${live}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${fullRefreshNote}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation

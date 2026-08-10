@@ -396,6 +396,16 @@ export function Vehicle(root) {
     // verified:false — so this chip must follow `verified` alone. The reason Scout wrote
     // is surfaced beside it rather than left in a tooltip nobody hovers.
     const homeReason = hs.state === "verified" ? null : hs.reason;
+    // How the verification SURVIVED a Local Agent restart, when Scout says it did. Shown beside
+    // the chip as provenance, never instead of it: the chip still follows `verified` alone, so a
+    // recovery state can only ever qualify a VERIFIED Home, never create one. When Scout could
+    // not recover the proof it reports the state and its own reason, and that reason is what the
+    // operator reads — this page never guesses why.
+    const homeRecoveryCell = hs.recoveredAfterRestart
+      ? `<span class="diag-detail" title="${escAttr(hs.recoveryReason || "")}">recovered after restart</span>`
+      : hs.recoveryState && hs.recoveryState !== "RECOVERED"
+        ? `<span class="diag-detail" title="${escAttr(hs.recoveryReason || "")}">recovery ${esc(hs.recoveryState.toLowerCase())}</span>`
+        : "";
     // Current waypoint / Mission loaded come from Scout's CONTINUOUS mission report
     // (mission_count / current_waypoint_display), not from the operator's on-demand
     // readback proxy. Both rows previously said "NOT FETCHED" for a vehicle that was
@@ -421,6 +431,7 @@ export function Vehicle(root) {
         ${row("Mission", md.mission_state || v.status || noTelem("no telem"), "keep")}
         ${row("Home verification",
               `<span class="pxm-chip ${homeCls}">${homeTxt}</span>`
+              + homeRecoveryCell
               + (homeReason ? `<span class="diag-detail">${esc(homeReason)}</span>` : ""), "keep")}
         ${row("Current waypoint", curWpCell, "keep")}
         ${row("Mission loaded", missionLoadedCell, "keep")}

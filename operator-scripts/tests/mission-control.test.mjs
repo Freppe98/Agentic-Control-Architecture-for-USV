@@ -671,8 +671,15 @@ test("the Map never sequences authority itself — one endpoint per intent", () 
 });
 
 test("the Map's mission lifecycle is never implemented with low-level vehicle commands", () => {
+  // COMMENTS ARE STRIPPED FIRST. The guard is about what the card DOES, and the card's prose has
+  // to be able to name the things it must not do — and, since Scout began reporting energy
+  // feasibility, to name RTL at all: "RTL Home", "RTL return margin" and "RTL INSUFFICIENT" are
+  // Scout's own vocabulary for whether the vehicle could get back, not a mode command. Matching
+  // the bare word in prose would either forbid explaining the rule or forbid displaying Scout's
+  // verdict; matching it in CODE still catches the only thing that was ever the danger.
   const card = mapSrc.slice(mapSrc.indexOf("function renderAgentMission"),
-    mapSrc.indexOf("function renderAgentMission") + 4500);
+    mapSrc.indexOf("function renderAgentMission") + 6000)
+    .replace(/^\s*\/\/.*$/gm, "");
   for (const t of ["SET_MODE_AUTO", "SET_MODE_LOITER", "RTL", "ARM", "DISARM",
     "createCommand"]) {
     assert.doesNotMatch(card, new RegExp(t), t);

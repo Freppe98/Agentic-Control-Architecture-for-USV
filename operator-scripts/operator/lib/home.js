@@ -111,6 +111,16 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
       : "Pixhawk Home is not verified for this deployment site. Set Home before autonomous operation.";
   }
 
+  // Scout's read-only VERIFICATION RECOVERY evidence — how the current verification survived a
+  // Local Agent restart ({state, reason, checked_at}). It is PROVENANCE ONLY and is deliberately
+  // read AFTER `state` has already been decided above: `verified` is the sole input to
+  // verified/unverified, so a recovery that reports RECOVERED while Scout says `verified:false`
+  // still reads UNVERIFIED here. Nothing in this function may promote a recovery into a
+  // verification, and coordinates alone never imply either.
+  const rec = home.verification_recovery && typeof home.verification_recovery === "object"
+    ? home.verification_recovery : null;
+  const recoveryState = rec && rec.state ? String(rec.state).toUpperCase() : null;
+
   return {
     state, available, verified, stale,
     homeLat, homeLng, vehLat, vehLng,
@@ -119,6 +129,12 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
     verifiedAgeS,
     verifiedDistanceM: home.verification_distance_m != null ? +home.verification_distance_m : null,
     verificationMethod: home.verification_method || null,
+    recoveryState,
+    // TRUE only when Scout BOTH recovered the proof and still reports the Home as verified.
+    // Either half alone is not a recovered verification.
+    recoveredAfterRestart: verified && recoveryState === "RECOVERED",
+    recoveryReason: rec && rec.reason ? String(rec.reason) : null,
+    recoveryCheckedAt: rec && rec.checked_at != null ? rec.checked_at : null,
     readyForAuto: home.ready_for_auto === true,
     readyForRtl: home.ready_for_rtl === true,
     reachable: home.reachable == null ? null : !!home.reachable,

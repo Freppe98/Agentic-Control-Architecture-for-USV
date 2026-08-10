@@ -182,6 +182,17 @@ export const ERROR_TEXT = {
   PROGRESSION_UNCONFIRMED: "Mission progression could not be confirmed",
   MISSION_EXECUTION_DISABLED: "Mission execution is disabled on Scout",
   REPLANNING_ACTIVE: "The replanning controller owns the vehicle",
+  // Scout's ENERGY-feasibility refusals. Each names WHICH of the two questions failed — Scout's
+  // Start gate requires both — because "not enough energy" alone does not tell an operator
+  // whether the vehicle can still get home.
+  INSUFFICIENT_ENERGY_FOR_PLANNED_MISSION:
+    "Scout reports insufficient energy to complete the planned mission",
+  INSUFFICIENT_ENERGY_FOR_RTL_RETURN:
+    "Scout reports insufficient energy to return to the verified RTL Home",
+  BATTERY_INVALID: "The battery estimate is unavailable, so energy feasibility cannot be decided",
+  POSITION_STALE: "Position data is stale, so energy feasibility cannot be decided",
+  RTL_HOME_UNAVAILABLE: "No verified RTL Home is available to evaluate a return against",
+  MISSION_UNAVAILABLE: "No mission is available to evaluate",
   ARBITRATION_BUSY: "Another write is in progress on Scout (write arbitration)",
   // Scout's STOP failure codes. Every one of them is raised AFTER the vehicle is safely
   // holding, so each reading says what is true of the vehicle as well as what failed.
@@ -232,6 +243,19 @@ const str = (v) => {
   const s = String(v).trim();
   return s === "" ? null : s;
 };
+// A finite number or null. Anything else — a string, a NaN, a missing key — is NOT a reading.
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+// A PERCENTAGE reading. Negative is the "I do not know" sentinel this fleet actually sends
+// (battery_remaining = -1), and rendering that as a battery level is the exact lie the station
+// forbids: a flat battery is an emergency, an absent reading is a gap.
+const pct = (v) => {
+  const n = num(v);
+  return n === null || n < 0 ? null : n;
+};
+// TRI-STATE. `true` / `false` / `null` are three different facts: Scout proved it, Scout
+// disproved it, Scout said nothing. Collapsing the third into the second reports a verdict
+// Scout never issued.
+const bool3 = (v) => (v === true ? true : v === false ? false : null);
 function first(obj, ...keys) {
   if (!isObj(obj)) return null;
   for (const k of keys) if (obj[k] !== undefined && obj[k] !== null) return obj[k];
@@ -249,6 +273,116 @@ export const STATUS_IDENTIFYING_FIELDS = [
   "can_start", "can_pause", "can_resume", "can_stop",
   "start_eligible", "execution_ready", "authority_blocks_start",
 ];
+
+// ── ENERGY FEASIBILITY: Scout's CONTINUOUS mission-energy verdict ──────────────────────────
+//
+// Scout evaluates, on every status, whether the vehicle can still finish the Operator-planned
+// mission AND whether it could abort right now and reach its current verified Pixhawk/RTL Home.
+// Those are TWO different questions and the station never merges them into one "home margin":
+//
+//   MISSION MARGIN      can Scout complete the REMAINING operator-planned mission?
+//   RTL RETURN MARGIN   can Scout abort NOW and return to the verified RTL Home?
+//
+// NOTHING HERE IS COMPUTED LOCALLY. The station has no battery model, no range model and no
+// reserve policy; it displays Scout's own `mission_feasible` / `rtl_return_feasible` verdicts and
+// Scout's own margins. Scout's Start gate requires BOTH verdicts, so the card's compact reading
+// must reflect both — a mission that is completable but unreturnable is NOT "FEASIBLE".
+export const ENERGY = {
+  FEASIBLE: "FEASIBLE",              // both verdicts true
+  INSUFFICIENT: "INSUFFICIENT",      // mission_feasible === false
+  RTL_INSUFFICIENT: "RTL_INSUFFICIENT", // mission completable, RTL return NOT
+  CHECKING: "CHECKING",              // Scout cannot evaluate right now (freshness)
+  UNKNOWN: "UNKNOWN",                // Scout evaluated to UNKNOWN, or a verdict is missing
+  NONE: "NONE",                      // this Scout reports no energy feasibility at all
+};
+
+// Scout's `reason` codes → operator text. PRESENTATION of Scout's own code, exactly like
+// ERROR_TEXT: an unrecognised reason is shown as-is rather than replaced.
+//
+// ORDER IS LOAD-BEARING. energyReasonText() also matches a code EMBEDDED in a longer sentence,
+// and "SUFFICIENT_ENERGY" is a substring of "INSUFFICIENT_ENERGY_FOR_…" — so the insufficiency
+// codes must be tried first or a deficit would read as sufficiency, which is the one direction
+// this mapping must never fail in.
+export const ENERGY_REASON_TEXT = {
+  INSUFFICIENT_ENERGY_FOR_PLANNED_MISSION: "Insufficient energy for the planned mission",
+  INSUFFICIENT_ENERGY_FOR_RTL_RETURN: "Insufficient energy for the RTL return",
+  SUFFICIENT_ENERGY: "Sufficient energy for the mission and the RTL return",
+  BATTERY_INVALID: "Battery estimate unavailable",
+  POSITION_STALE: "Position data stale",
+  RTL_HOME_UNAVAILABLE: "RTL Home unavailable",
+  MISSION_UNAVAILABLE: "Mission unavailable",
+};
+
+/** Operator text for Scout's energy `reason`. Accepts the bare code, a code inside Scout's own
+ *  sentence, or a structured {code, message} — and returns the text UNCHANGED when the code is
+ *  one this build has not seen, so a new Scout reason is still reported honestly. */
+export function energyReasonText(reason) {
+  const t = asText(reason);
+  if (!t) return null;
+  const up = t.toUpperCase();
+  if (ENERGY_REASON_TEXT[up]) return ENERGY_REASON_TEXT[up];
+  for (const [code, text] of Object.entries(ENERGY_REASON_TEXT)) {
+    if (up.includes(code)) return text;
+  }
+  return t;
+}
+
+// The reasons that mean "Scout is waiting for usable input", as opposed to "Scout cannot answer".
+// A stale fix resolves itself on the next position; an invalid battery or a missing RTL Home does
+// not. Both are NEUTRAL — an unknown is not an emergency and must never render as one.
+export const ENERGY_CHECKING_REASONS = ["POSITION_STALE"];
+
+// ── RISK: Scout's own authoritative agent risk level ───────────────────────────────────────
+//
+// Scout runs the continuous risk model and this station DISPLAYS it. Nothing here computes a
+// score, a level, a threshold or a floor, and nothing infers one from energy, comms or anything
+// else — a risk level is a claim about the vehicle's situation, and the only component holding
+// that situation is the agent. A Scout that reports no risk block reads "—", never LOW.
+//
+// SCOUT'S PIPELINE, and why only ONE of its outputs may be displayed as THE level:
+//
+//   weighted continuous score        →  risk.weighted_score / risk.weighted_level
+//   + non-compensatory floors        →  risk.component_floor_level / _reason / _source
+//   + hard feasibility override      →  risk.hard_constraint_violated / risk.hard_override_level
+//   ────────────────────────────────────────────────────────────────────────────────────────
+//   = GOVERNING level                →  risk.level          ← the only authoritative one
+//
+// The floors are NON-COMPENSATORY on purpose: a single severe component raises the governing
+// level regardless of how reassuring the weighted average is. Scout's own worked example —
+// score 0.2375, weighted_level LOW, component_floor_level HIGH
+// (COMMUNICATION_DISCONNECTED_NO_AUTONOMOUS_EXECUTION), level HIGH — is exactly the case a
+// station that rendered the score would get backwards, so `risk.level` is read directly and the
+// score is never mapped to a level here. See riskView().
+export const RISK_LEVELS = ["LOW", "ELEVATED", "HIGH", "CRITICAL", "UNKNOWN"];
+
+// Existing card tones only (ok / caution / warn / idle) — no new colour vocabulary. HIGH and
+// CRITICAL share the warn colour and are told apart by their label, which is what the card's
+// three semantic colours can honestly support.
+export const RISK_TONE = {
+  LOW: "ok", ELEVATED: "caution", HIGH: "warn", CRITICAL: "warn", UNKNOWN: "idle",
+};
+
+// Scout's risk COMPONENTS, in the order the operator reads them. Fixed here so the breakdown
+// cannot silently reorder between polls; a component Scout adds that is not in this list is
+// still displayed, appended after these (see riskComponents).
+export const RISK_COMPONENTS = ["energy", "communication", "navigation", "health", "mission"];
+
+// ── Scout's ADVISORY recommendation → the operator's compact word ──────────────────────────
+// DISPLAY ONLY, and deliberately inert. It is not a button, it does not enable or disable a
+// control, and it never produces a command: the recommendation is Scout's advice to a human,
+// and turning advice into an affordance would make the risk model a control path it was never
+// designed or authorised to be. A recommendation this build does not recognise is shown exactly
+// as Scout sent it.
+export const RECOMMENDATION_TEXT = {
+  CONTINUE: "CONTINUE",
+  CONTINUE_WITH_CAUTION: "CAUTION",
+  HOLD_RECOMMENDED: "HOLD",
+  RETURN_RECOMMENDED: "RETURN",
+};
+export const RECOMMENDATION_TONE = {
+  CONTINUE: "ok", CONTINUE_WITH_CAUTION: "caution", HOLD_RECOMMENDED: "warn",
+  RETURN_RECOMMENDED: "warn",
+};
 
 // Scout's mission/package binding vocabulary, verbatim.
 export const BINDING = { UNBOUND: "UNBOUND", BOUND: "BOUND", STALE_MISMATCH: "STALE_MISMATCH" };
@@ -353,6 +487,8 @@ export function normalizeStatus(res) {
   const bind = isObj(s.binding) ? s.binding : {};
   const conflict = isObj(s.package_conflict) ? s.package_conflict : {};
   const batt = isObj(s.battery_diagnostics) ? s.battery_diagnostics : {};
+  const nrg = isObj(s.energy_feasibility) ? s.energy_feasibility : {};
+  const rsk = isObj(s.risk) ? s.risk : {};
   const stopBlk = isObj(s.stop) ? s.stop : {};
   const state = str(s.state);
   const effective = str(s.effective_state) || state;
@@ -442,6 +578,85 @@ export function normalizeStatus(res) {
       raw: batt.battery_raw ?? null,
       observedAt: str(batt.battery_observed_at),
       telemetryAgeS: typeof batt.telemetry_age_s === "number" ? batt.telemetry_age_s : null,
+    },
+    // Scout's CONTINUOUS energy-feasibility evaluation, verbatim. Every verdict stays TRI-STATE
+    // and every number stays a number or null — a missing margin is not 0%, and an absent
+    // `mission_feasible` is not `false`. A Scout that predates the contract reports nothing here
+    // and `reported:false` is what keeps the card from inventing a verdict for it.
+    energy: {
+      reported: Object.keys(nrg).length > 0,
+      // asText, NOT str(): Scout's status and reason are bare codes today, but a structured
+      // {code, message} is a legitimate shape for either — and String()-ing one would print the
+      // literal "[object Object]" exactly where the energy verdict goes.
+      status: asText(nrg.status),
+      reason: asText(nrg.reason),
+      // Scout's own sentence about the verdict ("mission margin 17.27%, RTL return margin
+      // 78.92% -- both positive at effective battery 89% (PHYSICAL)."). Shown as-is where
+      // there is room for it; it is Scout's words, never reassembled from the numbers here.
+      message: asText(nrg.message),
+      // Percentages, through pct(): a negative is this fleet's "unknown" sentinel, never a level.
+      batteryPercent: pct(nrg.battery_percent),
+      batterySource: str(nrg.battery_source),
+      physicalBatteryPercent: pct(nrg.physical_battery_percent),
+      injectedBatteryPercent: pct(nrg.injected_battery_percent),
+      currentSequence: nrg.current_sequence ?? null,
+      remainingWaypointCount: nrg.remaining_waypoint_count ?? null,
+      plannedHome: isObj(nrg.planned_home) ? nrg.planned_home : null,
+      rtlHome: isObj(nrg.rtl_home) ? nrg.rtl_home : null,
+      plannedCompletionDistanceM: num(nrg.planned_completion_distance_m),
+      rtlReturnDistanceM: num(nrg.rtl_return_distance_m),
+      estimatedMissionEnergyPercent: num(nrg.estimated_mission_energy_percent),
+      estimatedRtlReturnEnergyPercent: num(nrg.estimated_rtl_return_energy_percent),
+      reserveMarginPercent: num(nrg.reserve_margin_percent),
+      usableRangeM: num(nrg.usable_range_m),
+      // MARGINS are signed by design — a negative margin is the deficit, not an unknown — so
+      // they go through num(), never pct().
+      missionMarginPercent: num(nrg.mission_margin_percent),
+      rtlReturnMarginPercent: num(nrg.rtl_return_margin_percent),
+      missionFeasible: bool3(nrg.mission_feasible),
+      rtlReturnFeasible: bool3(nrg.rtl_return_feasible),
+      missionGeometrySource: str(nrg.mission_geometry_source),
+      rtlReturnGeometrySource: str(nrg.rtl_return_geometry_source),
+      evaluatedAt: str(nrg.evaluated_at),
+      positionAgeS: num(nrg.position_age_s),
+      maxPositionAgeS: num(nrg.max_position_age_s),
+    },
+    // Scout's OWN risk verdict, in full. The station reads every field and derives NONE of
+    // them — see RISK_LEVELS for the pipeline these fields come out of.
+    //
+    // `level` is the GOVERNING level and is read from `risk.level` alone. `weightedLevel` and
+    // `score` are the pre-floor inputs: they are kept so the Agent page can EXPLAIN how the
+    // governing level was reached, and they are never substituted for it. Both spellings of
+    // level/score are accepted so an older Scout that ships `risk_level` needs no code change.
+    risk: {
+      reported: Object.keys(rsk).length > 0,
+      level: asText(first(rsk, "level", "risk_level")),
+      score: num(first(rsk, "score", "risk_score")),
+      weightedScore: num(rsk.weighted_score),
+      weightedLevel: asText(rsk.weighted_level),
+      // The non-compensatory severity floor. `component_floor_level` present means ONE
+      // component was severe enough to raise the governing level on its own, whatever the
+      // weighted average said. Null is "no floor was active", not "no floor exists".
+      floorLevel: asText(rsk.component_floor_level),
+      floorReason: asText(rsk.component_floor_reason),
+      floorSource: asText(rsk.component_floor_source),
+      // The hard feasibility override — Scout's mission/RTL feasibility gate outranking the
+      // continuous model entirely. TRI-STATE: false is "Scout checked and no hard constraint
+      // is violated"; null is "Scout said nothing", and the two must not look alike.
+      hardConstraintViolated: bool3(rsk.hard_constraint_violated),
+      hardOverrideLevel: asText(rsk.hard_override_level),
+      confidence: asText(rsk.confidence),
+      recommendation: asText(rsk.recommendation),
+      dominantComponent: asText(rsk.dominant_component),
+      dominantReason: asText(rsk.dominant_reason),
+      feasibilityStatus: asText(rsk.feasibility_status),
+      // Scout's own evaluation instant. Kept RAW (its epoch seconds, or whatever Scout sends)
+      // because the age shown to the operator is computed against it at render time and must
+      // never be confused with the age of our poll — polling creates no freshness.
+      evaluatedAt: rsk.evaluated_at ?? null,
+      components: isObj(rsk.components) ? rsk.components : null,
+      weights: isObj(rsk.weights) ? rsk.weights : null,
+      reason: asText(first(rsk, "reason", "detail", "summary")),
     },
     missionExecutionEnabled: s.mission_execution_enabled,
     lastError: first(s, "last_error"),
@@ -627,6 +842,256 @@ export function batteryView(status) {
       text: "Battery telemetry temporarily unavailable", detail };
   }
   return { known: true, percent: b.percent, text: `${b.percent}%`, detail };
+}
+
+/** A margin percentage as the card prints it: signed, whole, never a decimal tail. `20.13` is
+ *  "+20%", `-7.2` is "-7%". Null in, null out — the caller renders its own placeholder. */
+export function energyMarginText(percent) {
+  const n = num(percent);
+  if (n === null) return null;
+  const r = Math.round(n);
+  const whole = Object.is(r, -0) ? 0 : r;
+  return `${whole >= 0 ? "+" : ""}${whole}%`;
+}
+
+/** Scout's energy evidence as ONE readable line for the card's tooltip. Both margins are named
+ *  in full — MISSION and RTL RETURN are different questions and neither is "home margin". */
+export function energyDetail(energy) {
+  const e = isObj(energy) ? energy : {};
+  if (!e.reported) return null;
+  const m = (v) => (num(v) === null ? null : `${Math.round(v)} m`);
+  const p1 = (v) => (num(v) === null ? null : `${v.toFixed(1)}%`);
+  const signed1 = (v) => (num(v) === null ? null : `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`);
+  const yn = (v) => (v === true ? "yes" : v === false ? "no" : null);
+  return [
+    energyReasonText(e.reason),
+    signed1(e.missionMarginPercent) ? `mission margin ${signed1(e.missionMarginPercent)}` : null,
+    signed1(e.rtlReturnMarginPercent)
+      ? `RTL return margin ${signed1(e.rtlReturnMarginPercent)}` : null,
+    yn(e.missionFeasible) ? `mission feasible ${yn(e.missionFeasible)}` : null,
+    yn(e.rtlReturnFeasible) ? `RTL return feasible ${yn(e.rtlReturnFeasible)}` : null,
+    m(e.plannedCompletionDistanceM) ? `planned ${m(e.plannedCompletionDistanceM)}` : null,
+    m(e.rtlReturnDistanceM) ? `RTL return ${m(e.rtlReturnDistanceM)}` : null,
+    e.batteryPercent === null ? null : `battery ${Math.round(e.batteryPercent)}%`
+      + (e.batterySource ? ` (${e.batterySource})` : ""),
+    p1(e.reserveMarginPercent) ? `reserve ${p1(e.reserveMarginPercent)}` : null,
+    e.positionAgeS === null ? null : `position age ${e.positionAgeS.toFixed(1)} s`
+      + (e.maxPositionAgeS === null ? "" : ` of ${e.maxPositionAgeS} s`),
+    e.evaluatedAt ? `evaluated ${e.evaluatedAt}` : null,
+  ].filter(Boolean).join(" · ") || null;
+}
+
+/**
+ * THE compact ENERGY status, from Scout's authoritative verdicts only.
+ *
+ * The card answers "can I complete the planned mission?", so the visible percentage is the
+ * MISSION margin and never the RTL return margin. But Scout's Start gate requires BOTH verdicts,
+ * so the reading must reflect both — a run that can be completed but not returned from is NOT
+ * shown as a reassuring "FEASIBLE +20%".
+ *
+ * Order of decision, and why it is not the order the four cases are usually listed in:
+ *   1. mission_feasible === false      an explicit refusal outranks a missing sibling field. A
+ *                                      Scout that proved the mission infeasible while it could
+ *                                      not evaluate the RTL return has still told the operator
+ *                                      something they must act on, and showing UNKNOWN there
+ *                                      would hide a proven deficit.
+ *   2. rtl_return_feasible === false   likewise explicit, and the one case the compact reading
+ *                                      would otherwise misrepresent.
+ *   3. anything not proven true        UNKNOWN / CHECKING. Neutral, never an emergency.
+ *   4. both proven true                FEASIBLE, with the mission margin.
+ *
+ * @returns {{ reported, state, text, tone, marginPercent, marginText, reason, reasonText,
+ *             missionFeasible, rtlReturnFeasible, detail }}
+ */
+export function energyView(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const e = S.energy || {};
+  const reason = e.reason || null;
+  const reasonText = energyReasonText(reason);
+  const marginText = energyMarginText(e.missionMarginPercent);
+  const base = {
+    reported: e.reported === true,
+    marginPercent: e.missionMarginPercent ?? null, marginText,
+    reason, reasonText,
+    missionFeasible: e.missionFeasible ?? null,
+    rtlReturnFeasible: e.rtlReturnFeasible ?? null,
+    detail: energyDetail(e),
+  };
+
+  // An older Scout said NOTHING about energy. "—" is the honest reading; it is not a failure and
+  // it must not disable anything.
+  if (!e.reported) {
+    return { ...base, state: ENERGY.NONE, text: "—", tone: "idle",
+      detail: "This Scout does not report mission-energy feasibility." };
+  }
+  if (e.missionFeasible === false) {
+    return { ...base, state: ENERGY.INSUFFICIENT, tone: "warn",
+      text: marginText ? `INSUFFICIENT ${marginText}` : "INSUFFICIENT" };
+  }
+  if (e.rtlReturnFeasible === false) {
+    // The mission may well be completable. The vehicle could not get back, and Scout's Start
+    // gate refuses on exactly this — so the card says which of the two failed, not "FEASIBLE".
+    return { ...base, state: ENERGY.RTL_INSUFFICIENT, tone: "warn", text: "RTL INSUFFICIENT" };
+  }
+  if (e.missionFeasible === true && e.rtlReturnFeasible === true
+      && String(e.status || "").toUpperCase() !== "UNKNOWN") {
+    return { ...base, state: ENERGY.FEASIBLE, tone: "ok",
+      text: marginText ? `FEASIBLE ${marginText}` : "FEASIBLE" };
+  }
+  // Neither dimension is proven. NEUTRAL by design: an unknown is a gap in the inputs, not an
+  // emergency, and colouring it red would teach the operator to ignore the colour that matters.
+  const up = (reason || "").toUpperCase();
+  const checking = ENERGY_CHECKING_REASONS.some((c) => up.includes(c));
+  return { ...base, state: checking ? ENERGY.CHECKING : ENERGY.UNKNOWN, tone: "idle",
+    text: checking ? "CHECKING" : "UNKNOWN" };
+}
+
+/**
+ * THE compact RISK status — Scout's GOVERNING level, or nothing.
+ *
+ * `risk.level` is read directly and is the only field that decides what is displayed. It is NOT
+ * derived from `risk.score`, and it is NOT `risk.weighted_level`: Scout's governing level is the
+ * weighted level raised by any non-compensatory component floor and then by any hard-feasibility
+ * override, so the two disagree exactly when it matters most. Scout's own worked example —
+ *
+ *     score 0.2375 · weighted_level LOW · component_floor_level HIGH
+ *     (COMMUNICATION_DISCONNECTED_NO_AUTONOMOUS_EXECUTION) · level HIGH
+ *
+ * — must display HIGH. A station that rendered the score would show LOW for a vehicle whose own
+ * agent has assessed it as HIGH, which is the single worst direction this reading can fail in.
+ *
+ * There is no operator-side risk model and there must not be one. When Scout reports no risk
+ * block this reads "—", quietly; it never reads LOW.
+ *
+ * A level this build does not recognise is displayed AS SENT with a neutral tone and
+ * `known:false`, never bucketed into a level the operator would act on.
+ *
+ * The returned view also carries the EXPLANATION fields (weighted score/level, the floor, the
+ * hard override, confidence, the dominant component) so the Agent page can show how the
+ * governing level was reached. They are evidence for a human; nothing consumes them as a gate.
+ *
+ * @returns {{ reported, level, known, text, tone, score, weightedScore, weightedLevel,
+ *             floorLevel, floorReason, floorSource, floorActive, hardConstraintViolated,
+ *             hardOverrideLevel, confidence, dominantComponent, dominantReason, evaluatedAt,
+ *             governedBy, detail }}
+ */
+export function riskView(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const r = S.risk || {};
+  const score = r.score ?? null;
+  const explain = {
+    score,
+    weightedScore: r.weightedScore ?? null,
+    weightedLevel: r.weightedLevel || null,
+    floorLevel: r.floorLevel || null,
+    floorReason: r.floorReason || null,
+    floorSource: r.floorSource || null,
+    floorActive: !!r.floorLevel,
+    hardConstraintViolated: r.hardConstraintViolated ?? null,
+    hardOverrideLevel: r.hardOverrideLevel || null,
+    confidence: r.confidence || null,
+    dominantComponent: r.dominantComponent || null,
+    dominantReason: r.dominantReason || null,
+    evaluatedAt: r.evaluatedAt ?? null,
+  };
+  if (!r.reported || !r.level) {
+    return { ...explain, reported: r.reported === true, level: null, known: false, text: "—",
+      tone: "idle", governedBy: null,
+      detail: r.reported === true
+        ? "Scout reported a risk block but no governing level — nothing is claimed about risk."
+        : "This Scout does not report an agent risk level yet. The operator station never "
+          + "computes one." };
+  }
+  const level = r.level.toUpperCase();
+  const known = RISK_LEVELS.includes(level);
+
+  // WHICH stage of Scout's pipeline produced the governing level. Reported, not recomputed:
+  // this only names the stage whose level Scout's own fields show matching the governing one,
+  // and stays null when they do not — it never re-runs the floor or the override logic.
+  const eq = (v) => !!v && String(v).toUpperCase() === level;
+  const governedBy = r.hardConstraintViolated === true && eq(r.hardOverrideLevel) ? "hard"
+    : eq(r.floorLevel) ? "floor"
+      : eq(r.weightedLevel) ? "weighted" : null;
+
+  // The tooltip. Deliberately a short line and NOT the components object: dumping the nested
+  // per-component evidence here produced a multi-kilobyte hover on live Scout, which is not a
+  // tooltip anyone reads. The breakdown belongs on the Agent page (see riskComponents).
+  const detail = [
+    known ? null : "Risk level not recognised by this build — shown exactly as Scout sent it",
+    r.hardConstraintViolated === true
+      ? `hard constraint violated${r.hardOverrideLevel ? ` → ${r.hardOverrideLevel}` : ""}` : null,
+    r.floorLevel
+      ? `severity floor ${r.floorLevel}${r.floorReason ? ` (${r.floorReason})` : ""}` : null,
+    r.weightedLevel || r.weightedScore !== null
+      ? `weighted ${r.weightedLevel || "—"}${r.weightedScore === null ? "" : ` ${r.weightedScore}`}`
+      : score === null ? null : `score ${score}`,
+    r.dominantComponent
+      ? `dominant ${r.dominantComponent}${r.dominantReason ? ` (${r.dominantReason})` : ""}` : null,
+    r.confidence ? `confidence ${r.confidence}` : null,
+    r.reason || null,
+  ].filter(Boolean).join(" · ") || `Scout reports risk level ${level}.`;
+
+  return { ...explain, reported: true, level, known, text: level,
+    tone: known ? RISK_TONE[level] : "idle", governedBy, detail };
+}
+
+/**
+ * Scout's ADVISORY recommendation, mapped to the operator's compact word.
+ *
+ * DISPLAY ONLY. This never becomes a button, never enables or disables a control and never
+ * produces a command — see RECOMMENDATION_TEXT. An unrecognised recommendation is shown exactly
+ * as Scout sent it, with a neutral tone, rather than being bucketed into one of the four.
+ *
+ * @returns {{ reported, code, text, tone, known }}
+ */
+export function recommendationView(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const code = (S.risk && S.risk.recommendation) || null;
+  if (!code) return { reported: false, code: null, text: "—", tone: "idle", known: false };
+  const up = code.toUpperCase();
+  const known = Object.prototype.hasOwnProperty.call(RECOMMENDATION_TEXT, up);
+  return {
+    reported: true, code: up, known,
+    text: known ? RECOMMENDATION_TEXT[up] : up,
+    tone: known ? RECOMMENDATION_TONE[up] : "idle",
+  };
+}
+
+/**
+ * Scout's per-component risk breakdown, as a stable ordered list for the diagnostics table.
+ *
+ * PURE PRESENTATION of Scout's own numbers. `weightedContribution` is read from Scout's
+ * `weighted_score` field and is NOT computed as score × weight here: recomputing it would be a
+ * second model quietly disagreeing with the first whenever Scout changes how a component
+ * contributes. When Scout omits it, the cell stays null and reads "—".
+ *
+ * RISK_COMPONENTS fixes the order so the table cannot reshuffle between polls; a component Scout
+ * adds later is appended after the known ones rather than dropped.
+ *
+ * @returns {Array<{ name, score, weight, weightedContribution, reason, evidence }>}
+ */
+export function riskComponents(status) {
+  const S = status && status.present !== undefined ? status : normalizeStatus(status);
+  const comps = (S.risk && S.risk.components) || null;
+  if (!isObj(comps)) return [];
+  const weights = (S.risk && S.risk.weights) || null;
+  const names = [
+    ...RISK_COMPONENTS.filter((n) => n in comps),
+    ...Object.keys(comps).filter((n) => !RISK_COMPONENTS.includes(n)),
+  ];
+  return names.map((name) => {
+    const c = isObj(comps[name]) ? comps[name] : {};
+    return {
+      name: asText(c.name) || name,
+      score: num(c.score),
+      // Scout reports the weight on the component AND in a top-level `weights` map. The
+      // component's own value wins; the map is the fallback for a Scout that only sends one.
+      weight: num(c.weight) ?? (isObj(weights) ? num(weights[name]) : null),
+      weightedContribution: num(c.weighted_score),
+      reason: asText(c.reason),
+      evidence: isObj(c.evidence) ? c.evidence : null,
+    };
+  });
 }
 
 /**
@@ -1323,9 +1788,41 @@ export function firstClause(text, max = 44) {
  * Matching is on the reason Scout/the backend actually sent; an unrecognised one is shortened
  * rather than replaced, so a new backend message is still reported honestly.
  */
+// Scout's BARE reason codes → the short card line. Checked before the prose heuristics below,
+// longest/most specific first, because the generic rules would blur codes that mean materially
+// different things: `/position/i` reads POSITION_STALE as "Position not usable" (true but vague)
+// and nothing at all distinguishes a mission deficit from an RTL-return deficit. Every string
+// here is <= 44 characters, the card's short-line budget; the full reason is always the tooltip.
+//
+// The package-staleness codes are here for a second reason, and it is a correctness one rather
+// than a brevity one. They are DEFINITIVE: Scout performed the comparison and it failed — it
+// holds a package whose route hash is not the one on the flight controller. The generic
+// `/hash|package|verif/` rule below shortened every one of them to "Mission verification
+// unavailable", which states the opposite (that the check could not be run) and put an UNKNOWN
+// phrasing on the card beside the readiness line's definitive one. Two contradictory sentences
+// about one settled fact is what made a stale package look like a station that had lost its
+// footing at startup.
+export const START_BLOCK_REASON_TEXT = {
+  PLANNING_PACKAGE_MISSING: "Agent planning package missing",
+  PLANNING_PACKAGE_UNUSABLE: "Agent planning package unusable",
+  PLANNING_PACKAGE_STALE: "Agent planning package is stale",
+  ROUTE_HASH_STALE: "Agent planning package is stale",
+  INSUFFICIENT_ENERGY_FOR_PLANNED_MISSION: "Insufficient energy for planned mission",
+  INSUFFICIENT_ENERGY_FOR_RTL_RETURN: "Insufficient energy for RTL return",
+  RTL_HOME_UNAVAILABLE: "RTL Home unavailable",
+  MISSION_UNAVAILABLE: "Mission unavailable",
+  BATTERY_INVALID: "Battery estimate unavailable",
+  POSITION_STALE: "Position data stale",
+};
+
 export function shortStartBlocker(reason) {
   const t = asText(reason);
   if (!t) return "Start preconditions not met";
+  // Scout's own code, whether it arrived bare or embedded in a sentence.
+  const up = t.toUpperCase();
+  for (const [code, text] of Object.entries(START_BLOCK_REASON_TEXT)) {
+    if (up.includes(code)) return text;
+  }
   if (/another mission is active|while another mission/i.test(t))
     return "Another mission is still active";
   if (/no active mission/i.test(t)) return "No active mission";
@@ -1502,6 +1999,28 @@ export function missionCardView(status, {
     stopPhase: null,
     // Start is available AND pressing it will take Local Agent control first.
     authorityWillBeAcquired: false,
+    // The two COMPACT LIVE STATUSES, both of them Scout's own verdict and neither of them
+    // computed here. ENERGY answers "can the remaining planned mission be completed?" and carries
+    // the MISSION margin — but it reads RTL INSUFFICIENT when Scout can complete the run and not
+    // return from it, because Scout's Start gate requires both. RISK is Scout's GOVERNING
+    // level (`risk.level`, floors and hard overrides already applied); until Scout reports one
+    // it is a quiet "—" and never a reassuring LOW.
+    //
+    // THE TWO ARE INDEPENDENT AND ARE MEANT TO BE READ TOGETHER. Feasibility answers "can this
+    // be finished with reserve intact?"; risk answers "how close are we to conditions we do not
+    // want?". `ENERGY FEASIBLE +4%` beside `RISK HIGH` is not a contradiction to be smoothed
+    // over — it is the honest reading of a run that Scout can still complete while its energy
+    // margin has tightened enough to raise the governing level. Neither line is ever restated in
+    // the other's terms, and no third "TIGHT" verdict is invented on this station to bridge them.
+    //
+    // Set unconditionally, BEFORE the unsupported / unavailable / replanning / in-flight returns
+    // below, so every path leaves the card with a defined, honest reading rather than an absent
+    // field a renderer would have to guess at.
+    energy: energyView(S),
+    risk: riskView(S),
+    // Scout's advisory word (CONTINUE / CAUTION / HOLD / RETURN). Display only — it is not a
+    // button, it gates nothing, and it produces no command.
+    recommendation: recommendationView(S),
   };
 
   // Nothing may be claimed about an older or unreachable Scout — and the operator is told so in
