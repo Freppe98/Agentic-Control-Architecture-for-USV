@@ -501,7 +501,7 @@ def start_preconditions(deps, vid, base, *, mission_id, summary, fresh=False):
     }
 
 
-def preflight(deps, vid, base):
+def preflight(deps, vid, base, *, fresh=False):
     """Read-only Start preflight: the resolved mission identity plus the five precondition
     checks, computed by the SAME code the Start transaction enforces. Issues no write of any kind.
 
@@ -513,8 +513,11 @@ def preflight(deps, vid, base):
     call therefore paid for a live MAVLink download that could time out. Start availability is
     decided from stable lifecycle facts; the gate that matters is run_start's own fresh proof.
 
-    Evidence here is read through the bounded cache on purpose (fresh=False): this is a display,
-    it labels its own evidence age, and it authorizes nothing.
+    Evidence here is read through the bounded cache by default (fresh=False): this is a display,
+    it labels its own evidence age, and it authorizes nothing. `fresh=True` is for an explicit,
+    bounded, read-only re-proof operation (the Full Refresh transaction, mission_full_refresh.py)
+    that deliberately wants the SAME live-evidence proof the Start transaction would perform —
+    still issuing no write, because start_preconditions/readiness_evidence never do.
 
     Carries the proof-completeness triple alongside the verdict (see proof_completeness): a
     consumer must be able to tell "the vehicle is not ready" from "this round could not read the
@@ -537,7 +540,7 @@ def preflight(deps, vid, base):
             "readiness_reason_code": None, "readiness_reason": None,
             "summary": summary, "authority": deps.get_authority(vid),
         }
-    pre = start_preconditions(deps, vid, base, mission_id=mission_id, summary=summary)
+    pre = start_preconditions(deps, vid, base, mission_id=mission_id, summary=summary, fresh=fresh)
     return {
         "ok": pre["ok"], "mission_id": mission_id, "can_start": pre["ok"],
         "error_code": None, "error": None,
