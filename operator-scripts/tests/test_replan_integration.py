@@ -926,6 +926,12 @@ class V1SyncTests(unittest.TestCase):
         self.assertTrue(readiness["planning_package"]["usable"])
         self.assertEqual(readiness["planning_package"]["route_count"], 14)
         self.assertTrue(readiness["planning_package"]["no_go_checked"])
+        # The readiness body exposes the COUNT too, so the operator can compare Scout's copy
+        # against the approved record's own (the E2 preflight does exactly that). This Scout
+        # reports only the legacy geometry_validation block, so there is no count to carry —
+        # and it stays null rather than becoming a fabricated 0.
+        self.assertIn("no_go_zone_count", readiness["planning_package"])
+        self.assertIsNone(readiness["planning_package"]["no_go_zone_count"])
 
 
 class ReadinessPollingCostTests(unittest.TestCase):
@@ -1138,6 +1144,39 @@ class V1PackageNormalizerTests(unittest.TestCase):
         self.assertTrue(ev["no_go_available"])
         self.assertTrue(ev["no_go_checked"])
 
+    # ── The no-go COUNT, not just its availability (E2 experiment evidence) ──────────────
+    # Availability answers "did Scout report on no-go zones at all". The COUNT answers "is
+    # Scout planning against the obstacle this experiment is built around". Only the second
+    # catches a package that says no_go_zones_present with zero zones in it — which for the
+    # E2 water experiment is a plan with nothing to avoid, and a route that would prove
+    # nothing. Scout already sends the count in its v1 summary; the operator was dropping it.
+    def test_no_go_zone_count_is_carried_through_from_the_v1_summary(self):
+        ev = main._normalize_scout_package(v1_package_body(LIVE_MISSION_ID, LIVE_ROUTE_HASH))
+        self.assertEqual(ev["no_go_zone_count"], 1)
+        self.assertTrue(ev["no_go_zones_present"])
+
+    def test_no_go_zone_count_falls_back_to_the_packages_own_list(self):
+        body = v1_package_body(LIVE_MISSION_ID, LIVE_ROUTE_HASH)
+        del body["summary"]["no_go_zone_count"]
+        del body["summary"]["no_go_zones_present"]
+        ev = main._normalize_scout_package(body)
+        self.assertEqual(ev["no_go_zone_count"], 1)
+        self.assertTrue(ev["no_go_zones_present"])
+
+    def test_zero_zones_is_a_reported_count_of_zero_not_a_missing_one(self):
+        body = v1_package_body(LIVE_MISSION_ID, LIVE_ROUTE_HASH, no_go_zones=[])
+        ev = main._normalize_scout_package(body)
+        self.assertTrue(ev["no_go_available"])       # Scout answered
+        self.assertEqual(ev["no_go_zone_count"], 0)  # …and the answer was zero
+        self.assertFalse(ev["no_go_zones_present"])
+
+    def test_a_scout_that_reports_no_count_gets_None_never_a_defaulted_zero(self):
+        # A defaulted 0 would read as "no obstacle in the plan", which is a claim nobody made.
+        legacy = {"stored": True, "mission_id": "msn-legacy", "route_content_hash": "sha256:old"}
+        ev = main._normalize_scout_package(legacy, {"no_go_available": True})
+        self.assertIsNone(ev["no_go_zone_count"])
+        self.assertIsNone(ev["no_go_zones_present"])
+
     def test_connector_proven_safe_null_is_preserved_never_widened(self):
         ev = main._normalize_scout_package(v1_package_body(LIVE_MISSION_ID, LIVE_ROUTE_HASH))
         self.assertIsNone(ev["connector_proven_safe"])
@@ -1169,6 +1208,67 @@ class V1PackageNormalizerTests(unittest.TestCase):
             self.assertIsNone(ev["mission_id"])
             self.assertIsNone(ev["route_hash"])
             self.assertIsNone(ev["route_count"])
+
+
+class ActiveOriginalE2GeometryTests(unittest.TestCase):
+    """The active-original mission record IS the E2 map's reference geometry contract.
+
+    Once Scout uploads a revised safe return, the flight controller carries only the return
+    route — the outbound route and the obstacle are gone from the vehicle. The map therefore
+    draws its reference geometry from this record, which no replan can overwrite. These tests
+    pin that the endpoint keeps carrying the four things the map reads, on the REAL captured
+    record, so a future reshaping of the record cannot silently blank the experiment evidence.
+    """
+
+    def setUp(self):
+        self.client = TestClient(main.app)
+        self._records = dict(main.original_missions)
+        self._active = dict(main.active_original_by_vehicle)
+
+    def tearDown(self):
+        main.original_missions.clear()
+        main.original_missions.update(self._records)
+        main.active_original_by_vehicle.clear()
+        main.active_original_by_vehicle.update(self._active)
+
+    def _seed(self, rec):
+        main.original_missions[rec["mission_id"]] = rec
+        main.active_original_by_vehicle[SCOUT_VID] = rec["mission_id"]
+        r = self.client.get(f"/api/vehicles/{SCOUT_VID}/missions/active-original")
+        self.assertEqual(r.status_code, 200)
+        return r.json()["mission"]
+
+    def test_the_real_record_exposes_every_input_the_e2_map_draws(self):
+        mission = self._seed(real_record())
+        self.assertEqual(len(mission["route_waypoints"]), 14)
+        for wp in mission["route_waypoints"]:
+            self.assertIn("latitude", wp)
+            self.assertIn("longitude", wp)
+        inputs = mission["planning_inputs"]
+        # The AUTHORITATIVE no-go source. Present as a field even when the captured mission had
+        # none — an explicit empty list is the planner's answer, and the map must be able to tell
+        # that apart from a record that never carried the field.
+        self.assertIn("no_go_zones", inputs)
+        self.assertEqual(inputs["no_go_zones"], [])
+        self.assertTrue(inputs["navigable_boundary"])
+        self.assertIn("planning_home", inputs)
+        self.assertIn("shoreline_clearance_m", inputs)
+        self.assertEqual(mission["metrics"]["no_go_zone_count"], 0)
+
+    def test_one_no_go_zone_survives_the_endpoint_as_a_ring_of_lng_lat_points(self):
+        rec = real_record()
+        zone = [[12.8110, 56.6790], [12.8113, 56.6790], [12.8113, 56.6792], [12.8110, 56.6790]]
+        rec["planning_inputs"]["no_go_zones"] = [zone]
+        rec["metrics"]["no_go_zone_count"] = 1
+        mission = self._seed(rec)
+        self.assertEqual(mission["planning_inputs"]["no_go_zones"], [zone])
+        self.assertEqual(mission["metrics"]["no_go_zone_count"], 1)
+
+    def test_a_vehicle_with_no_approved_mission_answers_null_not_an_empty_plan(self):
+        main.active_original_by_vehicle.pop(SCOUT_VID, None)
+        r = self.client.get(f"/api/vehicles/{SCOUT_VID}/missions/active-original")
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()["mission"])
 
 
 class V1ReadinessNormalizationTests(unittest.TestCase):
@@ -1236,6 +1336,25 @@ class V1ReadinessNormalizationTests(unittest.TestCase):
         self.assertTrue(pkg["no_go_available"])
         self.assertTrue(pkg["no_go_checked"])
         self.assertIsNone(pkg["connector_proven_safe"])
+
+    def test_readiness_exposes_scouts_no_go_zone_count_for_the_e2_comparison(self):
+        # The E2 experiment turns on ONE no-go polygon. The operator can only verify that Scout
+        # is planning against the same obstacle set if the COUNT crosses the readiness contract,
+        # not merely the "Scout mentioned no-go zones" boolean.
+        rec = self._seed()
+        self._scout_v1(rec)
+        pkg = self._readiness()["planning_package"]
+        self.assertEqual(pkg["no_go_zone_count"], 1)
+        self.assertTrue(pkg["no_go_zones_present"])
+
+        # …and a Scout package with ZERO zones reports zero, not "unavailable" — that is the
+        # misconfiguration the preflight has to be able to see.
+        self._scout_v1(rec, no_go_zones=[])
+        main._pixhawk_readback_cache.clear()
+        pkg = self._readiness()["planning_package"]
+        self.assertTrue(pkg["no_go_available"])
+        self.assertEqual(pkg["no_go_zone_count"], 0)
+        self.assertFalse(pkg["no_go_zones_present"])
 
     def test_operator_matches_the_mission_id_scout_reports_as_null(self):
         # Scout's mission_id_consistent is null — it cannot see an operator mission id in the

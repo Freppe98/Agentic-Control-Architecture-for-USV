@@ -373,15 +373,22 @@ export const RISK_COMPONENTS = ["energy", "communication", "navigation", "health
 // and turning advice into an affordance would make the risk model a control path it was never
 // designed or authorised to be. A recommendation this build does not recognise is shown exactly
 // as Scout sent it.
+//
+// Both spellings Scout has used for the same two advisories are recognised (…_RECOMMENDED and
+// the bare RETURN_HOME / HOLD), so a build that ships either renders a word rather than a raw
+// enum. RETURN_HOME is the ADVICE "bring the vehicle home" — it is not RTL, and it is not the
+// safe-return route: what Scout then plans and uploads is a constrained safe-return mission.
 export const RECOMMENDATION_TEXT = {
   CONTINUE: "CONTINUE",
   CONTINUE_WITH_CAUTION: "CAUTION",
   HOLD_RECOMMENDED: "HOLD",
   RETURN_RECOMMENDED: "RETURN",
+  HOLD: "HOLD",
+  RETURN_HOME: "RETURN HOME",
 };
 export const RECOMMENDATION_TONE = {
   CONTINUE: "ok", CONTINUE_WITH_CAUTION: "caution", HOLD_RECOMMENDED: "warn",
-  RETURN_RECOMMENDED: "warn",
+  RETURN_RECOMMENDED: "warn", HOLD: "warn", RETURN_HOME: "warn",
 };
 
 // Scout's mission/package binding vocabulary, verbatim.

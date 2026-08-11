@@ -4836,6 +4836,18 @@ def _normalize_scout_package(scout, legacy_geometry=None):
     no_go_checked = _first_present(scout_readiness.get("no_go_zones_checked"),
                                    geometry.get("no_go_checked"))
 
+    # HOW MANY zones, not just whether the field exists. Availability answers "did Scout report
+    # on no-go zones at all"; the COUNT answers "is Scout planning against the obstacle this
+    # experiment is built around". They are different questions, and only the second one catches
+    # the configuration that reports no_go_zones_present=true with zero zones in the package.
+    # Scout already sends this in its v1 summary — it was simply being dropped here.
+    no_go_zone_count = summary.get("no_go_zone_count")
+    if no_go_zone_count is None and isinstance(package.get("no_go_zones"), list):
+        no_go_zone_count = len(package["no_go_zones"])
+    no_go_zones_present = summary.get("no_go_zones_present")
+    if no_go_zones_present is None and no_go_zone_count is not None:
+        no_go_zones_present = bool(no_go_zone_count)
+
     # connector_proven_safe is TRI-state and stays tri-state: null means Scout did not prove
     # the connector safe either way. It is never widened to true.
     if "connector_proven_safe" in scout_readiness:
@@ -4854,6 +4866,8 @@ def _normalize_scout_package(scout, legacy_geometry=None):
         "boundary_checked": boundary_checked,
         "no_go_available": no_go_available,
         "no_go_checked": no_go_checked,
+        "no_go_zone_count": no_go_zone_count,
+        "no_go_zones_present": no_go_zones_present,
         "connector_proven_safe": connector_proven_safe,
         "shoreline_clearance_available": geometry.get("shoreline_clearance_available"),
         # Scout's own verdicts, echoed rather than re-derived. `mission_id_consistent` is
@@ -5060,6 +5074,11 @@ def _compute_replan_readiness(vid, base, *, max_readback_age_s=PIXHAWK_READBACK_
         "boundary_checked": ev["boundary_checked"],
         "no_go_available": ev["no_go_available"],
         "no_go_checked": ev["no_go_checked"],
+        # The count Scout's package summary reports, carried through so the operator can compare
+        # it against the approved record's own no-go count (E2 preflight). Null when Scout does
+        # not report one — never defaulted to 0, which would read as "no obstacle".
+        "no_go_zone_count": ev["no_go_zone_count"],
+        "no_go_zones_present": ev["no_go_zones_present"],
         "connector_proven_safe": ev["connector_proven_safe"],
         "shoreline_clearance_available": ev["shoreline_clearance_available"],
         # Scout's own readiness verdict, echoed verbatim — including the mission-id comparison

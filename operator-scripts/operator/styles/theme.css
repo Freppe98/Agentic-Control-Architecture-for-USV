@@ -406,6 +406,13 @@ a { color:inherit; }
 .li-ic.wp.cur { background:var(--connected); }
 .li-ic.mstart { border-radius:5px; background:rgba(18,24,31,.92); border:1.5px solid var(--muted); }
 .li-ic.vhome { background:transparent; border:2px solid var(--connected); border-radius:50% 50% 50% 0; transform:rotate(-45deg); margin:0 2px; }
+/* E2 experiment-evidence swatches. The no-go swatch carries the SAME red as the zone itself
+   (and as the Plan page's), because that polygon is the experiment's binding constraint and has
+   to stay identifiable after Scout replaces the active mission. */
+.li-ic.mline { height:0; border-top:2px solid rgba(76,141,255,.82); margin-top:7px; }
+.li-ic.origline { height:0; border-top:2px dashed #8C9BAB; margin-top:7px; opacity:.75; }
+.li-ic.nogo { background:rgba(229,72,77,.22); border:1.5px solid #E5484D; border-radius:2px; }
+.li-ic.navb { background:transparent; border:1px dashed rgba(76,141,255,.5); border-radius:2px; }
 .li-dot { width:10px; height:10px; border-radius:50%; flex:none; }
 .li-dot.c { background:var(--connected); } .li-dot.p { background:var(--partitioned); } .li-dot.d { background:var(--disconnected); }
 .li-dot.dash { width:12px; height:12px; border-radius:50%; border:1.5px dashed var(--muted); background:transparent; }
@@ -430,6 +437,22 @@ a { color:inherit; }
 }
 .toast.warn { border-color:rgba(242,169,59,.5); color:var(--caution); }
 .toast.err { border-color:rgba(229,72,77,.5); color:var(--disconnected); }
+
+/* The safe-return replanning line — ONE short phrase from Scout's own replanning FSM, on the
+   map surface so the replan is visible without leaving the primary view. Sits under the toast
+   slot on the opposite side of the wind widget; the detailed evidence lives on the Agent page.
+   It never says "RTL": the constrained route Scout builds is a SAFE RETURN, and native Pixhawk
+   RTL is the fallback, not this. */
+.replan {
+  top:calc(var(--map-pad) + max(var(--map-tl-h), var(--map-tr-h)) + var(--map-ov-gap));
+  left:var(--map-pad); max-width:min(320px, calc(100% - var(--map-pad) * 2));
+  padding:7px 12px; font-family:var(--font-mono); font-size:11px; letter-spacing:.04em;
+  text-transform:uppercase; display:none; align-items:center; gap:8px; white-space:normal;
+  z-index:var(--z-map-toast);
+}
+.replan.ok { border-color:rgba(62,207,142,.55); color:var(--connected); }
+.replan.caution { border-color:rgba(242,169,59,.55); color:var(--caution); }
+.replan.warn { border-color:rgba(229,72,77,.55); color:var(--disconnected); }
 .usv-marker { position:relative; width:40px; height:40px; display:flex; align-items:center; justify-content:center; }
 .usv-marker .dot { width:20px; height:20px; border-radius:50%; display:flex; align-items:center; justify-content:center; border:2px solid #070C11; box-shadow:0 1px 3px rgba(0,0,0,.55); }
 .usv-marker .dot span { font-family:var(--font-mono); font-size:11px; font-weight:700; line-height:1; color:#0A0E13; }

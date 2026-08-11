@@ -22,7 +22,8 @@ import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSe
 import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
 import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
-import { missionRevisionSignal } from "../lib/replan.js";
+import { missionRevisionSignal, originalPlanningGeometry, safeReturnBanner,
+         normalizeReplanStatus } from "../lib/replan.js";
 import { missionShowable, nextVisibility, toggleVisibility, toggleButton } from "../lib/mission-visibility.js";
 import { createTelemetryCache } from "../lib/telemetry-cache.js";
 import { attachMapLayout } from "../lib/map-layout.js";
@@ -91,6 +92,32 @@ const CMD_LABEL = Object.fromEntries([...MAP_MODES, ...MAP_SAFETY, ...MAP_MISSIO
 // a home inside a location pin, deliberately unlike the numbered mission waypoints and
 // the mission-readback house icon. Colour comes from the verification state (CSS).
 const vehHomeSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-6.4 7-11a7 7 0 1 0-14 0c0 4.6 7 11 7 11Z"/><path d="M9.2 10.4 12 8l2.8 2.4V14H9.2z"/></svg>';
+
+// ── THE APPROVED-PLAN REFERENCE LAYER (E2 experiment evidence) ─────────────────────────────
+// Once Scout replans a safe return and uploads it, the flight controller carries ONLY the return
+// route: the outbound route and the obstacle it was planned around are gone from the vehicle
+// entirely. A map showing only the live Pixhawk mission at that moment cannot answer the one
+// question the E2 experiment exists to answer — did the vehicle avoid the no-go zone, or did it
+// cut straight through it?
+//
+// So the ORIGINAL planning geometry is drawn from the operator's own immutable original mission
+// record (revision 0), which no replan can overwrite, and it STAYS drawn across the replan. It is
+// deliberately subdued: the live mission stays the prominent thing on the map, with one exception
+// — the no-go zone, which keeps the same unmistakable red it has on the Plan page, because it is
+// the experiment's binding constraint and must remain legible after the active route is replaced.
+//
+// Panes keep the stacking honest: reference geometry BELOW the live route (overlayPane, 400), the
+// red no-go fill above the translucent navigable area, exactly as Plan.js orders them.
+const REF_PANES = [["e2-navigable", 392], ["e2-route", 394], ["e2-nogo", 396]];
+// Same red as the Plan page's no-go zones — one obstacle, one colour, across both pages.
+const REF_NOGO_STYLE = { color: "#E5484D", weight: 1.8, opacity: 0.95, fill: true,
+                         fillColor: "#E5484D", fillOpacity: 0.18, pane: "e2-nogo", interactive: true };
+const REF_BOUNDARY_STYLE = { color: "#4C8DFF", weight: 1.2, opacity: 0.45, fill: false,
+                             dashArray: "3 6", pane: "e2-navigable", interactive: false };
+// The original route is REFERENCE, not a route anyone is flying: subdued grey, finely dashed, and
+// never the blue/green the live mission owns.
+const REF_ROUTE_STYLE = { color: "#8C9BAB", weight: 2, opacity: 0.62, dashArray: "2 6",
+                          lineCap: "round", pane: "e2-route", interactive: false };
 
 export function Map(root) {
   const L = window.L;
@@ -161,6 +188,13 @@ export function Map(root) {
   // `shown` toggles the map overlay WITHOUT refetching (toggling never hits Scout).
   const pxm = {};
   let missionLayer = null;   // the single Leaflet layer group currently drawn (selected vehicle)
+  // The APPROVED-PLAN REFERENCE, per vehicle: the immutable original mission record (revision 0)
+  // and the geometry model derived from it. Read ONCE per vehicle at the same one-shot moments as
+  // the Start preflight — the record is immutable, so there is nothing to poll — and deliberately
+  // NOT wiped by a later failed read, so the reference stays on the map across a link outage.
+  //   { record, model, fetchedAt, loading, note }
+  const orig = {};
+  let originalLayer = null;  // the reference geometry layer group (selected vehicle)
   // Command types with a POST in flight right now — a synchronous guard against a rapid
   // double-press queuing a duplicate before the queue poll catches up (matters most for
   // LOITER, which has no confirmation modal to slow a double-click). Cleared per type in
@@ -260,6 +294,7 @@ export function Map(root) {
        <div id="map"></div>
        <div class="ov wind" id="wind"><div class="lbl">Wind</div><div class="arrow" id="wind-arrow">➜</div><div class="spd" id="wind-spd">—</div><div class="frm" id="wind-frm"></div></div>
        <div class="ov toast" id="map-toast"></div>
+       <div class="ov replan" id="map-replan" style="display:none"></div>
        <div class="ov legend" id="legend">
          <div class="legend-h"><span class="lbl">Legend</span><button class="legend-toggle" id="legend-toggle" title="Collapse legend">–</button></div>
          <div class="legend-body" id="legend-body">
@@ -278,6 +313,12 @@ export function Map(root) {
            <div class="li-group">
              <div class="li"><span class="li-ic mstart"></span>Mission start (Pixhawk seq 0)</div>
              <div class="li"><span class="li-ic vhome"></span>Vehicle Home (RTL point)</div>
+           </div>
+           <div class="li-group">
+             <div class="li"><span class="li-ic mline"></span>Active mission on the vehicle</div>
+             <div class="li"><span class="li-ic origline"></span>Original approved mission (reference)</div>
+             <div class="li"><span class="li-ic nogo"></span>No-go zone (original plan)</div>
+             <div class="li"><span class="li-ic navb"></span>Navigable area (original plan)</div>
            </div>
          </div>
        </div>
@@ -305,6 +346,9 @@ export function Map(root) {
   L.control.zoom({ position: "topright" }).addTo(map);
   L.control.scale({ position: "bottomright", imperial: false }).addTo(map);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20, attribution: "© OpenStreetMap" }).addTo(map);
+  // Reference-geometry panes, all BELOW Leaflet's default overlayPane (400) so the live mission
+  // route always draws over the approved plan — see REF_PANES for why the order matters.
+  REF_PANES.forEach(([name, z]) => { map.createPane(name); map.getPane(name).style.zIndex = String(z); });
   // One shared resize/corner contract for every map in the station (lib/map-layout.js):
   // ResizeObserver on the stage → coalesced invalidateSize, plus the measured top-corner
   // extents that theme.css offsets the Leaflet controls, legend and toast from.
@@ -643,6 +687,93 @@ export function Map(root) {
     applyMissionZoom();
   }
 
+  // ---- Approved-plan reference overlay (original route + no-go zones + navigable area) ----
+  // Everything drawn here comes from the IMMUTABLE original mission record. No geometry is
+  // derived from the live route, from the vehicle's track, or from anything Scout reports about
+  // the revision — in particular, a no-go zone is NEVER inferred from the shape of a route. A
+  // record without planning inputs simply draws less; it never draws a guess.
+  function origState(id) {
+    return orig[id] || (orig[id] = { record: null, model: null, fetchedAt: 0, loading: false, note: null });
+  }
+  function originalModel(id) {
+    const s = id != null ? orig[id] : null;
+    return (s && s.model) || originalPlanningGeometry(null);
+  }
+
+  // Read the vehicle's active original mission record. Immutable, so this is a one-shot read per
+  // vehicle per meaningful moment (selection / after a mission write / reconnect) — never polled.
+  // A failed read leaves the last-known record in place and only records a note.
+  function loadOriginalMission(id) {
+    if (id == null) return;
+    const s = origState(id);
+    if (s.loading) return;
+    s.loading = true;
+    api.getActiveOriginalMission(id).then((res) => {
+      const rec = res && res.mission ? res.mission : null;
+      if (rec) {
+        s.record = rec;
+        s.model = originalPlanningGeometry(rec);
+        s.fetchedAt = Date.now();
+        s.note = null;
+      } else {
+        // A definite "this vehicle has no approved mission" — clear rather than keep a stale one.
+        s.record = null; s.model = originalPlanningGeometry(null); s.fetchedAt = Date.now();
+        s.note = "none";
+      }
+    }).catch((e) => {
+      s.note = "error";
+      logQuiet("active-original mission", e);
+    }).finally(() => {
+      s.loading = false;
+      if (id === selId) { drawOriginalOverlay(id); renderPxm(); }
+    });
+  }
+
+  function clearOriginalOverlay() {
+    if (originalLayer) { map.removeLayer(originalLayer); originalLayer = null; }
+  }
+
+  // Rebuild the reference layer for one vehicle. Independent of the Pixhawk mission overlay and
+  // of its Show/Hide toggle: when Scout installs a revised return route the active overlay is
+  // replaced, and THIS layer is exactly what must not move.
+  function drawOriginalOverlay(id) {
+    clearOriginalOverlay();
+    if (!map || id == null) return;
+    const g = originalModel(id);
+    if (!g.present) return;
+    const layer = L.layerGroup();
+    g.navigableBoundary.forEach((ring) => L.polygon(ring, { ...REF_BOUNDARY_STYLE }).addTo(layer));
+    if (g.route.length > 1) {
+      L.polyline(g.route, { ...REF_ROUTE_STYLE })
+        .bindTooltip("Original approved mission (reference)", { sticky: true }).addTo(layer);
+    }
+    g.noGoZones.forEach((ring, i) => {
+      L.polygon(ring, { ...REF_NOGO_STYLE })
+        .bindTooltip(`NO-GO ZONE ${i + 1} of ${g.noGoZones.length} — original planning constraint`,
+          { sticky: true })
+        .addTo(layer);
+    });
+    layer.addTo(map);
+    originalLayer = layer;
+  }
+
+  // The compact, one-line replan message on the map. Real Scout state only — read from the
+  // mission-execution status' own replanning block, which this page already polls, so no extra
+  // traffic and no second FSM. Says "Safe return", never "RTL": the constrained route Scout
+  // builds is not the autopilot's native return-to-launch.
+  function renderReplanBanner() {
+    const box = document.getElementById("map-replan");
+    if (!box) return;
+    const forThis = mission.forVid != null && mission.forVid === selId;
+    const S = mx.normalizeStatus(forThis ? mission.status : null);
+    const fsm = (S.replanning && (S.replanning.fsmState || S.replanning.state)) || null;
+    const banner = fsm ? safeReturnBanner(normalizeReplanStatus({ fsm_state: fsm })) : null;
+    if (!banner) { box.style.display = "none"; box.textContent = ""; return; }
+    box.className = `ov replan ${banner.tone}`;
+    box.textContent = banner.strategy ? `${banner.text} · ${banner.strategy}` : banner.text;
+    box.style.display = "flex";
+  }
+
   // The single stateful Show/Hide toggle's click. Derives the next state from ACTUAL
   // visibility (not the last label): hiding remembers the explicit choice for this USV,
   // showing clears it. No-op while loading or when there is no valid mission to show.
@@ -716,6 +847,31 @@ export function Map(root) {
   const eyeOffSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.6 6.2A9.6 9.6 0 0 1 12 6c7 0 10.5 6.5 10.5 6.5a15.8 15.8 0 0 1-3.3 3.9M6.2 7.6A15.9 15.9 0 0 0 1.5 12.5S5 19 12 19a9.5 9.5 0 0 0 4.2-1M3 3l18 18"/></svg>';
   function toggleIcon(state) {
     return state === "shown" ? eyeOpenSvg : eyeOffSvg;
+  }
+
+  // ONE row saying what the approved-plan reference layer currently has. It exists so an absent
+  // reference is VISIBLE rather than silent: a map with no red polygon on it must be able to
+  // distinguish "there is no no-go zone in this plan" from "the plan could not be read". It never
+  // implies more than the record states, and it is the only reference-plan text on this page —
+  // the detailed E2 evidence lives on the Agent page.
+  function refPlanRow(id) {
+    const s = id != null ? orig[id] : null;
+    const g = originalModel(id);
+    if (!g.present) {
+      const txt = s && s.note === "error" ? "Could not be read"
+        : s && s.note === "none" ? "No approved mission" : "—";
+      return `<div class="pxm-row"><span class="k">Approved plan</span><span class="v" title="${escAttr(
+        "The immutable original mission record (revision 0). Without it the map cannot show the "
+        + "original route or the no-go zones the mission was planned around.")}">${esc(txt)}</span></div>`;
+    }
+    const zones = g.noGoZoneCount === null ? "no no-go field on the record"
+      : `${g.noGoZoneCount} no-go zone${g.noGoZoneCount === 1 ? "" : "s"}`;
+    const parts = [`${g.routeCount} wp`, zones];
+    return `<div class="pxm-row"><span class="k">Approved plan</span><span class="v" title="${escAttr(
+      "Reference geometry from the immutable original mission record"
+      + (g.missionId ? ` ${g.missionId}` : "")
+      + ". No-go zones come from its planning inputs — they are never inferred from the route.")}"
+      >${esc(parts.join(" · "))}</span></div>`;
   }
 
   function renderPxm() {
@@ -830,6 +986,7 @@ export function Map(root) {
         ${hash ? `<div class="pxm-row"><span class="k">Mission id</span><span class="v" title="${hash}">${hash.slice(0, 8)}</span></div>` : ""}
         <div class="pxm-row"><span class="k">Home</span><span class="pxm-chip ${homeChip[1]}">${homeChip[0]}</span></div>
         ${homeSub ? `<div class="pxm-note ${homeSubCls}">${homeSub}</div>` : ""}
+        ${refPlanRow(id)}
       </div>
       ${cachedNote}
       <div class="pxm-actions">
@@ -941,12 +1098,14 @@ export function Map(root) {
       // nothing extra.
       noteRevisionEvidence(forId);
       renderInspector();
+      renderReplanBanner();
     }).catch((e) => {
       if (forId !== selId) return;
       mission.status = null;
       mission.forVid = forId;
       logQuiet("mission-execution status", e);
       renderInspector();
+      renderReplanBanner();
     });
   }
 
@@ -975,6 +1134,10 @@ export function Map(root) {
     api.getPublishState(id).then((pb) => {
       if (forId === selId) { mission.publish = pb; mission.publishFor = forId; }
     }).catch(() => {});
+    // The APPROVED-PLAN REFERENCE rides along on the same moments. The record is immutable, so
+    // this is not a poll — it is re-read only when WHICH mission is active can have changed
+    // (selection, a mission write, a lifecycle transaction, reconnect, explicit Refresh).
+    loadOriginalMission(id);
     api.getMissionExecutionPreflight(id).then((pf) => {
       if (forId !== selId) return;
       mission.preflight = pf;
@@ -2018,6 +2181,9 @@ export function Map(root) {
     const v = fleet.find((x) => x.id === id);
     if (map && v && v.lat != null && v.lng != null) map.panTo([v.lat, v.lng]);
     renderDock(); renderPxm(); syncMissionOverlay(); renderInspector(); updateMarkers(); updateHomeMarker();
+    // The approved-plan reference follows the selected vehicle (per-USV, like every other
+    // overlay) and is redrawn from THIS vehicle's own record.
+    drawOriginalOverlay(id); renderReplanBanner();
   }
 
   // Default to a vehicle that is actually reporting (so the primary view opens on a
@@ -2139,6 +2305,7 @@ export function Map(root) {
     if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
     authCtl.dispose();
     clearMissionOverlay();
+    clearOriginalOverlay();
     detachMapLayout();
     if (map) { map.remove(); map = null; }
   };

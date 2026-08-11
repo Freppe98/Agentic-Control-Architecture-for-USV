@@ -164,6 +164,15 @@ export function normalizeReplanStatus(result) {
     // needs an explicitly NEW generation (clear + reapply the injection, rearm the controller,
     // or a new original mission execution). So "trigger still active" and "another attempt is
     // coming" are now different facts, and the UI must stop implying the second from the first.
+    // Scout's ACTION REQUEST — the third of the four independent layers (risk → advice →
+    // action request → FSM). It is read TOLERANTLY and never fabricated: a Scout that does not
+    // emit one leaves `reported:false`, and the UI must say "not reported", never "NONE".
+    // "NONE" is a claim Scout makes; silence is not the same claim.
+    actionRequest: {
+      reported: ["action_request", "requested_action", "operator_action_request"]
+        .some((k) => s[k] !== undefined),
+      code: first(s, "action_request", "requested_action", "operator_action_request"),
+    },
     trigger: {
       active: first(s, "trigger_active"),
       generation: first(s, "trigger_generation"),
@@ -181,6 +190,11 @@ export function normalizeReplanStatus(result) {
       removedCount: first(s, "removed_waypoint_count"),
       insertedCount: first(s, "inserted_waypoint_count"),
       revisedCount: first(s, "revised_waypoint_count"),
+      // The ORIGINAL route's waypoint count, so the revised count has something to be read
+      // against. Absent when Scout does not report it — never back-filled from the operator's
+      // own record, which would make an agreement look proven when it was assumed.
+      originalCount: first(s, "original_waypoint_count", "original_route_count"),
+      strategy: first(s, "strategy"),
       validationResult: first(s, "validation_result"),
       uploadResult: first(s, "upload_result"),
       readbackResult: first(s, "readback_result"),
@@ -430,7 +444,355 @@ export function replanMapModel(normStatus, { original = null, active = null } = 
     contradiction,
     authoritativeActiveHash,
     geometry,
+    // The ORIGINAL planning constraints (no-go zones, navigable boundary, planned route, planning
+    // home) taken from the immutable original mission record — the reference geometry the map must
+    // keep showing after Scout replaces the Pixhawk mission. Empty/absent when no record was
+    // supplied; never derived from any route.
+    planning: originalPlanningGeometry(original),
     // The map must NOT draw an obstacle layer — obstacle replanning is disabled by Scout.
     obstacleLayer: false,
   };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// THE E2 EXPERIMENT'S REFERENCE GEOMETRY
+// ══════════════════════════════════════════════════════════════════════════════════════════
+//
+// The E2 water experiment has to be VISUALLY INDISPUTABLE: the vehicle went around a no-go zone
+// on the way out, Scout replanned a constrained safe return, and the revised route went around
+// the SAME zone rather than straight through it. Once Scout uploads the revision, the Pixhawk
+// carries only the return route — the outbound route and the obstacle are gone from the flight
+// controller entirely. So the map has to keep the ORIGINAL planning geometry from a source that
+// the replan cannot overwrite.
+//
+// That source is the operator's own immutable ACTIVE ORIGINAL MISSION RECORD (revision 0,
+// GET /api/vehicles/{id}/missions/active-original). It already carries every input the map needs:
+//
+//     route_waypoints                   the approved outbound route  [{latitude, longitude}, …]
+//     planning_inputs.no_go_zones       the AUTHORITATIVE no-go rings  [[[lng, lat], …], …]
+//     planning_inputs.navigable_boundary   the shoreline-offset navigable area
+//     planning_inputs.planning_home     the planned home/route origin  [lng, lat]
+//     planning_inputs.shoreline_clearance_m   scalar metadata, NOT geometry
+//     metrics.no_go_zone_count          the count the planner itself recorded
+//
+// TWO RULES ARE LOAD-BEARING HERE:
+//
+//   1. NO-GO GEOMETRY IS NEVER INFERRED. Not from the route's shape, not from a gap between
+//      waypoints, not from where the vehicle turned. It comes from the planning inputs or it is
+//      reported absent. A fabricated obstacle on an examiner's map would be the single worst
+//      thing this station could draw.
+//   2. AN ABSENT RECORD DEGRADES QUIETLY. `present:false` with empty lists — the active mission
+//      still draws, and nothing is invented to fill the gap.
+//
+// Coordinate convention: planning inputs are stored [lng, lat] (the planner's GeoJSON-order
+// rings); route waypoints are {latitude, longitude} objects. Everything below returns
+// [lat, lng] pairs, which is what Leaflet takes. The two orders are NEVER guessed apart by
+// magnitude — the record's own convention is followed exactly.
+
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+/** One [lng, lat] planning point (or a {latitude,longitude} / {lat,lng} object) → [lat, lng]. */
+function planningPoint(p) {
+  if (Array.isArray(p) && p.length >= 2) {
+    const lng = num(p[0]), lat = num(p[1]);
+    return lat === null || lng === null ? null : [lat, lng];
+  }
+  if (isObj(p)) {
+    const lat = num(p.latitude !== undefined ? p.latitude : p.lat);
+    const lng = num(p.longitude !== undefined ? p.longitude : (p.lng !== undefined ? p.lng : p.lon));
+    return lat === null || lng === null ? null : [lat, lng];
+  }
+  return null;
+}
+
+/** One route waypoint ({latitude,longitude} — or {lat,lng}) → [lat, lng]. */
+function routePoint(w) {
+  if (!isObj(w)) return Array.isArray(w) ? planningPoint(w) : null;
+  const lat = num(w.latitude !== undefined ? w.latitude : w.lat);
+  const lng = num(w.longitude !== undefined ? w.longitude : (w.lng !== undefined ? w.lng : w.lon));
+  return lat === null || lng === null ? null : [lat, lng];
+}
+
+/**
+ * One polygon entry → a [lat,lng] ring, or null when it carries no usable geometry.
+ * Tolerates the spellings the planner and Scout each use for the same thing: a bare ring, a
+ * `{polygon|ring|coordinates}` wrapper, or a GeoJSON Polygon. A ring needs 3 real points to be
+ * a polygon at all — anything less is dropped rather than drawn as a degenerate shape.
+ */
+function polygonRing(entry) {
+  let ring = entry;
+  if (isObj(entry)) {
+    ring = entry.polygon || entry.ring || entry.coordinates || entry.points || null;
+    // GeoJSON Polygon: coordinates is a LIST OF RINGS; the first is the outer one.
+    if (Array.isArray(ring) && Array.isArray(ring[0]) && Array.isArray(ring[0][0])) ring = ring[0];
+  }
+  if (!Array.isArray(ring)) return null;
+  const pts = ring.map(planningPoint).filter(Boolean);
+  return pts.length >= 3 ? pts : null;
+}
+
+function polygonList(value) {
+  return arr(value).map(polygonRing).filter(Boolean);
+}
+
+/**
+ * The immutable original mission record → the reference geometry the E2 map draws.
+ *
+ * @param record the active-original mission record (or null)
+ * @returns {{ present, missionId, revision, routeHash, route, routeCount,
+ *             noGoZones, noGoZoneCount, noGoReported, navigableBoundary, home,
+ *             shorelineClearanceM, source }}
+ *
+ * `noGoReported` is the distinction the E2 preflight is built on: it is TRUE when the record
+ * carries a no-go field at all (an explicit empty list is an answer — the planner looked and
+ * recorded none) and FALSE when no such field exists (nobody has said anything). A count of 0
+ * with `noGoReported:true` is exactly the bad experiment configuration we must catch before the
+ * boat is in the water, and it is not the same fact as "the record predates the field".
+ */
+export function originalPlanningGeometry(record) {
+  const empty = {
+    present: false, missionId: null, revision: null, routeHash: null,
+    route: [], routeCount: 0, noGoZones: [], noGoZoneCount: null, noGoReported: false,
+    navigableBoundary: [], home: null, shorelineClearanceM: null,
+    source: null,
+  };
+  if (!isObj(record)) return empty;
+  // Some callers hold the endpoint envelope ({ ok, vehicle_id, mission }) rather than the record.
+  const rec = isObj(record.mission) ? record.mission : record;
+  if (!isObj(rec)) return empty;
+
+  const inputs = isObj(rec.planning_inputs) ? rec.planning_inputs : {};
+  const metrics = isObj(rec.metrics) ? rec.metrics : {};
+
+  // NO-GO: planning inputs first (what the route was planned AGAINST), then the record's own
+  // top-level copy. Never the route, never the segments, never the metrics count alone.
+  const noGoRaw = inputs.no_go_zones !== undefined ? inputs.no_go_zones
+    : (rec.no_go_zones !== undefined ? rec.no_go_zones : undefined);
+  const noGoReported = noGoRaw !== undefined && noGoRaw !== null;
+  const noGoZones = polygonList(noGoRaw);
+  // The count is the RECORD's own count of the zones it planned against. Prefer the drawable
+  // rings we actually resolved; fall back to the raw list length, then to the planner's metric,
+  // so a zone we could not parse still counts as present rather than silently vanishing.
+  let noGoZoneCount = null;
+  if (noGoReported) noGoZoneCount = Math.max(noGoZones.length, arr(noGoRaw).length);
+  else if (num(metrics.no_go_zone_count) !== null) noGoZoneCount = num(metrics.no_go_zone_count);
+
+  const boundaryRaw = inputs.navigable_boundary !== undefined ? inputs.navigable_boundary
+    : rec.navigable_geometry;
+  const route = arr(rec.route_waypoints).map(routePoint).filter(Boolean);
+
+  return {
+    present: true,
+    missionId: rec.mission_id != null ? rec.mission_id : null,
+    revision: rec.mission_revision != null ? rec.mission_revision : null,
+    routeHash: rec.route_hash != null ? rec.route_hash : null,
+    route,
+    routeCount: route.length,
+    noGoZones,
+    noGoZoneCount,
+    // A record that carries no no-go field at all, but whose planner metric recorded a count,
+    // has still "reported" the fact — the geometry is what is missing, not the answer.
+    noGoReported: noGoReported || noGoZoneCount !== null,
+    navigableBoundary: polygonList(boundaryRaw),
+    home: planningPoint(inputs.planning_home),
+    shorelineClearanceM: num(inputs.shoreline_clearance_m),
+    source: "ACTIVE_ORIGINAL_MISSION_RECORD",
+  };
+}
+
+// ── The compact map message for a safe-return replan ──────────────────────────────────────
+// One short line, from real Scout state only, so the Map does not become a diagnostics page.
+//
+// WORDING RULE: the constrained route Scout builds and uploads is a SAFE RETURN. It is NOT
+// "RTL". Native Pixhawk RTL is a different mechanism — a straight-line autopilot behaviour that
+// knows nothing about no-go zones — and it is the FALLBACK, reached only via FALLBACK_RTL. The
+// two must never share a word on this station: an examiner reading "RTL" over a replanned route
+// would be told the exact opposite of what the experiment is demonstrating.
+export const SAFE_RETURN_PHASE_TEXT = {
+  HOLD_REQUESTED: "Safe return — holding position",
+  HOLD_CONFIRMED: "Safe return — holding position",
+  PLANNING: "Safe return — planning",
+  VALIDATING: "Safe return — validating",
+  UPLOAD_REQUESTED: "Safe return — uploading",
+  VERIFYING_REVISION: "Safe return — verifying revision",
+  RESUME_REQUESTED: "Safe return — resuming",
+  MONITORING_REVISED: "Replanned safe return active",
+  SAFE_HOLD: "Safe return stopped — holding",
+  SUSPENDED: "Safe return suspended",
+  FAILED: "Safe return failed",
+  // The ONE place RTL is the right word: Scout has fallen back to the autopilot's own
+  // return-to-launch, which is NOT the constrained route.
+  FALLBACK_RTL: "Fell back to native Pixhawk RTL — route is NOT constrained",
+};
+
+/**
+ * The Map's compact replan line, or null when there is nothing real to say.
+ * @param norm normalizeReplanStatus() output
+ * @returns {{ text, tone, fsmState, strategy }|null}
+ */
+export function safeReturnBanner(norm) {
+  const S = norm || normalizeReplanStatus(null);
+  if (!S.present) return null;
+  const t = S.transaction || {};
+  const fsm = String(t.fsmState || "").toUpperCase();
+  const text = SAFE_RETURN_PHASE_TEXT[fsm];
+  if (!text) return null;                       // MONITORING and anything unknown say nothing
+  const tone = fsm === "MONITORING_REVISED" ? "ok"
+    : isTerminal(fsm) ? "warn" : "caution";
+  return { text, tone, fsmState: fsm, strategy: t.strategy || null };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// E2 PREFLIGHT — is the experiment CONFIGURED the way the run assumes?
+// ══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Read-only evidence, assembled from contracts the station already reads. It gates nothing and
+// commands nothing: its whole job is to let a bad experiment configuration be seen BEFORE Start,
+// rather than discovered from a recording afterwards.
+//
+// Every check is TRI-STATE. "PASS" and "FAIL" both require the evidence to have arrived;
+// "UNKNOWN" means nobody has answered, and an unanswered check is never counted as a pass.
+export const CHECK = { PASS: "PASS", FAIL: "FAIL", UNKNOWN: "UNKNOWN" };
+
+/** The planned E2 has exactly ONE no-go polygon in the middle. Presence alone is not enough:
+ *  `no_go_zones_present:true` with a count of 0 is the specific misconfiguration to catch. */
+export const E2_EXPECTED_NO_GO_ZONES = 1;
+
+const check = (key, label, state, value, detail) => ({ key, label, state, value, detail });
+const passIf = (cond) => (cond === true ? CHECK.PASS : cond === false ? CHECK.FAIL : CHECK.UNKNOWN);
+
+/**
+ * The E2 preflight checklist.
+ *
+ * @param missionExecution mx.normalizeStatus() output (or null) — state / risk / energy
+ * @param replanStatus     normalizeReplanStatus() output (or null) — FSM / action request
+ * @param readiness        the backend replan-readiness body (or null) — mission & package evidence
+ * @param packageVerdict   readinessLabel() output (or null) — the shared package verdict
+ * @param planning         originalPlanningGeometry() output (or null) — the operator's own record
+ * @param scoutNoGoZoneCount Scout's package-summary count, when the backend reports one
+ * @param homeVerified     Scout's continuously reported Home verification (tri-state)
+ * @returns {{ checks, ready, failed, unknown }}
+ */
+export function e2PreflightChecks({
+  missionExecution = null, replanStatus = null, readiness = null, packageVerdict = null,
+  planning = null, scoutNoGoZoneCount = null, homeVerified = null,
+  expectedNoGoZones = E2_EXPECTED_NO_GO_ZONES,
+} = {}) {
+  const S = isObj(missionExecution) ? missionExecution : {};
+  const R = replanStatus && replanStatus.transaction ? replanStatus : normalizeReplanStatus(replanStatus);
+  const rd = isObj(readiness) ? readiness : null;
+  const vm = rd && isObj(rd.vehicle_mission) ? rd.vehicle_mission : {};
+  const pk = rd && isObj(rd.planning_package) ? rd.planning_package : {};
+  // `planning` may be a RECORD or an already-derived model. The two are told apart by the model's
+  // own distinctive key, NOT by `source` — an absent-record model is a perfectly valid model with
+  // a null source, and re-normalizing one used to hand back `present:true` for a plan that does
+  // not exist, which is the exact class of fabrication this module exists to prevent.
+  const isModel = isObj(planning)
+    && Object.prototype.hasOwnProperty.call(planning, "noGoReported");
+  const geom = isModel ? planning : originalPlanningGeometry(planning);
+  const risk = isObj(S.risk) ? S.risk : {};
+  const energy = isObj(S.energy) ? S.energy : {};
+  const checks = [];
+
+  // 1. Scout's own mission-execution readiness — the state Start is offered from.
+  const mxState = S.present === false ? null : (S.state != null ? String(S.state).toUpperCase() : null);
+  checks.push(check("mission_execution", "Mission execution", mxState === null ? CHECK.UNKNOWN
+    : passIf(mxState === "READY"), mxState || "not reported",
+    "Scout's canonical mission-execution state. E2 starts from READY."));
+
+  // 2. Which approved mission this is.
+  const missionId = vm.mission_id || geom.missionId || null;
+  checks.push(check("mission_id", "Mission id", missionId ? CHECK.PASS : CHECK.UNKNOWN,
+    missionId || "not established",
+    "The approved mission record the run is executing."));
+
+  // 3. Route identity — the record's hash proven against the flight controller's read-back.
+  // An unreachable read-back, or a readiness body that never arrived, is UNKNOWN: nobody has
+  // answered. Only an actual mismatch reported by a reachable read-back is a FAIL.
+  const routeIdentity = (rd === null || vm.readback_reachable === false
+    || vm.readback_hash_match === undefined) ? null
+    : (vm.readback_hash_match === true && vm.pixhawk_verified === true);
+  checks.push(check("route_identity", "Route identity verified", passIf(routeIdentity),
+    vm.readback_reachable === false ? "read-back unreachable"
+      : vm.readback_hash_match === true ? (vm.pixhawk_verified ? "hash match · upload VERIFIED" : "hash match · upload not verified")
+      : vm.readback_hash_match === false ? "read-back hash does NOT match the approved route" : "not reported",
+    "The Pixhawk read-back hashes to the approved route AND the upload verified."));
+
+  // 4. The planning package on Scout — the SHARED verdict, never a second opinion.
+  const pkgState = packageVerdict && packageVerdict.state ? packageVerdict.state : null;
+  checks.push(check("package", "Planning package", pkgState === null ? CHECK.UNKNOWN
+    : passIf(pkgState === "READY"), pkgState ? pkgState.replace(/_/g, " ") : "not reported",
+    (packageVerdict && (packageVerdict.detail || packageVerdict.text))
+      || "Scout must hold the approved package for this exact mission."));
+
+  // 5. Home. Scout's continuously reported verification is preferred; the readiness body's
+  //    home_valid is the fallback when nobody has asked Scout directly.
+  const home = homeVerified === true ? true
+    : homeVerified === false ? false
+    : (vm.home_valid === undefined ? null : !!vm.home_valid);
+  checks.push(check("home", "Home", passIf(home),
+    home === true ? "verified" : home === false ? "not verified" : "not reported",
+    "The Start transaction sets and verifies Home; before Start this is information."));
+
+  // 6/7/8/9. THE FOUR INDEPENDENT LAYERS. Each is read from its OWN Scout field and none is
+  // derived from another — an FSM in HOLD_REQUESTED does not make the mission-level Advice HOLD,
+  // and a CRITICAL risk does not by itself make an action request exist.
+  // missionFeasible is TRI-STATE on the normalized status (bool3): null is "Scout said nothing",
+  // and it must not collapse into "not feasible".
+  const feasible = energy.missionFeasible === undefined ? null : energy.missionFeasible;
+  checks.push(check("feasibility", "Mission feasibility", passIf(feasible),
+    feasible === true ? "FEASIBLE" : feasible === false ? "NOT FEASIBLE" : "not reported",
+    "Scout's energy verdict for completing the planned mission."));
+
+  const level = risk.level ? String(risk.level).toUpperCase() : null;
+  checks.push(check("risk", "Risk", level === null ? CHECK.UNKNOWN : passIf(level === "LOW"),
+    level || "not reported", "Scout's GOVERNING risk level, read from risk.level alone."));
+
+  const advice = risk.recommendation ? String(risk.recommendation).toUpperCase() : null;
+  checks.push(check("advice", "Advice", advice === null ? CHECK.UNKNOWN
+    : passIf(advice === "CONTINUE"), advice || "not reported",
+    "Scout's advisory recommendation. Display only — it is never turned into a command, and the "
+    + "replanning FSM never overwrites it."));
+
+  const ar = R.actionRequest || {};
+  const arCode = ar.code ? String(ar.code).toUpperCase() : null;
+  checks.push(check("action_request", "Action request",
+    !ar.reported ? CHECK.UNKNOWN : passIf(arCode === "NONE" || arCode === null),
+    arCode || (ar.reported ? "NONE" : "not reported by Scout"),
+    ar.reported ? "Scout's explicit operator-action request."
+      : "This Scout build does not emit an action_request field on /agent/replan/status. The "
+        + "station will not invent one — see the E2 report's missing-contract note."));
+
+  const fsm = R.transaction && R.transaction.fsmState
+    ? String(R.transaction.fsmState).toUpperCase() : null;
+  checks.push(check("replan_fsm", "Replanning FSM", fsm === null ? CHECK.UNKNOWN
+    : passIf(fsm === "MONITORING"), fsm || "not reported",
+    "The replanning controller's own state. E2 starts from MONITORING."));
+
+  // 10. THE EXPERIMENT'S OWN CONSTRAINT. Presence of the field is not enough — the planned E2 has
+  //     exactly one no-go polygon, and a record that reports zero is a bad configuration to catch
+  //     on the bench, not in the water.
+  const count = geom.noGoZoneCount;
+  checks.push(check("no_go_zones", `No-go zones (expected ${expectedNoGoZones})`,
+    !geom.present || count === null ? CHECK.UNKNOWN : passIf(count === expectedNoGoZones),
+    !geom.present ? "no original mission record"
+      : count === null ? "no no-go field on the record" : String(count),
+    "Read from the immutable original mission record's planning inputs "
+    + "(planning_inputs.no_go_zones) — never inferred from the route's shape."));
+
+  // 11. Scout's own copy of the same count, when the package summary reports one. A DISAGREEMENT
+  //     here means Scout is planning against different constraints than the operator approved.
+  const scoutCount = num(scoutNoGoZoneCount);
+  if (scoutCount !== null || count !== null) {
+    const agrees = scoutCount === null ? null : (count === null ? null : scoutCount === count);
+    checks.push(check("no_go_zones_package", "No-go zones in Scout's package",
+      scoutCount === null ? CHECK.UNKNOWN
+        : agrees === null ? CHECK.UNKNOWN : passIf(agrees && scoutCount === expectedNoGoZones),
+      scoutCount === null ? "not reported by Scout" : String(scoutCount),
+      "Scout's planning-package summary count, compared with the approved record's."));
+  }
+
+  const failed = checks.filter((c) => c.state === CHECK.FAIL);
+  const unknown = checks.filter((c) => c.state === CHECK.UNKNOWN);
+  return { checks, ready: failed.length === 0 && unknown.length === 0, failed, unknown };
 }

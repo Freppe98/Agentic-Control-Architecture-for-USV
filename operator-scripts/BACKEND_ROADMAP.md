@@ -218,3 +218,37 @@ Agent presentation. It reimplements no step of the sequence, sends no LOITER, up
 reset or rearm, writes no authority of its own, and never exposes the legacy raw Pixhawk stop. A
 successful Stop resting at `NOT_READY` + `start_eligible=true` + `authority_blocks_start=true` is
 the expected landing, not a failure. See [`SCOUT_STOP_API.md`](SCOUT_STOP_API.md).
+
+---
+
+## E2 experiment evidence — open contract gaps (audited 2026-08-10)
+
+Everything the E2 water experiment's map evidence needs already exists in operator-owned
+contracts and is now consumed (see `operator/docs/verification/e2-experiment-evidence.md`). What
+follows is what is still MISSING, stated rather than invented.
+
+| Slot | Pages | Owner | Prio | State |
+|---|---|---|---|---|
+| **`action_request` on `GET /agent/replan/status`** | Agent (four-layer card, E2 preflight) | Local Agent | **P1** | **Missing — not emitted** |
+| **`revised_route` / revised waypoint geometry in the replan status or planning package** | Map (revised-route overlay before read-back) | Local Agent | P2 | Missing — geometry is only observable via the Pixhawk read-back |
+| **`no_go_zone_count` in the v1 planning-package summary** | Agent (E2 preflight) | Local Agent | P0 | **Shipped both sides** — Scout emits it; the operator now carries it through `_normalize_scout_package` → `readiness.planning_package.no_go_zone_count` |
+
+**`action_request` (REQUEST_RETURN_HOME / REQUEST_HOLD / NONE).** The E2 trigger is meant to be
+observable as four INDEPENDENT statements — risk `CRITICAL`, advice `RETURN_HOME`, action request
+`REQUEST_RETURN_HOME`, then the FSM progression. Three of the four are on the wire today:
+
+* risk level → `mission_execution/status` `risk.level`
+* advice → `mission_execution/status` `risk.recommendation`
+* FSM → `replan/status` `fsm_state`
+
+There is **no `action_request` field on any operator-visible Scout contract** — not on
+`/agent/replan/status`, not on `/agent/mission_execution/status`, not on the status packet. The
+station reads `action_request` / `requested_action` / `operator_action_request` tolerantly
+(`lib/replan.js normalizeReplanStatus`) and renders whichever one Scout starts sending; until then
+the row reads **"Not emitted by this Scout build"**. It is deliberately NOT rendered as `NONE`:
+"no request outstanding" is a claim Scout would be making, and silence is not that claim. No
+operator-side endpoint was invented for it, and none should be — the field belongs to Scout.
+
+**Revised-route geometry.** The map draws the revised safe return from the Pixhawk read-back once
+Scout has uploaded it, so the E2 evidence does not depend on this. Before the upload lands there is
+nothing to draw, and `replanMapModel` reports `revisedAvailable:false` rather than drawing a guess.

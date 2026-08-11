@@ -234,6 +234,10 @@ test("E2. every recommendation maps to its one compact word", () => {
     CONTINUE_WITH_CAUTION: "CAUTION",
     HOLD_RECOMMENDED: "HOLD",
     RETURN_RECOMMENDED: "RETURN",
+    // Both spellings Scout has shipped for the same two advisories. RETURN_HOME is the ADVICE
+    // "bring the vehicle home" — it is not RTL and it is not the constrained safe-return route.
+    HOLD: "HOLD",
+    RETURN_HOME: "RETURN HOME",
   });
   for (const [code, word] of Object.entries(RECOMMENDATION_TEXT)) {
     assert.equal(recommendationView(S({ risk: { ...RISK_LOW, recommendation: code } })).text, word);

@@ -22,7 +22,7 @@ import { vehicleRows } from "../components/VehicleDock.js";
 import { commState, cls, fmtAge } from "../lib/ui.js";
 import { AVAIL, availSlot, availTag } from "../lib/availability.js";
 import { createAuthorityController } from "../lib/authority.js";
-import { canonicalVehicleId } from "../lib/selection.js";
+import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import * as replan from "../lib/replan.js";
 import { readinessLabel, READINESS_STATE } from "../lib/mission-publish.js";
 import * as mx from "../lib/mission-execution.js";
@@ -94,6 +94,11 @@ export function Agent(root) {
   let replanStatus = null, replanReadiness = null, replanConfig = null, replanExperiment = null;
   let publishState = null;
   let replanMsg = null, replanBusy = false, replanForVid = null;
+  // The immutable ORIGINAL mission record (revision 0) for the selected vehicle. It is the
+  // authoritative source of the planning constraints the E2 experiment is judged against —
+  // above all the no-go zones the route was planned around. Immutable, so it is read on the same
+  // cadence as the rest of this page's reads and never merged into anything.
+  let originalMission = null, originalForVid = null;
 
   // Mission-execution lifecycle state, per SELECTED vehicle only. `mxStatus` is Scout's canonical
   // status (the ONLY thing the primary button is derived from — never the last click, never the
@@ -129,6 +134,7 @@ export function Agent(root) {
   function loadReplan(id) {
     if (id == null) {
       replanStatus = replanReadiness = replanConfig = replanExperiment = publishState = null;
+      originalMission = null; originalForVid = null;
       return;
     }
     const forId = id;
@@ -139,13 +145,19 @@ export function Agent(root) {
       // download. It is what lets this page distinguish "a sync is owed" from "Scout disagrees"
       // — the durable record knows the former; Scout's package evidence alone cannot.
       api.getPublishState(id),
-    ]).then(([st, rd, cf, ex, pb]) => {
+      // The approved planning constraints (no-go zones, boundary, route) this vehicle's mission
+      // was built against. Operator-owned and immutable — Scout cannot overwrite it, which is
+      // exactly why the E2 evidence is anchored on it.
+      api.getActiveOriginalMission(id),
+    ]).then(([st, rd, cf, ex, pb, om]) => {
       if (forId !== selId) return;                 // selection moved — discard stale fetch
       replanStatus = st.status === "fulfilled" ? st.value : null;
       replanReadiness = rd.status === "fulfilled" ? rd.value : null;
       replanConfig = cf.status === "fulfilled" ? cf.value : null;
       replanExperiment = ex.status === "fulfilled" ? ex.value : null;
       publishState = pb.status === "fulfilled" ? pb.value : null;
+      originalMission = om.status === "fulfilled" && om.value ? (om.value.mission || null) : null;
+      originalForVid = forId;
       replanForVid = forId;
       renderDetail();
     });
@@ -1062,10 +1074,97 @@ export function Agent(root) {
         <span class="tag">safe-return lifecycle — decision, FSM, mission revision &amp; package shown verbatim from Scout ${S.decision.simulated ? rp("SIMULATED", "p") : ""}</span>
         ${replanMsg ? `<span style="margin-left:8px">${rp(replanMsg.label + ": " + replan.outcomeLabel(replanMsg.outcome) + (replanMsg.code ? " (" + replanMsg.code + ")" : ""), OUTCOME_TINT[replanMsg.outcome] || "u")}</span>` : ""}
       </div>
+      <div class="subgrid two">${e2PreflightCard(v, S, rd)}${layerCard(v, S)}</div>
       <div class="subgrid two">${readinessCard(rd)}${decisionReplanCard(S)}</div>
       <div class="subgrid two">${transactionCard(S)}${missionRevisionCard(S)}</div>
       <div class="subgrid two">${execConfigCard(cfg, S, rd, exp, av2(v, stale))}${experimentCard(exp, v)}</div>
       ${transitionsReplanCard(S)}`;
+  }
+
+  // ── E2 EXPERIMENT PREFLIGHT ────────────────────────────────────────────────────────────────
+  // Read-only. It gates nothing, commands nothing and starts nothing — its whole purpose is to
+  // make a BAD EXPERIMENT CONFIGURATION visible on the bench instead of in the water. Every check
+  // is tri-state, and an unanswered check is never counted as a pass.
+  //
+  // The one the experiment lives or dies by is the no-go count. `no_go_zones_present:true` with a
+  // count of zero is a plan with nothing to avoid — the route would be a straight line and the
+  // recording would prove nothing. So presence is not the test; `count == 1` is.
+  const CHECK_TINT = { PASS: "c", FAIL: "d", UNKNOWN: "u" };
+  const CHECK_MARK = { PASS: "PASS", FAIL: "FAIL", UNKNOWN: "?" };
+
+  function e2Model(v, S, rd) {
+    const omForThis = originalForVid != null && v && originalForVid === v.id;
+    const mxForThis = mxForVid != null && v && mxForVid === v.id;
+    const pubFor = publishState && replanForVid === selId ? publishState : null;
+    const home = v && v.home && typeof v.home === "object" ? v.home : null;
+    return replan.e2PreflightChecks({
+      missionExecution: mx.normalizeStatus(mxForThis ? mxStatus : null),
+      replanStatus: S,
+      readiness: rd,
+      packageVerdict: rd || pubFor ? readinessLabel({ publish: pubFor, readiness: rd }) : null,
+      planning: replan.originalPlanningGeometry(omForThis ? originalMission : null),
+      // Scout's own copy of the same count, from the planning-package summary the backend now
+      // carries through. Null when Scout does not report one — never defaulted to zero.
+      scoutNoGoZoneCount: rd && rd.planning_package
+        ? rd.planning_package.no_go_zone_count : null,
+      homeVerified: home && typeof home.verified === "boolean" ? home.verified : null,
+    });
+  }
+
+  function e2PreflightCard(v, S, rd) {
+    const m = e2Model(v, S, rd);
+    const cond = m.ready ? rp("E2 CONFIGURATION VERIFIED", "c")
+      : m.failed.length ? rp(`${m.failed.length} FAILING`, "d")
+      : rp(`${m.unknown.length} UNVERIFIED`, "u");
+    const rows = m.checks.map((c) => row(
+      `${esc(c.label)}`,
+      `${rp(CHECK_MARK[c.state], CHECK_TINT[c.state])} <span class="cond" title="${escAttr(c.detail || "")}">${esc(String(c.value))}</span>`)).join("");
+    return card("E2 experiment preflight", cond,
+      m.ready ? "ok" : m.failed.length ? "caution" : "idle",
+      `<div class="metrics">${rows}</div>
+       <div class="reason-note">${gapSvg}<span>Read-only evidence assembled from contracts this station already reads — it starts nothing and blocks nothing. The <b>no-go count</b> comes from the approved mission record's own planning inputs (<span class="mono">planning_inputs.no_go_zones</span>), never from the shape of a route; a plan that reports zones <i>present</i> but a count of <b>0</b> is the misconfiguration this row exists to catch.</span></div>`,
+      true);
+  }
+
+  // ── THE FOUR INDEPENDENT LAYERS ────────────────────────────────────────────────────────────
+  // Risk, Advice, Action Request and the replanning FSM are four separate statements Scout makes,
+  // and this card's only job is to keep them separate. In particular:
+  //
+  //   • the FSM entering HOLD_REQUESTED is an EXECUTION STEP of a safe return. It is not a reason
+  //     to rewrite the mission-level Advice as HOLD, and nothing here does;
+  //   • a CRITICAL risk does not manufacture an action request. If Scout emits no
+  //     action_request field, this says so — it never prints "NONE" on Scout's behalf, because
+  //     "no request" is a claim and silence is not that claim.
+  //
+  // The E2 trigger is visible here as CRITICAL → RETURN_HOME → REQUEST_RETURN_HOME followed by the
+  // FSM progression, each in its own row, each from its own field.
+  function layerCard(v, S) {
+    const mxForThis = mxForVid != null && v && mxForVid === v.id;
+    const M = mx.normalizeStatus(mxForThis ? mxStatus : null);
+    const risk = M.risk || {};
+    const ar = S.actionRequest || {};
+    const fsm = S.transaction ? S.transaction.fsmState : null;
+    const lvl = risk.level ? String(risk.level).toUpperCase() : null;
+    const riskTint = { LOW: "c", ELEVATED: "p", HIGH: "d", CRITICAL: "d" }[lvl] || "u";
+    const adv = risk.recommendation ? String(risk.recommendation).toUpperCase() : null;
+    const advTint = adv === "CONTINUE" ? "c" : adv ? "p" : "u";
+    const arCode = ar.code ? String(ar.code).toUpperCase() : null;
+    const banner = replan.safeReturnBanner(S);
+    return card("Risk · Advice · Action request · FSM",
+      banner ? rp(banner.text, banner.tone === "ok" ? "c" : banner.tone === "warn" ? "d" : "p")
+             : availTag(AVAIL.LIVE),
+      lvl === "CRITICAL" || lvl === "HIGH" ? "caution" : "ok",
+      `<div class="metrics">
+         ${row("Risk (Scout's governing level)", lvl ? rp(lvl, riskTint) : availSlot(AVAIL.GAP, { label: "Not reported" }))}
+         ${row("Advice (advisory recommendation)", adv ? rp(adv, advTint) : availSlot(AVAIL.GAP, { label: "Not reported" }))}
+         ${row("Action request", ar.reported
+            ? rp(arCode || "NONE", arCode && arCode !== "NONE" ? "p" : "c")
+            : availSlot(AVAIL.GAP, { label: "Not emitted by this Scout build",
+                dev: "Scout does not send action_request / requested_action on /agent/replan/status" }))}
+         ${row("Replanning FSM", fsm ? `<b>${esc(fsm)}</b>` : availSlot(AVAIL.GAP, { label: "Not reported" }))}
+       </div>
+       <div class="reason-note">${gapSvg}<span>Four <b>independent</b> Scout statements, each read from its own field. A replanning FSM in <span class="mono">HOLD_REQUESTED</span> is an execution step of the safe return — it does <b>not</b> change the mission-level Advice, and no level here is derived from any other.</span></div>`,
+      false);
   }
 
   function av2(v, stale) {
@@ -1104,6 +1203,11 @@ export function Agent(root) {
          ${pk.scout_state == null && pk.scout_replanning_ready == null ? ""
            : row("Scout readiness", `${badge(pk.scout_replanning_ready, "READY", "NOT READY")}${pk.scout_state ? " " + rp(pk.scout_state, "u") : ""}`)}
          ${row("Boundary supplied", badge(vm.boundary_supplied, "YES", "NO"))}
+         ${/* The COUNT, not just "did Scout mention no-go zones". Zero zones reported as present
+              is a real configuration — and for E2 a broken one — so the number is shown. */""}
+         ${row("No-go zones in package", pk.no_go_zone_count == null
+            ? rp("count not reported", "u")
+            : `${rp(String(pk.no_go_zone_count), pk.no_go_zone_count > 0 ? "c" : "p")} ${pk.no_go_checked ? rp("CHECKED", "c") : rp("not checked", "u")}`)}
          ${row("Connector proven safe", pk.connector_proven_safe == null ? rp("unknown", "u") : badge(pk.connector_proven_safe, "PROVEN", "NOT PROVEN"))}
        </div>
        ${lims.length ? `<div class="reason-note">${warnSvg}<span>Limitations: ${esc(lims)}</span></div>` : ""}
@@ -1184,22 +1288,38 @@ export function Agent(root) {
        ${latch.detail ? `<div class="reason-note">${warnSvg}<span>${esc(latch.detail)}. The cooldown timer is not counting down to another automatic attempt — Scout has already spent this trigger generation. Clear and re-apply the experiment injection, rearm the replanning controller, or run a new original mission to arm a new one.</span></div>` : ""}`;
   }
 
+  // ── Safe-return mission revision (the CONSTRAINED route Scout builds) ──────────────────────
+  // WORDING IS LOAD-BEARING. What Scout produces here is a SAFE RETURN MISSION: a route built
+  // from previously approved/traversed geometry and validated against the navigable area, the
+  // shoreline clearance, the ORIGINAL no-go zones and the home corridor. That is not "RTL".
+  // Native Pixhawk RTL is the autopilot's own straight-line return, it knows nothing about a
+  // no-go zone, and it appears in this station in exactly two places: the `rtl_fallback_enabled`
+  // config flag and the terminal FSM state FALLBACK_RTL. Calling the replanned route "RTL" would
+  // tell an examiner the opposite of what the E2 experiment demonstrates.
   function missionRevisionCard(S) {
     const m = S.missionRevision;
-    if (!S.present) return card("Mission revision", availTag(AVAIL.GAP), "idle",
-      gapBody("No mission revision reported."), false);
-    return card("Mission revision", val(m.revision === null ? "—" : "rev " + m.revision), "ok",
+    if (!S.present) return card("Safe return mission revision", availTag(AVAIL.GAP), "idle",
+      gapBody("No safe-return mission revision reported."), false);
+    const t = S.transaction || {};
+    const fallback = asText(t.fallback);
+    return card("Safe return mission revision", val(m.revision === null ? "—" : "rev " + m.revision), "ok",
       `<div class="metrics">
+         ${row("Strategy", `<b>${val(m.strategy || t.strategy)}</b>`)}
+         ${row("Revision number", val(m.revision))}
          ${row("Original hash", `<span class="mono">${shortHash(m.originalHash)}</span>`)}
          ${row("Revised hash", `<span class="mono">${shortHash(m.revisedHash)}</span>`)}
+         ${row("Original waypoints", val(m.originalCount))}
          ${row("Preserved waypoints", val(m.preservedCount))}
          ${row("Removed waypoints", val(m.removedCount))}
          ${row("Inserted waypoints", val(m.insertedCount))}
          ${row("Revised waypoints", val(m.revisedCount))}
-         ${row("Validation result", val(m.validationResult))}
-         ${row("Upload result", val(m.uploadResult))}
-         ${row("Readback result", val(m.readbackResult))}
-       </div>`, false);
+         ${row("Validation outcome", val(m.validationResult))}
+         ${row("Upload outcome", val(m.uploadResult))}
+         ${row("Readback outcome", val(m.readbackResult))}
+         ${row("Fallback state", fallback ? rp(esc(fallback), "p") : `<span class="txt-u">—</span>`)}
+         ${row("Last error", asText(t.lastError) ? `<span class="txt-d">${esc(t.lastError)}</span>` : `<span class="txt-u">—</span>`)}
+       </div>
+       <div class="reason-note">${gapSvg}<span>This is a <b>constrained safe-return mission</b> Scout planned, validated and uploaded — validated against the navigable geometry, the navigable boundary, shoreline clearance, the <b>original no-go zones</b> and the home corridor. It is <b>not</b> native Pixhawk RTL, which is the straight-line autopilot fallback (config <span class="mono">rtl_fallback_enabled</span> / terminal state <span class="mono">FALLBACK_RTL</span>) and respects no no-go zone.</span></div>`, false);
   }
 
   function execConfigCard(cfg, S, rd, exp, auth) {
@@ -1540,6 +1660,10 @@ export function Agent(root) {
   function select(id) {
     if (id === selId) return;
     selId = id;
+    // Share the selection so the operator carries ONE vehicle between pages. Reading the Map's
+    // evidence for usv-2 and this page's E2 evidence for usv-3 is a mistake that costs a whole
+    // experiment run, and it was possible only because this page kept a selection of its own.
+    setSelectedVehicleId(id);
     authCtl.reset();
     // Isolation: clear the previous vehicle's replan + mission-execution panels immediately (so
     // no stale lifecycle state, operation result or completion claim can be read as this
@@ -1557,7 +1681,11 @@ export function Agent(root) {
   function onFleet(data) {
     fleet = Array.isArray(data) ? data : [];
     if (selId == null && fleet.length) {
-      selId = (fleet.find((v) => v.online) || fleet.find((v) => v.lat != null) || fleet[0]).id;
+      // First payload: adopt the SHARED selection when it still names a vehicle in this fleet,
+      // else fall back to one that is actually reporting (the same rule the Map uses).
+      const shared = getSelectedVehicleId();
+      selId = shared != null && fleet.some((v) => v.id === shared) ? shared
+        : (fleet.find((v) => v.online) || fleet.find((v) => v.lat != null) || fleet[0]).id;
       loadAuthority(selId);
       loadReplan(selId);
       loadMissionExecution(selId);
