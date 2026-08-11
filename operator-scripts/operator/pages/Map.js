@@ -1605,9 +1605,13 @@ export function Map(root) {
     //           weighted level and it is never derived from the score here, so a weighted LOW
     //           under a HIGH communication floor reads HIGH, which is what it is. Until Scout
     //           reports a level it is a quiet "—" — never LOW.
-    //   ADVICE  is Scout's advisory recommendation (CONTINUE / CAUTION / HOLD / RETURN), and
-    //           only appears when Scout sends one. It is TEXT: not a button, not a link, and
-    //           nothing on this card acts on it. Risk never triggers a command.
+    //   ADVICE  is Scout's advisory recommendation (CONTINUE / CAUTION / RETURN HOME / HOLD),
+    //           and only appears when Scout sends one. It is TEXT: not a button, not a link, and
+    //           nothing on this card acts on it. Risk never triggers a command. ADVICE is Scout's
+    //           mission-level verdict — separate from the FSM step named in the headline above
+    //           (e.g. "Agent is replanning — LOITER"), which is the procedural step in flight,
+    //           not the advice. A LOITER/HOLD step is normal while the advice reads RETURN HOME;
+    //           this card never shows ADVICE HOLD unless Scout's recommendation itself is HOLD.
     //
     // ENERGY AND RISK ARE SEPARATE READINGS AND MAY DISAGREE. `FEASIBLE +4%` beside `HIGH` is
     // correct and useful — the run is still completable with reserve, and the margin is tight

@@ -205,6 +205,32 @@ class ReplanProxyRouteTests(unittest.TestCase):
         # hit Scout's 8090 base for THIS vehicle
         self.assertTrue(any(u.startswith("http://10.0.2.10:8090") for _, u in self.fake.calls))
 
+    def test_status_proxies_action_request_verbatim(self):
+        """CONTRACT: the final Scout implementation added ActionRequest to
+        replan_controller.status(), so `action_request` arrives on the SAME body as
+        fsm_state/current_decision/reason_codes — this operator is a thin proxy and must
+        forward it unmodified, never synthesize or drop it."""
+        self.fake.set("GET", "/agent/replan/status", FakeResp({
+            "fsm_state": "HOLD_REQUESTED",
+            "current_decision": "SAFE_RETURN",
+            "reason_codes": ["ENERGY_MARGIN_LOW"],
+            "action_request": "REQUEST_HOLD",
+        }))
+        r = self.client.get(f"/api/vehicles/{SCOUT_VID}/replan/status")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()["scout"]
+        self.assertEqual(body["action_request"], "REQUEST_HOLD")
+        self.assertEqual(body["fsm_state"], "HOLD_REQUESTED")
+        self.assertEqual(body["current_decision"], "SAFE_RETURN")
+
+    def test_status_missing_action_request_is_not_fabricated(self):
+        """An older Scout that has not yet added ActionRequest to its status body must not have
+        one synthesized for it by the operator proxy."""
+        self.fake.set("GET", "/agent/replan/status", FakeResp({"fsm_state": "MONITORING"}))
+        r = self.client.get(f"/api/vehicles/{SCOUT_VID}/replan/status")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("action_request", r.json()["scout"])
+
     def test_config_get_proxies(self):
         self.fake.set("GET", "/agent/replan/config", FakeResp({"dry_run": True}))
         r = self.client.get(f"/api/vehicles/{SCOUT_VID}/replan/config")

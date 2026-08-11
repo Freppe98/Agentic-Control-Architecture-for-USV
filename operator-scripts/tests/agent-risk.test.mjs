@@ -34,9 +34,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  normalizeStatus, riskView, recommendationView, riskComponents, missionCardView, startGate,
-  RISK_LEVELS, RECOMMENDATION_TEXT,
+  normalizeStatus, riskView, recommendationView, riskComponents,
+  missionCardView, startGate, RISK_LEVELS, RECOMMENDATION_TEXT,
 } from "../operator/lib/mission-execution.js";
+import {
+  normalizeReplanStatus, actionRequestView, ACTION_REQUEST_TEXT,
+} from "../operator/lib/replan.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, p), "utf8");
@@ -232,6 +235,8 @@ test("E2. every recommendation maps to its one compact word", () => {
   assert.deepEqual(RECOMMENDATION_TEXT, {
     CONTINUE: "CONTINUE",
     CONTINUE_WITH_CAUTION: "CAUTION",
+    RETURN_HOME: "RETURN HOME",
+    HOLD: "HOLD",
     HOLD_RECOMMENDED: "HOLD",
     RETURN_RECOMMENDED: "RETURN",
     // Both spellings Scout has shipped for the same two advisories. RETURN_HOME is the ADVICE
@@ -370,4 +375,239 @@ test("the Agent page explains the governing level with Scout's own stages", () =
   // magnitude in the one table whose whole purpose is to show Scout's arithmetic.
   assert.doesNotMatch(cblock, /replace\(\/0\+\$\//);
   assert.match(cblock, /String\(Number\(v\.toFixed/);
+});
+
+// ── THE THREE-CONCEPT MODEL: risk level, advice/recommendation and replan FSM step are three
+// independent facts Scout reports, and this station must never conflate them — a LOITER/HOLD
+// FSM step is a normal procedural moment under a RETURN HOME advice, and HOLD may only be shown
+// as the advice when Scout's own recommendation field says so, never inferred from risk or FSM. ─
+
+test("A. CRITICAL risk + RETURN_HOME advice + a LOITER replan step: three independent facts, "
+  + "never collapsed into ADVICE HOLD", () => {
+  const st = S({
+    risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "RETURN_HOME" },
+    replanning: { active: true, fsm_state: "LOITER" },
+  });
+  const card = missionCardView(st, {});
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.text, "RETURN HOME");
+  assert.notEqual(card.recommendation.text, "HOLD");
+  // The FSM step is presentation on the existing status line — never a second recommendation.
+  assert.match(card.headline, /LOITER/);
+  assert.doesNotMatch(card.headline, /HOLD/);
+});
+
+test("B. CRITICAL + RETURN_HOME + RETURNING_HOME: the FSM step and the advice are shown "
+  + "separately and both survive", () => {
+  const st = S({
+    risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "RETURN_HOME" },
+    replanning: { active: true, fsm_state: "RETURNING_HOME" },
+  });
+  const card = missionCardView(st, {});
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.text, "RETURN HOME");
+  assert.match(card.headline, /RETURNING_HOME/);
+});
+
+test("C. CRITICAL + HOLD + SAFE_HOLD: ADVICE reads HOLD only because Scout's own "
+  + "recommendation says HOLD, not because the FSM is a hold-shaped step", () => {
+  const st = S({
+    risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "HOLD" },
+    replanning: { active: true, fsm_state: "SAFE_HOLD" },
+  });
+  const card = missionCardView(st, {});
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.text, "HOLD");
+  assert.match(card.headline, /SAFE_HOLD/);
+});
+
+test("D. RETURN_HOME advice + RTL_FALLBACK FSM step: advice stays RETURN HOME, the fallback "
+  + "step is named on its own line", () => {
+  const st = S({
+    risk: { ...RISK_LOW, level: "HIGH", recommendation: "RETURN_HOME" },
+    replanning: { active: true, fsm_state: "RTL_FALLBACK" },
+  });
+  const card = missionCardView(st, {});
+  assert.equal(card.recommendation.text, "RETURN HOME");
+  assert.match(card.headline, /RTL_FALLBACK/);
+});
+
+test("E. a missing recommendation reads '—', never inferred from the risk level", () => {
+  const st = S({ risk: { ...RISK_LOW, level: "CRITICAL", recommendation: null } });
+  const card = missionCardView(st, {});
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.reported, false);
+  assert.equal(card.recommendation.text, "—");
+  assert.notEqual(card.recommendation.text, "HOLD");
+  assert.notEqual(card.recommendation.text, "CONTINUE");
+});
+
+test("F. a replan step with no reported FSM state reads the generic replanning line, never a "
+  + "fabricated step name", () => {
+  const st = S({
+    risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "RETURN_HOME" },
+    replanning: { active: true },
+  });
+  const card = missionCardView(st, {});
+  assert.equal(card.headline, "Agent is replanning");
+});
+
+test("G. RETURN_HOME and HOLD advice generate no command — no rtl/return/hold action is ever "
+  + "in the card's button set because Scout advised one", () => {
+  for (const recommendation of ["RETURN_HOME", "HOLD"]) {
+    const st = S({ risk: { ...RISK_LOW, level: "CRITICAL", recommendation } });
+    const buttons = missionCardView(st, {}).buttons.map((b) => b.action);
+    for (const forbidden of ["rtl", "return", "return_home", "hold"]) {
+      assert.equal(buttons.includes(forbidden), false, `${recommendation} → ${forbidden}`);
+    }
+  }
+});
+
+test("H. neither page hardcodes a risk→advice, advice→command or FSM→advice policy", () => {
+  for (const [name, src] of [["Map.js", mapSrc], ["Agent.js", agentSrc]]) {
+    // CRITICAL (or any level) driving a HOLD/RETURN verdict directly.
+    assert.doesNotMatch(src, /risk\.level\s*===?\s*["']CRITICAL["']/, name);
+    assert.doesNotMatch(src, /level\s*===?\s*["']CRITICAL["']\s*\?[^:]*HOLD/, name);
+    // An FSM/replanning step forcing the advice to read HOLD.
+    assert.doesNotMatch(src, /fsm(?:State)?\s*===?\s*["']LOITER["'][^;\n]*HOLD/i, name);
+    assert.doesNotMatch(src, /LOITER[^;\n]*(?:advice|recommendation)\s*=\s*["']HOLD["']/i, name);
+    // The advice never reaches a command call.
+    assert.doesNotMatch(src, /recommendation[\s\S]{0,80}(?:createCommand|api\.rtl)/i, name);
+  }
+});
+
+// ── ACTION REQUEST: Scout's decision_policy output, published on the REPLAN status ─────────────
+// Scout's finished pipeline is risk/feasibility → decision_policy.ActionRequest → replan FSM, and
+// the FINAL Scout implementation added ActionRequest to `replan_controller.status()` — i.e. it is
+// published on `GET /agent/replan/status` (normalized by operator/lib/replan.js), NOT inside
+// mission-execution's `risk` block and NOT a speculative top-level field on the mission-execution
+// body. This station reads it from the replan status ONLY: never from `risk.action_request`, and
+// never inferred from `risk.level` or from `recommendation`. Like the recommendation, it is
+// display only — never a button, never a command. These tests pin the four semantic examples the
+// reconciliation task specified and the four-layer independence (risk / advice / action request /
+// FSM step) that must hold across them, now sourced from the two Scout endpoints that actually
+// carry each fact.
+
+// A Scout replan status envelope, mirroring `envelope()` above but for `/agent/replan/status`.
+const RS = (over = {}) => normalizeReplanStatus({ scout: { ...over }, supported: true, reachable: true });
+
+test("mission-execution.js carries no action_request field at all — risk.action_request is not "
+  + "a source this station's mission-execution layer reads or exposes", () => {
+  const mxSrc = read("../operator/lib/mission-execution.js");
+  assert.doesNotMatch(mxSrc, /action_request/);
+  assert.doesNotMatch(mxSrc, /actionRequest/i);
+});
+
+test("every action request maps to its one compact word, and an unknown one is shown verbatim", () => {
+  assert.deepEqual(ACTION_REQUEST_TEXT, {
+    NONE: "NONE",
+    REQUEST_RETURN_HOME: "REQUEST RETURN HOME",
+    REQUEST_HOLD: "REQUEST HOLD",
+  });
+  for (const [code, word] of Object.entries(ACTION_REQUEST_TEXT)) {
+    assert.equal(actionRequestView(RS({ action_request: code })).text, word);
+  }
+  const odd = actionRequestView(RS({ action_request: "DIVERT" }));
+  assert.equal(odd.text, "DIVERT");
+  assert.equal(odd.known, false);
+});
+
+test("D. a missing action request reads '—', never NONE and never inferred from risk or advice", () => {
+  // A CRITICAL/RETURN_HOME mission-execution risk block carries no bearing on this at all.
+  const st = S({ risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "RETURN_HOME" } });
+  const card = missionCardView(st, {});
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.text, "RETURN HOME");
+  const view = actionRequestView(RS());   // Scout's replan status reports no action_request
+  assert.equal(view.reported, false);
+  assert.equal(view.text, "—");
+  assert.notEqual(view.text, "NONE");
+});
+
+test("an older Scout replan body with no action_request field at all is unaffected — the "
+  + "mission-execution risk/advice card still reads normally, independently", () => {
+  const card = missionCardView(S({ risk: RISK_LOW }), {});
+  assert.equal(card.risk.reported, true);
+  assert.equal(card.recommendation.reported, true);
+  const view = actionRequestView(RS({ fsm_state: "MONITORING" }));
+  assert.equal(view.reported, false);
+  assert.equal(view.text, "—");
+});
+
+test("risk.action_request on the MISSION-EXECUTION body is never read as the action request — "
+  + "GET /agent/replan/status is the only authoritative source", () => {
+  const st = S({ risk: { ...RISK_LOW, action_request: "REQUEST_HOLD" } });
+  const card = missionCardView(st, {});
+  assert.equal("actionRequest" in card, false);
+  // The identical code on the REPLAN body, where Scout actually publishes it, IS read.
+  assert.equal(actionRequestView(RS({ action_request: "REQUEST_HOLD" })).text, "REQUEST HOLD");
+});
+
+// ── CASE A/B/C — the exact semantic examples the reconciliation task specifies. All four layers
+// (risk, advice, action request, FSM step) are independent facts, sourced from the TWO different
+// Scout status endpoints (mission-execution for risk/advice, replan for action request/FSM step),
+// and none is derived from another.
+test("A. CRITICAL + RETURN_HOME + REQUEST_RETURN_HOME + HOLD_REQUESTED: all four shown "
+  + "independently, advice stays RETURN HOME", () => {
+  const card = missionCardView(
+    S({ risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "RETURN_HOME" } }), {});
+  const act = actionRequestView(RS({ action_request: "REQUEST_RETURN_HOME", fsm_state: "HOLD_REQUESTED" }));
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.text, "RETURN HOME");
+  assert.equal(act.text, "REQUEST RETURN HOME");
+  assert.notEqual(card.recommendation.text, "HOLD");
+});
+
+test("B. CRITICAL + RETURN_HOME + REQUEST_RETURN_HOME + RETURNING_HOME", () => {
+  const card = missionCardView(
+    S({ risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "RETURN_HOME" } }), {});
+  const act = actionRequestView(RS({ action_request: "REQUEST_RETURN_HOME", fsm_state: "RETURNING_HOME" }));
+  assert.equal(card.recommendation.text, "RETURN HOME");
+  assert.equal(act.text, "REQUEST RETURN HOME");
+});
+
+test("C. CRITICAL + HOLD + REQUEST_HOLD + SAFE_HOLD", () => {
+  const card = missionCardView(
+    S({ risk: { ...RISK_LOW, level: "CRITICAL", recommendation: "HOLD" } }), {});
+  const act = actionRequestView(RS({ action_request: "REQUEST_HOLD", fsm_state: "SAFE_HOLD" }));
+  assert.equal(card.risk.text, "CRITICAL");
+  assert.equal(card.recommendation.text, "HOLD");
+  assert.equal(act.text, "REQUEST HOLD");
+});
+
+test("REQUEST_RETURN_HOME and REQUEST_HOLD generate no command — neither reaches a createCommand "
+  + "or api.rtl call anywhere the pages source the action request", () => {
+  for (const code of ["REQUEST_RETURN_HOME", "REQUEST_HOLD"]) {
+    assert.equal(actionRequestView(RS({ action_request: code })).reported, true);
+  }
+  for (const [name, src] of [["Map.js", mapSrc], ["Agent.js", agentSrc]]) {
+    assert.doesNotMatch(src, /action_?[Rr]equest[\s\S]{0,80}(?:createCommand|api\.rtl)/i, name);
+  }
+});
+
+test("the Map card does not render an Action Request row — it stays the three-line "
+  + "ENERGY/RISK/ADVICE block; the concept lives on the Agent diagnostics page only", () => {
+  const i = mapSrc.indexOf("const live =");
+  const block = mapSrc.slice(i, i + 1200);
+  assert.doesNotMatch(block, /Action Request/i);
+  assert.doesNotMatch(block, /actionRequest/);
+});
+
+test("the Agent page exposes Action Request as its own row, sourced from the normalized REPLAN "
+  + "status model — never from mission-execution's mx.actionRequestView (removed)", () => {
+  const i = agentSrc.indexOf("function mxRiskRows");
+  const block = agentSrc.slice(i, agentSrc.indexOf("\n  }", i));
+  assert.ok(block.includes("Action request (decision_policy)"));
+  assert.match(block, /replan\.actionRequestView/);
+  assert.doesNotMatch(block, /mx\.actionRequestView/);
+});
+
+test("no page infers the action request from risk.level or from the recommendation", () => {
+  for (const [name, src] of [["Map.js", mapSrc], ["Agent.js", agentSrc]]) {
+    assert.doesNotMatch(src,
+      /risk\.level[\s\S]{0,80}action_?[Rr]equest\s*=/, name);
+    assert.doesNotMatch(src,
+      /recommendation[\s\S]{0,80}action_?[Rr]equest\s*=/, name);
+    assert.doesNotMatch(src, /action_?[Rr]equest[\s\S]{0,80}(?:createCommand|api\.rtl)/i, name);
+  }
 });

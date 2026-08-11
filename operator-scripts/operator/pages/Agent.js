@@ -460,6 +460,9 @@ export function Agent(root) {
     const S = mx.normalizeStatus(raw);
     const ops = forThis ? mxOps : [];
     const res = forThis ? mxResult : null;
+    // The Action Request row (mxRiskRows) is authoritatively sourced from Scout's replan status
+    // (GET /agent/replan/status), not from this mission-execution status — see currentReplanStatus.
+    const RS = currentReplanStatus(v);
 
     const head = `<div class="sect" style="padding:14px 0 6px"><span class="lbl">Mission execution lifecycle (Scout Local Agent)</span>
         <span class="tag">Scout owns the whole transaction — start, pause, resume, replanning handoff, return and final hold. The operator issues no separate LOITER, Set Home or AUTO for Start.</span>
@@ -473,10 +476,17 @@ export function Agent(root) {
       return head + gapBody("Scout mission-execution status is unavailable — the Local Agent did not answer. Nothing about the lifecycle can be shown; no action is offered.");
     }
     return head +
-      `<div class="subgrid two">${mxControlCard(S, res, ops)}${mxHomeCard(S, ops)}</div>
+      `<div class="subgrid two">${mxControlCard(S, res, ops, RS)}${mxHomeCard(S, ops)}</div>
        <div class="subgrid two">${mxSequenceCard(S)}${mxReturnCard(S)}</div>
        ${mxStopCard(S, ops)}
        ${mxOperationsCard(ops)}`;
+  }
+
+  // The replan-status half of the isolation guard used both here and in replanSection: only
+  // Scout's replan status actually fetched for THIS vehicle is ever normalized and shown.
+  function currentReplanStatus(v) {
+    const forThis = replanForVid != null && v && replanForVid === v.id;
+    return forThis ? replan.normalizeReplanStatus(replanStatus) : replan.normalizeReplanStatus(null);
   }
 
   // --- STOP: Scout's safe-abort evidence -----------------------------------------------------
@@ -542,7 +552,7 @@ export function Agent(root) {
   // labelled section that is COLLAPSED BY DEFAULT (see mxFallbackControls), for the case where
   // the Map card cannot be used and an engineer needs the raw path. Rearm stays a first-class
   // advanced tool — it is a controller-maintenance action, not normal mission operation.
-  function mxControlCard(S, res, ops) {
+  function mxControlCard(S, res, ops, RS) {
     const rearm = mx.rearmAvailability(S);
     const lastCode = (ops.slice(-1)[0] || {}).scout_error_code || null;
     const blockers = mx.startBlockers(S, { lastErrorCode: lastCode });
@@ -572,7 +582,7 @@ export function Agent(root) {
        ${mxBindingRows(S)}
        ${mxBatteryRows(S)}
        ${mxEnergyRows(S)}
-       ${mxRiskRows(S)}
+       ${mxRiskRows(S, RS)}
        <div class="reason-note">${gapSvg}<span><b>Normal mission controls are on the Map page.</b>
          Start, Pause, Resume and Stop live in the Map's <b>Agent Mission</b> card, which runs
          each as one operation including the control-authority hand-off. This page is the
@@ -780,7 +790,7 @@ export function Agent(root) {
   // RISK IS NOT READINESS. Nothing here disables Start, and Start is not offered because risk
   // is low — that verdict comes from Scout's own start_eligible / start_block_reason (see
   // mxEligibilityRows). The two answer different questions and are kept apart on purpose.
-  function mxRiskRows(S) {
+  function mxRiskRows(S, RS) {
     const view = mx.riskView(S);
     if (!view.reported) {
       return `<div class="reason-note">${gapSvg}<span>This Scout reports no agent risk
@@ -791,6 +801,11 @@ export function Agent(root) {
     }
     const tint = { ok: "c", caution: "p", warn: "d", idle: "u" }[view.tone] || "u";
     const rec = mx.recommendationView(S);
+    // Action Request is Scout's decision_policy output, published on the REPLAN status
+    // (GET /agent/replan/status) — not on this mission-execution status. Sourced from the
+    // same normalized replan model the Replanning lifecycle section below renders, so this
+    // row and that section can never disagree about what Scout reported.
+    const act = replan.actionRequestView(RS);
     const num = (v) => (typeof v === "number" ? `<b>${esc(String(v))}</b>` : `<span class="txt-u">—</span>`);
     const code = (v) => (v ? `<span class="mono">${esc(v)}</span>` : `<span class="txt-u">—</span>`);
     // WHICH stage Scout's own fields show as producing the governing level. Named, not
@@ -809,6 +824,10 @@ export function Agent(root) {
               // Scout's own code, shown beside the compact word only when the two differ —
               // "CONTINUE CONTINUE" is noise, "CAUTION CONTINUE_WITH_CAUTION" is evidence.
               + (rec.code === rec.text ? "" : ` <span class="mono txt-u">${esc(rec.code)}</span>`)
+            : `<span class="txt-u">not reported</span>`)}
+         ${row("Action request (decision_policy)", act.reported
+            ? `${rp(act.text, { ok: "c", caution: "p", warn: "d", idle: "u" }[act.tone] || "u")}`
+              + (act.code === act.text ? "" : ` <span class="mono txt-u">${esc(act.code)}</span>`)
             : `<span class="txt-u">not reported</span>`)}
          ${row("Confidence", view.confidence ? rp(view.confidence, "u") : `<span class="txt-u">—</span>`)}
        </div>
@@ -841,7 +860,10 @@ export function Agent(root) {
          control Scout has not itself refused — Start eligibility comes from Scout's
          <span class="mono">start_eligible</span> / <span class="mono">start_block_reason</span>
          above. The recommendation is <b>advisory text</b>: it is never a button and never issues
-         a command.</span></div>`;
+         a command. The <b>action request</b> is a fourth, independent fact — Scout's own
+         decision_policy → replan FSM pipeline output — shown exactly as Scout reports it. It is
+         never inferred from the risk level or from the recommendation, never a button, and never
+         issues a command: Scout's replanning FSM (below) is what acts on it, onboard.</span></div>`;
   }
 
   // Scout's per-component breakdown. Score, weight and weighted contribution are all Scout's own
@@ -1060,7 +1082,7 @@ export function Agent(root) {
   function replanSection(v, { connected, stale }) {
     // Isolation guard: only render replan state actually fetched for THIS vehicle.
     const forThis = replanForVid != null && v && replanForVid === v.id;
-    const S = forThis ? replan.normalizeReplanStatus(replanStatus) : replan.normalizeReplanStatus(null);
+    const S = currentReplanStatus(v);
     const rd = forThis && replanReadiness ? replanReadiness : null;
     const cfg = forThis && replanConfig ? replanConfig : null;
     const exp = forThis && replanExperiment ? replanExperiment : null;
