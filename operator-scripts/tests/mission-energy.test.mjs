@@ -458,5 +458,5 @@ test("the Agent page carries the detailed evidence, both margins kept apart", ()
 });
 
 test("the diagnostics rows are wired into the existing lifecycle card, not a new panel", () => {
-  assert.match(agentSrc, /\$\{mxBatteryRows\(S\)\}\s*\n\s*\$\{mxEnergyRows\(S\)\}\s*\n\s*\$\{mxRiskRows\(S\)\}/);
+  assert.match(agentSrc, /\$\{mxBatteryRows\(S\)\}\s*\n\s*\$\{mxEnergyRows\(S\)\}\s*\n\s*\$\{mxRiskRows\(S, RS\)\}/);
 });

@@ -488,7 +488,8 @@ test("missing, empty and malformed replan data all fail to NOT replanning", () =
 test("replan.active=true DOES show replanning", () => {
   const s = S({ replanning: { active: true, fsm_state: "PLANNING" } });
   assert.equal(s.replanning.active, true);
-  assert.equal(card(s).headline, "Agent is replanning");
+  // The FSM step is appended verbatim — Scout's own spelling, never translated or dropped.
+  assert.equal(card(s).headline, "Agent is replanning — PLANNING");
   assert.equal(isReplanning({ active: true }), true);
 });
 
@@ -497,11 +498,15 @@ test("an explicit replan transaction state shows replanning, an idle one does no
     assert.equal(isReplanning({ active: false, state: st }), true, st);
     assert.equal(isReplanning({ active: false, fsm_state: st }), true, st);
     assert.equal(card(S({ replanning: { active: false, fsm_state: st } })).headline,
-      "Agent is replanning", st);
+      `Agent is replanning — ${st}`, st);
   }
   for (const st of FSM_IDLE) assert.equal(isReplanning({ active: false, state: st }), false, st);
   assert.equal(isReplanning({}, EFFECTIVE_REPLANNING), true);
-  assert.equal(card(S({ effective_state: EFFECTIVE_REPLANNING })).headline, "Agent is replanning");
+  // No fsm_state override here — the default fixture's replanning block still carries its own
+  // (MONITORING), and that is exactly what is shown: verbatim, even though the transaction was
+  // proven active via effective_state rather than via the replanning block itself.
+  assert.equal(card(S({ effective_state: EFFECTIVE_REPLANNING })).headline,
+    "Agent is replanning — MONITORING");
   assert.deepEqual([...EXPLICIT_REPLAN_STATES].sort(),
     [EFFECTIVE_REPLANNING, ...FSM_ACTIVE_ORDER].sort());
 });

@@ -374,21 +374,25 @@ export const RISK_COMPONENTS = ["energy", "communication", "navigation", "health
 // designed or authorised to be. A recommendation this build does not recognise is shown exactly
 // as Scout sent it.
 //
+// CONTINUE / CONTINUE_WITH_CAUTION / RETURN_HOME / HOLD is the current (final) vocabulary.
 // Both spellings Scout has used for the same two advisories are recognised (…_RECOMMENDED and
 // the bare RETURN_HOME / HOLD), so a build that ships either renders a word rather than a raw
 // enum. RETURN_HOME is the ADVICE "bring the vehicle home" — it is not RTL, and it is not the
 // safe-return route: what Scout then plans and uploads is a constrained safe-return mission.
+// This station never infers HOLD from a risk level or an FSM step: HOLD is shown ONLY when
+// Scout's own recommendation field says HOLD (or the older HOLD_RECOMMENDED).
 export const RECOMMENDATION_TEXT = {
   CONTINUE: "CONTINUE",
   CONTINUE_WITH_CAUTION: "CAUTION",
+  RETURN_HOME: "RETURN HOME",
+  HOLD: "HOLD",
+  // Backward compatibility — an older Scout's spelling of the same two advisories.
   HOLD_RECOMMENDED: "HOLD",
   RETURN_RECOMMENDED: "RETURN",
-  HOLD: "HOLD",
-  RETURN_HOME: "RETURN HOME",
 };
 export const RECOMMENDATION_TONE = {
-  CONTINUE: "ok", CONTINUE_WITH_CAUTION: "caution", HOLD_RECOMMENDED: "warn",
-  RETURN_RECOMMENDED: "warn", HOLD: "warn", RETURN_HOME: "warn",
+  CONTINUE: "ok", CONTINUE_WITH_CAUTION: "caution", RETURN_HOME: "warn", HOLD: "warn",
+  HOLD_RECOMMENDED: "warn", RETURN_RECOMMENDED: "warn",
 };
 
 // Scout's mission/package binding vocabulary, verbatim.
@@ -2025,8 +2029,8 @@ export function missionCardView(status, {
     // field a renderer would have to guess at.
     energy: energyView(S),
     risk: riskView(S),
-    // Scout's advisory word (CONTINUE / CAUTION / HOLD / RETURN). Display only — it is not a
-    // button, it gates nothing, and it produces no command.
+    // Scout's advisory word (CONTINUE / CAUTION / RETURN HOME / HOLD). Display only — it is not
+    // a button, it gates nothing, and it produces no command.
     recommendation: recommendationView(S),
   };
 
@@ -2047,8 +2051,16 @@ export function missionCardView(status, {
   // THE ONE PLACE this card says "replanning" — and only on Scout's explicit evidence
   // (normalizeStatus → isReplanning). A readiness refresh, a mission read-back refresh, a
   // pending status request, NOT_READY, stale evidence or a missing field never reach here.
+  //
+  // The FSM step (LOITER / PLANNING / VALIDATING / UPLOADING / RETURNING_HOME / RTL_FALLBACK /
+  // SAFE_HOLD / …) is appended VERBATIM, exactly as Scout spelled it — this is presentation of
+  // the one concise status line the card already has, never a new row, and never a translation
+  // this station invents meaning for. It is the procedural step in flight, not the mission-level
+  // advice: a LOITER step here is compatible with an ADVICE of RETURN HOME shown above, and this
+  // line must never be read as, or replace, that advice.
   if (S.replanning.active) {
-    out.headline = "Agent is replanning";
+    const fsm = replanFsm(S);
+    out.headline = fsm ? `Agent is replanning — ${fsm}` : "Agent is replanning";
     return out;
   }
   // Scout's binding/conflict verdict, read BEFORE the ordinary pre-start presentation so a newly

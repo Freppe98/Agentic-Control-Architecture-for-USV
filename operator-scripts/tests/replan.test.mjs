@@ -13,7 +13,7 @@ import {
   isTransactionActive, isTerminal, executionStage, stagePatch,
   realExecutionBlockers, canEnableRealExecution, normalizeTransition,
   normalizeReplanStatus, outcomeLabel, injectionPayload, injectionHasOverride,
-  replanMapModel,
+  replanMapModel, actionRequestView,
 } from "../operator/lib/replan.js";
 
 const read = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
@@ -76,6 +76,7 @@ test("normalizeReplanStatus reads the canonical object and classifies the transa
     fsm_state: "PLANNING", current_step: "generate_route", transition_id: "tx-9",
     revision: 1, strategy: "SAFE_RETURN", retry_count: 0,
     decision: "SAFE_RETURN", reason_codes: ["ENERGY_MARGIN_LOW"],
+    action_request: "REQUEST_RETURN_HOME",
     snapshot_id: "snap-1", energy_calculation: { margin_percent: -5 },
     original_mission_hash: "sha256:aaa", revised_mission_hash: "sha256:bbb",
     package_consistency: PACKAGE_CONSISTENT,
@@ -89,11 +90,62 @@ test("normalizeReplanStatus reads the canonical object and classifies the transa
   assert.equal(n.transaction.terminal, false);
   assert.equal(n.decision.decision, "SAFE_RETURN");
   assert.deepEqual(n.decision.reasonCodes, ["ENERGY_MARGIN_LOW"]);
+  assert.equal(n.decision.actionRequest, "REQUEST_RETURN_HOME");
   assert.equal(n.package.consistent, true);
   assert.equal(n.missionRevision.originalHash, "sha256:aaa");
   assert.equal(n.transitions.length, 1);
   assert.equal(n.transitions[0].to, "HOLD_REQUESTED");
   assert.equal(n.execution.obstacleExecutionEnabled, false);
+});
+
+// ── CONTRACT: the FINAL Scout implementation added ActionRequest to
+// replan_controller.status() — i.e. `action_request` is a top-level field of the SAME body
+// as fsm_state / current_decision / reason_codes / current_step / strategy, all published
+// together on `GET /agent/replan/status`. This pins that exact shape so a future Scout
+// response that moves the field elsewhere fails this test instead of silently going unread.
+test("contract: action_request is consumed from the same replan_controller.status() body as "
+  + "fsm_state/current_decision/reason_codes/current_step/strategy", () => {
+  const scout = {
+    fsm_state: "HOLD_REQUESTED",
+    current_step: "verify_hold",
+    current_decision: "SAFE_RETURN",
+    reason_codes: ["ENERGY_MARGIN_LOW", "COMMUNICATION_DEGRADED"],
+    strategy: "SAFE_RETURN",
+    action_request: "REQUEST_HOLD",
+  };
+  const n = normalizeReplanStatus({ scout, supported: true, reachable: true });
+  assert.equal(n.transaction.fsmState, "HOLD_REQUESTED");
+  assert.equal(n.transaction.currentStep, "verify_hold");
+  assert.equal(n.transaction.strategy, "SAFE_RETURN");
+  assert.equal(n.decision.decision, "SAFE_RETURN");
+  assert.deepEqual(n.decision.reasonCodes, ["ENERGY_MARGIN_LOW", "COMMUNICATION_DEGRADED"]);
+  assert.equal(n.decision.actionRequest, "REQUEST_HOLD");
+  const act = actionRequestView(n);
+  assert.equal(act.reported, true);
+  assert.equal(act.code, "REQUEST_HOLD");
+  assert.equal(act.text, "REQUEST HOLD");
+});
+
+test("actionRequestView reads ONLY normalizeReplanStatus().decision.actionRequest — a body "
+  + "with every other replan field but no action_request reads not-reported, never inferred "
+  + "from decision/reason_codes/fsm_state", () => {
+  const n = normalizeReplanStatus({
+    scout: {
+      fsm_state: "HOLD_REQUESTED", current_decision: "SAFE_RETURN",
+      reason_codes: ["ENERGY_MARGIN_LOW"], current_step: "verify_hold", strategy: "SAFE_RETURN",
+    },
+    supported: true, reachable: true,
+  });
+  const act = actionRequestView(n);
+  assert.equal(act.reported, false);
+  assert.equal(act.code, null);
+  assert.equal(act.text, "—");
+});
+
+test("actionRequestView on an unsupported/unreachable replan status reads not-reported, "
+  + "never a fabricated NONE", () => {
+  assert.equal(actionRequestView(normalizeReplanStatus(null)).reported, false);
+  assert.equal(actionRequestView(normalizeReplanStatus({ supported: false })).reported, false);
 });
 
 test("an older Scout (supported:false) normalizes to not-present without throwing", () => {

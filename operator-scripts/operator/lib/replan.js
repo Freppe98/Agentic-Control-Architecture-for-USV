@@ -142,6 +142,12 @@ export function normalizeReplanStatus(result) {
       simulated: decisionSimulated,
       simulationState: first(s, "simulation_state"),
       realBattery: first(s, "battery_percent", "real_battery_percent"),
+      // Scout's decision_policy ActionRequest — the FINAL Scout implementation added this to
+      // replan_controller.status(), so it is published HERE, on the canonical replan status
+      // body, and nowhere else. Read from this field alone: never from mission-execution's
+      // `risk` block, never from a speculative top-level field, and never inferred from
+      // `decision`, `reason_codes` or `fsm_state`. See actionRequestView below.
+      actionRequest: first(s, "action_request"),
     },
     transaction: {
       fsmState,
@@ -207,6 +213,45 @@ export function normalizeReplanStatus(result) {
     },
     transitions: arr(first(s, "transition_history", "transitions"))
       .map(normalizeTransition).filter(Boolean),
+  };
+}
+
+// ── Scout's decision_policy ACTION REQUEST → the operator's compact word ───────────────────
+// Published on Scout's canonical replan status (`GET /agent/replan/status` → `action_request`),
+// alongside `current_decision` / `reason_codes` / `fsm_state` / `current_step` / `strategy` — NOT
+// on mission-execution's `risk` block. DISPLAY ONLY, exactly like `decision`: never a button,
+// never gates a control, never issues a command. Absent reads "—", never NONE — a Scout that has
+// not (yet) started reporting this field has said nothing, which is different from Scout saying
+// "no action requested".
+export const ACTION_REQUEST_TEXT = {
+  NONE: "NONE",
+  REQUEST_RETURN_HOME: "REQUEST RETURN HOME",
+  REQUEST_HOLD: "REQUEST HOLD",
+};
+export const ACTION_REQUEST_TONE = {
+  NONE: "ok", REQUEST_RETURN_HOME: "warn", REQUEST_HOLD: "warn",
+};
+
+/**
+ * Scout's decision_policy ActionRequest, read from `normalizeReplanStatus().decision.actionRequest`
+ * — the authoritative source per Scout's final `replan_controller.status()` contract. Independent
+ * of `decision`, `reason_codes` and `fsm_state`; this station never derives it from any of them,
+ * and it never becomes a button or a command. An unrecognised code is shown exactly as Scout sent
+ * it.
+ *
+ * @param norm normalizeReplanStatus() output
+ * @returns {{ reported, code, text, tone, known }}
+ */
+export function actionRequestView(norm) {
+  const S = norm || normalizeReplanStatus(null);
+  const code = (S.decision && S.decision.actionRequest) || null;
+  if (!code) return { reported: false, code: null, text: "—", tone: "idle", known: false };
+  const up = String(code).toUpperCase();
+  const known = Object.prototype.hasOwnProperty.call(ACTION_REQUEST_TEXT, up);
+  return {
+    reported: true, code: up, known,
+    text: known ? ACTION_REQUEST_TEXT[up] : up,
+    tone: known ? ACTION_REQUEST_TONE[up] : "idle",
   };
 }
 
