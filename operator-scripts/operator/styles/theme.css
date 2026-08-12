@@ -1334,6 +1334,9 @@ table.dt tbody tr.acked td:first-child { opacity:1; }
 .pl-sw.boundary { border-top-color:#4C8DFF; }
 .pl-sw.navigable { border-top-color:#3ECF8E; border-top-style:dashed; }
 .pl-sw.nogo { border-top-color:#E5484D; height:9px; border:1px solid #E5484D; background:rgba(229,72,77,.16); margin-top:0; }
+/* Approved Home corridor — approved TRANSIT geometry, not survey area, so the swatch is a thin
+   dashed amber line rather than a filled block like the no-go zone. */
+.pl-sw.corridor { border-top-color:#E5B84D; border-top-style:dashed; }
 .pl-sw.approach { border-top-color:#F2A93B; border-top-style:dashed; }
 .pl-sw.primary { border-top-color:#3ECF8E; }
 .pl-sw.transition { border-top-color:#C7D2DE; border-top-style:dashed; }

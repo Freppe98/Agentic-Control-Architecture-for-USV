@@ -488,5 +488,280 @@ class TestMissionRecord(unittest.TestCase):
         self.assertNotIn("upload_context", res.json()["command"]["params"])
 
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# NO-GO CLEARANCE (`no_go_clearance_m`)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The operator-configurable minimum routing distance from every drawn no-go polygon. What is
+# pinned here: the defaults a fresh plan uses, that the parameter survives normalization →
+# generation → package → finalized record, that BOTH waypoints and segments honour it, and
+# that the ORIGINAL polygon is what the package stores (never the buffered exclusion).
+
+
+def _proj_for(boundary=None):
+    return planning._utm_for(boundary or BOUNDARY)[0]
+
+
+def _zone_proj(zone, boundary=None):
+    from shapely.geometry import Polygon
+    from shapely.ops import transform
+    return transform(_proj_for(boundary).transform, Polygon([(c[0], c[1]) for c in zone]))
+
+
+def _min_route_distance_to_zone_m(route_waypoints, zone, boundary=None):
+    """Smallest distance (metres) from any route waypoint to the ORIGINAL no-go polygon.
+    0 for a waypoint on or inside it — which is exactly what a clearance must prevent."""
+    from shapely.geometry import Point
+    to_proj = _proj_for(boundary)
+    zp = _zone_proj(zone, boundary)
+    return min(zp.distance(Point(*to_proj.transform(w["longitude"], w["latitude"])))
+               for w in route_waypoints)
+
+
+def _min_segment_distance_to_zone_m(segments, zone, boundary=None):
+    """Smallest distance from any generated SEGMENT (the legs between waypoints, not just the
+    waypoints) to the original no-go polygon. This is the number a route that skims the red
+    polygon between two individually-clear waypoints fails on."""
+    from shapely.geometry import LineString
+    from shapely.ops import transform
+    to_proj = _proj_for(boundary)
+    zp = _zone_proj(zone, boundary)
+    best = float("inf")
+    for s in segments:
+        coords = [(p[0], p[1]) for p in (s.get("coordinates") or [])]
+        if len(coords) < 2:
+            continue
+        best = min(best, zp.distance(transform(to_proj.transform, LineString(coords))))
+    return best
+
+
+class TestNoGoClearanceDefaults(unittest.TestCase):
+    """Defaults + normalization — no geometry stack required."""
+
+    def test_fresh_plan_defaults(self):
+        self.assertEqual(planning.DEFAULT_SHORELINE_CLEARANCE_M, 5.0)
+        self.assertEqual(planning.DEFAULT_NO_GO_CLEARANCE_M, 5.0)
+        self.assertEqual(planning.DEFAULT_LANE_SPACING_M, 10.0)
+
+    def test_absent_no_go_clearance_defaults_to_5(self):
+        inp = planning.normalize_generate_inputs({"boundary": BOUNDARY, "lane_spacing_m": 25})
+        self.assertEqual(inp["no_go_clearance_m"], 5.0)
+
+    def test_absent_lane_spacing_defaults_to_10(self):
+        inp = planning.normalize_generate_inputs({"boundary": BOUNDARY})
+        self.assertEqual(inp["lane_spacing_m"], 10.0)
+
+    def test_supplied_values_are_preserved_including_zero(self):
+        inp = planning.normalize_generate_inputs(
+            {"boundary": BOUNDARY, "lane_spacing_m": 25, "no_go_clearance_m": 0})
+        self.assertEqual(inp["no_go_clearance_m"], 0.0, "explicit 0 is a real choice, not absent")
+        inp = planning.normalize_generate_inputs(
+            {"boundary": BOUNDARY, "lane_spacing_m": 25, "no_go_clearance_m": 12.5})
+        self.assertEqual(inp["no_go_clearance_m"], 12.5)
+
+    def test_negative_no_go_clearance_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            planning.normalize_generate_inputs(
+                {"boundary": BOUNDARY, "lane_spacing_m": 25, "no_go_clearance_m": -1})
+        self.assertIn("No-go clearance", str(ctx.exception))
+
+    def test_supplied_invalid_lane_spacing_is_still_rejected(self):
+        # Defaulting the ABSENT field must not weaken validation of a supplied one.
+        for bad in (0, -5, "wide"):
+            with self.assertRaises(ValueError):
+                planning.normalize_generate_inputs(
+                    {"boundary": BOUNDARY, "lane_spacing_m": bad})
+
+    def test_no_go_clearance_is_generation_affecting(self):
+        base = {"boundary": BOUNDARY, "lane_spacing_m": 25, "no_go_zones": [ZONE]}
+        a = planning._input_revision(planning.normalize_generate_inputs(
+            {**base, "no_go_clearance_m": 5}))
+        b = planning._input_revision(planning.normalize_generate_inputs(
+            {**base, "no_go_clearance_m": 10}))
+        self.assertNotEqual(a, b, "a clearance change must outdate an existing route")
+
+
+@requires_geometry
+class TestNoGoClearanceGeometry(unittest.TestCase):
+    """The clearance is real geometry: waypoints AND segments keep their distance."""
+
+    def _gen(self, clearance, **over):
+        return planning.generate_survey(
+            base_inputs(no_go_zones=[ZONE], no_go_clearance_m=clearance,
+                        home=[12.9995, 56.6985], **over),
+            max_route_waypoints=800)
+
+    def test_waypoints_stay_outside_the_buffered_zone(self):
+        r = self._gen(5)
+        d = _min_route_distance_to_zone_m(r["route_waypoints"], ZONE)
+        self.assertGreaterEqual(
+            d, 5 - planning.COVER_TOL_M,
+            f"closest waypoint is {d:.2f} m from the no-go polygon, under the 5 m clearance")
+
+    def test_segments_do_not_intersect_the_buffered_zone(self):
+        # The E2 case: a leg 2 m outside the red polygon is NOT acceptable at a 5 m clearance,
+        # even when both of its endpoints are individually clear.
+        r = self._gen(5)
+        d = _min_segment_distance_to_zone_m(r["segments"], ZONE)
+        self.assertGreaterEqual(
+            d, 5 - planning.COVER_TOL_M,
+            f"a generated segment passes {d:.2f} m from the no-go polygon at a 5 m clearance")
+
+    def test_larger_clearance_pushes_the_route_further_out(self):
+        d0 = _min_route_distance_to_zone_m(self._gen(0)["route_waypoints"], ZONE)
+        d5 = _min_route_distance_to_zone_m(self._gen(5)["route_waypoints"], ZONE)
+        d10 = _min_route_distance_to_zone_m(self._gen(10)["route_waypoints"], ZONE)
+        self.assertLess(d0, 5 - planning.COVER_TOL_M,
+                        "with no clearance the route may run along the zone boundary")
+        self.assertGreaterEqual(d5, 5 - planning.COVER_TOL_M)
+        self.assertGreaterEqual(d10, 10 - planning.COVER_TOL_M)
+        self.assertGreater(d10, d5, "a larger clearance is a strictly larger exclusion")
+
+    def test_zero_clearance_excludes_the_original_geometry_only(self):
+        from shapely.geometry import Point
+        r = self._gen(0)
+        zp = _zone_proj(ZONE)
+        to_proj = _proj_for()
+        for w in r["route_waypoints"]:
+            self.assertFalse(zp.buffer(-planning.COVER_TOL_M).contains(
+                Point(*to_proj.transform(w["longitude"], w["latitude"]))),
+                "a waypoint fell inside the drawn zone even at zero clearance")
+
+    def test_navigable_model_buffers_the_zone_not_the_drawn_polygon(self):
+        grid = planning._NavGrid(BOUNDARY, 10, [ZONE], step_m=25, no_go_clearance=5)
+        self.assertIsNotNone(grid.nogo_original)
+        self.assertGreater(grid.nogo.area, grid.nogo_original.area,
+                           "the exclusion is the drawn zone EXPANDED")
+        # The drawn polygon is preserved untouched beside the derived exclusion.
+        self.assertAlmostEqual(grid.nogo_original.area, _zone_proj(ZONE).area, delta=1.0)
+        self.assertTrue(grid.buffer_valid)
+
+    def test_exclusion_rings_are_derived_output_not_stored_inputs(self):
+        r = self._gen(5)
+        self.assertEqual(r["planning_inputs"]["no_go_zones"][0][:len(ZONE)],
+                         [list(p) for p in ZONE],
+                         "the package stores the ORIGINAL operator-drawn ring")
+        self.assertEqual(r["planning_inputs"]["no_go_clearance_m"], 5)
+        self.assertTrue(r["no_go_exclusion_rings"], "the derived overlay is offered separately")
+        # …and it is genuinely a different (larger) ring than the one the operator drew.
+        self.assertNotEqual(r["no_go_exclusion_rings"][0], r["planning_inputs"]["no_go_zones"][0])
+        self.assertEqual(planning.generate_survey(
+            base_inputs(no_go_zones=[ZONE], no_go_clearance_m=0),
+            max_route_waypoints=800)["no_go_exclusion_rings"], [],
+            "no clearance → no separate exclusion overlay to draw")
+
+    def test_metrics_and_package_carry_the_clearance(self):
+        r = self._gen(7)
+        self.assertEqual(r["metrics"]["no_go_clearance_m"], 7)
+        self.assertEqual(r["planning_inputs"]["no_go_clearance_m"], 7)
+        self.assertEqual(r["planning_inputs"]["shoreline_clearance_m"], 10)
+        self.assertEqual(r["planning_inputs"]["lane_spacing_m"], 25)
+
+    def test_clearance_that_swallows_the_navigable_area_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            planning.generate_survey(
+                base_inputs(no_go_zones=[ZONE], no_go_clearance_m=400), max_route_waypoints=800)
+        self.assertIn("no-go", str(ctx.exception).lower())
+
+
+@requires_geometry
+class TestNoGoClearanceValidation(unittest.TestCase):
+    def test_generated_route_validates_against_its_own_clearance(self):
+        inp = base_inputs(no_go_zones=[ZONE], no_go_clearance_m=5, home=[12.9995, 56.6985])
+        r = planning.generate_survey(inp, max_route_waypoints=800)
+        v = planning.validate_plan({**inp, "route_waypoints": r["route_waypoints"],
+                                    "segments": r["segments"], "route_hash": r["route_hash"]},
+                                   max_route_waypoints=800)
+        self.assertTrue(v["ok"], v["errors"])
+        self.assertTrue(v["checks"]["waypoints_clear_no_go"])
+        self.assertTrue(v["checks"]["route_clears_no_go"])
+        self.assertTrue(v["checks"]["no_go_buffer_valid"])
+        self.assertEqual(v["checks"]["no_go_clearance_m"], 5)
+
+    def test_waypoint_inside_the_clearance_band_is_rejected(self):
+        # 1e-5 deg lat ~ 1.1 m: a waypoint ~2 m above the zone is OUTSIDE the drawn polygon but
+        # inside the 5 m exclusion — it must fail at 5 m and pass at 0 m.
+        near = [{"latitude": 56.699918, "longitude": 13.0020, "loiter_time_s": 0},
+                {"latitude": 56.699920, "longitude": 13.0021, "loiter_time_s": 0}]
+        body = {**base_inputs(no_go_zones=[ZONE]), "route_waypoints": near}
+        strict = planning.validate_plan({**body, "no_go_clearance_m": 5}, max_route_waypoints=800)
+        self.assertFalse(strict["ok"])
+        self.assertFalse(strict["checks"]["waypoints_clear_no_go"])
+        self.assertTrue(any("no-go" in e.lower() for e in strict["errors"]))
+        loose = planning.validate_plan({**body, "no_go_clearance_m": 0}, max_route_waypoints=800)
+        self.assertTrue(loose["checks"]["waypoints_clear_no_go"],
+                        "the same waypoints are legal when no clearance is required")
+
+    def test_segment_between_two_clear_waypoints_that_crosses_the_band_is_rejected(self):
+        # Both endpoints are ~45 m clear of the zone; the straight leg between them cuts
+        # through it. Waypoint filtering alone would pass this route.
+        a, b = [13.0010, 56.69975], [13.0030, 56.69975]
+        route = [{"latitude": a[1], "longitude": a[0], "loiter_time_s": 0},
+                 {"latitude": b[1], "longitude": b[0], "loiter_time_s": 0}]
+        segs = [{"kind": "primary", "coordinates": [a, b]}]
+        v = planning.validate_plan(
+            {**base_inputs(no_go_zones=[ZONE], no_go_clearance_m=5),
+             "route_waypoints": route, "segments": segs}, max_route_waypoints=800)
+        self.assertTrue(v["checks"]["waypoints_clear_no_go"],
+                        "both endpoints are individually clear")
+        self.assertFalse(v["checks"]["route_clears_no_go"], "the LEG is not")
+        self.assertFalse(v["ok"])
+        self.assertTrue(any("no-go" in e.lower() for e in v["errors"]))
+
+    def test_segment_skimming_the_zone_fails_at_5m_and_passes_at_0m(self):
+        # A leg ~2 m outside the red polygon: acceptable with no clearance, NOT acceptable at 5 m.
+        a, b = [13.0010, 56.6999181], [13.0030, 56.6999181]
+        segs = [{"kind": "primary", "coordinates": [a, b]}]
+        route = [{"latitude": p[1], "longitude": p[0], "loiter_time_s": 0} for p in (a, b)]
+        body = {**base_inputs(no_go_zones=[ZONE]), "route_waypoints": route, "segments": segs}
+        self.assertFalse(planning.validate_plan(
+            {**body, "no_go_clearance_m": 5}, max_route_waypoints=800)["checks"]["route_clears_no_go"])
+        self.assertTrue(planning.validate_plan(
+            {**body, "no_go_clearance_m": 0}, max_route_waypoints=800)["checks"]["route_clears_no_go"])
+
+
+@requires_geometry
+class TestNoGoClearanceMissionRecord(unittest.TestCase):
+    """The finalized immutable record keeps the constraint AND its provenance."""
+
+    def setUp(self):
+        self.client = TestClient(main.app)
+        main.commands.clear(); main.commands_by_id.clear()
+        main.original_missions.clear(); main.mission_id_by_command.clear()
+        main.active_original_by_vehicle.clear()
+        main.comms_state_by_id[SCOUT_VID] = "CONNECTED"
+
+    def test_finalized_record_carries_all_four_planning_inputs(self):
+        pkg = planning.generate_survey(
+            base_inputs(no_go_zones=[ZONE], no_go_clearance_m=5, home=[12.9995, 56.6985],
+                        approach_waypoints=[[12.9998, 56.6988]]),
+            max_route_waypoints=800)
+        res = self.client.post("/api/missions/finalize",
+                               json={"vehicle_id": SCOUT_VID, "mission_package": pkg,
+                                     "confirm": True})
+        self.assertEqual(res.status_code, 200)
+        pi = res.json()["mission"]["planning_inputs"]
+        self.assertEqual(pi["shoreline_clearance_m"], 10)
+        self.assertEqual(pi["no_go_clearance_m"], 5)
+        self.assertEqual(pi["lane_spacing_m"], 25)
+        self.assertEqual(len(pi["no_go_zones"]), 1)
+        for pt in ZONE:
+            self.assertIn(pt, pi["no_go_zones"][0],
+                          "the record stores the ORIGINAL drawn zone, not a buffered one")
+
+    def test_generate_endpoint_defaults_the_clearance_for_an_older_caller(self):
+        # A request body from before the parameter existed still generates, and reports the
+        # default it was actually planned with rather than pretending it had none.
+        res = self.client.post("/api/planning/generate",
+                               json=base_inputs(no_go_zones=[ZONE]))
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["planning_inputs"]["no_go_clearance_m"], 5.0)
+
+    def test_generate_endpoint_400s_on_a_negative_clearance(self):
+        res = self.client.post("/api/planning/generate",
+                               json=base_inputs(no_go_clearance_m=-2))
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("No-go clearance", res.json()["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

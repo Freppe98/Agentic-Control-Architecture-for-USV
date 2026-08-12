@@ -256,6 +256,13 @@ def build_package(record, home, *, usv_id, revision=None, source=SOURCE):
         limitations.append("no no-go zones supplied")
     limitations.append("shoreline_clearance_m is a scalar metadata value — it is not itself "
                        "geometry Scout can run an onboard clearance check against")
+    no_go_clearance = inputs.get("no_go_clearance_m")
+    if no_go_clearance is None:
+        no_go_clearance = metrics.get("no_go_clearance_m")
+    if no_go_clearance is not None and float(no_go_clearance) > 0:
+        limitations.append(
+            f"the operator planned this route with a {no_go_clearance} m no-go clearance; this "
+            f"package carries the ORIGINAL no_go_zones only and has no field for the clearance")
     limitations.append("survey_graph not supplied by the Operator Station")
 
     meta = {
@@ -264,6 +271,8 @@ def build_package(record, home, *, usv_id, revision=None, source=SOURCE):
         "segment_label_counts": segment_label_counts(route),
         "boundary_supplied": bool(boundary_pts),
         "no_go_supplied": bool(no_go),
+        "no_go_clearance_m": no_go_clearance,
+        "no_go_clearance_in_package": False,
         "home": home_obj,
         "revision": rev,
         "mission_id": mission_id,
@@ -286,6 +295,10 @@ def build_package(record, home, *, usv_id, revision=None, source=SOURCE):
 #   navigable_geometry        [[[lng, lat], ...], ...]         — a LIST OF RINGS (inset may
 #                                                                be a MultiPolygon)
 #   no_go_zones               [[[lng, lat], ...], ...]         — a LIST OF RINGS; [] stays []
+#                                                                (the ORIGINAL operator-drawn
+#                                                                rings; the operator's
+#                                                                no_go_clearance_m is NOT a v1
+#                                                                field — see build_v1_package)
 #   route_waypoints           [{latitude, longitude, loiter_time_s}, ...]
 #   segments                  full objects (segment_id, kind, coordinates, length_m,
 #                             raw_point_count, final_point_count, start/end_execution_seq)
@@ -343,10 +356,21 @@ V1_FIELD_ORDER = (
 def derive_home_corridor(record):
     """(ring, meta) for a record's approved Home corridor — see V1_OPTIONAL_FIELDS.
 
+    A record finalized after the geometry-contract change STORES the corridor that finalization
+    proved, and that stored ring is what ships — the package must carry the exact geometry the
+    operator approved, not a fresh derivation that a later change to planning.py could shift.
+    A historical record has no such key and is derived from its segments exactly as before.
+
     The geometry lives in planning.py (which owns shapely/pyproj); it is imported LAZILY so this
     module stays importable, and the package stays buildable, on a backend without the geometry
     stack. Without it no corridor can be CHECKED, so none is emitted — the fail-closed direction.
     """
+    stored = record.get("home_corridor")
+    if isinstance(stored, list) and len(stored) >= 3:
+        meta = record.get("home_corridor_meta")
+        meta = dict(meta) if isinstance(meta, dict) else {"available": True, "reason": None}
+        meta.update(available=True, reason=None, source="finalized_record")
+        return stored, meta
     try:
         import planning
     except Exception as exc:                                  # pragma: no cover - defensive
@@ -358,11 +382,22 @@ def derive_home_corridor(record):
     zones = record.get("no_go_zones")
     if zones is None:
         zones = inputs.get("no_go_zones")
+    # ABSENT means "planned before the parameter existed", which is 0 — the drawn zone geometry
+    # itself. A historical record is never retro-tightened, and never broadened either.
+    clearance = inputs.get("no_go_clearance_m")
+    if clearance is None:
+        clearance = (record.get("metrics") or {}).get("no_go_clearance_m")
+    # The APPROVED transit geometry, which is the record's execution transit legs plus any
+    # planning-only legs it approved without executing (the Home → A1 connector under
+    # `route_start_mode: first_approach`). A record without the key has none — its approved
+    # transit geometry is its execution transit geometry, exactly as before.
     return planning.home_corridor_ring(
         segments=record.get("segments"),
+        planning_only_transit_segments=record.get("planning_only_transit_segments"),
         navigable_geometry=navigable,
         no_go_zones=zones,
         planning_home=inputs.get("planning_home"),
+        no_go_clearance_m=float(clearance) if clearance is not None else 0.0,
     )
 
 # The fields every detailed record entry must carry. Preserved verbatim (plus anything else
@@ -553,6 +588,18 @@ def build_v1_package(record, *, vehicle_id=None, source=SOURCE, home_corridor=No
     if clearance is None:
         raise PackageError("mission record has no shoreline_clearance_m")
 
+    # NO-GO CLEARANCE — the minimum routing distance the operator required from every drawn
+    # no-go polygon. It is reported in `meta` (and in the limitations below), NOT put on the
+    # wire: `V1_FIELDS` defines the v1 package as an EXACT field set, Scout's v1 receiver
+    # validates against that set, and this repository holds no evidence that an unknown key is
+    # accepted rather than rejected. Inventing the field and calling the package synchronized
+    # is precisely the failure this module refuses to commit — so what Scout receives is the
+    # ORIGINAL no_go_zones and nothing derived, and the clearance is reported as a stated gap
+    # until the Scout contract is extended. See _v1_limitations.
+    no_go_clearance = inputs.get("no_go_clearance_m")
+    if no_go_clearance is None:
+        no_go_clearance = metrics.get("no_go_clearance_m")
+
     created_at = record.get("created_at")
     if not isinstance(created_at, str) or not created_at:
         raise PackageError("mission record has no created_at")
@@ -609,15 +656,19 @@ def build_v1_package(record, *, vehicle_id=None, source=SOURCE, home_corridor=No
         "no_go_zone_count": len(no_go_zones),
         "boundary_point_count": len(boundary),
         "shoreline_clearance_m": clearance,
+        # What the operator PLANNED against, reported beside what was actually sent. None when
+        # the record predates the parameter — absent is not 0.
+        "no_go_clearance_m": no_go_clearance,
+        "no_go_clearance_in_package": False,
         "home_corridor_supplied": corridor is not None,
         "home_corridor_vertex_count": len(corridor) if corridor is not None else 0,
         "home_corridor": corridor_meta,
-        "limitations": _v1_limitations(no_go_zones, corridor, corridor_meta),
+        "limitations": _v1_limitations(no_go_zones, corridor, corridor_meta, no_go_clearance),
     }
     return package, meta
 
 
-def _v1_limitations(no_go_zones, corridor=None, corridor_meta=None):
+def _v1_limitations(no_go_zones, corridor=None, corridor_meta=None, no_go_clearance_m=None):
     """What the package does NOT prove, stated by the operator rather than left for Scout to
     discover. Reported alongside every sync so an absent constraint is never read as a
     cleared one."""
@@ -627,6 +678,12 @@ def _v1_limitations(no_go_zones, corridor=None, corridor_meta=None):
                            "the operator's actual input, not a missing constraint")
     limitations.append("shoreline_clearance_m is a scalar metadata value — it is not itself "
                        "geometry Scout can run an onboard clearance check against")
+    if no_go_clearance_m is not None and float(no_go_clearance_m) > 0:
+        limitations.append(
+            f"the operator planned this route with a {no_go_clearance_m} m no-go clearance, but "
+            f"replan-planning-package-v1 has no field for it — the package carries the ORIGINAL "
+            f"no_go_zones only, so Scout will replan against the zone boundary and NOT against "
+            f"the operator's clearance until the package contract carries no_go_clearance_m")
     limitations.append("no survey graph is supplied — Scout cannot re-derive coverage lanes "
                        "from this package, only reuse the approved route and geometry")
     if corridor is None:
@@ -639,7 +696,9 @@ def _v1_limitations(no_go_zones, corridor=None, corridor_meta=None):
     else:
         limitations.append(
             f"home_corridor is the approved transit path buffered to "
-            f"{(corridor_meta or {}).get('half_width_m')} m either side; it proves a connector "
-            f"to the PLANNED Home only. A runtime launch Home outside it is not covered, and "
-            f"the corridor is never widened to reach one")
+            f"{(corridor_meta or {}).get('half_width_m')} m either side, with the operator's "
+            f"effective no-go exclusion already SUBTRACTED from it — so the ring is safe to use "
+            f"as approved geometry directly. It proves a connector to the PLANNED Home only: a "
+            f"runtime launch Home outside it is not covered, and the corridor is never widened "
+            f"to reach one")
     return limitations

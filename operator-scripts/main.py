@@ -2434,8 +2434,11 @@ async def planning_generate(request: Request):
     """Generate a segmented side-scan survey route from the operator's planning inputs.
 
     Body: { boundary (GeoJSON Polygon or ring), shoreline_clearance_m, no_go_zones[],
-    lane_spacing_m, primary_angle_deg, dual_pass, secondary_angle_deg, home?,
-    transit_waypoints[]?, survey_speed_mps? }. Returns segments (typed geometry for the map),
+    no_go_clearance_m, lane_spacing_m, primary_angle_deg, dual_pass, secondary_angle_deg,
+    home?, transit_waypoints[]?, survey_speed_mps? }. `no_go_clearance_m` is the minimum
+    routing distance kept from every drawn no-go polygon (absent → 5 m; see
+    planning.normalize_generate_inputs); the ORIGINAL zones are what the response echoes back.
+    Returns segments (typed geometry for the map),
     route_waypoints (flat mission-contract route), metrics, intersections and warnings.
     Deterministic and read-only: no command is created, no vehicle state is touched."""
     if not planning.PLANNING_AVAILABLE:
@@ -2447,6 +2450,15 @@ async def planning_generate(request: Request):
             "ok": False, "error": "bad_request", "message": "Request body is not valid JSON."})
     try:
         result = planning.generate_survey(body, max_route_waypoints=MAX_ROUTE_WAYPOINTS)
+    except planning.GeometryConsistencyError as exc:
+        # The generated route contradicts the geometry it would be shipped with. A 400 naming
+        # the specific geometric fault — NEVER a package built against a broadened region. The
+        # raw operator boundary is not a fallback for the navigable geometry (see planning.py).
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "mission_geometry_inconsistent",
+            "message": "The generated route does not fit the mission's own navigable geometry.",
+            "codes": exc.codes, "failures": exc.failures,
+            "errors": [f"{f['code']}: {f['message']}" for f in exc.failures]})
     except ValueError as exc:
         # A planning-input problem the operator can fix (empty inset, no coverage, bad
         # geometry) — a 400 with the specific reason(s), not a 500.
@@ -2487,7 +2499,8 @@ async def planning_validate(request: Request):
 async def fleet_generate(request: Request):
     """Generate a fleet plan (child missions + allocation + fleet validation) from shared
     survey geometry and the selected vehicles. Body: { boundary, shoreline_clearance_m,
-    no_go_zones[], lane_spacing_m, primary_angle_deg, dual_pass, secondary_angle_deg,
+    no_go_zones[], no_go_clearance_m, lane_spacing_m, primary_angle_deg, dual_pass,
+    secondary_angle_deg,
     minimum_fleet_separation_m, balance_metric, vehicles:[{vehicle_id, vehicle_name, colour,
     home, survey_speed_mps}], manual_assignments? }. Deterministic and read-only: no command
     is created, no vehicle state is touched."""
@@ -2942,7 +2955,24 @@ def _new_mission_record(vehicle_id, package, command):
         "navigable_geometry": package.get("navigable_boundary")
                               or (package.get("planning_inputs") or {}).get("navigable_boundary"),
         "no_go_zones": (package.get("planning_inputs") or {}).get("no_go_zones") or [],
+        # The APPROVED Home corridor, stored with the record at finalization rather than
+        # re-derived later. Derivation is deterministic, so the two agree — but storing it means
+        # the geometry Scout receives is the exact geometry the operator saw and finalize
+        # PROVED, instead of a fresh derivation that could differ if planning.py ever changes.
+        # None when Home lies inside the navigable geometry (no corridor is needed) or when none
+        # could be proven; historical records simply lack the key and are re-derived as before.
+        "home_corridor": package.get("home_corridor"),
+        "home_corridor_meta": package.get("home_corridor_meta"),
+        # The finalize-time geometry proof, kept as evidence of what was checked.
+        "geometry_check": package.get("geometry_check"),
+        # THE EXECUTION ROUTE — what was flattened, hashed, uploaded and is flown.
         "segments": package.get("segments") or [],
+        # APPROVED TRANSIT GEOMETRY THAT IS NOT EXECUTED, so the record makes the distinction
+        # auditable rather than leaving it to be re-derived. Empty for every mission whose
+        # approved transit is fully executed; one planning-only `home_transit_connector` under
+        # `route_start_mode: first_approach`. It is a corridor/validation source only and is
+        # NEVER part of the route, the route hash or the MISSION_UPLOAD command.
+        "planning_only_transit_segments": package.get("planning_only_transit_segments") or [],
         "original_execution_order": package.get("original_execution_order") or [],
         "route_waypoints": params.get("waypoints") or package.get("route_waypoints") or [],
         "metrics": package.get("metrics") or {},
@@ -3020,6 +3050,29 @@ async def finalize_mission(request: Request):
             "ok": False, "error": "route_hash_mismatch",
             "message": "The mission package route_hash does not match its route waypoints — "
                        "regenerate the plan before finalizing."})
+
+    # ── THE SINGLE AUTHORITATIVE GEOMETRY-CONSISTENCY GATE ───────────────────────────────
+    # The last point at which an internally inconsistent mission can still be refused. It runs
+    # on the package AS SUBMITTED, so a body assembled outside the generate endpoint — an edited
+    # draft, a replayed plan, a direct API caller — is held to exactly the same contract:
+    # every route leg inside navigable_geometry ∪ home_corridor, every leg outside the effective
+    # no-go exclusion, Home covered by approved geometry. Failing here means NO immutable record
+    # and NO MISSION_UPLOAD command; the raw survey boundary is never substituted to make a
+    # failing package pass. Both live E2 failures were packages that would not survive this.
+    if planning.PLANNING_AVAILABLE:
+        geometry = planning.check_package_geometry(package)
+        if not geometry["ok"]:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "mission_geometry_inconsistent",
+                "message": "The mission package geometry is not self-consistent — it was not "
+                           "finalized. Regenerate the plan so the route fits the navigable "
+                           "geometry.",
+                "codes": [f["code"] for f in geometry["failures"]],
+                "failures": geometry["failures"],
+                # `errors` is the shape the Plan page already renders for a rejected upload, so
+                # the operator sees the actual geometric fault rather than a generic refusal.
+                "errors": [f"{f['code']}: {f['message']}." for f in geometry["failures"]],
+                "checks": geometry["checks"]})
 
     # Optional, additive upload metadata forwarded VERBATIM to Scout in the command params
     # (agent_command_view). It carries no authority and does not affect the route/hash/counts

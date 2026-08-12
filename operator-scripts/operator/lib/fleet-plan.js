@@ -147,6 +147,9 @@ export function fleetPlanningBody(fleet, geom) {
   return {
     boundary: geom.boundary,
     shoreline_clearance_m: num(p.shoreline_clearance_m) || 0,
+    // The SAME shared parameter Single Vehicle sends — the two modes must never interpret the
+    // same saved plan's no-go clearance differently.
+    no_go_clearance_m: num(p.no_go_clearance_m) || 0,
     lane_spacing_m: num(p.lane_spacing_m),
     primary_angle_deg: ((num(p.primary_angle_deg) || 0) % 360 + 360) % 360,
     dual_pass: !!p.dual_pass,
@@ -173,6 +176,7 @@ export function fleetInputRevision(fleet, geom) {
     b: ring(geom && geom.boundary),
     z: (geom && geom.noGoZones || []).map((zz) => ring(zz.ring)),
     c: num(p.shoreline_clearance_m) || 0,
+    ngc: num(p.no_go_clearance_m) || 0,
     s: num(p.lane_spacing_m),
     a: ((num(p.primary_angle_deg) || 0) % 360 + 360) % 360,
     d: !!p.dual_pass,

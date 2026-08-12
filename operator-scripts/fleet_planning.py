@@ -94,9 +94,23 @@ def normalize_fleet_inputs(raw):
         errors.append("Shoreline clearance must be a number >= 0 metres.")
         clearance = 0.0
 
-    spacing = _num(raw.get("lane_spacing_m"))
-    if spacing is None or spacing <= 0:
-        errors.append("Lane spacing must be a positive number of metres.")
+    # Same no-go-clearance contract as single-vehicle planning (planning.normalize_generate_
+    # inputs): absent → the 5 m default, supplied → validated. Single Vehicle and Fleet Mission
+    # must never interpret the same saved plan differently, so the rule is copied exactly.
+    if raw.get("no_go_clearance_m") is None:
+        no_go_clearance = planning.DEFAULT_NO_GO_CLEARANCE_M
+    else:
+        no_go_clearance = _num(raw.get("no_go_clearance_m"))
+        if no_go_clearance is None or no_go_clearance < 0:
+            errors.append("No-go clearance must be a number >= 0 metres.")
+            no_go_clearance = planning.DEFAULT_NO_GO_CLEARANCE_M
+
+    if raw.get("lane_spacing_m") is None:
+        spacing = planning.DEFAULT_LANE_SPACING_M
+    else:
+        spacing = _num(raw.get("lane_spacing_m"))
+        if spacing is None or spacing <= 0:
+            errors.append("Lane spacing must be a positive number of metres.")
 
     primary = _num(raw.get("primary_angle_deg", 0))
     primary = (primary % 360.0) if primary is not None else 0.0
@@ -173,6 +187,7 @@ def normalize_fleet_inputs(raw):
     return {
         "boundary": boundary,
         "shoreline_clearance_m": float(clearance),
+        "no_go_clearance_m": float(no_go_clearance),
         "lane_spacing_m": float(spacing),
         "primary_angle_deg": float(primary),
         "dual_pass": dual,
@@ -583,7 +598,10 @@ def _build_child_mission(grid, vehicle, prim_lines, sec_lines, shared, navigable
         "boundary": shared["boundary"],
         "shoreline_clearance_m": shared["shoreline_clearance_m"],
         "navigable_boundary": navigable,
+        # Original rings + the clearance parameter, exactly as the single-vehicle package
+        # stores them — a fleet child mission is an ordinary operator-survey-plan-v1 package.
         "no_go_zones": shared["no_go_zones"],
+        "no_go_clearance_m": shared["no_go_clearance_m"],
         "lane_spacing_m": shared["lane_spacing_m"],
         "primary_angle_deg": shared["primary_angle_deg"],
         "dual_pass": shared["dual_pass"],
@@ -593,6 +611,19 @@ def _build_child_mission(grid, vehicle, prim_lines, sec_lines, shared, navigable
         "approach_waypoints": [],
         "return_waypoints": [],
     }
+    # THE SAME GEOMETRY CONTRACT AS A SINGLE-VEHICLE MISSION. A fleet child is an ordinary
+    # operator-survey-plan-v1 package and gets no exemption: its approved Home corridor is
+    # derived from its own transit segments (a fleet home is routinely outside the survey
+    # polygon), and the whole route is then proven against navigable ∪ corridor − exclusion.
+    # A failure raises, so an inconsistent child mission is never assembled into a fleet plan.
+    home_corridor, home_corridor_meta = planning.home_corridor_ring(
+        segments=segments, navigable_geometry=navigable,
+        no_go_zones=shared["no_go_zones"], planning_home=home,
+        no_go_clearance_m=shared["no_go_clearance_m"])
+    if home_corridor is None:
+        warnings.append(f"{vehicle['vehicle_id']}: no approved Home corridor could be derived "
+                        f"({home_corridor_meta['reason']}).")
+
     metrics = {
         "waypoint_count": len(route_wps),
         "assigned_survey_line_count": len(assigned_ids),
@@ -613,13 +644,29 @@ def _build_child_mission(grid, vehicle, prim_lines, sec_lines, shared, navigable
         "contract_version": planning.ROUTE_CONTRACT_VERSION,
         "planning_inputs": planning_inputs,
         "segments": segments,
+        # A fleet child always starts at its own planning Home (`route_start_mode:
+        # planning_home`), so every approved transit leg is an EXECUTED leg and there is no
+        # planning-only geometry. Stated explicitly so the child package has the same shape as
+        # a single-vehicle one and the empty list is an answer, not an omission.
+        "planning_only_transit_segments": [],
         "original_execution_order": order,
         "route_waypoints": route_wps,
         "route_hash": route_hash,
         "metrics": metrics,
         "navigable_boundary": navigable,
+        "home_corridor": home_corridor,
+        "home_corridor_meta": home_corridor_meta,
         "warnings": warnings,
     }
+    geometry_check = planning.check_mission_geometry(
+        segments=segments, route_waypoints=route_wps, navigable_geometry=navigable,
+        no_go_zones=shared["no_go_zones"], no_go_clearance_m=shared["no_go_clearance_m"],
+        planning_home=home, home_corridor=home_corridor)
+    if not geometry_check["ok"]:
+        raise planning.GeometryConsistencyError([
+            {**f, "message": f"{vehicle['vehicle_id']}: {f['message']}"}
+            for f in geometry_check["failures"]])
+    package["geometry_check"] = geometry_check
     return {
         "vehicle_id": vehicle["vehicle_id"],
         "vehicle_name": vehicle["vehicle_name"],
@@ -730,17 +777,26 @@ def generate_fleet(raw_inputs, max_route_waypoints=None):
 
     boundary = inp["boundary"]
     clearance = inp["shoreline_clearance_m"]
+    no_go_clearance = inp["no_go_clearance_m"]
     spacing = inp["lane_spacing_m"]
     zones = inp["no_go_zones"]
 
-    grid = planning._NavGrid(boundary, clearance, zones, step_m=spacing)
+    # The SAME navigable model the single-vehicle planner builds, including the buffered no-go
+    # exclusion — `_survey_lines` subtracts `grid.nogo`, so the fleet's allocatable survey lines
+    # are clipped to the identical exclusion the single-vehicle coverage is.
+    grid = planning._NavGrid(boundary, clearance, zones, step_m=spacing,
+                             no_go_clearance=no_go_clearance)
+    if not grid.buffer_valid:
+        raise FleetPlanError(f"The no-go clearance of {no_go_clearance} m could not be applied — "
+                             f"buffering the no-go zones produced invalid geometry.")
     if grid.empty:
         raise FleetPlanError("The navigable area is empty after applying the shoreline clearance "
-                             "and no-go zones.")
+                             "and the no-go zones with their no-go clearance.")
     if grid.disconnected:
         raise DisconnectedNavigableError(
-            f"The shoreline clearance and no-go zones split the survey into {len(grid.components)} "
-            f"disconnected navigable regions — fleet generation requires one connected region.")
+            f"The shoreline clearance and the no-go zones (with a {no_go_clearance} m no-go "
+            f"clearance) split the survey into {len(grid.components)} disconnected navigable "
+            f"regions — fleet generation requires one connected region.")
 
     for v in inp["vehicles"]:
         v["_home_proj"] = _home_proj(grid, v["home"])
@@ -786,6 +842,7 @@ def generate_fleet(raw_inputs, max_route_waypoints=None):
         "boundary": boundary,
         "shoreline_clearance_m": clearance,
         "no_go_zones": zones,
+        "no_go_clearance_m": no_go_clearance,
         "lane_spacing_m": spacing,
         "primary_angle_deg": inp["primary_angle_deg"],
         "dual_pass": inp["dual_pass"],
@@ -844,6 +901,7 @@ def _input_revision(inp):
         "b": [rd(p) for p in inp["boundary"]],
         "z": [[rd(p) for p in z] for z in inp["no_go_zones"]],
         "c": inp["shoreline_clearance_m"],
+        "ngc": inp["no_go_clearance_m"],
         "s": inp["lane_spacing_m"],
         "pa": inp["primary_angle_deg"],
         "d": inp["dual_pass"],
@@ -892,6 +950,9 @@ def _assemble_fleet_plan(inp, shared, prim_lines, sec_lines, vehicle_plans, navi
             "survey_polygon": inp["boundary"],
             "no_go_zones": inp["no_go_zones"],
             "shoreline_safety_margin_m": inp["shoreline_clearance_m"],
+            # Explicit alongside the ORIGINAL rings above — the fleet plan states the
+            # constraint, it does not ship pre-buffered geometry in place of what was drawn.
+            "no_go_clearance_m": inp["no_go_clearance_m"],
             "survey_line_spacing_m": inp["lane_spacing_m"],
             "survey_orientation_deg": inp["primary_angle_deg"],
             "second_pass_enabled": inp["dual_pass"],
@@ -1004,6 +1065,10 @@ def validate_fleet(fleet_plan):
                     "home": (pkg.get("planning_inputs") or {}).get("planning_home"),
                     "route_waypoints": pkg.get("route_waypoints"),
                     "segments": pkg.get("segments"),
+                    # The child's OWN approved geometry, so validation judges what was generated
+                    # rather than re-deriving a corridor that could differ from the shipped one.
+                    "navigable_boundary": pkg.get("navigable_boundary"),
+                    "home_corridor": pkg.get("home_corridor"),
                     "route_hash": pkg.get("route_hash")}
             res = planning.validate_plan(body)
             per_vehicle[v["vehicle_id"]] = {"ok": res["ok"], "errors": res["errors"],
@@ -1020,10 +1085,17 @@ def validate_fleet(fleet_plan):
     approach_conflicts = 0
     if PLANNING_AVAILABLE and len(vehicles) >= 2:
         boundary = (fleet_plan.get("shared_geometry") or {}).get("survey_polygon")
+        shared_geom = fleet_plan["shared_geometry"]
+        ngc = shared_geom.get("no_go_clearance_m")
         grid = planning._NavGrid(boundary,
-                                 (fleet_plan["shared_geometry"]).get("shoreline_safety_margin_m", 0),
-                                 (fleet_plan["shared_geometry"]).get("no_go_zones") or [],
-                                 step_m=(fleet_plan["shared_geometry"]).get("survey_line_spacing_m", 10))
+                                 shared_geom.get("shoreline_safety_margin_m", 0),
+                                 shared_geom.get("no_go_zones") or [],
+                                 step_m=shared_geom.get("survey_line_spacing_m",
+                                                        planning.DEFAULT_LANE_SPACING_M),
+                                 # Absent (a plan from before the parameter existed) takes the
+                                 # same default normalize_fleet_inputs would have applied.
+                                 no_go_clearance=(planning.DEFAULT_NO_GO_CLEARANCE_M
+                                                  if ngc is None else ngc))
         geoms = {v["vehicle_id"]: _vehicle_geom(grid, v) for v in vehicles}
 
         for a, b in combinations(vehicles, 2):

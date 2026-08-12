@@ -307,5 +307,74 @@ class TestFleetUploadReuse(unittest.TestCase):
         self.assertIn("fleet", r.json()["error"])
 
 
+@requires_geometry
+class TestFleetNoGoClearance(unittest.TestCase):
+    """Fleet Mission shares the single-vehicle geometry model, so it must interpret the SAME
+    saved plan's `no_go_clearance_m` identically — a fleet child mission is an ordinary
+    operator-survey-plan-v1 package."""
+
+    def _fleet(self, **over):
+        return F.generate_fleet(
+            fleet_body([veh("A", W_HOME), veh("B", E_HOME)], no_go_zones=[SPLIT_ZONE], **over),
+            max_route_waypoints=900)
+
+    def test_default_and_supplied_clearance_normalize_like_single_vehicle(self):
+        absent = F.normalize_fleet_inputs(fleet_body([veh("A", W_HOME), veh("B", E_HOME)]))
+        self.assertEqual(absent["no_go_clearance_m"], planning.DEFAULT_NO_GO_CLEARANCE_M)
+        supplied = F.normalize_fleet_inputs(
+            fleet_body([veh("A", W_HOME), veh("B", E_HOME)], no_go_clearance_m=0))
+        self.assertEqual(supplied["no_go_clearance_m"], 0.0)
+        with self.assertRaises(F.FleetPlanError):
+            F.normalize_fleet_inputs(
+                fleet_body([veh("A", W_HOME), veh("B", E_HOME)], no_go_clearance_m=-3))
+
+    def test_clearance_survives_into_shared_geometry_and_every_child_mission(self):
+        plan = self._fleet(no_go_clearance_m=6)
+        self.assertEqual(plan["shared_geometry"]["no_go_clearance_m"], 6)
+        self.assertEqual(len(plan["shared_geometry"]["no_go_zones"]), 1)
+        for vp in plan["vehicles"]:
+            pi = vp["mission_package"]["planning_inputs"]
+            self.assertEqual(pi["no_go_clearance_m"], 6)
+            self.assertEqual(pi["shoreline_clearance_m"], 8)
+            self.assertEqual(pi["lane_spacing_m"], 30)
+            for pt in SPLIT_ZONE:
+                self.assertIn(pt, pi["no_go_zones"][0], "children keep the ORIGINAL zone ring")
+
+    def test_fleet_routes_honour_the_clearance_identically_to_single_vehicle(self):
+        from shapely.geometry import LineString, Polygon
+        from shapely.ops import transform
+        clearance = 6
+        plan = self._fleet(no_go_clearance_m=clearance)
+        to_proj = planning._utm_for(WIDE)[0]
+        zp = transform(to_proj.transform, Polygon([(c[0], c[1]) for c in SPLIT_ZONE]))
+        worst = float("inf")
+        for vp in plan["vehicles"]:
+            for s in vp["mission_package"]["segments"]:
+                coords = [(p[0], p[1]) for p in s["coordinates"]]
+                if len(coords) >= 2:
+                    worst = min(worst, zp.distance(transform(to_proj.transform, LineString(coords))))
+        self.assertGreaterEqual(
+            worst, clearance - planning.COVER_TOL_M,
+            f"a fleet segment passes {worst:.2f} m from the no-go zone at a {clearance} m clearance")
+
+    def test_clearance_change_outdates_a_fleet_allocation(self):
+        def rev(clearance):
+            return F._input_revision(F.normalize_fleet_inputs(
+                fleet_body([veh("A", W_HOME), veh("B", E_HOME)],
+                           no_go_zones=[SPLIT_ZONE], no_go_clearance_m=clearance)))
+        self.assertNotEqual(rev(4), rev(8))
+        self.assertEqual(rev(6), rev(6), "the revision stays deterministic")
+
+    def test_fleet_validation_reuses_the_plan_s_own_clearance(self):
+        # Fleet validation must re-derive the navigable model from the plan's OWN clearance, so
+        # the child missions it just generated validate cleanly against it. (Cross-vehicle
+        # conflicts are a separate, deliberate finding of the deconfliction layer and are not
+        # what this test pins.)
+        plan = self._fleet(no_go_clearance_m=6)
+        v = F.validate_fleet(plan)
+        self.assertTrue(v["checks"]["child_missions_valid"],
+                        [e for e in v["errors"] if "child mission" in e])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,15 +51,55 @@ test("EMPTY until a boundary exists; drawing it enables no-go zones", () => {
   m = P.setBoundary(m, RING);
   assert.equal(P.hasBoundary(m), true);
   assert.equal(P.canAddZone(m), true, "no-go enabled once a boundary exists");
-  assert.equal(P.planState(m), P.PLAN_STATES.BOUNDARY_DEFINED);
+  // Lane spacing now carries a working 10 m default, so a boundary alone is already
+  // generatable — CONFIGURED, not BOUNDARY_DEFINED.
+  assert.equal(P.planState(m), P.PLAN_STATES.CONFIGURED);
 });
 
-test("state advances to CONFIGURED once lane spacing is set", () => {
+test("BOUNDARY_DEFINED is what a CLEARED lane spacing looks like", () => {
   let m = P.setBoundary(P.emptyModel(), RING);
+  assert.equal(P.canGenerate(m), true, "the default lane spacing is immediately usable");
+  m = P.setParam(m, "lane_spacing_m", null);      // operator cleared the field
   assert.equal(P.canGenerate(m), false);
+  assert.equal(P.planState(m), P.PLAN_STATES.BOUNDARY_DEFINED);
   m = P.setParam(m, "lane_spacing_m", 25);
   assert.equal(P.canGenerate(m), true);
   assert.equal(P.planState(m), P.PLAN_STATES.CONFIGURED);
+});
+
+// ---- planning-parameter defaults (a FRESH plan) ----------------------------
+test("a fresh plan starts at 5 m shoreline clearance, 5 m no-go clearance, 10 m lane spacing", () => {
+  const p = P.defaultParams();
+  assert.equal(p.shoreline_clearance_m, 5);
+  assert.equal(p.no_go_clearance_m, 5);
+  assert.equal(p.lane_spacing_m, 10);
+  // The empty model the page renders from carries the same values — the UI shows them at once.
+  const m = P.emptyModel();
+  assert.equal(m.params.shoreline_clearance_m, 5);
+  assert.equal(m.params.no_go_clearance_m, 5);
+  assert.equal(m.params.lane_spacing_m, 10);
+});
+
+test("no_go_clearance_m reaches the backend request body, including an explicit 0", () => {
+  let m = P.setBoundary(P.emptyModel(), RING);
+  assert.equal(P.planningInputs(m).no_go_clearance_m, 5, "the default is sent, not omitted");
+  m = P.setParam(m, "no_go_clearance_m", 12);
+  assert.equal(P.planningInputs(m).no_go_clearance_m, 12);
+  m = P.setParam(m, "no_go_clearance_m", 0);
+  assert.equal(P.planningInputs(m).no_go_clearance_m, 0, "explicit 0 is sent as 0, not defaulted");
+});
+
+test("changing the no-go clearance outdates a generated route", () => {
+  let m = P.setBoundary(P.emptyModel(), RING);
+  m = P.addNoGoZone(m, ZONE);
+  m = P.applyGenerated(m, fakeGenerated(m));
+  assert.equal(P.isOutdated(m), false);
+  const before = P.inputRevision(m);
+  m = P.setParam(m, "no_go_clearance_m", 12);
+  assert.notEqual(P.inputRevision(m), before, "no-go clearance is generation-affecting");
+  assert.equal(P.isOutdated(m), true);
+  assert.equal(P.planState(m), P.PLAN_STATES.ROUTE_OUTDATED);
+  assert.equal(m.validation, null, "the previous validation no longer applies");
 });
 
 // ---- (3) no-go zones: stable ids, add/remove -------------------------------
@@ -236,6 +276,41 @@ test("route-start mode defaults to planning_home and only accepts known modes", 
   assert.equal(P.setRouteStart(m, "bogus").routeStartMode, "planning_home", "unknown → default");
 });
 
+test("a draft round-trips all three clearance/spacing parameters", () => {
+  let m = P.setBoundary(P.emptyModel(), RING);
+  m = P.setParam(m, "shoreline_clearance_m", 7);
+  m = P.setParam(m, "no_go_clearance_m", 12);
+  m = P.setParam(m, "lane_spacing_m", 18);
+  const back = P.fromDraft(P.toDraft(m, "Lake B"));
+  assert.equal(back.params.shoreline_clearance_m, 7);
+  assert.equal(back.params.no_go_clearance_m, 12);
+  assert.equal(back.params.lane_spacing_m, 18);
+  // An explicit ZERO clearance is a real operator choice and must survive as 0, not become 5.
+  const zeroed = P.fromDraft(P.toDraft(P.setParam(m, "no_go_clearance_m", 0)));
+  assert.equal(zeroed.params.no_go_clearance_m, 0);
+});
+
+test("an OLD draft without no_go_clearance_m loads with the 5 m default and does not crash", () => {
+  const legacy = { vehicle_id: 2, plan: { boundary: RING, no_go_zones: [{ id: "ngz-1", ring: ZONE }],
+                                          params: { shoreline_clearance_m: 5, lane_spacing_m: 25,
+                                                    primary_angle_deg: 0, dual_pass: false } } };
+  const m = P.fromDraft(legacy);
+  assert.equal(m.params.no_go_clearance_m, 5, "missing no-go clearance takes the new default");
+  assert.equal(m.params.lane_spacing_m, 25, "a stored lane spacing is not overwritten");
+  assert.equal(P.planningInputs(m).no_go_clearance_m, 5);
+  assert.equal(P.planState(m), P.PLAN_STATES.CONFIGURED);
+});
+
+test("an old draft that stored a NULL lane spacing loads with the 10 m default", () => {
+  const legacy = { plan: { boundary: RING, params: { lane_spacing_m: null, shoreline_clearance_m: 5 } } };
+  const m = P.fromDraft(legacy);
+  assert.equal(m.params.lane_spacing_m, 10);
+  assert.equal(m.params.no_go_clearance_m, 5);
+  // secondary_angle_deg is the one parameter whose stored null is meaningful (→ primary + 90).
+  const withSec = P.fromDraft({ plan: { boundary: RING, params: { secondary_angle_deg: null } } });
+  assert.equal(withSec.params.secondary_angle_deg, null);
+});
+
 test("a draft with the OLD transit field still loads (migration to approach)", () => {
   const legacy = { vehicle_id: 2, plan: { boundary: RING, transit: [[12.9995, 56.6985]], params: { lane_spacing_m: 25 } } };
   const m = P.fromDraft(legacy);
@@ -276,10 +351,188 @@ test("Plan page puts no-go zones in a dedicated pane above the navigable fill", 
   assert.ok(zOf("pl-route") > zOf("pl-nogo"), "route lines sit above no-go zones");
 });
 
+test("Plan page exposes No-go clearance in the Planning Parameters panel", () => {
+  assert.match(PLAN_SRC, /"No-go clearance"/, "the parameter is labelled in the panel");
+  assert.match(PLAN_SRC, /Minimum routing clearance from operator-defined no-go zones\./,
+               "the existing help affordance carries the agreed tooltip text");
+  assert.match(PLAN_SRC, /wireNum\("pp-ngclear", "no_go_clearance_m"\)/,
+               "editing it goes through setParam, so it invalidates like other geometry params");
+  // Ordered directly after Shoreline clearance and before Lane spacing, in BOTH panels.
+  const order = [...PLAN_SRC.matchAll(/"(Shoreline clearance|No-go clearance|Lane spacing)"/g)]
+    .map((mm) => mm[1]);
+  assert.deepEqual(order.slice(0, 3), ["Shoreline clearance", "No-go clearance", "Lane spacing"]);
+  assert.deepEqual(order.slice(3, 6), ["Shoreline clearance", "No-go clearance", "Lane spacing"],
+                   "the fleet Shared survey pattern panel uses the same order");
+});
+
+test("the original no-go polygon keeps its red style; the buffered exclusion is a separate outline", () => {
+  // The red fill+outline is unchanged and still owns the pl-nogo pane.
+  assert.match(PLAN_SRC, /const NOGO_STYLE = \{ color: "#E5484D".*fill: true.*pane: "pl-nogo" \}/);
+  // The derived exclusion is unfilled, dashed, and NOT in the no-go pane — it can never
+  // visually replace the operator-drawn zone.
+  const excl = PLAN_SRC.match(/const NOGO_EXCLUSION_STYLE = \{[^}]*\}/);
+  assert.ok(excl, "a distinct style exists for the buffered exclusion");
+  assert.match(excl[0], /fill: false/);
+  assert.match(excl[0], /dashArray/);
+  assert.ok(!/pane: "pl-nogo"/.test(excl[0]), "the exclusion does not sit in the no-go pane");
+  assert.match(PLAN_SRC, /no_go_exclusion_rings/, "drawn only from a real generation result");
+});
+
 test("Plan page defines a distinct style for every ordered segment kind", () => {
   for (const kind of ["start_connector", "approach", "survey_entry_connector", "primary",
                       "pass_transition", "secondary", "return_connector", "return_approach",
                       "final_home_connector"]) {
     assert.match(PLAN_SRC, new RegExp(`${kind}:`), `SEG_STYLE has ${kind}`);
   }
+});
+
+// ---- the mission-geometry contract on the page side -------------------------------------
+// The geometry itself is proven in the backend (planning.check_mission_geometry, pinned by
+// tests/test_mission_geometry.py). What the page owes the contract is narrower and is what
+// these pin: a draft must round-trip every input the proof depends on, the finalize payload
+// must carry the whole proven package unaltered, and the approved corridor must be drawn from
+// the generation result rather than approximated.
+
+test("a draft round-trips every input the geometry proof depends on", () => {
+  // approach, return, no-go clearance, shoreline clearance, lane spacing — in one round trip,
+  // because a draft that loses any one of them reloads as a DIFFERENT mission whose stored
+  // route was proven against geometry the page no longer holds.
+  let m = P.setBoundary(P.emptyModel(), RING);
+  m = P.setParam(m, "shoreline_clearance_m", 6);
+  m = P.setParam(m, "no_go_clearance_m", 8);
+  m = P.setParam(m, "lane_spacing_m", 14);
+  m = P.setHome(m, [12.999, 56.698]);
+  m = P.setApproach(m, [[12.9995, 56.6985], [13.0000, 56.6988]]);
+  m = P.setReturns(m, [[13.0010, 56.6988], [12.9996, 56.6986]]);
+  m = P.addNoGoZone(m, ZONE);
+  m = { ...m, vehicleId: 2 };
+  m = P.applyGenerated(m, fakeGenerated(m));
+
+  const back = P.fromDraft(P.toDraft(m, "Lake C"));
+  assert.equal(back.params.shoreline_clearance_m, 6);
+  assert.equal(back.params.no_go_clearance_m, 8);
+  assert.equal(back.params.lane_spacing_m, 14);
+  assert.deepEqual(back.approach, m.approach);
+  assert.deepEqual(back.returns, m.returns);
+  assert.deepEqual(back.home, m.home);
+  assert.deepEqual(back.noGoZones[0].ring, m.noGoZones[0].ring, "the DRAWN zone, not a buffer");
+  // The restored route is still current: nothing the proof depends on changed in transit.
+  assert.equal(P.isOutdated(back), false);
+  assert.equal(P.inputRevision(back), P.inputRevision(m));
+});
+
+test("the finalize payload ships the whole generated package, geometry included", () => {
+  // The backend re-proves the package it is handed. Sending a thinned or re-assembled body
+  // would either fail that proof or, worse, pass a different one.
+  let m = P.setBoundary(P.emptyModel(), RING);
+  m = { ...m, vehicleId: 2 };
+  const generated = { ...fakeGenerated(m), home_corridor: [[13.0, 56.698], [13.001, 56.698], [13.001, 56.6985]],
+                      home_corridor_meta: { available: true, half_width_m: 6 } };
+  m = P.applyGenerated(m, generated);
+  const payload = P.finalizePayload(m);
+  assert.equal(payload.mission_package, generated, "the package is passed by reference, unedited");
+  assert.deepEqual(payload.mission_package.home_corridor, generated.home_corridor);
+  assert.equal(payload.confirm, true);
+});
+
+test("Plan page draws the approved Home corridor subtly, only from a real generation", () => {
+  const style = PLAN_SRC.match(/const HOME_CORRIDOR_STYLE = \{[^}]*\}/);
+  assert.ok(style, "a distinct style exists for the approved Home corridor");
+  assert.match(style[0], /dashArray/, "dashed, so it reads as approved transit, not survey area");
+  assert.match(style[0], /fillOpacity: 0\.0\d/, "translucent enough not to dominate");
+  assert.ok(!/pane: "pl-nogo"/.test(style[0]),
+            "the corridor never sits in the no-go pane — red stays the operator's own geometry");
+  // Drawn from the generation result's own field; the page never derives or approximates one.
+  assert.match(PLAN_SRC, /model\.generated && model\.generated\.home_corridor/);
+  assert.match(PLAN_SRC, /Approved Home corridor/, "labelled for the operator");
+});
+
+// ── route-start mode: WHERE EXECUTION BEGINS, not what geometry is approved ─────────────
+// The backend owns the geometry (tests/test_route_start_mode.py). These pin the page's side of
+// the same distinction: the mode round-trips, changing it invalidates a generated route, the
+// help text says what stays true of Home, and the page sends/draws the approved-but-not-executed
+// geometry the backend returns instead of quietly dropping it.
+
+test("a draft round-trips planning home, route-start mode, approach and return", () => {
+  let m = P.setBoundary(P.emptyModel(), RING);
+  m = P.setHome(m, [13.002, 56.6985]);
+  m = P.setApproach(m, [[13.0015, 56.699], [13.002, 56.6992]]);
+  m = P.setReturns(m, [[13.003, 56.6995], [13.0035, 56.6988]]);
+  m = P.setRouteStart(m, "first_approach");
+  const back = P.fromDraft(P.toDraft(m, "First-approach plan"));
+  assert.deepEqual(back.home, [13.002, 56.6985], "planning home survives");
+  assert.equal(back.routeStartMode, "first_approach", "the route-start mode survives");
+  assert.deepEqual(back.approach, m.approach, "approach list survives in order");
+  assert.deepEqual(back.returns, m.returns, "return list survives in order, separately");
+  assert.notDeepEqual(back.returns, [...back.approach].reverse(),
+                      "the return list is never re-derived from the approach on load");
+  // The revision is over the mode too, so a reloaded draft is not spuriously outdated.
+  assert.equal(P.inputRevision(back), P.inputRevision(m));
+});
+
+test("an old draft without route_start_mode loads as planning_home", () => {
+  const legacy = { plan: { boundary: RING, home: [13.002, 56.6985], approach: [[13.0015, 56.699]] } };
+  assert.equal(P.fromDraft(legacy).routeStartMode, "planning_home");
+});
+
+test("switching route-start mode invalidates the generated route and the validation", () => {
+  let m = P.setParam(P.setBoundary(P.emptyModel(), RING), "lane_spacing_m", 25);
+  m = P.setHome(m, [13.002, 56.6985]);
+  m = P.setApproach(m, [[13.0015, 56.699]]);
+  m = P.applyGenerated(m, fakeGenerated(m));
+  m = P.applyValidation(m, { ok: true, errors: [], warnings: [], checks: {} });
+  assert.equal(P.isOutdated(m), false);
+  assert.equal(P.planState(m), P.PLAN_STATES.VALID);
+  const switched = P.setRouteStart(m, "first_approach");
+  assert.equal(P.isOutdated(switched), true, "the route no longer matches its inputs");
+  assert.equal(switched.validation, null, "a validation of the previous route is not evidence");
+  assert.equal(P.planState(switched), P.PLAN_STATES.ROUTE_OUTDATED);
+  assert.equal(P.canUpload(switched), false, "an outdated route may not be uploaded");
+});
+
+test("the route-start help says Home keeps its safety meaning under first approach", () => {
+  const help = P.ROUTE_START_HELP;
+  assert.match(help.planning_home, /begins from Planning Home/i);
+  assert.match(help.first_approach, /begins at the first approach waypoint/i);
+  // The old wording left "first approach" open to reading as "Home no longer applies", which is
+  // the opposite of the semantics — Home stays the return reference and the corridor anchor.
+  assert.match(help.first_approach, /Planning Home remains/i);
+  assert.match(help.first_approach, /Home-corridor anchor/i);
+  assert.deepEqual(Object.keys(help).sort(), [...P.ROUTE_START_MODES].sort(),
+                   "every offered mode has help text, and no mode is described that is not offered");
+  assert.match(PLAN_SRC, /P\.ROUTE_START_HELP\[model\.routeStartMode\]/,
+               "the page renders the help for the SELECTED mode");
+});
+
+test("validation is sent the approved transit geometry, not only the execution segments", () => {
+  // The backend re-derives the Home corridor from the approved transit geometry. Sending only
+  // `segments` would make it derive from a subset and refuse a corridor generation proved.
+  assert.match(PLAN_SRC, /planning_only_transit_segments: model\.generated\.planning_only_transit_segments \|\| \[\]/);
+  assert.match(PLAN_SRC, /segments: model\.generated\.segments/);
+});
+
+test("the page draws approved planning-only transit distinctly from the flown route", () => {
+  const style = PLAN_SRC.match(/const PLANNING_ONLY_SEG_STYLE = \{[^}]*\}/);
+  assert.ok(style, "planning-only transit has its own style");
+  assert.match(style[0], /dashArray/, "dashed, so it never reads as a leg the vehicle will fly");
+  // Drawn from the generation result's own field — the page never derives or approximates it.
+  assert.match(PLAN_SRC, /model\.generated\.planning_only_transit_segments \|\| \[\]/);
+  assert.match(PLAN_SRC, /not part of the uploaded route/,
+               "labelled as approved geometry that is not executed");
+  // No waypoint dots and no arrows: it has no execution sequence, because it is not uploaded.
+  assert.ok(!/ARROW_KINDS\.has\("home_transit_connector"\)/.test(PLAN_SRC));
+});
+
+test("finalize still sends the whole generated package, planning-only geometry included", () => {
+  let m = P.setParam(P.setBoundary(P.emptyModel(), RING), "lane_spacing_m", 25);
+  m = { ...m, vehicleId: 2 };
+  const generated = { ...fakeGenerated(m),
+    planning_only_transit_segments: [{ segment_id: "pln-01-home_transit_connector",
+                                       kind: "home_transit_connector", planning_only: true,
+                                       coordinates: [[13.0, 56.698], [13.0, 56.699]] }] };
+  m = P.applyGenerated(m, generated);
+  const payload = P.finalizePayload(m);
+  assert.equal(payload.mission_package, generated, "passed by reference, unedited");
+  assert.equal(payload.mission_package.planning_only_transit_segments.length, 1,
+               "the record can only make the distinction auditable if the field reaches it");
 });

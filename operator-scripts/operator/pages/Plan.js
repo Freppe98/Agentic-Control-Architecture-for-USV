@@ -51,6 +51,11 @@ const SEG_STYLE = {
   return_approach:        { color: "#F5C542", weight: 2.6, opacity: 0.95, dashArray: "9 6" },
   final_home_connector:   { color: "#F5C542", weight: 2.2, opacity: 0.9, dashArray: "2 6" },
 };
+// PLANNING-ONLY approved transit: geometry the plan approved but the uploaded route does NOT
+// contain (the Home → A1 leg under route_start_mode "first approach"). Drawn in the same amber
+// approach hue so its role is obvious, but thin, faint and finely dotted so it never reads as a
+// leg the vehicle will fly — that distinction is the whole point of the mode.
+const PLANNING_ONLY_SEG_STYLE = { color: "#F2A93B", weight: 1.4, opacity: 0.45, dashArray: "1 5" };
 // Segment kinds that carry a direction the operator must read (approach/return order).
 const ARROW_KINDS = new Set(["approach", "return_approach", "start_connector",
                              "survey_entry_connector", "return_connector", "final_home_connector"]);
@@ -62,6 +67,19 @@ const NAVIGABLE_STYLE = { color: "#3ECF8E", weight: 1, opacity: 0.5, dashArray: 
 // changes the red semantics.
 const NOGO_STYLE = { color: "#E5484D", weight: 1.8, opacity: 0.95, fill: true, fillColor: "#E5484D", fillOpacity: 0.22, pane: "pl-nogo" };
 const NOGO_SEL_STYLE = { ...NOGO_STYLE, weight: 2.6, dashArray: "5 4" };
+// The BUFFERED no-go exclusion the generator routed around (original zone + no-go clearance).
+// Deliberately a thin unfilled dashed outline UNDER the zones' own pane: it is derived routing
+// geometry shown for explanation, and it must never read as, or visually replace, the red
+// polygon the operator drew — that stays the authoritative restricted area.
+const NOGO_EXCLUSION_STYLE = { color: "#E5484D", weight: 1, opacity: 0.5, dashArray: "3 5", fill: false, pane: "pl-navigable" };
+// The APPROVED HOME CORRIDOR: the transit path this generation produced, buffered to the stated
+// half-width, minus the no-go exclusion. It is the geometry that makes a Home outside the survey
+// area legal, so the operator should be able to SEE what was approved — but it is approved
+// transit, not survey area, so it is deliberately subtler than everything around it: a thin
+// dashed amber outline with a barely-there fill, in the navigable pane so the no-go red and the
+// route always draw above it. Absent when Home is inside the navigable area (none is needed) or
+// when none could be proven — in which case nothing is drawn, never an outline "for reassurance".
+const HOME_CORRIDOR_STYLE = { color: "#E5B84D", weight: 1, opacity: 0.55, dashArray: "6 4", fill: true, fillColor: "#E5B84D", fillOpacity: 0.05, pane: "pl-navigable" };
 
 const WORKFLOW = [
   ["vehicle", "Vehicle"], ["area", "Survey Area"], ["restrictions", "Restrictions"],
@@ -120,6 +138,7 @@ export function Plan(root) {
            <div class="li"><span class="pl-sw boundary"></span>Survey boundary</div>
            <div class="li"><span class="pl-sw navigable"></span>Navigable (shoreline-offset)</div>
            <div class="li"><span class="pl-sw nogo"></span>No-go zone</div>
+           <div class="li"><span class="pl-sw corridor"></span>Approved Home corridor</div>
            <div class="li"><span class="pl-sw approach"></span>Approach (A1→) &amp; entry</div>
            <div class="li"><span class="pl-sw primary"></span>Primary coverage</div>
            <div class="li"><span class="pl-sw transition"></span>Pass transition</div>
@@ -344,6 +363,27 @@ export function Plan(root) {
       : (model.generated && model.generated.navigable_boundary);
     if (Array.isArray(nav)) nav.forEach((r) => L.polygon(r.map(toLL), { ...NAVIGABLE_STYLE }).addTo(layers.navigable));
 
+    // The buffered no-go exclusion the generated route was routed around — only ever from a
+    // generation (never faked), and only when a non-zero no-go clearance actually widened it.
+    const excl = planMode === "fleet" ? null
+      : (model.generated && model.generated.no_go_exclusion_rings);
+    if (Array.isArray(excl)) {
+      excl.forEach((r) => L.polygon(r.map(toLL), { ...NOGO_EXCLUSION_STYLE })
+        .bindTooltip("No-go clearance boundary", { sticky: true }).addTo(layers.navigable));
+    }
+
+    // The approved Home corridor, when this generation proved one. Drawn from the generated
+    // package only — the page never derives or approximates it.
+    const corridor = planMode === "fleet" ? null
+      : (model.generated && model.generated.home_corridor);
+    if (Array.isArray(corridor) && corridor.length >= 3) {
+      const halfWidth = (model.generated.home_corridor_meta || {}).half_width_m;
+      L.polygon(corridor.map(toLL), { ...HOME_CORRIDOR_STYLE })
+        .bindTooltip("Approved Home corridor"
+          + (halfWidth ? ` — approved transit path ±${halfWidth} m` : ""), { sticky: true })
+        .addTo(layers.navigable);
+    }
+
     // No-go zones.
     model.noGoZones.forEach((z) => {
       const isSel = selected && selected.type === "nogo" && selected.id === z.id;
@@ -370,6 +410,16 @@ export function Plan(root) {
           L.polyline(s.coordinates.map(toLL), { ...style, pane: "pl-route" }).addTo(layers.route);
           if (ARROW_KINDS.has(s.kind)) drawArrows(s.coordinates, style.color);
         }
+      });
+      // APPROVED BUT NOT EXECUTED. Drawn from the generated package only, and without waypoint
+      // dots or arrows: it has no execution sequence because it is not in the uploaded route.
+      // Showing it is what makes the Home corridor legible — the corridor reaches Home along
+      // this leg, and without it the operator would see a corridor with no visible source.
+      (model.generated.planning_only_transit_segments || []).forEach((s) => {
+        if (!s || !Array.isArray(s.coordinates) || s.coordinates.length < 2) return;
+        L.polyline(s.coordinates.map(toLL), { ...PLANNING_ONLY_SEG_STYLE, pane: "pl-route" })
+          .bindTooltip("Approved planning geometry — not part of the uploaded route", { sticky: true })
+          .addTo(layers.route);
       });
       (model.generated.route_waypoints || []).forEach((w, i) => {
         L.circleMarker([w.latitude, w.longitude], { radius: 2.6, color: "#0C141C", weight: 0.6, fillColor: "#DCE3EC", fillOpacity: 0.9, pane: "pl-markers" })
@@ -476,6 +526,7 @@ export function Plan(root) {
       </div>
       <div class="plan-note plan-note-sm">${infoIcon}<span>Planning Home is route-planning geometry only. It does <b>not</b> change the Pixhawk HOME_POSITION or the RTL home.</span></div>
       <div class="plan-field"><label class="plan-fl" for="pl-start">Start route from</label><select id="pl-start" ${model.home ? "" : "disabled title='Set a planning home to start there'"}>${startOpts}</select></div>
+      <div class="plan-help">${P.ROUTE_START_HELP[model.routeStartMode] || ""}</div>
 
       <div class="plan-sec"><span class="lbl">Approach waypoints</span></div>
       <div class="plan-help">Approach waypoints define the operator-approved route into the survey area before coverage begins. They are visited in numbered order (A1 → A2 → survey entry).</div>
@@ -683,6 +734,7 @@ export function Plan(root) {
         <div class="msect"><span class="lbl">Planning parameters</span></div>
         <div class="plan-params">
           ${fld("Shoreline clearance", "pp-clear", p.shoreline_clearance_m, "m", "Distance inward from the operator-drawn survey boundary — keeps the route off the shore.")}
+          ${fld("No-go clearance", "pp-ngclear", p.no_go_clearance_m, "m", "Minimum routing clearance from operator-defined no-go zones.")}
           ${fld("Lane spacing", "pp-space", p.lane_spacing_m, "m", "Distance between parallel side-scan survey lines — choose from the sonar swath width and desired overlap/quality. This is NOT waypoint spacing.")}
           ${fld("Survey angle", "pp-angle", p.primary_angle_deg, "°", "Orientation of the survey lines, 0–359°.")}
           ${fld("Survey speed", "pp-speed", p.survey_speed_mps, "m/s", "Used ONLY to estimate mission duration — it is not uploaded.")}
@@ -704,6 +756,7 @@ export function Plan(root) {
 
     // wire param inputs (change marks route outdated via lib immutability)
     wireNum("pp-clear", "shoreline_clearance_m");
+    wireNum("pp-ngclear", "no_go_clearance_m");
     wireNum("pp-space", "lane_spacing_m");
     wireNum("pp-angle", "primary_angle_deg");
     wireNum("pp-speed", "survey_speed_mps");
@@ -738,6 +791,7 @@ export function Plan(root) {
       ["Boundary area", fmtArea(m.boundary_area_m2)],
       ["Navigable area", fmtArea(m.navigable_area_m2)],
       ["Shoreline clearance", `${m.shoreline_clearance_m} m`],
+      ["No-go clearance", m.no_go_clearance_m == null ? "—" : `${m.no_go_clearance_m} m`],
       ["Lane spacing", `${m.lane_spacing_m} m`],
       ["No-go zones", String(m.no_go_zone_count)],
       ["Pass mode", m.dual_pass ? "Dual pass" : "One pass"],
@@ -807,6 +861,7 @@ export function Plan(root) {
         <div class="msect"><span class="lbl">Shared survey pattern</span></div>
         <div class="plan-params">
           ${fld("Shoreline clearance", "pp-clear", p.shoreline_clearance_m, "m")}
+          ${fld("No-go clearance", "pp-ngclear", p.no_go_clearance_m, "m", "Minimum routing clearance from operator-defined no-go zones.")}
           ${fld("Lane spacing", "pp-space", p.lane_spacing_m, "m", "Distance between parallel survey lines. Distinct from the fleet route separation.")}
           ${fld("Survey angle", "pp-angle", p.primary_angle_deg, "°")}
           <div class="plan-prow"><label for="pp-dual">Dual pass</label><span class="plan-inp"><input id="pp-dual" type="checkbox" ${p.dual_pass ? "checked" : ""}/> <span class="u">2nd pass, clipped per vehicle</span></span></div>
@@ -823,6 +878,7 @@ export function Plan(root) {
         <div class="plan-note">${infoIcon}<span>Fleet planning performs static partitioning and pre-deployment route-conflict validation. It reduces planned route overlap but does <b>not</b> replace runtime vehicle-to-vehicle collision detection or avoidance.</span></div>
       </div>`;
     wireNum("pp-clear", "shoreline_clearance_m");
+    wireNum("pp-ngclear", "no_go_clearance_m");
     wireNum("pp-space", "lane_spacing_m");
     wireNum("pp-angle", "primary_angle_deg");
     wireNum("pp-angle2", "secondary_angle_deg");
@@ -1091,7 +1147,13 @@ export function Plan(root) {
     if (!P.hasRoute(model) || P.isOutdated(model) || busyVal) return;
     busyVal = true; renderActions();
     try {
-      const body = { ...P.planningInputs(model), route_waypoints: model.generated.route_waypoints, segments: model.generated.segments };
+      // The execution route AND the approved transit geometry that is not executed (the
+      // Home → A1 leg under route_start_mode: first_approach). Validation re-derives the Home
+      // corridor from the same authoritative set the generator did — sending only the execution
+      // segments would make it re-derive from a subset and refuse a corridor generation proved.
+      const body = { ...P.planningInputs(model), route_waypoints: model.generated.route_waypoints,
+                     segments: model.generated.segments,
+                     planning_only_transit_segments: model.generated.planning_only_transit_segments || [] };
       const res = await api.validatePlan(body);
       apply(P.applyValidation(model, res), false);
     } catch (e) { apply(P.applyValidation(model, { ok: false, errors: ["Validation request failed."], warnings: [], checks: {} }), false); }

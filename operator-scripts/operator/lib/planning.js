@@ -26,14 +26,18 @@ export const PLAN_STATES = {
   ERROR: "ERROR",                     // terminal upload failure
 };
 
-/** The planning parameters, with the sensible defaults the UI starts from. Lane spacing is
- *  intentionally null (no invented sonar default): the operator must choose it per the sonar
- *  swath width and desired overlap. Speed has a conservative default used only for the
- *  duration ESTIMATE. */
+/** The planning parameters, with the sensible defaults the UI starts from — the same values
+ *  planning.py applies when a caller omits the field (DEFAULT_SHORELINE_CLEARANCE_M,
+ *  DEFAULT_NO_GO_CLEARANCE_M, DEFAULT_LANE_SPACING_M), so a fresh plan and a replayed one
+ *  agree. Lane spacing now carries a 10 m working default rather than starting empty: the
+ *  operator still tunes it to the sonar swath width and desired overlap, but the page is
+ *  immediately generatable instead of blocking on an unset field. Speed has a conservative
+ *  default used only for the duration ESTIMATE. */
 export function defaultParams() {
   return {
     shoreline_clearance_m: 5,
-    lane_spacing_m: null,
+    no_go_clearance_m: 5,          // minimum routing clearance from operator-drawn no-go zones
+    lane_spacing_m: 10,
     primary_angle_deg: 0,
     dual_pass: false,
     secondary_angle_deg: null,     // null → primary + 90 at generation time
@@ -63,11 +67,27 @@ export function emptyModel() {
   };
 }
 
-/** Route-start modes offered by the page. Planning home is the prototype default. */
+/** Route-start modes offered by the page. Planning home is the prototype default.
+ *
+ *  The mode chooses WHERE THE EXECUTED MISSION ROUTE BEGINS — and nothing else. It does not
+ *  change what geometry is approved: in both modes the approved transit network runs from the
+ *  planning Home through the approach chain to the survey, and back through the return chain to
+ *  the planning Home, and that network is what the Home corridor is derived from. Under
+ *  "first approach" the Home → A1 leg is approved PLANNING-ONLY geometry (the backend returns it
+ *  as `planning_only_transit_segments`) rather than an uploaded leg. */
 export const ROUTE_START_MODES = ["planning_home", "first_approach"];
 export const ROUTE_START_LABEL = {
   planning_home: "Planning home",
   first_approach: "First approach waypoint",
+};
+/** What each mode actually means, shown under the selector. Deliberately says what stays true
+ *  of Home in `first_approach` — the old wording left it open to read as "Home no longer
+ *  applies", which is the opposite of the safety semantics. */
+export const ROUTE_START_HELP = {
+  planning_home: "Mission execution begins from Planning Home.",
+  first_approach: "Mission execution begins at the first approach waypoint (A1). Planning Home "
+                  + "remains the approved return reference and Home-corridor anchor — the "
+                  + "Home → A1 leg stays approved planning geometry, it is just not uploaded.",
 };
 
 function num(v) {
@@ -135,6 +155,9 @@ export function planningInputs(model) {
   return {
     boundary: model.boundary,
     shoreline_clearance_m: num(p.shoreline_clearance_m) || 0,
+    // Sent explicitly, including 0 — the backend reads `null` as "not stated" and would apply
+    // its 5 m default, which is not what an operator who cleared the field meant.
+    no_go_clearance_m: num(p.no_go_clearance_m) || 0,
     lane_spacing_m: num(p.lane_spacing_m),
     primary_angle_deg: ((num(p.primary_angle_deg) || 0) % 360 + 360) % 360,
     dual_pass: !!p.dual_pass,
@@ -150,8 +173,9 @@ export function planningInputs(model) {
 
 /** A stable revision string over EVERY generation-affecting input. Two models with the same
  *  geometry + parameters produce the same revision; any change to the boundary, a no-go zone,
- *  the home, transit waypoints, spacing, clearance, angle, dual-pass or speed changes it — so
- *  a stored generatedRevision that no longer matches is exactly "the route is outdated". */
+ *  the home, transit waypoints, spacing, shoreline clearance, NO-GO CLEARANCE, angle,
+ *  dual-pass or speed changes it — so a stored generatedRevision that no longer matches is
+ *  exactly "the route is outdated". */
 export function inputRevision(model) {
   const i = planningInputs(model);
   const ring = (r) => (r || []).map((p) => [round7(p[0]), round7(p[1])]);
@@ -163,6 +187,7 @@ export function inputRevision(model) {
     rt: ring(i.return_waypoints),
     m: i.route_start_mode,
     c: i.shoreline_clearance_m,
+    ngc: i.no_go_clearance_m,
     s: i.lane_spacing_m,
     a: i.primary_angle_deg,
     d: i.dual_pass,
@@ -317,6 +342,22 @@ export function toDraft(model, name) {
   };
 }
 
+/** Merge stored draft params over the defaults. A key that is ABSENT — or stored as null by a
+ *  draft written before the parameter existed / before it had a default — takes the current
+ *  default, so an old draft loads with 5 m no-go clearance and a usable lane spacing instead
+ *  of a null the page then blocks on. An explicit stored 0 is a real value and is kept. */
+function paramsFromDraft(stored) {
+  const out = { ...defaultParams() };
+  for (const [k, v] of Object.entries(stored || {})) {
+    if (v === null || v === undefined) continue;   // "not stated" → keep the default
+    out[k] = v;
+  }
+  // secondary_angle_deg is legitimately null (→ primary + 90 at generation time), so it is the
+  // one parameter whose stored null must survive the merge above.
+  if (stored && "secondary_angle_deg" in stored) out.secondary_angle_deg = stored.secondary_angle_deg;
+  return out;
+}
+
 /** Rebuild a model from a stored draft. The zone sequence is restored past the highest
  *  existing id so new zones never collide with loaded ones. */
 export function fromDraft(draft) {
@@ -340,7 +381,7 @@ export function fromDraft(draft) {
     approach,
     returns: Array.isArray(d.returns) ? d.returns : [],
     routeStartMode: ROUTE_START_MODES.includes(d.route_start_mode) ? d.route_start_mode : "planning_home",
-    params: { ...defaultParams(), ...(d.params || {}) },
+    params: paramsFromDraft(d.params),
     generated: d.generated || null,
     generatedRevision: d.generated_revision || null,
     validation: d.validation || null,

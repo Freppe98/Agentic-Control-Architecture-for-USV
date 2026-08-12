@@ -257,8 +257,226 @@ Identical inputs produce a **byte-equivalent route and hash** (asserted per fixt
 size limit (`MAX_GRID_CELLS_PER_AXIS`) is unchanged; the safety predicate is memoised by
 normalised endpoint pair so the O(n²) compression re-checks nothing twice.
 
+## No-go clearance (`no_go_clearance_m`)
+
+A configurable minimum routing distance between generated geometry and every operator-drawn
+no-go polygon, added beside the existing planning parameters.
+
+### Where it is applied
+
+**One place: `planning._NavGrid.__init__`.** The projected union of the drawn zones
+(`nogo_original`) is buffered outward by `no_go_clearance_m` into `nogo` — the *exclusion* —
+and `navigable = inset − nogo`. Round joins are deliberate: a round outward buffer is exactly
+the set of points within N m of the polygon, which is the minimum-distance semantic the
+parameter promises (a mitre join would silently push corners out by N·√2).
+
+Because every consumer already judges against that one grid, the clearance reaches all of them
+without a parallel distance check: coverage repair (`repair_path`), every connector kind
+(`safe_connector`), the LOS-compression safety predicate, `validate_plan`, and the fleet
+survey-line clip in `fleet_planning._survey_lines`. The ported degree-ring generators
+(`run_lawnmower_with_obstacles`) receive `grid.exclusion_rings_deg()` instead of the raw zones,
+so the coverage lanes themselves — not only the connectors — respect it.
+
+### Original vs buffered geometry
+
+| | geometry | where it lives |
+|---|---|---|
+| **Original** (authoritative, drawn by the operator, red on Map/Plan) | `nogo_original` | `planning_inputs.no_go_zones`, the immutable mission record, the Scout package |
+| **Buffered exclusion** (derived routing geometry) | `nogo` | `generate` response `no_go_exclusion_rings` only — a thin dashed unfilled outline in the `pl-navigable` pane |
+
+The buffered ring never replaces the red polygon and is never stored as an input.
+
+### Waypoint **and** segment enforcement
+
+Both halves are checked, independently, so a route cannot pass by filtering waypoints alone:
+
+- `checks.waypoints_clear_no_go` — every route waypoint is outside the exclusion (runs even
+  when a plan is submitted without `segments`).
+- `checks.route_clears_no_go` — every segment *leg* clears the exclusion. Two individually
+  clear endpoints whose straight leg cuts an exclusion corner **fail here**.
+- `checks.no_go_buffer_valid` / `navigable_connected` — invalid buffer geometry and "no
+  navigable space left after the clearance operations" are explicit errors.
+
+### Connector defect found and fixed
+
+Applying the clearance exposed a real hole in `safe_connector`: the route endpoint is a
+planning coordinate, not a grid cell, so `to_grid` snapped it up to half a diagonal away and
+that **stitch leg was emitted unverified** — cutting an exclusion corner the A* had carefully
+routed around. `nearest_free` now only accepts a cell the endpoint can reach by a leg that
+clears the exclusion, and every emitted hop is re-checked before return (`ConnectorError`
+rather than a silently invalid connector). Scoped to the no-go predicate on purpose:
+approach/return/home legs legitimately start outside the inset, so containment keeps its
+existing tolerance semantics.
+
+### Defaults (a fresh plan)
+
+`shoreline_clearance_m = 5`, `no_go_clearance_m = 5`, `lane_spacing_m = 10` — declared once in
+`planning.py` (`DEFAULT_*`) and mirrored in `operator/lib/planning.js` `defaultParams()`. An
+**absent** field takes the default; a **supplied** one is validated (`>= 0`, spacing `> 0`), so
+an explicit `0` clearance means zero clearance and an explicit `0` spacing is still an error.
+Old drafts load through `paramsFromDraft`, which treats a stored `null` as "not stated".
+
+### Measured (E2 parameters: shoreline 5 m, lane 10 m, one rectangular zone)
+
+| `no_go_clearance_m` | min waypoint distance | min **segment** distance |
+|---|---|---|
+| 0 | 0.00 m | 0.00 m |
+| 5 | 4.99 m | 4.85 m |
+| 10 | 9.99 m | 9.89 m |
+
+(The ~0.15 m shortfall is round-buffer chord discretisation, inside `COVER_TOL_M`.)
+
+### Scout package
+
+`replan-planning-package-v1` has **no** `no_go_clearance_m` field, and `V1_FIELDS` defines the
+wire package as an exact key set Scout's receiver validates against. The clearance is therefore
+**not** put on the wire and geometry is **not** pre-buffered: Scout receives the original
+`no_go_zones`, and `meta.no_go_clearance_m` / `meta.no_go_clearance_in_package: false` plus an
+explicit limitation report the gap. **Scout contract extension still required** — see Known
+limitations.
+
+## Mission geometry contract (finalize-mission-geometry)
+
+Two live E2 replanning runs fell back to native Pixhawk RTL. Run 1: the verified runtime Home
+ended outside both the mission's navigable boundary and its `home_corridor`. Run 2: **the
+package itself was internally inconsistent** — several approved route waypoints lay outside the
+`navigable_boundary` shipped in the same package, so `RETRACE_APPROVED` reused waypoints that
+Scout's safe-return validation correctly refused.
+
+### Root architectural inconsistency
+
+Only the **coverage** kinds (`primary`, `secondary`, `pass_transition`) were ever required to
+stay inside the shoreline inset. Every transit leg — `start_connector`, `approach`,
+`survey_entry_connector`, `return_connector`, `return_approach`, `final_home_connector` — was
+checked for no-go clearance **only** and was free to run anywhere, including straight out of
+the navigable area to a Home on the shore (`safe_connector` emits the un-contained stitch leg
+from the real endpoint to the first free grid cell by design). A package could therefore ship a
+route its own `navigable_geometry` did not contain, and nothing refused it.
+
+### The invariant, proven once
+
+```
+every finalized route segment ⊂ (navigable_geometry ∪ home_corridor)
+                              − (no_go_zones ⊕ no_go_clearance_m)
+and the planning Home is itself inside that approved geometry
+```
+
+`planning.check_mission_geometry` is the single implementation. It runs at **four** points, so
+they cannot disagree: `generate_survey` (raises `GeometryConsistencyError` before returning a
+package), `validate_plan` (reports as errors with the code prefixed), `POST
+/api/missions/finalize` (400 `mission_geometry_inconsistent`, **no record and no
+MISSION_UPLOAD command**), and `fleet_planning._build_child_mission` (per child).
+
+Waypoints **and** legs **and** segments are all swept — a straight leg between two approved
+points is not itself approved. Codes (`planning.GEOMETRY_ERROR_CODES`):
+`INVALID_NAVIGABLE_GEOMETRY`, `ROUTE_EMPTY`, `ROUTE_WAYPOINT_INVALID`,
+`ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY`, `TRANSIT_OUTSIDE_APPROVED_GEOMETRY`,
+`ROUTE_NO_GO_VIOLATION`, `HOME_OUTSIDE_APPROVED_GEOMETRY`, `HOME_CORRIDOR_DISCONNECTED`,
+`HOME_CORRIDOR_INCOMPLETE`, `HOME_CORRIDOR_NO_GO_VIOLATION`.
+
+### The raw operator boundary is not a fallback
+
+There is no path in the Operator that substitutes `planning_inputs.boundary` for the navigable
+geometry — not in generation, validation, finalization, the mission record or either package
+builder. A route that fits the boundary but not the inset **fails**, because accepting it would
+silently discard the shoreline clearance that keeps the hull off the shore. Pinned by
+`tests/test_mission_geometry.py::TestRawBoundaryIsNotAFallback`, which asserts both directions:
+the fixture route *does* pass against the raw ring, and *is* refused against the real navigable
+geometry.
+
+### Home corridor, tightened
+
+`home_corridor_ring` now takes `no_go_clearance_m` and **subtracts** the effective exclusion
+from the buffered transit envelope before checking anything, rather than testing the raw zones
+for contact. Subtracting keeps a merely-grazing corridor usable (it is dented) while refusing
+one that only connects *through* the exclusion: the clip splitting the polygon, holing it, or
+cutting it away from Home / the survey area / its own transit centreline are all refusals. The
+exterior ring of a holed polygon would fill the hole straight back in, which is exactly the
+legal tunnel that must never ship — hence the hole refusal. `HOME_CORRIDOR_HALF_WIDTH_M = 6.0`
+is unchanged and is still the only corridor width in planning semantics.
+
+The corridor is now **stored on the finalized record** (`home_corridor`, `home_corridor_meta`)
+instead of being re-derived at package-build time, so Scout receives the exact ring finalization
+proved. A historical record without the key is re-derived exactly as before, at clearance 0.
+
+## Route-start mode: execution start ≠ geometry provenance start
+
+`route_start_mode` chooses **where the executed mission route begins** — and nothing else. It
+does not change which geometry is approved.
+
+| Mode | Uploaded route | Approved Home↔survey transit network |
+|---|---|---|
+| `planning_home` | Home → approach → survey entry → survey → return → Home | identical to the executed transit legs |
+| `first_approach` | **A1** → … → survey entry → survey → return → Home | Home → A1 → … → survey entry, **and** survey → return → Home |
+
+Under `first_approach` the **Home → A1 leg is approved planning-only geometry**: it is generated
+by the same `safe_connector`, swept by the same containment/no-go proof, and is a corridor
+source — but it is never concatenated into the route, so it cannot move the route hash.
+
+Two clearly separated structures carry that, on the package and on the immutable record:
+
+```
+segments                        THE EXECUTION ROUTE — flattened, hashed, uploaded, flown
+planning_only_transit_segments  APPROVED transit that is deliberately NOT executed
+```
+
+`planning.approved_transit_segments()` is the union and is the single authoritative corridor
+source; `home_corridor_ring` and `check_mission_geometry` both take
+`planning_only_transit_segments` explicitly. A record without the field (every mission planned
+before it existed) reads as `[]` — its approved transit geometry *is* its execution transit
+geometry, which is the previous behaviour exactly.
+
+**Root cause of the old refusal.** `first_approach` used to skip building the Home → A1
+connector entirely, and the corridor was derived from the emitted `segments` only. The approach
+chain (A1 → … → survey entry) and the Home-anchored return chain (survey → R1 → … → Home) were
+then two disconnected pieces; buffering them produced a MultiPolygon, the single-ring contract
+refused it (*"the approved transit geometry is not contiguous"*), and a mission with a Home
+outside the navigable area failed its own proof with `HOME_OUTSIDE_APPROVED_GEOMETRY` +
+`TRANSIT_OUTSIDE_APPROVED_GEOMETRY`. The corridor derivation was tied too tightly to the
+execution subset; the fix corrected the **source**, and loosened no check.
+
+### The approved chain fails clearly when it is genuinely broken
+
+A required link that cannot be routed is a hard, coded refusal — no invented corridor, no
+widened region, no tunnel through a no-go buffer, no substituted or reversed waypoints:
+
+`HOME_TO_APPROACH_DISCONNECTED`, `APPROACH_TO_SURVEY_DISCONNECTED`,
+`SURVEY_TO_RETURN_DISCONNECTED`, `RETURN_TO_HOME_DISCONNECTED` (all in
+`planning.GEOMETRY_ERROR_CODES`, raised as `GeometryConsistencyError` → the existing 400
+`mission_geometry_inconsistent`). The first three are pinned by fixtures in
+`tests/test_route_start_mode.py`. `RETURN_TO_HOME_DISCONNECTED` is the mirror guard on the final
+Home leg and is not separately reachable today: the Home → approach (or Home → survey entry)
+connector is built first and already proves Home is reachable from the navigable region, so a
+later Home leg cannot be the first to fail. It stays so that raise site is coded like its three
+siblings rather than surfacing as a bare `ConnectorError`.
+
+Approach and return remain **separate operator lists**. "Use reversed approach" is an explicit
+Plan-page action that populates `return_waypoints`; the backend has no reversal path and never
+synthesizes a return from an approach.
+
+### No runtime corridor patch
+
+There is no Operator endpoint that PATCHes or attaches `home_corridor` after mission creation,
+and the normal workflow never needed one — `REPLAN_PATCHABLE_FIELDS` is Scout's runtime replan
+config (`dry_run`, `rtl_fallback_enabled`, battery thresholds …) and contains no geometry.
+Nothing was removed.
+
 ## Known limitations
 
+- **Scout replans against the zone boundary, not the operator's no-go clearance.** The v1
+  planning package cannot carry `no_go_clearance_m`, so a Scout-authored safe return may come
+  closer to a no-go zone than the operator's planning parameter required. Extending the Scout
+  package contract with an additive `no_go_clearance_m` is the open item; nothing here invents
+  the field or claims the constraint is synchronized.
+- The **Home corridor** is now clipped by the buffered exclusion, not merely checked against the
+  original zones (see *Mission geometry contract*). Remaining limit: the corridor proves a
+  connector to the **planned** Home only. A runtime launch Home outside it is not covered and
+  the corridor is never widened to reach one — Scout fails closed, which is correct. Planning
+  Home and Pixhawk-verified Home stay distinct; nothing here blurs them.
+- The corridor is a **single ring** by contract. A mission whose approved transit legs are
+  genuinely not contiguous yields no corridor. `route_start_mode: first_approach` is no longer
+  such a mission — see *Route-start mode* above; its Home → A1 leg is approved planning-only
+  geometry and the corridor is derived from the approved network, not the execution subset.
 - Route quality is **cleanup, not smoothing**: the vehicle flies straight legs between items;
   no splines/Dubins/curvature. A legitimate coverage U-turn in a narrow lobe is retained (it is
   required by the geometry), not counted as a backtrack.

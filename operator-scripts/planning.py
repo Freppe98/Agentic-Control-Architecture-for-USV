@@ -63,6 +63,20 @@ TOLERANCE = 1e-9
 # from 1.5 to 1.0 m/s to match the fleet-wide survey-speed default (single + fleet planning).
 DEFAULT_PLANNING_SPEED_MPS = 1.0
 
+# ── Planning-parameter defaults a FRESH plan starts from ────────────────────────────────
+# These are the values the Plan page shows immediately (operator/lib/planning.js
+# defaultParams mirrors them) and the values applied when a caller — an older draft, a
+# script, a replayed request — omits the field entirely. They are NOT applied to a supplied
+# value: an explicit 0 clearance means zero clearance, and an explicit non-positive lane
+# spacing is still an error.
+#
+# `shoreline_clearance_m` keeps its historic ABSENT semantics (0.0, see
+# normalize_generate_inputs) so no stored plan silently changes meaning; the 5 m default is
+# what the UI starts a NEW plan with.
+DEFAULT_SHORELINE_CLEARANCE_M = 5.0
+DEFAULT_NO_GO_CLEARANCE_M = 5.0
+DEFAULT_LANE_SPACING_M = 10.0
+
 
 class PlanningUnavailable(RuntimeError):
     """Raised when a generation/validation entry point is called but the geometry stack is
@@ -711,6 +725,35 @@ SEGMENT_KINDS = (
     "final_home_connector",  # last return WP → planning home
 )
 
+# PLANNING-ONLY segment kinds. These are APPROVED transit geometry that is deliberately NOT part
+# of the uploaded execution route, so they never appear in `segments`, never reach
+# `_flatten_segments`, and never enter the route or its hash. They ride on the package/record
+# under `planning_only_transit_segments` and exist for corridor derivation, geometric validation
+# and safe-return provenance — see the EXECUTION ROUTE vs APPROVED TRANSIT GEOMETRY note in
+# generate_survey.
+PLANNING_ONLY_SEGMENT_KINDS = (
+    # planning home → first approach waypoint, when `route_start_mode: first_approach` says the
+    # EXECUTED route begins at A1. The leg is still approved planning geometry: it is what proves
+    # Home is connected to the survey, and it is the corridor's anchor at the Home end.
+    "home_transit_connector",
+)
+
+# WHERE THE EXECUTED MISSION ROUTE BEGINS — and nothing else.
+#
+#   planning_home   the uploaded route begins at the planning Home:
+#                     Home → approach (if any) → survey entry → survey → return (if any) → Home
+#   first_approach  the uploaded route begins at the FIRST APPROACH WAYPOINT:
+#                     A1 → … → survey entry → survey → return (if any) → Home
+#
+# The mode chooses the EXECUTION start. It does NOT change the safety meaning of the approved
+# Home/transit geometry: in BOTH modes the approved transit network runs from the planning Home
+# through the approach chain to the navigable survey geometry, and back from the survey through
+# the return chain to the planning Home. In `first_approach` the Home → A1 leg is approved
+# PLANNING-ONLY geometry (see PLANNING_ONLY_SEGMENT_KINDS) rather than an executed leg, so
+#
+#     execution start != geometry provenance start
+#
+# and the Home corridor is derived from the approved network, not from the execution subset.
 ROUTE_START_MODES = ("planning_home", "first_approach")
 
 # Safe-connector resolution bound. A grid finer than this many cells on an axis is refused as
@@ -755,7 +798,8 @@ GENERATION_ALGORITHM = {
 # carry operator waypoints that are preserved as anchors; only the generated points between them
 # are compressed. Coverage kinds get conservative cleanup only (dedup + provably-collinear), so
 # lane spacing / endpoints / fragment boundaries are never shortcut across.
-_AGGRESSIVE_KINDS = frozenset({"start_connector", "survey_entry_connector", "pass_transition",
+_AGGRESSIVE_KINDS = frozenset({"start_connector", "home_transit_connector",
+                               "survey_entry_connector", "pass_transition",
                                "return_connector", "final_home_connector"})
 _MODERATE_KINDS = frozenset({"approach", "return_approach"})
 _CONSERVATIVE_KINDS = frozenset({"primary", "secondary"})
@@ -785,21 +829,55 @@ def _close(a, b, tol=JOIN_TOL_DEG):
     return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
 
 
+def _buffer_exclusion(nogo_union, no_go_clearance_m):
+    """The forbidden no-go EXCLUSION geometry: the drawn zone union expanded outward by the
+    operator's no-go clearance. `None` in → `None` out (no zones is a real answer, not an
+    empty polygon). A clearance of 0 returns the original union unchanged, so "no clearance"
+    means exactly the geometry the operator drew.
+
+    Round joins (shapely's default) on purpose — see _NavGrid's docstring: the round buffer is
+    the set of points within N metres of the polygon, which is the minimum-distance semantic
+    the parameter promises. A mitre join would silently push corners out by N·√2."""
+    if nogo_union is None:
+        return None
+    if not no_go_clearance_m or no_go_clearance_m <= TOLERANCE:
+        return nogo_union
+    try:
+        buffered = nogo_union.buffer(abs(no_go_clearance_m))
+    except Exception:
+        return nogo_union
+    if buffered.is_empty or not buffered.is_valid:
+        buffered = buffered.buffer(0) if not buffered.is_empty else nogo_union
+    return buffered if not buffered.is_empty else nogo_union
+
+
 class _NavGrid:
     """The shared navigable model + safe point-to-point connector for one generation.
 
     Built ONCE per generate_survey call so every connector (coverage lane turns, no-go-split
     sections, pass transition, survey-entry/return connectors) is judged against, and routed
     inside, the identical navigable geometry. The navigable region is the survey boundary
-    inset by the shoreline clearance MINUS the union of the no-go zones — the exact space a
-    coverage/inter-coverage connector must stay within.
+    inset by the shoreline clearance MINUS the no-go EXCLUSION (the drawn zones expanded by the
+    no-go clearance) — the exact space a coverage/inter-coverage connector must stay within.
 
     ONE strategy, deterministic: a direct segment is accepted only when it is covered by the
     navigable polygon (within COVER_TOL_M) and clears no-go interiors; otherwise a bounded
     4-neighbour grid A* (adapted from the ported compute_return_path) finds an orthogonal
-    safe path. No diagonal shortcuts, no second planner."""
+    safe path. No diagonal shortcuts, no second planner.
 
-    def __init__(self, boundary, clearance, zones, step_m):
+    NO-GO CLEARANCE. `no_go_clearance` is the minimum routing distance the operator requires
+    between generated geometry and a drawn no-go polygon. It is applied HERE, once, as an
+    OUTWARD buffer of the zone union (`nogo_original` → `nogo`), so every consumer of this
+    grid — coverage repair, every connector kind, the LOS compression safety predicate, the
+    fleet survey-line clip, validation — judges against the same exclusion. Round joins are
+    deliberate: a round outward buffer is exactly the set of points within `no_go_clearance`
+    metres of the polygon, which is exactly the semantic "stay at least N m away".
+
+    The ORIGINAL polygon is kept (`nogo_original`) and is what the Plan/Map draw and what the
+    mission record stores. The buffered exclusion is derived routing geometry and never
+    replaces it."""
+
+    def __init__(self, boundary, clearance, zones, step_m, no_go_clearance=0.0):
         self.to_proj, self.to_deg = _utm_for(boundary)
         poly_deg = Polygon([(c[0], c[1]) for c in boundary])
         if not poly_deg.is_valid:
@@ -818,7 +896,11 @@ class _NavGrid:
                 zpolys.append(transform(self.to_proj.transform, zp))
             except Exception:
                 continue
-        self.nogo = unary_union(zpolys) if zpolys else None
+        # The operator's drawn zones, unmodified — provenance, never routed against directly.
+        self.nogo_original = unary_union(zpolys) if zpolys else None
+        self.no_go_clearance_m = float(abs(no_go_clearance or 0.0))
+        self.nogo = _buffer_exclusion(self.nogo_original, self.no_go_clearance_m)
+        self.buffer_valid = self.nogo is None or (self.nogo.is_valid and not self.nogo.is_empty)
 
         nav = inset
         if self.nogo is not None and not nav.is_empty:
@@ -857,6 +939,36 @@ class _NavGrid:
     def disconnected(self):
         return len(self.components) > 1
 
+    def exclusion_rings_deg(self):
+        """The BUFFERED no-go exclusion as `[[lng, lat], ...]` rings — the forbidden geometry
+        handed to the ported lawnmower/return generators (which take zones in degrees) and
+        offered to the Plan page as an optional dashed overlay. Derived routing geometry: the
+        operator's own rings stay untouched in `planning_inputs.no_go_zones`."""
+        if self.nogo is None or self.nogo.is_empty:
+            return []
+        polys = self.nogo.geoms if isinstance(self.nogo, MultiPolygon) else [self.nogo]
+        rings = []
+        for poly in polys:
+            if poly.is_empty or not hasattr(poly, "exterior"):
+                continue
+            deg = transform(self.to_deg.transform, poly)
+            rings.append([[round(x, 7), round(y, 7)] for x, y in deg.exterior.coords])
+        return rings
+
+    def point_clears_nogo(self, pt_deg):
+        """True when a [lng, lat] point lies outside the buffered no-go exclusion. Shrunk by
+        COVER_TOL_M so a point routed exactly ALONG the exclusion edge (which the avoidance
+        generator legitimately produces) is not reported as inside it."""
+        if self.nogo is None or self.nogo.is_empty:
+            return True
+        try:
+            probe = self.nogo.buffer(-COVER_TOL_M)
+            if probe.is_empty:
+                return True
+            return not probe.contains(Point(*self.to_proj.transform(pt_deg[0], pt_deg[1])))
+        except Exception:
+            return True
+
     def _build_grid(self):
         if self._grid is not None:
             return
@@ -887,6 +999,10 @@ class _NavGrid:
         return outside.is_empty or outside.length < CONNECTOR_EPS_M
 
     def _seg_clears_nogo(self, line_proj):
+        """True when a projected SEGMENT clears the buffered no-go exclusion (`self.nogo`,
+        already expanded by the operator's no-go clearance). This is what makes the clearance a
+        segment guarantee and not just a waypoint filter: two individually-clear endpoints whose
+        straight leg cuts the corner of the exclusion fail here."""
         if self.nogo is None:
             return True
         try:
@@ -1060,18 +1176,40 @@ class _NavGrid:
                 return False
             return grid[r][c] == 0
 
-        def nearest_free(r, c):
-            if is_free(r, c):
+        def stitch_clears(anchor_deg, rc):
+            """Does the snap leg anchor→cell clear the no-go exclusion?
+
+            The route's real endpoint is a planning coordinate, not a grid cell: `to_grid`
+            rounds it to a cell centre up to half a diagonal (step·√2/2) away, and that stitch
+            leg is part of the emitted connector even though the A* never routed it. Snapping to
+            the merely-nearest free cell can therefore cut an exclusion corner the A* carefully
+            went around — and with a no-go clearance in play the endpoint routinely sits exactly
+            ON the exclusion edge, which is precisely where it happens.
+
+            Deliberately the NO-GO predicate, not the full `require_inside` one: several
+            connector kinds legitimately begin at an operator waypoint OUTSIDE the inset
+            (approach/return/home legs, the survey-entry connector), so demanding containment of
+            the snap leg would refuse routes that have always been valid. The no-go exclusion is
+            the constraint that must hold for every leg regardless."""
+            try:
+                return self._seg_clears_nogo(transform(
+                    self.to_proj.transform, LineString([anchor_deg, to_coord(rc)])))
+            except Exception:
+                return False
+
+        def nearest_free(r, c, anchor_deg):
+            if is_free(r, c) and stitch_clears(anchor_deg, (r, c)):
                 return (r, c)
             for dist in range(1, max(rows, cols)):
                 for dr in range(-dist, dist + 1):
                     for dc in range(-dist, dist + 1):
-                        if is_free(r + dr, c + dc):
-                            return (r + dr, c + dc)
+                        rc = (r + dr, c + dc)
+                        if is_free(*rc) and stitch_clears(anchor_deg, rc):
+                            return rc
             return None
 
-        start = nearest_free(*to_grid(a_deg))
-        goal = nearest_free(*to_grid(b_deg))
+        start = nearest_free(*to_grid(a_deg), a_deg)
+        goal = nearest_free(*to_grid(b_deg), b_deg)
         if start is None or goal is None:
             raise ConnectorError(
                 "No safe connector exists between two approved route points — the navigable "
@@ -1116,6 +1254,23 @@ class _NavGrid:
         # PART 4: compress the raw grid staircase to its turn points, each shortcut re-verified
         # safe. Instrument raw-vs-simplified so the route-quality metrics can report the gain.
         simplified = self._compress_los(path, require_inside)
+        # FINAL NO-GO GUARANTEE: every emitted hop is CHECKED against the no-go exclusion, not
+        # assumed clear. _compress_los falls back to the adjacent point when no longer shortcut
+        # is safe, and that fallback is the one step it does not verify — so a leg clipping the
+        # exclusion could otherwise leave here silently. This module's contract is to RAISE
+        # rather than emit an invalid connector. (Containment keeps its existing tolerance
+        # semantics; only the no-go constraint is tightened here.)
+        for u, w in zip(simplified, simplified[1:]):
+            try:
+                clear = self._seg_clears_nogo(
+                    transform(self.to_proj.transform, LineString([u, w])))
+            except Exception:
+                clear = True
+            if not clear:
+                raise ConnectorError(
+                    "No safe connector could be routed between two approved route points — "
+                    "every path found crosses the no-go exclusion (the no-go zones plus the "
+                    "no-go clearance).")
         self.astar_connector_count += 1
         self.raw_connector_pts += len(path)
         self.final_connector_pts += len(simplified)
@@ -1386,6 +1541,10 @@ def _input_revision(inp):
         "a": [rd(p) for p in (inp.get("approach_waypoints") or [])],
         "r": [rd(p) for p in (inp.get("return_waypoints") or [])],
         "c": inp.get("shoreline_clearance_m"),
+        # No-go clearance is generation-affecting: it moves the exclusion the whole route is
+        # routed around, so a change to it must outdate an existing route exactly like a
+        # shoreline-clearance or lane-spacing change does.
+        "ngc": inp.get("no_go_clearance_m"),
         "s": inp.get("lane_spacing_m"),
         "pa": inp.get("primary_angle_deg"),
         "d": inp.get("dual_pass"),
@@ -1412,9 +1571,25 @@ def normalize_generate_inputs(raw):
         errors.append("Shoreline clearance must be a number >= 0 metres.")
         clearance = 0.0
 
-    spacing = _num(raw.get("lane_spacing_m"))
-    if spacing is None or spacing <= 0:
-        errors.append("Lane spacing must be a positive number of metres.")
+    # No-go clearance: the minimum routing distance from every drawn no-go polygon. ABSENT
+    # (an older draft, an older caller) means "not stated" and takes the 5 m default; a
+    # SUPPLIED value is validated, so an explicit 0 stays 0 (original geometry exclusion only).
+    if raw.get("no_go_clearance_m") is None:
+        no_go_clearance = DEFAULT_NO_GO_CLEARANCE_M
+    else:
+        no_go_clearance = _num(raw.get("no_go_clearance_m"))
+        if no_go_clearance is None or no_go_clearance < 0:
+            errors.append("No-go clearance must be a number >= 0 metres.")
+            no_go_clearance = DEFAULT_NO_GO_CLEARANCE_M
+
+    # Lane spacing: absent takes the 10 m default (same migration rule); a supplied value must
+    # still be a positive number — an explicit 0 or -1 remains an error, never a silent 10.
+    if raw.get("lane_spacing_m") is None:
+        spacing = DEFAULT_LANE_SPACING_M
+    else:
+        spacing = _num(raw.get("lane_spacing_m"))
+        if spacing is None or spacing <= 0:
+            errors.append("Lane spacing must be a positive number of metres.")
 
     primary = _num(raw.get("primary_angle_deg", 0))
     if primary is None:
@@ -1487,6 +1662,7 @@ def normalize_generate_inputs(raw):
     return {
         "boundary": boundary,
         "shoreline_clearance_m": float(clearance),
+        "no_go_clearance_m": float(no_go_clearance),
         "lane_spacing_m": float(spacing),
         "primary_angle_deg": float(primary),
         "dual_pass": dual,
@@ -1557,6 +1733,7 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
 
     boundary = inp["boundary"]
     clearance = inp["shoreline_clearance_m"]
+    no_go_clearance = inp["no_go_clearance_m"]
     spacing = inp["lane_spacing_m"]
     zones = inp["no_go_zones"]
     home = inp["home"]
@@ -1570,33 +1747,46 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
             "The survey boundary is empty after applying the shoreline clearance — "
             "reduce the clearance or enlarge the boundary.")
 
-    grid = _NavGrid(boundary, clearance, zones, step_m=spacing)
+    grid = _NavGrid(boundary, clearance, zones, step_m=spacing, no_go_clearance=no_go_clearance)
+    if not grid.buffer_valid:
+        raise ValueError(
+            f"The no-go clearance of {no_go_clearance} m could not be applied — buffering the "
+            f"no-go zones produced invalid geometry. Check the drawn zones or reduce the "
+            f"no-go clearance.")
     if grid.empty:
         raise ValueError(
-            "The navigable area is empty after applying the shoreline clearance and no-go "
-            "zones — reduce the clearance/zones or enlarge the boundary.")
+            "The navigable area is empty after applying the shoreline clearance and the "
+            "no-go zones with their no-go clearance — reduce the clearance(s)/zones or "
+            "enlarge the boundary.")
     if grid.disconnected:
         raise DisconnectedNavigableError(
-            f"The shoreline clearance and no-go zones split the survey into "
-            f"{len(grid.components)} disconnected navigable regions. Survey generation "
-            f"currently requires one connected navigable region — split the survey into "
-            f"separate missions, or adjust the clearance / no-go zones.")
+            f"The shoreline clearance and the no-go zones (with a {no_go_clearance} m no-go "
+            f"clearance) split the survey into {len(grid.components)} disconnected navigable "
+            f"regions. Survey generation currently requires one connected navigable region — "
+            f"split the survey into separate missions, or adjust the clearance / no-go zones.")
+
+    # The BUFFERED exclusion, derived once, handed to the ported generators (which take zones
+    # as degree rings). This is what makes the no-go clearance apply to the coverage lanes
+    # themselves and not only to the connectors _NavGrid routes. The operator's ORIGINAL rings
+    # are untouched and are what `planning_inputs.no_go_zones` carries.
+    exclusion_rings = grid.exclusion_rings_deg()
 
     # Coverage passes: the ported lawnmower, then every UNSAFE internal hop repaired inside
     # the navigable region (this is the fix for outside-polygon lane connectors).
     primary_raw = _dedup(run_lawnmower_with_obstacles(
-        boundary, spacing, inp["primary_angle_deg"], clearance, zones or None))
+        boundary, spacing, inp["primary_angle_deg"], clearance, exclusion_rings or None))
     if len(primary_raw) < 2:
         raise ValueError(
             "No coverage route could be generated — the navigable area may be too small "
-            "for the chosen lane spacing, or fully blocked by no-go zones.")
+            "for the chosen lane spacing, or fully blocked by the no-go zones and their "
+            "no-go clearance.")
     primary_coords = grid.repair_path(primary_raw)
 
     secondary_coords = None
     intersections = []
     if inp["dual_pass"]:
         secondary_raw = _dedup(run_lawnmower_with_obstacles(
-            boundary, spacing, inp["secondary_angle_deg"], clearance, zones or None))
+            boundary, spacing, inp["secondary_angle_deg"], clearance, exclusion_rings or None))
         if len(secondary_raw) < 2:
             warnings.append("Dual pass requested, but the secondary pass produced no route; "
                             "only the primary pass was generated.")
@@ -1617,14 +1807,37 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         # No approach points to start from, but a home exists — use it as the start anchor.
         start_mode = "planning_home"
 
+    # ── EXECUTION ROUTE vs APPROVED TRANSIT GEOMETRY ─────────────────────────────────────
+    # `segments` is the EXECUTION route: the ordered geometry that is flattened, hashed,
+    # uploaded and flown. It is the only thing `_flatten_segments` ever sees.
+    #
+    # `planning_only_segments` is APPROVED TRANSIT geometry the plan contains but the execution
+    # route deliberately does not carry. Today that is exactly one leg — planning Home → first
+    # approach waypoint under `route_start_mode: first_approach`, where the operator has said
+    # the mission STARTS at A1. The leg is generated and safety-checked identically to an
+    # executed connector; it is what the Home corridor is anchored on and what proves Home is
+    # connected to the survey. It is NEVER concatenated into the route and so can never move a
+    # byte of the route hash.
+    #
+    # Choosing the route-start mode therefore changes WHERE EXECUTION BEGINS, and nothing about
+    # which geometry is approved (see ROUTE_START_MODES).
     segments = []
+    planning_only_segments = []
     seq = [0]
+    pseq = [0]
     raw_segment_pts = [0]   # summed pre-cleanup segment points, for the route-quality metric
 
-    def new_seg(kind, coords):
-        seq[0] += 1
+    def new_seg(kind, coords, planning_only=False):
         raw = _dedup(coords)
-        raw_segment_pts[0] += len(raw)
+        if planning_only:
+            pseq[0] += 1
+            segment_id = f"pln-{pseq[0]:02d}-{kind}"
+        else:
+            seq[0] += 1
+            segment_id = f"seg-{seq[0]:02d}-{kind}"
+            # Route-quality counts the EXECUTION route only, so a planning-only leg is not
+            # summed here (and its connector counters are restored below).
+            raw_segment_pts[0] += len(raw)
         # PART 6 segment-specific policy: aggressive LOS for generated connectors, operator
         # waypoints preserved as anchors on approach/return, conservative dedup+collinear only
         # for coverage. require_inside matches the segment's own connector safety policy.
@@ -1632,24 +1845,70 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         cleaned = grid.clean_path(
             raw, require_inside=(kind in _REQUIRE_INSIDE_KINDS),
             anchors=anchors, aggressive=(kind in _AGGRESSIVE_KINDS))
-        return {"segment_id": f"seg-{seq[0]:02d}-{kind}", "kind": kind,
-                "coordinates": [[float(c[0]), float(c[1])] for c in cleaned],
-                "length_m": round(_path_length_m(cleaned), 2),
-                "raw_point_count": len(raw), "final_point_count": len(cleaned)}
+        seg = {"segment_id": segment_id, "kind": kind,
+               "coordinates": [[float(c[0]), float(c[1])] for c in cleaned],
+               "length_m": round(_path_length_m(cleaned), 2),
+               "raw_point_count": len(raw), "final_point_count": len(cleaned)}
+        if planning_only:
+            # Stated on the segment itself, so a consumer reading one segment in isolation can
+            # never mistake approved planning geometry for something the vehicle will fly.
+            seg["planning_only"] = True
+        return seg
+
+    def build_connector(a, b, kind, require_inside, planning_only=False):
+        """The safe connector segment a→b, or None when a and b are the same point."""
+        if _close(a, b):
+            return None
+        path = grid.safe_connector(a, b, require_inside=require_inside)
+        if len(path) < 2:
+            return None
+        return new_seg(kind, path, planning_only=planning_only)
 
     def connect(a, b, kind, require_inside):
-        """Append a connector segment a→b if a and b are not already the same point."""
-        if _close(a, b):
-            return
-        path = grid.safe_connector(a, b, require_inside=require_inside)
-        if len(path) >= 2:
-            segments.append(new_seg(kind, path))
+        """Append a connector segment a→b to the EXECUTION route."""
+        seg = build_connector(a, b, kind, require_inside)
+        if seg is not None:
+            segments.append(seg)
 
-    # 1. START CONNECTOR + APPROACH + SURVEY ENTRY CONNECTOR
-    start_anchor = home if start_mode == "planning_home" else None
+    def chain_broken(code, message, exc):
+        """A required leg of the approved Home↔survey network could not be routed. A hard,
+        coded failure — never a widened region, an invented corridor or a silent omission."""
+        return GeometryConsistencyError([
+            {"code": code, "message": message, "detail": str(exc)}])
+
+    # 1. HOME → APPROACH + APPROACH + SURVEY ENTRY CONNECTOR
+    #
+    # The Home → A1 connector is derived whenever a planning Home and approach waypoints both
+    # exist, in BOTH route-start modes, because it is the approved geometry that joins Home to
+    # the survey. The mode only decides whether it is EXECUTED:
+    #   planning_home   → an executed `start_connector` (execution route + corridor source)
+    #   first_approach  → a planning-only `home_transit_connector` (corridor source only)
     if approach:
-        if start_anchor is not None:
-            connect(start_anchor, approach[0], "start_connector", require_inside=False)
+        if home is not None:
+            executed_start = (start_mode == "planning_home")
+            kind = "start_connector" if executed_start else "home_transit_connector"
+            # A planning-only leg must not colour the route-quality diagnostics, which describe
+            # the uploaded route; the grid's connector counters are restored around it.
+            counters = (grid.raw_connector_pts, grid.final_connector_pts,
+                        grid.connector_len_before_m, grid.connector_len_after_m)
+            try:
+                seg = build_connector(home, approach[0], kind, require_inside=False,
+                                      planning_only=not executed_start)
+            except ConnectorError as exc:
+                raise chain_broken(
+                    "HOME_TO_APPROACH_DISCONNECTED",
+                    "no safe route could be found between the planning Home and approach "
+                    "waypoint A1 — the approved transit network does not reach the survey from "
+                    "Home, so no Home corridor may be derived and the mission is refused. Move "
+                    "the Home or A1, or adjust the no-go zones / no-go clearance between them",
+                    exc)
+            if seg is not None:
+                if executed_start:
+                    segments.append(seg)
+                else:
+                    planning_only_segments.append(seg)
+                    (grid.raw_connector_pts, grid.final_connector_pts,
+                     grid.connector_len_before_m, grid.connector_len_after_m) = counters
         # The approach polyline, each hop validated (a manually drawn line is not assumed
         # safe): safe hops kept straight, unsafe hops routed around no-go interiors.
         approach_path = [approach[0]]
@@ -1664,10 +1923,19 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         # echoed planning_inputs.approach_waypoints regardless.
         if len(approach_path) >= 2:
             segments.append(new_seg("approach", approach_path))
-        connect(approach[-1], survey_entry, "survey_entry_connector", require_inside=True)
-    elif start_anchor is not None:
-        # No approach WPs: planning home → survey entry is the single entry connector.
-        connect(start_anchor, survey_entry, "survey_entry_connector", require_inside=True)
+        try:
+            connect(approach[-1], survey_entry, "survey_entry_connector", require_inside=True)
+        except ConnectorError as exc:
+            raise chain_broken(
+                "APPROACH_TO_SURVEY_DISCONNECTED",
+                "no safe route could be found between the last approach waypoint and the survey "
+                "entry inside the navigable area — the approach chain does not reach the survey "
+                "geometry", exc)
+    elif home is not None:
+        # No approach WPs: planning home → survey entry is the single entry connector, and it is
+        # executed in both modes (first_approach has no approach waypoint to start from and has
+        # already fallen back to planning_home above).
+        connect(home, survey_entry, "survey_entry_connector", require_inside=True)
     else:
         warnings.append("No planning home and no approach waypoints — the route begins "
                         "directly at the survey entry.")
@@ -1681,8 +1949,20 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         segments.append(new_seg("secondary", secondary_coords))
 
     # 4. RETURN CONNECTOR + RETURN APPROACH + FINAL HOME CONNECTOR
+    #
+    # The return chain is the operator's own list and is INDEPENDENT of the approach — it is
+    # never derived by reversing it (the operator asks for a reversed copy explicitly on the
+    # Plan page, which populates `return_waypoints` and is then just an ordinary return list).
+    # It is executed in both route-start modes: `first_approach` moves the START of execution,
+    # not its end, so the uploaded route still finishes at the planning Home.
     if returns:
-        connect(coverage_end, returns[0], "return_connector", require_inside=True)
+        try:
+            connect(coverage_end, returns[0], "return_connector", require_inside=True)
+        except ConnectorError as exc:
+            raise chain_broken(
+                "SURVEY_TO_RETURN_DISCONNECTED",
+                "no safe route could be found between the end of the survey and return waypoint "
+                "R1 inside the navigable area — the survey does not reach the return chain", exc)
         return_path = [returns[0]]
         for a, b in zip(returns, returns[1:]):
             if grid.segment_is_safe(a, b, require_inside=False):
@@ -1692,7 +1972,14 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         if len(return_path) >= 2:
             segments.append(new_seg("return_approach", return_path))
         if home is not None:
-            connect(returns[-1], home, "final_home_connector", require_inside=False)
+            try:
+                connect(returns[-1], home, "final_home_connector", require_inside=False)
+            except ConnectorError as exc:
+                raise chain_broken(
+                    "RETURN_TO_HOME_DISCONNECTED",
+                    "no safe route could be found between the last return waypoint and the "
+                    "planning Home — the return chain does not reach Home, so the mission has no "
+                    "approved way back", exc)
     elif home is not None:
         # No explicit return WPs: a safe generated connector straight back to planning home.
         try:
@@ -1746,6 +2033,7 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "transit_length_m": round(transit_len, 2),
         "lane_spacing_m": spacing,
         "shoreline_clearance_m": clearance,
+        "no_go_clearance_m": no_go_clearance,
         "primary_angle_deg": inp["primary_angle_deg"],
         "secondary_angle_deg": inp["secondary_angle_deg"] if inp["dual_pass"] else None,
         "dual_pass": inp["dual_pass"],
@@ -1792,25 +2080,48 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     }
     metrics["route_quality"] = route_quality
 
-    # The approved Home corridor, derived from the connector segments THIS generation just
-    # produced and validated. Emitted for the Plan/Map overlay and, later, for the Scout package
-    # — from the same function, so what the operator sees drawn is what Scout is sent. A refusal
-    # is normal and is reported with its reason rather than as a warning the operator must clear.
+    # The approved Home corridor, derived from the APPROVED TRANSIT geometry THIS generation just
+    # produced and validated — the executed transit legs PLUS any planning-only leg (the Home →
+    # A1 connector under `first_approach`). Deriving it from the execution subset alone is what
+    # used to leave a `first_approach` mission with an approach chain disconnected from the Home-
+    # anchored return chain, hence no single-ring corridor at all. Emitted for the Plan/Map
+    # overlay and, later, for the Scout package — from the same function, so what the operator
+    # sees drawn is what Scout is sent. A refusal is normal and is reported with its reason
+    # rather than as a warning the operator must clear.
     home_corridor, home_corridor_meta = home_corridor_ring(
-        segments=segments, navigable_geometry=navigable_boundary,
-        no_go_zones=zones, planning_home=home)
+        segments=segments, planning_only_transit_segments=planning_only_segments,
+        navigable_geometry=navigable_boundary,
+        no_go_zones=zones, planning_home=home, no_go_clearance_m=no_go_clearance)
     if home_corridor is None and home is not None:
         warnings.append(
             "No approved Home corridor could be derived: "
             f"{home_corridor_meta['reason']}. If the launch Home ends up outside the approved "
             "navigable area, the agent cannot prove a safe return and will hold in LOITER.")
 
+    # ── THE GEOMETRY CONTRACT, PROVEN BEFORE ANYTHING IS RETURNED ───────────────────────────
+    # Generation does not get to emit a package whose own route contradicts its own geometry.
+    # A failure here is a hard error with a specific code, NOT a warning and NOT an excuse to
+    # widen the safety region to the raw operator boundary — see check_mission_geometry.
+    geometry_check = check_mission_geometry(
+        segments=segments, planning_only_transit_segments=planning_only_segments,
+        route_waypoints=route_waypoints,
+        navigable_geometry=navigable_boundary, no_go_zones=zones,
+        no_go_clearance_m=no_go_clearance, planning_home=home,
+        home_corridor=home_corridor)
+    if not geometry_check["ok"]:
+        raise GeometryConsistencyError(geometry_check["failures"])
+
     input_revision = _input_revision(inp)
     planning_inputs = {
         "boundary": boundary,
         "shoreline_clearance_m": clearance,
         "navigable_boundary": navigable_boundary,
+        # PROVENANCE: the operator's ORIGINAL no-go rings, plus the clearance parameter that
+        # was routed against them. The buffered exclusion is deliberately NOT stored here —
+        # a consumer that needs it derives it from these two, and the Map keeps drawing the
+        # red polygon the operator actually drew.
         "no_go_zones": zones,
+        "no_go_clearance_m": no_go_clearance,
         "lane_spacing_m": spacing,
         "primary_angle_deg": inp["primary_angle_deg"],
         "dual_pass": inp["dual_pass"],
@@ -1826,15 +2137,32 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "mission_package_version": MISSION_PACKAGE_VERSION,
         "contract_version": ROUTE_CONTRACT_VERSION,
         "planning_inputs": planning_inputs,
+        # THE EXECUTION ROUTE. Flattened, hashed, uploaded, flown.
         "segments": segments,
+        # APPROVED TRANSIT GEOMETRY THAT IS NOT EXECUTED. Same segment shape, each entry flagged
+        # `planning_only: true`. Empty for every mission whose approved transit is entirely
+        # executed (which is every `planning_home` mission); one `home_transit_connector` under
+        # `first_approach` with a planning Home and approach waypoints. It exists for corridor
+        # derivation, geometric validation and safe-return provenance — it is deliberately NOT
+        # part of `segments`, `original_execution_order`, `route_waypoints` or `route_hash`.
+        "planning_only_transit_segments": planning_only_segments,
         "original_execution_order": original_execution_order,
         "route_waypoints": route_waypoints,
         "route_hash": _route_hash(route_waypoints),
         "metrics": metrics,
         "route_quality": route_quality,
         "generation_algorithm": GENERATION_ALGORITHM,
+        # The proof, carried with the package: every route leg is inside approved geometry and
+        # outside the effective no-go exclusion. Always `ok:true` here (generation raises
+        # otherwise) — it is retained so finalize and the Plan page can show WHAT was proven.
+        "geometry_check": geometry_check,
         "intersections": intersections,
         "navigable_boundary": navigable_boundary,
+        # The buffered no-go exclusion this generation routed around, as drawable rings. A
+        # DERIVED overlay for the Plan page (subtle dashed outline) — the authoritative,
+        # operator-defined zone stays `planning_inputs.no_go_zones` and stays red. Empty when
+        # there are no zones, or when the clearance is 0 (then it equals the drawn geometry).
+        "no_go_exclusion_rings": exclusion_rings if no_go_clearance > TOLERANCE else [],
         # The approved Home corridor for the Plan/Map overlay: a single implicitly-closed
         # [[lng, lat], ...] ring, or None when none is proven (with the reason in
         # `home_corridor_meta`). Drawn distinctly from the survey boundary, the no-go zones and
@@ -1927,8 +2255,14 @@ def _navigable_rings_deg(boundary, clearance):
 # The connector legs that, together, are the approved path between the planning Home and the
 # survey area. Coverage passes are deliberately excluded — they are the survey, not the
 # connector, and buffering them would produce a "corridor" covering the whole site.
+#
+# `home_transit_connector` is the PLANNING-ONLY Home → A1 leg (`route_start_mode:
+# first_approach`). It is approved transit geometry the execution route does not carry, and it
+# is a corridor source for exactly the same reason every other kind here is: the operator
+# approved it and this station validated it. It never appears in `segments`, so listing it here
+# only ever matches geometry supplied as `planning_only_transit_segments`.
 HOME_CORRIDOR_SOURCE_KINDS = (
-    "start_connector", "approach", "survey_entry_connector",
+    "start_connector", "home_transit_connector", "approach", "survey_entry_connector",
     "return_connector", "return_approach", "final_home_connector",
 )
 
@@ -1945,6 +2279,26 @@ HOME_CORRIDOR_HALF_WIDTH_M = 6.0
 HOME_CORRIDOR_SIMPLIFY_M = 0.25
 
 
+def approved_transit_segments(segments, planning_only_transit_segments=None):
+    """The COMPLETE approved Home↔survey transit network of a package or record: every
+    transit/connector segment of the EXECUTION route, plus every PLANNING-ONLY transit segment
+    the plan approved but does not execute.
+
+    This is the authoritative corridor source and the authoritative answer to "which geometry did
+    the operator approve between Home and the survey". It is a superset of the execution transit
+    legs and is never a substitute for them: `segments` remains what is uploaded and flown.
+
+    Planning-only legs come first because the only one that exists (the Home → A1 connector under
+    `route_start_mode: first_approach`) precedes the execution route geometrically. A record
+    without the field — every mission planned before it existed — yields the execution transit
+    legs alone, which is exactly the previous behaviour.
+    """
+    planning_only = [s for s in (planning_only_transit_segments or []) if isinstance(s, dict)]
+    executed = [s for s in (segments or [])
+                if isinstance(s, dict) and s.get("kind") in HOME_CORRIDOR_SOURCE_KINDS]
+    return planning_only + executed
+
+
 def _corridor_lines(segments):
     """The approved transit centrelines from a record's `segments`, as [[lng,lat],...] lists."""
     out = []
@@ -1959,7 +2313,8 @@ def _corridor_lines(segments):
 
 
 def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_home,
-                       half_width_m=HOME_CORRIDOR_HALF_WIDTH_M):
+                       no_go_clearance_m=0.0, half_width_m=HOME_CORRIDOR_HALF_WIDTH_M,
+                       planning_only_transit_segments=None):
     """Derive the approved Home corridor from already-approved planning geometry.
 
     Returns `(ring, meta)`. `ring` is a single implicitly-closed `[[lng, lat], ...]` polygon ring
@@ -1967,12 +2322,31 @@ def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_ho
     `meta["reason"]` names which requirement failed. Refusing is a normal outcome (see the note
     above): Scout then fails closed rather than returning through unapproved water.
 
+    NO-GO CLEARANCE. `no_go_clearance_m` is the operator's minimum routing distance from every
+    drawn no-go polygon — the SAME scalar the route was generated against. The EFFECTIVE
+    exclusion (zones buffered by it) is SUBTRACTED from the corridor before any requirement is
+    checked, so the ring that goes on the wire is one the exclusion has already dented. That is
+    what makes "a corridor may never open a legal tunnel through a no-go buffer" a property of
+    the shipped geometry rather than a promise: if the exclusion splits the corridor, punches a
+    hole in it, or cuts it away from Home or from the survey area, no corridor is emitted at all.
+    A clearance of 0 (or a historical record that predates the parameter) means the drawn zone
+    geometry itself, which is the pre-existing behaviour exactly.
+
+    APPROVED GEOMETRY, NOT THE EXECUTION SUBSET. The source is `approved_transit_segments` — the
+    execution route's transit legs PLUS `planning_only_transit_segments`. The two differ only
+    under `route_start_mode: first_approach`, where the Home → A1 leg is approved but not
+    executed; deriving from the execution subset alone would leave the approach chain
+    disconnected from the Home-anchored return chain and refuse a corridor that the operator's
+    own approved geometry does prove. Nothing here fabricates that leg: it is supplied by the
+    caller only when the generator actually routed and validated it.
+
     Pure and deterministic: the same record always yields the same ring.
     """
     meta = {"available": False, "reason": None, "half_width_m": half_width_m,
-            "source_segment_kinds": [], "vertex_count": 0,
+            "no_go_clearance_m": float(abs(no_go_clearance_m or 0.0)),
+            "source_segment_kinds": [], "vertex_count": 0, "planning_only_source_count": 0,
             "contains_planning_home": None, "overlaps_navigable": None,
-            "clears_no_go_zones": None}
+            "covers_transit_path": None, "clears_no_go_zones": None}
     if not PLANNING_AVAILABLE:
         meta["reason"] = ("the geometry stack (shapely/pyproj) is not installed, so no corridor "
                           "can be derived or checked")
@@ -1983,14 +2357,16 @@ def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_ho
         meta["reason"] = "the mission has no planning home to build a corridor around"
         return None, meta
 
-    lines = _corridor_lines(segments)
+    approved = approved_transit_segments(segments, planning_only_transit_segments)
+    lines = _corridor_lines(approved)
     if not lines:
         meta["reason"] = ("the mission has no approved transit/connector segments — there is no "
                           "operator-approved path between Home and the survey area to buffer")
         return None, meta
-    meta["source_segment_kinds"] = sorted({
-        s.get("kind") for s in (segments or [])
-        if isinstance(s, dict) and s.get("kind") in HOME_CORRIDOR_SOURCE_KINDS})
+    meta["source_segment_kinds"] = sorted({s.get("kind") for s in approved})
+    meta["planning_only_source_count"] = sum(
+        1 for s in (planning_only_transit_segments or [])
+        if isinstance(s, dict) and s.get("kind") in HOME_CORRIDOR_SOURCE_KINDS)
 
     nav_rings = [r for r in (navigable_geometry or [])
                  if isinstance(r, list) and len(r) >= 3]
@@ -2047,8 +2423,56 @@ def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_ho
         meta["reason"] = "the simplified corridor is not a single valid polygon"
         return None, meta
 
+    # ── THE EXCLUSION IS SUBTRACTED, NOT MERELY TESTED AGAINST ──────────────────────────────
+    # The drawn zones expanded by the operator's no-go clearance — the same effective exclusion
+    # every connector in this mission was routed around (_NavGrid.nogo). Shrunk by COVER_TOL_M
+    # for the identical reason `_seg_clears_nogo` shrinks it: a leg routed exactly ALONG the
+    # exclusion edge is legitimate output of the avoidance generator, not a violation.
+    #
+    # Subtracting rather than rejecting on contact is what keeps this honest AND usable: a
+    # corridor that merely grazes the exclusion is dented and stays valid, while one that only
+    # "works" by passing THROUGH the exclusion is split (MultiPolygon) or holed and is refused
+    # below. Taking the exterior ring of a HOLED polygon would fill the hole straight back in —
+    # which is exactly the legal tunnel this must never ship — so a hole is a refusal too.
+    zones = [z for z in (no_go_zones or []) if isinstance(z, list) and len(z) >= 3]
+    exclusion = None
+    exclusion_touched = False
+    if zones:
+        exclusion = _buffer_exclusion(unary_union([proj_poly(z) for z in zones]),
+                                      float(abs(no_go_clearance_m or 0.0)))
+    if exclusion is not None and not exclusion.is_empty:
+        try:
+            probe = exclusion.buffer(-COVER_TOL_M)
+        except Exception:                                     # pragma: no cover - defensive
+            probe = exclusion
+        if not probe.is_empty:
+            exclusion_touched = bool(corridor.intersects(probe))
+            clipped = corridor.difference(probe)
+            if clipped.is_empty:
+                meta["clears_no_go_zones"] = False
+                meta["reason"] = ("the no-go exclusion (the drawn zones plus the "
+                                  f"{meta['no_go_clearance_m']} m no-go clearance) covers the "
+                                  "whole corridor")
+                return None, meta
+            if isinstance(clipped, MultiPolygon):
+                meta["clears_no_go_zones"] = False
+                meta["reason"] = ("the no-go exclusion splits the corridor in two — the approved "
+                                  "transit path only connects by passing through the no-go "
+                                  "clearance, which is not a corridor that may be approved")
+                return None, meta
+            if list(clipped.interiors):
+                meta["clears_no_go_zones"] = False
+                meta["reason"] = ("the no-go exclusion lies wholly inside the corridor — the "
+                                  "single-ring contract cannot express the hole, and shipping "
+                                  "the outer ring would approve routing straight through it")
+                return None, meta
+            corridor = clipped
+        meta["clears_no_go_zones"] = True
+    else:
+        meta["clears_no_go_zones"] = True
+
     home_pt = Point(*to_proj.transform(home[0], home[1]))
-    meta["contains_planning_home"] = bool(corridor.contains(home_pt))
+    meta["contains_planning_home"] = bool(corridor.buffer(COVER_TOL_M).contains(home_pt))
     if not meta["contains_planning_home"]:
         meta["reason"] = ("the corridor derived from the approved transit path does not contain "
                           "the planning Home")
@@ -2061,15 +2485,31 @@ def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_ho
                           "proves no connection to the survey geometry")
         return None, meta
 
-    zones = [z for z in (no_go_zones or []) if isinstance(z, list) and len(z) >= 3]
-    if zones:
-        blocked = unary_union([proj_poly(z) for z in zones])
-        meta["clears_no_go_zones"] = not corridor.intersects(blocked)
-        if not meta["clears_no_go_zones"]:
-            meta["reason"] = "the corridor would cross a no-go zone"
-            return None, meta
-    else:
-        meta["clears_no_go_zones"] = True
+    # The corridor must still COVER the transit path it was derived from. Without this the
+    # dented corridor could ship while the very legs it exists to approve fall outside it.
+    # Navigable area counts as coverage: the approach/return connectors run through the survey
+    # region, which is approved geometry in its own right.
+    approved = unary_union([corridor, navigable]).buffer(COVER_TOL_M)
+    uncovered = []
+    for line in lines:
+        rest = proj_line(line).difference(approved)
+        if not rest.is_empty and rest.length >= CONNECTOR_EPS_M:
+            uncovered.append(round(rest.length, 2))
+    meta["covers_transit_path"] = not uncovered
+    if uncovered and exclusion_touched:
+        # The corridor lost that coverage to the SUBTRACTION above: the transit path runs through
+        # (or within the clearance of) a no-go zone, so no corridor can approve it without
+        # approving the crossing. Named as the no-go refusal it actually is.
+        meta["clears_no_go_zones"] = False
+        meta["reason"] = ("the corridor would cross a no-go zone — the no-go exclusion (the "
+                          f"drawn zones plus the {meta['no_go_clearance_m']} m no-go clearance) "
+                          f"cuts {max(uncovered)} m out of the approved transit path, which no "
+                          f"corridor may bridge")
+        return None, meta
+    if uncovered:
+        meta["reason"] = ("the corridor does not cover the approved transit path it was derived "
+                          f"from ({max(uncovered)} m of it falls outside)")
+        return None, meta
 
     deg = transform(to_deg.transform, corridor)
     coords = [[round(x, 7), round(y, 7)] for x, y in deg.exterior.coords]
@@ -2084,6 +2524,443 @@ def home_corridor_ring(*, segments, navigable_geometry, no_go_zones, planning_ho
 
     meta.update(available=True, reason=None, vertex_count=len(coords))
     return coords, meta
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# MISSION GEOMETRY CONSISTENCY — the single authoritative pre-finalization proof
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# WHY THIS EXISTS. Two live E2 replanning failures came from the SAME root cause: the mission
+# package was internally inconsistent. Route waypoints the operator had approved sat OUTSIDE
+# the `navigable_geometry` shipped in the very same package, because generation only ever
+# required the COVERAGE passes to stay inside the shoreline inset — every transit leg (start
+# connector, approach, return, home leg) was checked for no-go clearance alone and was allowed
+# to run anywhere. Scout then tried to reuse those approved waypoints for RETRACE_APPROVED, its
+# safe-return validation correctly refused them, retries exhausted, and native RTL took over.
+#
+# THE INVARIANT PROVEN HERE, once, for the whole mission:
+#
+#     every finalized route segment is contained in APPROVED geometry
+#         approved = navigable_geometry ∪ home_corridor
+#     and lies outside the EFFECTIVE no-go exclusion
+#         exclusion = drawn no-go zones ⊕ no_go_clearance_m
+#     and the planning Home is itself inside approved geometry.
+#
+# THE RAW OPERATOR BOUNDARY IS NOT PART OF THIS AND NEVER BECOMES PART OF IT. When the route
+# does not fit the computed navigable geometry the answer is a hard, coded failure — never a
+# widened safety region. Broadening to the raw boundary would silently discard the shoreline
+# clearance the operator set, which is the one thing keeping the hull off the shore.
+#
+# SEGMENTS, NOT JUST WAYPOINTS. Two individually-approved endpoints can be joined by a leg that
+# cuts outside the inset or clips a no-go buffer corner, so every LEG is swept, not only its
+# ends. Coverage kinds are held to the navigable geometry alone; transit kinds may additionally
+# use the corridor, which is precisely what the corridor is for.
+
+# Stable, matchable failure identifiers. These are the operator's own codes (the wire contract
+# is unchanged); they appear in the API error body and in the raised exception so a log line
+# names the actual geometric fault rather than a prose paraphrase of it.
+GEOMETRY_ERROR_CODES = (
+    "INVALID_NAVIGABLE_GEOMETRY",     # no usable navigable geometry to validate against
+    "ROUTE_EMPTY",                    # no route waypoints at all
+    "ROUTE_WAYPOINT_INVALID",         # a waypoint is not a finite in-range coordinate
+    "ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY",   # a survey point/leg leaves the navigable geometry
+    "TRANSIT_OUTSIDE_APPROVED_GEOMETRY",  # a transit leg is in neither navigable nor corridor
+    "ROUTE_NO_GO_VIOLATION",          # a point/leg enters the effective no-go exclusion
+    "HOME_OUTSIDE_APPROVED_GEOMETRY", # planning Home is in neither navigable nor corridor
+    "HOME_CORRIDOR_DISCONNECTED",     # corridor is not one polygon, or misses the survey area
+    "HOME_CORRIDOR_INCOMPLETE",       # corridor misses its own Home or its own transit path
+    "HOME_CORRIDOR_NO_GO_VIOLATION",  # corridor overlaps the effective no-go exclusion
+    # ── THE APPROVED HOME↔SURVEY CHAIN. Raised by generate_survey when a required leg of the
+    # approved transit network cannot be routed at all, so the operator reads WHICH chain is
+    # broken instead of a generic "no safe connector". These are refusals, never repairs: no
+    # corridor is invented, no region widened, no waypoint moved, no return substituted.
+    "HOME_TO_APPROACH_DISCONNECTED",     # planning Home ↛ first approach waypoint
+    "APPROACH_TO_SURVEY_DISCONNECTED",   # last approach waypoint ↛ survey entry
+    "SURVEY_TO_RETURN_DISCONNECTED",     # survey end ↛ first return waypoint
+    "RETURN_TO_HOME_DISCONNECTED",       # last return waypoint ↛ planning Home
+)
+
+# Segment kinds whose ENTIRE geometry must lie inside the navigable survey region. Everything
+# else is transit and may additionally rely on the approved Home corridor.
+GEOMETRY_SURVEY_KINDS = ("primary", "secondary", "pass_transition")
+
+# How many offending indices a single failure names before eliding. The operator needs enough to
+# locate the fault, not a wall of numbers.
+_MAX_OFFENDERS = 5
+
+# Area tolerance (m²) for the corridor-vs-exclusion overlap test. A corridor derived by CLIPPING
+# the exclusion out shares its boundary with the exclusion exactly, and that shared boundary
+# survives a round trip through 7-decimal-place wire coordinates as a ~1 cm sliver. Testing bare
+# `.area > 0` would read that rounding noise as a no-go violation. The corridor is additionally
+# shrunk by COVER_TOL_M before the test — the same half-metre tolerance every other containment
+# check here uses — so what is measured is real overlap, not a shared edge.
+_AREA_EPS_M2 = 1.0
+
+
+class GeometryConsistencyError(ValueError):
+    """A mission's own geometry contradicts itself — raised INSTEAD of returning a package.
+
+    Carries `failures` ([{code, message, ...}]) and `codes`, so the API layer can report the
+    specific geometric fault. Never raised for a route that merely looks awkward: every failure
+    is a containment or clearance property that was actually measured."""
+
+    def __init__(self, failures):
+        self.failures = [dict(f) for f in (failures or [])]
+        self.codes = [f.get("code") for f in self.failures]
+        super().__init__("; ".join(
+            f"{f.get('code')}: {f.get('message')}" for f in self.failures) or
+            "the mission geometry is inconsistent")
+
+
+def _elide(items):
+    shown = list(items)[:_MAX_OFFENDERS]
+    return f"{shown}{' …' if len(items) > len(shown) else ''}"
+
+
+def check_mission_geometry(*, segments, route_waypoints, navigable_geometry, no_go_zones,
+                           no_go_clearance_m, planning_home, home_corridor=None,
+                           planning_only_transit_segments=None):
+    """Prove (or disprove) that one mission's geometry is self-consistent.
+
+    Returns `{ok, failures, checks}` — it never repairs, never widens and never falls back to
+    the raw operator boundary. `failures` entries carry a stable `code` from
+    GEOMETRY_ERROR_CODES plus an actionable message. Pure, deterministic and network-free: the
+    same package always yields the same verdict.
+
+    EXECUTION ROUTE vs APPROVED GEOMETRY. `segments` + `route_waypoints` are the EXECUTED
+    mission and are held to the full contract. `planning_only_transit_segments` is approved
+    transit geometry that is not executed (the Home → A1 leg under `route_start_mode:
+    first_approach`); it is held to the SAME containment and no-go rules, because it is what the
+    Home corridor is derived from and an unchecked leg must never become approved geometry. It
+    is deliberately not required to join the route: not executing a leg is the point of the mode.
+
+    Callers: `generate_survey` (raises before returning a package), `validate_plan` (reports as
+    errors), POST /api/missions/finalize (refuses to store the immutable record) and
+    `fleet_planning` (per child mission). One implementation, so those four can never disagree.
+    """
+    _require_available()
+    failures = []
+    planning_only = [s for s in (planning_only_transit_segments or []) if isinstance(s, dict)]
+    checks = {"navigable_ring_count": 0, "home_corridor_supplied": home_corridor is not None,
+              "planning_only_transit_segment_count": len(planning_only),
+              "no_go_clearance_m": float(abs(no_go_clearance_m or 0.0))}
+
+    def fail(code, message, **extra):
+        failures.append({"code": code, "message": message, **extra})
+
+    nav_rings = [r for r in (navigable_geometry or [])
+                 if isinstance(r, (list, tuple)) and len(r) >= 3]
+    checks["navigable_ring_count"] = len(nav_rings)
+    if not nav_rings:
+        fail("INVALID_NAVIGABLE_GEOMETRY",
+             "the mission carries no navigable geometry — there is nothing to validate the "
+             "route against, and the raw survey boundary is not a substitute for it")
+        return {"ok": False, "failures": failures, "checks": checks}
+
+    route = route_waypoints if isinstance(route_waypoints, list) else []
+    checks["waypoint_count"] = len(route)
+    if not route:
+        fail("ROUTE_EMPTY", "the mission has no route waypoints")
+        return {"ok": False, "failures": failures, "checks": checks}
+
+    coords = []
+    bad = []
+    for i, wp in enumerate(route):
+        lat = _num(wp.get("latitude")) if isinstance(wp, dict) else None
+        lng = _num(wp.get("longitude")) if isinstance(wp, dict) else None
+        if lat is None or abs(lat) > 90 or lng is None or abs(lng) > 180:
+            bad.append(i + 1)
+        else:
+            coords.append((lng, lat))
+    checks["waypoints_finite"] = not bad
+    if bad:
+        fail("ROUTE_WAYPOINT_INVALID",
+             f"route waypoint(s) {_elide(bad)} are not valid latitude/longitude coordinates",
+             waypoints=bad[:_MAX_OFFENDERS])
+        return {"ok": False, "failures": failures, "checks": checks}
+
+    # ONE projection for the whole proof, taken from the navigable geometry — the same frame
+    # `home_corridor_ring` uses, so metres mean metres and the two can never disagree.
+    to_proj, _ = _utm_for(nav_rings[0])
+
+    def proj_poly(ring):
+        return Polygon([to_proj.transform(c[0], c[1]) for c in ring]).buffer(0)
+
+    def proj_line(pts):
+        return LineString([to_proj.transform(p[0], p[1]) for p in pts])
+
+    try:
+        navigable = unary_union([proj_poly(r) for r in nav_rings])
+    except Exception as exc:                                  # pragma: no cover - defensive
+        fail("INVALID_NAVIGABLE_GEOMETRY",
+             f"the navigable geometry could not be interpreted as a polygon ({exc})")
+        return {"ok": False, "failures": failures, "checks": checks}
+    checks["navigable_valid"] = bool(navigable and not navigable.is_empty and navigable.is_valid)
+    if not checks["navigable_valid"]:
+        fail("INVALID_NAVIGABLE_GEOMETRY",
+             "the navigable geometry is empty or invalid — reduce the shoreline clearance or "
+             "enlarge the survey boundary")
+        return {"ok": False, "failures": failures, "checks": checks}
+
+    # The EFFECTIVE exclusion: the operator's drawn zones expanded by the no-go clearance. The
+    # drawn rings stay untouched (provenance); this derived geometry is what the route is held
+    # to, exactly as it is during generation.
+    zones = [z for z in (no_go_zones or []) if isinstance(z, (list, tuple)) and len(z) >= 3]
+    exclusion = None
+    if zones:
+        try:
+            exclusion = _buffer_exclusion(unary_union([proj_poly(z) for z in zones]),
+                                          float(abs(no_go_clearance_m or 0.0)))
+        except Exception:                                     # pragma: no cover - defensive
+            exclusion = None
+    probe = None
+    if exclusion is not None and not exclusion.is_empty:
+        try:
+            probe = exclusion.buffer(-COVER_TOL_M)
+        except Exception:                                     # pragma: no cover - defensive
+            probe = exclusion
+        if probe.is_empty:
+            probe = None
+    checks["no_go_zone_count"] = len(zones)
+
+    corridor = None
+    if home_corridor:
+        try:
+            corridor = proj_poly(home_corridor)
+        except Exception:
+            corridor = None
+        if corridor is None or corridor.is_empty or not corridor.is_valid:
+            fail("HOME_CORRIDOR_DISCONNECTED",
+                 "the supplied home_corridor is not a valid polygon")
+            corridor = None
+        elif isinstance(corridor, MultiPolygon):
+            fail("HOME_CORRIDOR_DISCONNECTED",
+                 "the supplied home_corridor is more than one polygon — the contract carries a "
+                 "single approved ring")
+            corridor = None
+
+    approved = unary_union([navigable, corridor]) if corridor is not None else navigable
+    approved_tol = approved.buffer(COVER_TOL_M)
+    navigable_tol = navigable.buffer(COVER_TOL_M)
+
+    def covered(line, region_tol):
+        rest = line.difference(region_tol)
+        return rest.is_empty or rest.length < CONNECTOR_EPS_M
+
+    def clears(line):
+        if probe is None:
+            return True
+        try:
+            return line.intersection(probe).length < CONNECTOR_EPS_M
+        except Exception:                                     # pragma: no cover - defensive
+            return True
+
+    # ── every route WAYPOINT is covered, and clears the exclusion ────────────────────────────
+    outside = [i + 1 for i, c in enumerate(coords)
+               if not approved_tol.contains(Point(*to_proj.transform(c[0], c[1])))]
+    checks["waypoints_within_approved"] = not outside
+    if outside:
+        fail("ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY",
+             f"route waypoint(s) {_elide(outside)} lie outside the approved geometry "
+             f"(navigable geometry"
+             + (" plus the approved Home corridor)" if corridor is not None else ")")
+             + " — the route and the geometry shipped with it do not agree",
+             waypoints=outside[:_MAX_OFFENDERS])
+    if probe is not None:
+        inzone = [i + 1 for i, c in enumerate(coords)
+                  if probe.contains(Point(*to_proj.transform(c[0], c[1])))]
+        checks["waypoints_clear_no_go"] = not inzone
+        if inzone:
+            fail("ROUTE_NO_GO_VIOLATION",
+                 f"route waypoint(s) {_elide(inzone)} lie inside the no-go exclusion "
+                 f"(the drawn zones plus a {checks['no_go_clearance_m']} m no-go clearance)",
+                 waypoints=inzone[:_MAX_OFFENDERS])
+    else:
+        checks["waypoints_clear_no_go"] = True
+
+    # ── every route LEG is covered, and clears the exclusion ─────────────────────────────────
+    # Independent of the segmentation on purpose: a route submitted with no segments, or with
+    # segments that do not flatten to it, is still held to the full leg guarantee.
+    leg_outside, leg_nogo = [], []
+    for i, (a, b) in enumerate(zip(coords, coords[1:])):
+        line = proj_line([a, b])
+        if not covered(line, approved_tol):
+            leg_outside.append(i + 1)
+        if not clears(line):
+            leg_nogo.append(i + 1)
+    checks["route_legs_within_approved"] = not leg_outside
+    checks["route_legs_clear_no_go"] = not leg_nogo
+    if leg_outside:
+        fail("ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY",
+             f"route leg(s) {_elide(leg_outside)} (waypoint N → N+1) leave the approved "
+             f"geometry even though their endpoints may not — a straight leg between two "
+             f"approved points is not itself approved",
+             legs=leg_outside[:_MAX_OFFENDERS])
+    if leg_nogo:
+        fail("ROUTE_NO_GO_VIOLATION",
+             f"route leg(s) {_elide(leg_nogo)} (waypoint N → N+1) cross the no-go exclusion "
+             f"(the drawn zones plus a {checks['no_go_clearance_m']} m no-go clearance)",
+             legs=leg_nogo[:_MAX_OFFENDERS])
+
+    # ── per-SEGMENT coverage, with the kind-specific rule ────────────────────────────────────
+    # The EXECUTION segments and the PLANNING-ONLY approved transit legs are swept together and
+    # to the same standard — a planning-only leg is approved geometry, and approving an unchecked
+    # leg is exactly how a corridor would come to cover water nothing ever validated. They are
+    # labelled distinctly so the operator can tell which of the two a fault is in.
+    segs = [s for s in (segments or []) if isinstance(s, dict)]
+    survey_bad, transit_bad, seg_nogo = [], [], []
+    swept = ([(f"{i + 1}", s) for i, s in enumerate(segs)]
+             + [(f"P{i + 1}", s) for i, s in enumerate(planning_only)])
+    for tag, s in swept:
+        sc = [(p[0], p[1]) for p in (s.get("coordinates") or [])
+              if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if len(sc) < 2:
+            continue
+        try:
+            line = proj_line(sc)
+        except Exception:                                     # pragma: no cover - defensive
+            continue
+        label = (f"{tag} ({s.get('kind')}, planning-only)" if tag.startswith("P")
+                 else f"{tag} ({s.get('kind')})")
+        if s.get("kind") in GEOMETRY_SURVEY_KINDS:
+            if not covered(line, navigable_tol):
+                survey_bad.append(label)
+        elif not covered(line, approved_tol):
+            transit_bad.append(label)
+        if not clears(line):
+            seg_nogo.append(label)
+    checks["survey_segments_within_navigable"] = not survey_bad
+    checks["transit_segments_within_approved"] = not transit_bad
+    checks["segments_clear_no_go"] = not seg_nogo
+    if survey_bad:
+        fail("ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY",
+             f"survey segment(s) {_elide(survey_bad)} leave the navigable geometry — coverage "
+             f"must stay inside the shoreline-offset region, and the raw survey boundary is not "
+             f"a substitute for it",
+             segments=survey_bad[:_MAX_OFFENDERS])
+    if transit_bad:
+        fail("TRANSIT_OUTSIDE_APPROVED_GEOMETRY",
+             f"transit segment(s) {_elide(transit_bad)} lie outside both the navigable geometry "
+             f"and the approved Home corridor"
+             + ("" if corridor is not None else
+                " (no Home corridor is available to approve them)"),
+             segments=transit_bad[:_MAX_OFFENDERS])
+    if seg_nogo:
+        fail("ROUTE_NO_GO_VIOLATION",
+             f"segment(s) {_elide(seg_nogo)} cross the no-go exclusion (the drawn zones plus a "
+             f"{checks['no_go_clearance_m']} m no-go clearance)",
+             segments=seg_nogo[:_MAX_OFFENDERS])
+
+    # ── the planning Home is itself covered ──────────────────────────────────────────────────
+    home = _point_of(planning_home) if planning_home is not None else None
+    checks["home_set"] = home is not None
+    if home is not None:
+        home_pt = Point(*to_proj.transform(home[0], home[1]))
+        checks["home_within_approved"] = bool(approved_tol.contains(home_pt))
+        if not checks["home_within_approved"]:
+            fail("HOME_OUTSIDE_APPROVED_GEOMETRY",
+                 "the planning Home lies outside the navigable geometry and outside any approved "
+                 "Home corridor — derive an approach/return transit the corridor can be built "
+                 "from, or move the Home into the navigable area")
+        if probe is not None and probe.contains(home_pt):
+            checks["home_clears_no_go"] = False
+            fail("ROUTE_NO_GO_VIOLATION",
+                 "the planning Home lies inside the no-go exclusion")
+        else:
+            checks["home_clears_no_go"] = True
+    else:
+        checks["home_within_approved"] = None
+
+    # ── the corridor itself ──────────────────────────────────────────────────────────────────
+    if corridor is not None:
+        checks["corridor_overlaps_navigable"] = bool(
+            corridor.intersection(navigable).area > TOLERANCE)
+        if not checks["corridor_overlaps_navigable"]:
+            fail("HOME_CORRIDOR_DISCONNECTED",
+                 "the approved Home corridor does not overlap the navigable geometry, so it "
+                 "proves no connection between Home and the survey area")
+        if home is not None:
+            contains_home = corridor.buffer(COVER_TOL_M).contains(
+                Point(*to_proj.transform(home[0], home[1])))
+            checks["corridor_contains_home"] = bool(contains_home)
+            if not contains_home and not checks.get("home_within_approved"):
+                fail("HOME_CORRIDOR_INCOMPLETE",
+                     "the approved Home corridor does not contain the planning Home it exists "
+                     "to approve")
+        # The corridor must cover the APPROVED transit path it claims — the legs that are not
+        # already inside the navigable geometry are exactly the ones it is the only approval for.
+        # Planning-only legs are included: they are corridor sources, so a corridor that does not
+        # cover one was not derived from the geometry it is shipped with.
+        corridor_tol = unary_union([corridor, navigable]).buffer(COVER_TOL_M)
+        missed = []
+        for tag, s in swept:
+            if s.get("kind") not in HOME_CORRIDOR_SOURCE_KINDS:
+                continue
+            sc = [(p[0], p[1]) for p in (s.get("coordinates") or [])
+                  if isinstance(p, (list, tuple)) and len(p) >= 2]
+            if len(sc) >= 2 and not covered(proj_line(sc), corridor_tol):
+                missed.append(f"{tag} ({s.get('kind')}"
+                              + (", planning-only)" if tag.startswith("P") else ")"))
+        checks["corridor_covers_transit"] = not missed
+        if missed:
+            fail("HOME_CORRIDOR_INCOMPLETE",
+                 f"the approved Home corridor does not cover transit segment(s) {_elide(missed)} "
+                 f"— it was not derived from the transit path it is shipped with",
+                 segments=missed[:_MAX_OFFENDERS])
+        if probe is not None:
+            try:
+                inner = corridor.buffer(-COVER_TOL_M)
+            except Exception:                                 # pragma: no cover - defensive
+                inner = corridor
+            crosses = (not inner.is_empty) and inner.intersection(probe).area > _AREA_EPS_M2
+            checks["corridor_clears_no_go"] = not crosses
+            if crosses:
+                fail("HOME_CORRIDOR_NO_GO_VIOLATION",
+                     "the approved Home corridor overlaps the no-go exclusion (the drawn zones "
+                     "plus a "
+                     f"{checks['no_go_clearance_m']} m no-go clearance) — approving it would "
+                     "open a legal route through geometry the operator excluded")
+        else:
+            checks["corridor_clears_no_go"] = True
+
+    return {"ok": not failures, "failures": failures, "checks": checks}
+
+
+def mission_geometry_arguments(package):
+    """Pull `check_mission_geometry`'s inputs out of an operator-survey-plan-v1 package OR an
+    immutable mission record — the two carry the same geometry under the same names, in slightly
+    different places. One extractor so the generate, finalize and package paths validate exactly
+    the same fields.
+
+    Backward compatible by construction: a historical record without `no_go_clearance_m` reads
+    as 0.0 (the drawn zone geometry itself, which is what it was planned against), one without
+    `home_corridor` reads as None, and one without `planning_only_transit_segments` reads as []
+    — its approved transit geometry simply is its execution transit geometry. Nothing is
+    invented, and nothing is broadened."""
+    pkg = package if isinstance(package, dict) else {}
+    inputs = pkg.get("planning_inputs") if isinstance(pkg.get("planning_inputs"), dict) else {}
+    metrics = pkg.get("metrics") if isinstance(pkg.get("metrics"), dict) else {}
+
+    navigable = _first_present(pkg.get("navigable_geometry"), pkg.get("navigable_boundary"),
+                               inputs.get("navigable_boundary"))
+    zones = pkg.get("no_go_zones")
+    if zones is None:
+        zones = inputs.get("no_go_zones")
+    clearance = _first_present(inputs.get("no_go_clearance_m"), metrics.get("no_go_clearance_m"))
+    return {
+        "segments": pkg.get("segments") or [],
+        "planning_only_transit_segments": pkg.get("planning_only_transit_segments") or [],
+        "route_waypoints": pkg.get("route_waypoints") or [],
+        "navigable_geometry": navigable or [],
+        "no_go_zones": zones or [],
+        "no_go_clearance_m": float(clearance) if clearance is not None else 0.0,
+        "planning_home": inputs.get("planning_home"),
+        "home_corridor": pkg.get("home_corridor"),
+    }
+
+
+def check_package_geometry(package):
+    """`check_mission_geometry` applied to a whole package/record. Returns the same report."""
+    return check_mission_geometry(**mission_geometry_arguments(package))
 
 
 def _point_in_any_zone(pt, zones):
@@ -2146,6 +3023,7 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
 
     boundary = inp["boundary"]
     clearance = inp["shoreline_clearance_m"]
+    no_go_clearance = inp["no_go_clearance_m"]
     zones = inp["no_go_zones"]
 
     inset = _inset_polygon(boundary, clearance)
@@ -2155,14 +3033,24 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
         errors.append("The survey boundary is empty after applying the shoreline clearance.")
 
     grid = None
+    checks["no_go_clearance_m"] = no_go_clearance
     try:
-        grid = _NavGrid(boundary, clearance, zones, step_m=inp["lane_spacing_m"])
+        grid = _NavGrid(boundary, clearance, zones, step_m=inp["lane_spacing_m"],
+                        no_go_clearance=no_go_clearance)
+        checks["no_go_buffer_valid"] = bool(grid.buffer_valid)
+        if not grid.buffer_valid:
+            errors.append(f"The no-go clearance of {no_go_clearance} m could not be applied — "
+                          f"buffering the no-go zones produced invalid geometry.")
         checks["navigable_connected"] = not grid.disconnected and not grid.empty
+        if grid.empty:
+            errors.append("No navigable space remains after applying the shoreline clearance "
+                          "and the no-go exclusion (zones + no-go clearance).")
         if grid.disconnected:
             errors.append("The navigable region is not connected — survey generation "
                           "requires one connected navigable region.")
     except Exception:
         checks["navigable_connected"] = None
+        checks["no_go_buffer_valid"] = None
 
     for i, z in enumerate(zones):
         try:
@@ -2234,6 +3122,47 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
         checks["no_invisible_jumps"] = None
         checks["flatten_matches_route"] = None
 
+    # ── THE AUTHORITATIVE GEOMETRY CONTRACT ──────────────────────────────────────────────
+    # The same single proof generation and finalization run: every route leg inside
+    # navigable ∪ home_corridor, every leg outside the effective no-go exclusion, Home covered.
+    # The corridor is taken from the submitted package when it carries one and is otherwise
+    # RE-DERIVED from the submitted segments — never invented, never widened, and the raw
+    # operator boundary is never substituted for the navigable geometry.
+    #
+    # It runs BEFORE the per-segment sweep below, which it subsumes: the sweep still computes
+    # its long-standing `checks` keys, but its error text is suppressed for any fault this proof
+    # has already named, so the operator reads each geometric fault once with its code.
+    navigable_rings = _first_present(
+        raw.get("navigable_geometry") if isinstance(raw, dict) else None,
+        raw.get("navigable_boundary") if isinstance(raw, dict) else None,
+        _navigable_rings_deg(boundary, clearance))
+    #
+    # The APPROVED transit geometry is the submitted execution transit legs plus any submitted
+    # planning-only legs (`first_approach`'s Home → A1 connector). Validation re-derives the
+    # corridor from that same authoritative set — never from the execution subset alone, which
+    # would refuse a corridor the mission's own approved geometry proves.
+    corridor = raw.get("home_corridor") if isinstance(raw, dict) else None
+    raw_planning_only = raw.get("planning_only_transit_segments") if isinstance(raw, dict) else None
+    planning_only = [s for s in (raw_planning_only or []) if isinstance(s, dict)]
+    if corridor is None and (segs or planning_only) and inp["home"] is not None:
+        corridor, _ = home_corridor_ring(
+            segments=segs, planning_only_transit_segments=planning_only,
+            navigable_geometry=navigable_rings, no_go_zones=zones,
+            planning_home=inp["home"], no_go_clearance_m=no_go_clearance)
+    geometry = check_mission_geometry(
+        segments=segs, planning_only_transit_segments=planning_only,
+        route_waypoints=route, navigable_geometry=navigable_rings,
+        no_go_zones=zones, no_go_clearance_m=no_go_clearance, planning_home=inp["home"],
+        home_corridor=corridor)
+    geometry_codes = {f["code"] for f in geometry["failures"]}
+    checks["geometry_consistent"] = geometry["ok"]
+    checks["geometry_codes"] = sorted(geometry_codes)
+    checks["geometry"] = geometry["checks"]
+    for failure in geometry["failures"]:
+        errors.append(f"{failure['code']}: {failure['message']}.")
+    reported_outside = "ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY" in geometry_codes
+    reported_no_go = "ROUTE_NO_GO_VIOLATION" in geometry_codes
+
     # ── Geometry containment (per segment, against the navigable region) ─────────────────
     if grid is not None and not grid.empty and segs:
         inside_ok = True
@@ -2248,11 +3177,16 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
                 continue
             if s.get("kind") in _INSIDE_KINDS and not grid._seg_covered(lp):
                 inside_ok = False
-                errors.append(f"Segment {i + 1} ({s.get('kind')}) leaves the navigable "
-                              f"(shoreline-offset) area.")
+                if not reported_outside:
+                    errors.append(f"Segment {i + 1} ({s.get('kind')}) leaves the navigable "
+                                  f"(shoreline-offset) area.")
             if not grid._seg_clears_nogo(lp):
                 clears_ok = False
-                errors.append(f"Segment {i + 1} ({s.get('kind')}) crosses a no-go interior.")
+                if not reported_no_go:
+                    errors.append(
+                        f"Segment {i + 1} ({s.get('kind')}) crosses the no-go exclusion"
+                        + (f" (no-go clearance {no_go_clearance} m around a no-go zone)."
+                           if no_go_clearance > TOLERANCE else " (a no-go interior)."))
         checks["segments_within_navigable"] = inside_ok
         checks["coverage_within_navigable"] = all(
             grid._seg_covered(transform(grid.to_proj.transform,
@@ -2263,6 +3197,23 @@ def validate_plan(raw, max_route_waypoints=None, min_waypoints=2):
         checks["segments_within_navigable"] = None
         checks["coverage_within_navigable"] = None
         checks["route_clears_no_go"] = None
+
+    # ── Route WAYPOINTS clear the no-go exclusion ────────────────────────────────────────
+    # Checked independently of the segment sweep above, so a route submitted WITHOUT segments
+    # is still held to the operator's no-go clearance. This is the waypoint half of the
+    # guarantee; the segment sweep is the leg half — a plan must pass both.
+    if grid is not None and zones:
+        offenders = [i + 1 for i, pt in enumerate(coords) if not grid.point_clears_nogo(pt)]
+        checks["waypoints_clear_no_go"] = not offenders
+        if offenders and not reported_no_go:
+            shown = offenders[:5]
+            errors.append(
+                f"Route waypoint(s) {shown}{' …' if len(offenders) > len(shown) else ''} lie "
+                f"inside the no-go exclusion"
+                + (f" (no-go clearance {no_go_clearance} m around a no-go zone)."
+                   if no_go_clearance > TOLERANCE else " (a no-go zone)."))
+    else:
+        checks["waypoints_clear_no_go"] = None
 
     # ── Operator approach/return points appear in the executed order ─────────────────────
     def _in_route(pt):

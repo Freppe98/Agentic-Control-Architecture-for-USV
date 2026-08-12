@@ -638,6 +638,47 @@ class V1PackageBuildTests(unittest.TestCase):
         self.assertEqual(pkg["no_go_zones"], [zone])
         self.assertEqual(meta["no_go_zone_count"], 1)
 
+    # ── no-go CLEARANCE: what Scout actually receives, stated honestly ────────────────────
+    # replan-planning-package-v1 has no `no_go_clearance_m` field, and V1_FIELDS defines the
+    # package as an EXACT key set that Scout's receiver validates against. So the operator's
+    # clearance is NOT put on the wire and NOT baked into pre-buffered geometry: Scout gets the
+    # ORIGINAL rings, and the gap is reported rather than papered over.
+    def test_no_go_clearance_is_not_silently_added_to_the_wire_package(self):
+        rec = real_record()
+        zone = [[12.8109, 56.6790], [12.8110, 56.6790], [12.8110, 56.6791], [12.8109, 56.6790]]
+        rec["no_go_zones"] = [zone]
+        rec.setdefault("planning_inputs", {})["no_go_clearance_m"] = 5
+        pkg, meta = replan_package.build_v1_package(rec)
+        self.assertNotIn("no_go_clearance_m", pkg, "the v1 contract has no such field")
+        self.assertEqual(
+            tuple(k for k in pkg if k not in replan_package.V1_OPTIONAL_FIELDS),
+            replan_package.V1_FIELDS, "the wire key set is unchanged")
+        # The zones Scout receives are the operator's ORIGINAL geometry, never pre-buffered.
+        self.assertEqual(pkg["no_go_zones"], [zone])
+
+    def test_no_go_clearance_is_reported_operator_side_as_a_stated_gap(self):
+        rec = real_record()
+        rec["no_go_zones"] = [[[12.8109, 56.6790], [12.8110, 56.6790], [12.8110, 56.6791]]]
+        rec.setdefault("planning_inputs", {})["no_go_clearance_m"] = 5
+        _, meta = replan_package.build_v1_package(rec)
+        self.assertEqual(meta["no_go_clearance_m"], 5)
+        self.assertFalse(meta["no_go_clearance_in_package"])
+        self.assertTrue(any("no_go_clearance_m" in l for l in meta["limitations"]),
+                        "the missing contract field is reported, not assumed synchronized")
+
+    def test_no_clearance_planned_means_no_clearance_limitation(self):
+        # A record planned with 0 m (or from before the parameter existed) states nothing extra.
+        rec = real_record()
+        rec["no_go_zones"] = [[[12.8109, 56.6790], [12.8110, 56.6790], [12.8110, 56.6791]]]
+        rec.setdefault("planning_inputs", {})["no_go_clearance_m"] = 0
+        _, meta = replan_package.build_v1_package(rec)
+        self.assertEqual(meta["no_go_clearance_m"], 0)
+        self.assertFalse(any("no_go_clearance_m" in l for l in meta["limitations"]))
+        legacy = real_record()
+        legacy.get("planning_inputs", {}).pop("no_go_clearance_m", None)
+        _, legacy_meta = replan_package.build_v1_package(legacy)
+        self.assertIsNone(legacy_meta["no_go_clearance_m"], "absent is not 0")
+
     # ── the detailed metadata v1 exists to preserve ──────────────────────────────────────
     def test_detailed_segments_preserved_in_full(self):
         rec = real_record()
