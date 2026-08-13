@@ -129,7 +129,7 @@ Reported continuously by the Local Agent/Scout Flask on every status packet:
 `main.home_block(vid, payload, telemetry)` mirrors these fields verbatim onto the fleet
 payload's `home` block (`verified`, `verified_at`, `verification_method`,
 `verification_distance_m`, `ready_for_auto`, `ready_for_rtl`, `reason`, `home_position`,
-`reachable`, plus convenience `lat`/`lng`/`available`), with one rule layered on top:
+`reachable`, plus convenience `lat`/`lng`/`available`/`reported`), with one rule layered on top:
 `verified`/`ready_for_auto`/`ready_for_rtl`/`verified_at` are forced to
 false/false/false/null whenever the status is **stale** — either (a) the current status
 packet omitted `payload.agent.home_status` and the block fell back to the last one
@@ -138,6 +138,18 @@ uses), or (b) the vehicle itself isn't `CONNECTED`. A stale status is displayed 
 unverified, never silently trusted as still current — this is what makes a Scout/Pixhawk
 restart (which stops or resets `home_status`) immediately clear the UI's verified state
 rather than latching the last good reading.
+
+`reported` is the block's own honesty flag: `false` when Scout has never sent a
+`home_status` at all. It exists because `ready_for_auto`/`ready_for_rtl` are `false` in
+BOTH that case and a real Scout refusal, and a consumer that presents the fail-closed
+default as Scout's answer invents a refusal Scout never made. See
+[start-readiness.md](start-readiness.md) for the three readiness layers built on it.
+
+**Set Home is NOT a prerequisite for starting a mission.** Scout's Start transaction sets
+the launch position as Home and verifies it as one of its own phases, under its own guard.
+Manual Set Home remains an explicit operator tool — for diagnostics, for explicit operator
+intent, and to make RTL available before a run — but the Start button is gated on Scout's
+`start_eligible`, never on `verified`, `ready_for_auto` or `ready_for_rtl`.
 
 ## UI states
 

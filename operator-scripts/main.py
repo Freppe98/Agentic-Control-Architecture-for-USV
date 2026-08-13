@@ -514,6 +514,11 @@ def home_block(vid: int, payload: dict, telemetry: dict):
     stale = is_fallback or comms_state_by_id.get(vid, "UNKNOWN") != "CONNECTED"
     if hs is None:
         return {
+            # `reported:false` is the one thing that separates "Scout says AUTO/RTL are not
+            # available yet" from "Scout has said NOTHING about Home". Both leave the booleans
+            # below False — they are the fail-closed default — but only the first is a claim,
+            # and a consumer that presents an unreported gap as Scout's answer is inventing one.
+            "reported": False,
             "source": "scout", "available": False, "reachable": None, "home_position": None,
             "lat": None, "lng": None, "verified": False, "verified_at": None,
             "verification_method": None, "verification_distance_m": None,
@@ -525,6 +530,9 @@ def home_block(vid: int, payload: dict, telemetry: dict):
     lat = _mission_coord(home_position.get("latitude"), home_position.get("lat")) if home_position else None
     lng = _mission_coord(home_position.get("longitude"), home_position.get("lng")) if home_position else None
     return {
+        # Scout reported the block. Its contents may still be stale (see below) or say that
+        # nothing is verified yet — those are ANSWERS, and they are presented as such.
+        "reported": True,
         "source": "scout",
         "available": lat is not None and lng is not None,
         "reachable": hs.get("reachable"),

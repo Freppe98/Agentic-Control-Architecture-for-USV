@@ -69,16 +69,29 @@ export function fmtAgo(s) {
  *
  * @param v     fleet vehicle object (uses v.home, v.lat, v.lng)
  * @param opts  { phase: 'idle'|'pending'|'failed', failMessage, now (ms) }
- * @returns {{ state, available, verified, homeLat, homeLng, vehLat, vehLng,
+ * @returns {{ state, available, verified, reported, homeLat, homeLng, vehLat, vehLng,
  *             distanceM, verifiedAt, verifiedAgeS, verifiedDistanceM,
  *             verificationMethod, readyForAuto, readyForRtl, reachable, stale,
  *             reason, failMessage }}
- *   state: 'unknown' | 'unverified' | 'pending' | 'verified'
+ *   state:    'unknown' | 'unverified' | 'pending' | 'verified'
+ *   reported: whether Scout sent a home_status block at all. `readyForAuto`/`readyForRtl`
+ *             are only Scout's ANSWER when this is true; otherwise they are the fail-closed
+ *             default and mean nothing (see readinessLayers in lib/mission-readiness.js).
  */
 export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.now() } = {}) {
   const home = (v && v.home) || {};
   const available = home.available === true && home.lat != null && home.lng != null;
   const stale = home.stale === true;
+  // Did Scout report a Home status block AT ALL? The backend stamps `reported` (main.home_block);
+  // an older payload that predates the flag is inferred from the fields Scout can only have sent
+  // itself. This is what keeps "Scout has not told us anything about Home" from being presented
+  // as "Scout says AUTO and RTL are unavailable" — the booleans below are False in both cases.
+  // The three fallback inputs are deliberately ones the UNREPORTED default block cannot carry
+  // (main.home_block sets available:false, reachable:null, home_position:null there); `verified`
+  // is NOT one of them, because it is False in both cases and would make the two look alike.
+  const reported = home.reported === true
+    || (home.reported === undefined
+        && (available || home.reachable != null || home.home_position != null));
   const verified = home.verified === true; // backend already forces this false when stale
   const homeLat = available ? +home.lat : null;
   const homeLng = available ? +home.lng : null;
@@ -122,7 +135,7 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
   const recoveryState = rec && rec.state ? String(rec.state).toUpperCase() : null;
 
   return {
-    state, available, verified, stale,
+    state, available, verified, stale, reported,
     homeLat, homeLng, vehLat, vehLng,
     distanceM,
     verifiedAt: home.verified_at || null,
@@ -135,6 +148,11 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
     recoveredAfterRestart: verified && recoveryState === "RECOVERED",
     recoveryReason: rec && rec.reason ? String(rec.reason) : null,
     recoveryCheckedAt: rec && rec.checked_at != null ? rec.checked_at : null,
+    // Scout's OWN sentence, verbatim and regardless of verification state. `reason` above is the
+    // operator-facing explanation for an UNVERIFIED Home and is deliberately null once Home is
+    // verified; this one survives, because a verified Home that Scout still refuses AUTO or RTL
+    // for is exactly the case where Scout's sentence is the only evidence there is.
+    scoutReason: home.reason ? String(home.reason) : null,
     readyForAuto: home.ready_for_auto === true,
     readyForRtl: home.ready_for_rtl === true,
     reachable: home.reachable == null ? null : !!home.reachable,

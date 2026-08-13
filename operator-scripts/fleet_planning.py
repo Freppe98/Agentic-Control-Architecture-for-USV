@@ -22,11 +22,12 @@ routes reduce risk but do not eliminate it. The UI states this; nothing here cla
 REUSE
 -----
 Coverage geometry, the navigable model and every safe connector come from planning.py: _NavGrid
-(navigable region + bounded A* connectors), the ported boustrophedon scan math, _flatten_segments,
+(navigable region + bounded A* connectors), _SurveyFrame + _lane_fragments (the shared survey-frame
+lane clipper), _aligned_transition (the shared survey-frame connector), _flatten_segments,
 _route_waypoints, _route_hash, _path_length_m and the shared UTM projection. The ONE piece this
-module adds at the geometry level is per-survey-LINE extraction (planning.py returns a single
-stitched coverage path; fleet allocation needs individually addressable lines), kept faithful to
-the same projection/rotation/clip the ported generator uses.
+module adds at the geometry level is per-survey-LINE addressing (planning.py returns a single
+stitched coverage path; fleet allocation needs individually addressable lines with stable ids) —
+the lane geometry and the no-go routing rule are the single-vehicle planner's, not a second copy.
 
 COORDINATE CONVENTION — identical to planning.py: geometry crosses this boundary as GeoJSON
 [longitude, latitude]; child route waypoints are {latitude, longitude, loiter_time_s}. All metres
@@ -44,9 +45,8 @@ from planning import (PLANNING_AVAILABLE, PlanningUnavailable, ConnectorError,
                       DisconnectedNavigableError, DEFAULT_PLANNING_SPEED_MPS, TOLERANCE)
 
 if PLANNING_AVAILABLE:  # same guarded geometry stack planning.py uses
-    from shapely.geometry import Polygon, LineString, MultiLineString, Point
-    from shapely.ops import unary_union, transform
-    from shapely.affinity import rotate
+    from shapely.geometry import LineString
+    from shapely.ops import transform
 
 FLEET_PLAN_VERSION = "operator-fleet-plan-v1"
 ALLOCATION_METHOD = "contiguous_survey_lines"
@@ -210,71 +210,40 @@ def _survey_lines(grid, boundary, spacing, angle_deg, clearance, zones, pass_kin
     """Extract the individual, separately-addressable survey lines of ONE coverage pass, in
     contiguous sweep order, each with a stable id and projected geometry.
 
-    Faithful to the ported boustrophedon geometry (same UTM projection, same shoreline inset,
-    same scan-line clip, same no-go subtraction) — but it returns the lines SEPARATELY instead
-    of stitching them into one path, because fleet allocation assigns COMPLETE lines to vehicles
-    (never arbitrary waypoint chunks). A no-go zone that splits a nominal row into several
-    segments yields several lines (…-a, …-b), each a first-class allocatable unit."""
-    to_proj, to_deg = grid.to_proj, grid.to_deg
-    poly_deg = Polygon([(c[0], c[1]) for c in boundary])
-    if not poly_deg.is_valid:
-        poly_deg = poly_deg.buffer(0)
-    main = transform(to_proj.transform, poly_deg)
-    if clearance and clearance > TOLERANCE:
-        main = main.buffer(-abs(clearance), join_style=2)
-    if grid.nogo is not None and not main.is_empty:
-        main = main.difference(grid.nogo)
-    if main.is_empty:
+    The lane geometry is NOT re-derived here: it comes from planning._lane_fragments, the SAME
+    shared survey-frame lane clipper the single-vehicle planner uses. A child mission therefore
+    gets the identical lanes, at the identical spacing, clipped against the identical buffered
+    no-go exclusion, subject to the identical minimum-useful-fragment rule — a fleet mission can
+    never route around a no-go zone by a different rule from a single-vehicle one.
+
+    What this function still owns is fleet-specific: the lines are returned SEPARATELY instead of
+    stitched into one path (fleet allocation assigns COMPLETE lines to vehicles, never arbitrary
+    waypoint chunks) with a stable id each. A no-go zone that splits a nominal row into several
+    fragments yields several lines (…-a, …-b), each a first-class allocatable unit."""
+    frame = planning._SurveyFrame(grid, angle_deg)
+    fragments, _skipped = planning._lane_fragments(frame, spacing)
+    if not fragments:
         return []
 
-    centroid = main.centroid
-    math_angle = (90.0 - angle_deg) % 360.0
-    rot = rotate(main, -math_angle, origin=centroid)
-    minx, miny, maxx, maxy = rot.bounds
-    width = maxx - minx
-    sep = abs(spacing) if spacing > 1e-6 else 0.1
-    ys = _linspace(miny + sep / 2, maxy - sep / 2, max(1, int((maxy - miny) / sep)))
+    # Rows are re-indexed over the lanes that actually produced coverage, so a line id stays a
+    # dense 1-based sweep rank (a nominal lane offset that falls outside the region has no line).
+    dense_row = {row: i for i, row in enumerate(sorted({f["row"] for f in fragments}))}
+    per_row_total = {}
+    for f in fragments:
+        per_row_total[f["row"]] = per_row_total.get(f["row"], 0) + 1
 
-    raw_lines = []  # (sweep_y, [ [x,y] proj-rot coords ])
-    for y in ys:
-        scan = LineString([(minx - width * 1.1, y), (maxx + width * 1.1, y)])
-        clipped = rot.buffer(0).intersection(scan)
-        segs = []
-        if isinstance(clipped, LineString) and clipped.length > TOLERANCE:
-            segs = [clipped]
-        elif isinstance(clipped, MultiLineString):
-            segs = [s for s in clipped.geoms if s.length > TOLERANCE]
-        segs.sort(key=lambda s: s.coords[0][0])  # left→right within the row
-        for s in segs:
-            raw_lines.append((y, list(s.coords)))
-
-    # Rotate each line back to true UTM, then to degrees; assign stable ids in sweep order.
     lines = []
-    # unrotate helper
-    def unrot(pts):
-        ls = rotate(LineString(pts), math_angle, origin=centroid)
-        return list(ls.coords)
-
-    # Group by sweep row so split segments in one row share a row index with -a/-b suffixes.
-    row_index = -1
-    last_y = None
-    per_row_seq = 0
-    for y, rot_coords in raw_lines:
-        if last_y is None or abs(y - last_y) > TOLERANCE:
-            row_index += 1
-            per_row_seq = 0
-            last_y = y
-        else:
-            per_row_seq += 1
-        proj_coords = unrot(rot_coords)
-        deg_ls = transform(to_deg.transform, LineString(proj_coords))
-        coords_deg = [[round(x, 7), round(yy, 7)] for x, yy in deg_ls.coords]
-        suffix = "" if per_row_seq == 0 and not _row_is_split(raw_lines, y) else "-" + chr(ord("a") + per_row_seq)
-        line_id = f"{pass_kind}-line-{row_index + 1:04d}{suffix}"
+    for f in fragments:
+        proj_coords = [frame.rot_to_proj(p) for p in f["rot"]]
+        coords_deg = [[round(c[0], 7), round(c[1], 7)]
+                      for c in (frame.rot_to_deg(p) for p in f["rot"])]
+        row_index = dense_row[f["row"]]
+        split = per_row_total[f["row"]] > 1
+        suffix = "" if not split else "-" + chr(ord("a") + f["along_index"])
         cx = sum(p[0] for p in proj_coords) / len(proj_coords)
         cy = sum(p[1] for p in proj_coords) / len(proj_coords)
         lines.append({
-            "id": line_id,
+            "id": f"{pass_kind}-line-{row_index + 1:04d}{suffix}",
             "pass_kind": pass_kind,
             "row": row_index,
             "coords_deg": coords_deg,
@@ -287,17 +256,6 @@ def _survey_lines(grid, boundary, spacing, angle_deg, clearance, zones, pass_kin
             "centroid_proj": (cx, cy),
         })
     return lines
-
-
-def _row_is_split(raw_lines, y):
-    return sum(1 for (yy, _) in raw_lines if abs(yy - y) <= TOLERANCE) > 1
-
-
-def _linspace(a, b, n):
-    if n <= 1:
-        return [(a + b) / 2]
-    step = (b - a) / (n - 1)
-    return [a + step * i for i in range(n)]
 
 
 def _proj_len(coords):
@@ -489,9 +447,15 @@ def _order_from_home(lines, home_proj):
     return list(reversed(lines)) if reverse else list(lines)
 
 
-def _coverage_coords(lines, home_proj):
+def _coverage_coords(lines, home_proj, frame=None):
     """Alternating boustrophedon coverage coords (deg) through ordered lines, each line entered
-    at the endpoint nearest the running cursor — the standard lawnmower sweep."""
+    at the endpoint nearest the running cursor — the standard lawnmower sweep.
+
+    When a survey `frame` is supplied, the hop between two consecutive lines is built by the SHARED
+    planning._aligned_transition instead of a bare straight jump: survey-frame-aligned where safe,
+    orthogonal in the survey frame otherwise, and only then the generic safe connector. This is the
+    same helper (and the same priority order and the same safety predicate) the single-vehicle
+    planner uses, so a child mission's no-go routing rule is not a second rule."""
     ordered = _order_from_home(lines, home_proj)
     coords = []
     cursor = None
@@ -509,9 +473,22 @@ def _coverage_coords(lines, home_proj):
                 seq = ln["coords_deg"]
             else:
                 seq = list(reversed(ln["coords_deg"]))
+        if coords and frame is not None and not planning._close(coords[-1], seq[0]):
+            path, _category = planning._aligned_transition(
+                frame, coords[-1], seq[0],
+                in_dir=_rot_dir(frame, coords[-2:]), out_dir=_rot_dir(frame, seq[:2]))
+            coords.extend(path[1:-1])   # seq[0] is appended with the line itself
         coords.extend(seq)
         cursor = coords[-1]
     return planning._dedup(coords)
+
+
+def _rot_dir(frame, two_deg_pts):
+    """Unit heading of a two-point degree leg in the survey frame's rotated coordinates — the
+    frame _aligned_transition ranks bend orders in. None when the leg is degenerate."""
+    if len(two_deg_pts) < 2:
+        return None
+    return planning._unit(frame.deg_to_rot(two_deg_pts[0]), frame.deg_to_rot(two_deg_pts[1]))
 
 
 def _deg_dist(a, b):
@@ -526,14 +503,20 @@ def _build_child_mission(grid, vehicle, prim_lines, sec_lines, shared, navigable
     home_proj = vehicle["_home_proj"]
     warnings = []
 
+    # Each pass gets its OWN survey frame from its OWN angle, so the secondary pass's transitions
+    # are orthogonal in the secondary frame — no first-pass orientation leaks into the second.
+    prim_frame = planning._SurveyFrame(grid, shared["primary_angle_deg"])
     prim_ordered = _order_lines_by_sweep(list(prim_lines))
-    primary_cov = _coverage_coords(prim_ordered, home_proj)
+    primary_cov = _coverage_coords(prim_ordered, home_proj, frame=prim_frame)
     primary_cov = grid.repair_path(primary_cov)
 
     secondary_cov = None
     if sec_lines:
+        sec_frame = planning._SurveyFrame(
+            grid, shared.get("secondary_angle_deg") or shared["primary_angle_deg"])
         sec_ordered = _order_lines_by_sweep(list(sec_lines))
-        secondary_cov = grid.repair_path(_coverage_coords(sec_ordered, home_proj))
+        secondary_cov = grid.repair_path(
+            _coverage_coords(sec_ordered, home_proj, frame=sec_frame))
 
     survey_entry = primary_cov[0]
     coverage_end = (secondary_cov[-1] if secondary_cov else primary_cov[-1])

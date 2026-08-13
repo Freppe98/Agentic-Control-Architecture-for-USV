@@ -251,6 +251,32 @@ class TestHomeBlockScoutOwnedTruth(SetHomeTestBase):
         self.assertFalse(block["stale"])  # "never reported" is distinct from "stale"
         self.assertIn("does not report Home status", block["reason"])
 
+    def test_reported_flag_separates_scout_silence_from_scout_saying_no(self):
+        """`ready_for_auto` / `ready_for_rtl` are False in BOTH the unreported default and a
+        real Scout refusal. `reported` is the only thing that tells the two apart, and the
+        readiness display needs it: presenting a fail-closed default as Scout's answer would
+        invent a refusal Scout never made (see operator/lib/mission-readiness.readinessLayers)."""
+        silence = main.home_block(SCOUT_VID, {}, {})
+        self.assertFalse(silence["reported"])
+        self.assertFalse(silence["ready_for_auto"])
+        self.assertFalse(silence["ready_for_rtl"])
+
+        # Scout DID report — and its answer happens to be "not yet", which is the normal
+        # pre-Start state of every healthy mission: Start is what sets and verifies Home.
+        payload = {"agent": {"home_status": {
+            "verified": False, "reachable": True,
+            "home_position": {"latitude": 56.65, "longitude": 12.87},
+            "ready_for_auto": False, "ready_for_rtl": False,
+            "reason": "Home has not been verified this runtime -- perform Set Home Here "
+                      "before AUTO/RTL/RESUME.",
+        }}}
+        answered = main.home_block(SCOUT_VID, payload, {})
+        self.assertTrue(answered["reported"])
+        self.assertFalse(answered["verified"])
+        self.assertFalse(answered["ready_for_auto"])
+        self.assertFalse(answered["ready_for_rtl"])
+        self.assertIn("has not been verified this runtime", answered["reason"])
+
     def test_verified_true_from_scout_is_reflected_verbatim(self):
         payload = {"agent": {"home_status": {
             "verified": True, "verified_at": "2026-07-15T10:00:00+00:00",

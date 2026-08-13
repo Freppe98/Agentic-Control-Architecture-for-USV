@@ -1568,12 +1568,28 @@ export function Map(root) {
     // the operation the operator actually pressed.
     const stopResult = res && res.action === "stop" && res.view.outcome !== "pending"
       ? res.view : null;
+    // SCOUT'S OWN HOME STATUS, read ONCE, from the fleet payload's continuously-reported
+    // agent.home_status (lib/home.js). It feeds the three DISPLAY layers below — Home, AUTO
+    // readiness, RTL readiness — and nothing else. It is deliberately NOT an input to `gate`
+    // above: the Start transaction is what sets and verifies Home, so an unverified Home, a
+    // `ready_for_auto:false` and a `ready_for_rtl:false` are pending steps before Start, never
+    // reasons to withhold the button that performs them.
+    const hs = homeStatus(v);
     const card = mx.missionCardView(S, {
       busy: mission.busy, startBlocked: !gate.canStart, startBlockedReason: gate.reason,
       readiness: rv, starting, stopping, stopResult, preflight: pf,
       // Home comes from Scout's own continuously-reported home_status (lib/home.js), which is a
       // better source than the mission-execution status' verified_home block.
-      homeVerified: homeStatus(v).verified,
+      homeVerified: hs.verified,
+      homeState: hs.state, homeReported: hs.reported, homeStale: hs.stale,
+      // hs.reason is the operator-facing explanation for an UNVERIFIED Home and is null once
+      // Home is verified; hs.scoutReason is Scout's own sentence either way, and it is the only
+      // evidence there is for a VERIFIED Home that Scout still refuses AUTO or RTL for.
+      homeReason: hs.reason || hs.scoutReason,
+      // Tri-state: when Scout has reported no Home block at all its `false` defaults are not its
+      // answer, and presenting them as one would invent a refusal Scout never made.
+      readyForAuto: hs.reported ? hs.readyForAuto : null,
+      readyForRtl: hs.reported ? hs.readyForRtl : null,
       missionId: mission.preflight && mission.preflight.mission_id,
       unavailableDetail: "Mission lifecycle status could not be read from the Scout Local " +
         "Agent. Nothing about the mission is assumed — no lifecycle action is offered.",
@@ -1661,6 +1677,23 @@ export function Map(root) {
     // it as one of its own phases.
     const home = card.home
       ? `<div class="amx-note${card.home.tone === "warn" ? " warn" : ""}" title="${escAttr(card.home.title || "")}">${esc(card.home.text)}</div>`
+      : "";
+
+    // THE THREE READINESS LAYERS, as three rows: Home, AUTO readiness, RTL readiness.
+    //
+    // They exist because one merged verdict is what produced the defect this card was rebuilt
+    // around: an unverified Home turned into "Agent NOT_READY", "RTL Home unavailable" and a
+    // DISABLED Start button — beside a line promising Home would be set during Start. Three of
+    // those four statements were about a step Start itself performs, under Scout's own guard.
+    //
+    // Split out, each says only what it is. `Home: Not verified` + `AUTO readiness: Waiting for
+    // Start Home setup` + `RTL readiness: Waiting for verified Home` beside an ENABLED Start
+    // Mission is the correct, complete reading of a healthy mission on the slipway. None of the
+    // three is a blocker and none of them can disable anything: they come from Scout's
+    // home_status, and the Start button comes from `gate`, which never sees them.
+    const layers = card.readinessLayers
+      ? `<div class="amx-grid">${card.readinessLayers.rows.map((r) =>
+          `<div class="amx-row"><span class="k">${esc(r.label)}</span><span class="v${r.tone ? " " + esc(r.tone) : ""}" title="${escAttr(r.title || "")}">${esc(r.text)}</span></div>`).join("")}</div>`
       : "";
 
     // A FINISHED run says so in its own line: "Final LOITER verified" beside the COMPLETED chip,
@@ -1803,7 +1836,10 @@ export function Map(root) {
          </div>`
         : "";
 
-    return `<div class="amx">${head}${rows}${live}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${fullRefreshNote}${info}${resultNote}</div>`;
+    // The three readiness layers sit directly under the identity rows and ABOVE the buttons, so
+    // the operator reads "which readiness is missing" before reaching the control, rather than
+    // inferring it from a blocker line that no longer exists for Home.
+    return `<div class="amx">${head}${rows}${layers}${live}${progress}${buttons}${stopOut}${conflict}${blocker}${completion}${authorityNote}${home}${battery}${pkgLine}${fullRefreshNote}${info}${resultNote}</div>`;
   }
 
   // Per-action hover copy for an ENABLED lifecycle button. Each says what the ONE operation

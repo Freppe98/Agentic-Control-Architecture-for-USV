@@ -26,6 +26,10 @@ import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "
 import * as replan from "../lib/replan.js";
 import { readinessLabel, READINESS_STATE } from "../lib/mission-publish.js";
 import * as mx from "../lib/mission-execution.js";
+// The SAME two pure derivations the Map's Agent Mission card uses for Home / AUTO / RTL
+// readiness, so the diagnostic surface and the operational one cannot word them differently.
+import { homeStatus } from "../lib/home.js";
+import { readinessLayers } from "../lib/mission-readiness.js";
 import * as ev from "../lib/evidence.js";
 import { asText, esc, escAttr } from "../lib/format.js";
 
@@ -476,7 +480,7 @@ export function Agent(root) {
       return head + gapBody("Scout mission-execution status is unavailable — the Local Agent did not answer. Nothing about the lifecycle can be shown; no action is offered.");
     }
     return head +
-      `<div class="subgrid two">${mxControlCard(S, res, ops, RS)}${mxHomeCard(S, ops)}</div>
+      `<div class="subgrid two">${mxControlCard(S, res, ops, RS)}${mxHomeCard(S, ops, v)}</div>
        <div class="subgrid two">${mxSequenceCard(S)}${mxReturnCard(S)}</div>
        ${mxStopCard(S, ops)}
        ${mxOperationsCard(ops)}`;
@@ -942,7 +946,13 @@ export function Agent(root) {
   }
 
   // --- Home: what Start does to it, and what Scout verified ---------------------------------
-  function mxHomeCard(S, ops) {
+  //
+  // THREE LAYERS, NOT ONE. `verified`, `ready_for_auto` and `ready_for_rtl` answer three
+  // different questions, and none of them answers the Start question — that is `start_eligible`,
+  // shown in the Mission lifecycle card beside it. This card previously rendered a single red
+  // NOT VERIFIED verdict for a mission whose Home simply had not been set YET, which is the
+  // normal pre-Start state of every healthy mission: Start sets and verifies Home itself.
+  function mxHomeCard(S, ops, v) {
     // The requested launch Home comes from the most recent operation that carried a home_result;
     // it is Scout's report of what it asked for, never an operator-side Home decision.
     const lastHome = ops.slice().reverse().map((o) => o.home_result).find((h) => h && typeof h === "object") || null;
@@ -952,10 +962,38 @@ export function Agent(root) {
       : (lastHome && typeof lastHome.verification_distance_m === "number" ? lastHome.verification_distance_m : null);
     const verified = lastHome ? lastHome.verified : (S.home.verified ? true : null);
     const rp2 = S.returnCompletion;
+    // Scout's continuously-reported home_status for THIS vehicle, through the same pure
+    // derivation the Map's Agent Mission card uses, so the two surfaces cannot word the same
+    // three facts differently.
+    const hs = homeStatus(v);
+    const layers = readinessLayers({
+      homeState: hs.state, homeReported: hs.reported, homeStale: hs.stale,
+      readyForAuto: hs.reported ? hs.readyForAuto : null,
+      readyForRtl: hs.reported ? hs.readyForRtl : null,
+      // Scout's own sentence survives verification (see homeStatus.scoutReason) — it is the only
+      // evidence for a verified Home that Scout still will not accept AUTO or RTL against.
+      homeReason: hs.reason || hs.scoutReason,
+      homeRequiredBeforeStart: S.home.requiredBeforeStart === true,
+    });
+    // A neutral tone (null) is the PENDING pre-Start step and must not be tinted like a fault:
+    // "u" is this page's muted/unknown tint, and "d" is reserved for Scout actually refusing
+    // something it should be able to do.
+    const layerTint = { ok: "c", warn: "d", idle: "u" };
+    const layerRows = layers.rows.map((l) =>
+      row(l.label, `<span title="${escAttr(l.title || "")}">${rp(l.text, layerTint[l.tone] || "u")}</span>`)).join("");
+    // The card's own verdict follows the HOME LAYER, which is neutral before Start. A Home that
+    // has simply not been set yet is not a "caution" — Start sets it — so the caution tone is
+    // reserved for the one case that is one: a Scout that declares it needs a verified Home
+    // BEFORE the transaction, or a verified Home that Scout still refuses to act on.
+    const homeCaution = layers.home.tone === "warn" || layers.auto.tone === "warn"
+      || layers.rtl.tone === "warn";
     return card("Home (set and verified by Scout)",
-      verified === true ? rp("VERIFIED", "c") : verified === false ? rp("NOT VERIFIED", "d") : rp("not reported", "u"),
-      verified === true ? "ok" : verified === false ? "caution" : "idle",
+      verified === true ? rp("VERIFIED", "c")
+        : homeCaution ? rp("NOT VERIFIED", "d")
+        : verified === false ? rp("NOT VERIFIED YET", "u") : rp("not reported", "u"),
+      verified === true ? "ok" : homeCaution ? "caution" : "idle",
       `<div class="metrics">
+         ${layerRows}
          ${row("Requested launch Home", coord(req))}
          ${row("Verified Home", coord(ver))}
          ${row("Verification distance", dist == null ? `<span class="txt-u">—</span>` : dist.toFixed(2) + " m")}
@@ -964,7 +1002,8 @@ export function Agent(root) {
          ${row("Distance to Home (return)", rp2.distanceToHomeM == null ? `<span class="txt-u">—</span>` : rp2.distanceToHomeM.toFixed(1) + " m")}
          ${row("Home error", asText(lastHome && lastHome.error) ? `<span class="txt-d">${esc(lastHome.error)}</span>` : `<span class="txt-u">—</span>`)}
        </div>
-       <div class="reason-note">${warnSvg}<span><b>Start Mission resets Home to the vehicle's current launch position.</b> Scout sets it, reads it back, verifies it and synchronizes the planning package to it. The Home in the original plan is not retained.</span></div>`, false);
+       <div class="reason-note">${warnSvg}<span><b>Start Mission resets Home to the vehicle's current launch position.</b> Scout sets it, reads it back, verifies it and synchronizes the planning package to it. The Home in the original plan is not retained.</span></div>
+       <div class="reason-note">${gapSvg}<span><b>These three are not the Start question.</b> Whether the guarded Start transaction may be entered is Scout's <span class="mono">start_eligible</span> (Mission lifecycle card); <span class="mono">ready_for_auto</span> and <span class="mono">ready_for_rtl</span> answer whether Scout would accept an AUTO or RTL command <i>this instant</i>. Before Start both are normally false, because Home has not been set yet — and setting it is a phase of Start, not a prerequisite for pressing it.</span></div>`, false);
   }
 
   // --- Pause/resume sequence evidence, including the continuation warning --------------------

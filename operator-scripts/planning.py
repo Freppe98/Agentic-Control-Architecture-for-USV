@@ -18,6 +18,23 @@ written coverage algorithm would drift from the one the fleet was validated agai
 module keeps the two ported functions faithful and adds ONLY an operator-side orchestration
 layer (segmentation, metrics, validation) on top.
 
+ONE DELIBERATE DEPARTURE — HOW A NO-GO ZONE IS ROUTED AROUND
+-----------------------------------------------------------
+The ported generator's OBSTACLE handling bridges a lane that an obstacle cut in two by walking
+ALONG THE OBSTACLE BOUNDARY. With the operator's no-go clearance applied, the obstacle it is
+handed is the ROUND buffered exclusion, so those bridges came out as chains of ~1 m chords
+tracing a buffer arc — safe, but a rounded, constantly-turning "coverage" leg with no stable
+sonar heading. Side-scan sonar wants the opposite: long straight legs on one heading.
+
+Coverage generation therefore runs through _survey_frame_coverage (see the SURVEY-FRAME COVERAGE
+GENERATION banner) instead: the SAME lane family at the SAME spacing and sweep order, but each
+lane is CLIPPED against the approved region into straight survey-angle-parallel fragments, and
+fragments are joined with survey-frame-orthogonal transitions. run_lawnmower_with_obstacles and
+its obstacle-bridging helpers are retained below as the ported reference geometry (and are what
+the no-obstacle lane family is still faithful to), but they no longer produce the mission route.
+The safety geometry is IDENTICAL either way — same shoreline inset, same buffered no-go
+exclusion, same _NavGrid.segment_is_safe on every leg.
+
 DEPENDENCIES / GRACEFUL DEGRADATION
 -----------------------------------
 Generation needs shapely + pyproj + numpy (geometry, UTM projection, scan-line math). The
@@ -769,6 +786,33 @@ CONNECTOR_EPS_M = 1.0
 # the shared endpoint between adjacent segments so the flat route carries no duplicate.
 JOIN_TOL_DEG = 1e-7
 
+# ── WIRE PRECISION: why coverage is not built flush against the navigable edge ────────────
+# Route waypoints AND geometry rings both go on the wire rounded to 7 decimal places
+# (mission_contract.route_content_hash, _route_waypoints, the `[[lng, lat], ...]` ring
+# emitters). At Nordic latitudes 1e-7° is ~1.11 cm of latitude and ~0.61 cm of longitude, so
+# ONE rounding can displace a point by up to ~0.64 cm — and the route and the polygon are
+# rounded INDEPENDENTLY, so the two can move ~1.3 cm relative to each other.
+#
+# That matters because `_coverage_fragments` clips each lane against the navigable polygon
+# itself: a lane's endpoints land EXACTLY on the navigable boundary, and the cross-lane
+# transition joining two such endpoints therefore runs ALONG that boundary. Serialize it and
+# the leg lands a few millimetres OUTSIDE the polygon it was clipped from. COVER_TOL_M hides
+# that from the operator; Scout, which must prove every approved leg is retraceable and does
+# so with exact containment, rejects the package with ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY.
+#
+# WIRE_MARGIN_M is the margin coverage geometry is built INSIDE the navigable region so it
+# survives that round trip. It is deliberately an order of magnitude below any clearance an
+# operator can configure (a 1 m shoreline clearance is 20x this), and it only ever moves
+# coverage FURTHER from the shore and the exclusion — it can never open a violation. It is a
+# representation margin, not a safety tolerance: the safety regions themselves are untouched.
+WIRE_MARGIN_M = 0.05
+# How far coverage LANES are clipped inside the approved region — one wire margin further in
+# than WIRE_MARGIN_M, so a lane end is STRICTLY interior to the region every transition leaving
+# it is proven against (a leg collinear with the region edge cannot be certified: a collinear
+# line's `difference` is the whole line, not an empty set). The measurable cost is this much
+# trimmed off each end of each coverage fragment, ~0.1% of the surveyed line length.
+COVERAGE_EDGE_INSET_M = 2.0 * WIRE_MARGIN_M
+
 # Route-cleanup tunables (projected metres / degrees). Deliberately conservative: a point the
 # cleanup drops lies — within these bounds — on the straight leg the Pixhawk already flies
 # between its two kept neighbours, so removing it cannot move the executed corridor. This is
@@ -783,11 +827,50 @@ CLEANUP_COLLINEAR_DEG = 2.0    # a middle point whose turn is under this is redu
 BACKTRACK_ANGLE_DEG = 160.0
 BACKTRACK_RETURN_M = 3.0
 
+# ── SURVEY FRAME (sonar coverage quality) ────────────────────────────────────────────────
+# The SURVEY FRAME is the two axes of the operator's chosen survey angle:
+#     U  parallel to survey_angle       — the sonar lane direction
+#     V  perpendicular to survey_angle  — the cross-lane (lane-spacing) direction
+# "Orthogonal" anywhere in this module means orthogonal IN THAT FRAME. It never means
+# geographic north/east: at survey_angle 42° the coverage legs are ≈42° and the cross-lane
+# transitions ≈132°, and nothing is snapped to the projection's grid axes.
+#
+# A generated leg counts as survey-aligned when its projected bearing sits within this tolerance
+# of U or V, modulo the 180° direction reversal (a lane flown either way is the same axis). Used
+# for the diagnostics and for deciding whether a DIRECT transition is already aligned — never as
+# a substitute for the geometric safety checks, which are unchanged.
+SURVEY_ALIGN_TOL_DEG = 5.0
+# Legs shorter than this carry no meaningful heading (a sub-metre stitch leg is not an
+# "arbitrary-angle coverage leg"), so the alignment classifier ignores them. Tied to the existing
+# cleanup spacing rather than invented.
+ALIGN_MIN_LEG_M = CLEANUP_MIN_SPACING_M
+# MINIMUM USEFUL COVERAGE FRAGMENT. A buffered no-go exclusion clipping a nominal lane can leave
+# a 1–2 m sliver at a corner: two extra turns for a fragment that carries almost no sonar swath.
+# The threshold is derived from EXISTING semantics, not invented — a quarter of the operator's
+# own lane spacing, and never below the cleanup's near-duplicate spacing:
+#     min_useful = max(CLEANUP_MIN_SPACING_M, 0.25 · lane_spacing_m)
+# The unexamined water a dropped fragment can leave is therefore under a quarter of one lane
+# cell, and every drop is COUNTED and REPORTED (route_quality.skipped_short_fragment_count /
+# _length_m, plus a generation warning) rather than silently swallowed.
+MIN_FRAGMENT_LANE_FRACTION = 0.25
+# How far OUTSIDE a no-go exclusion's survey-frame extent a bypass staircase is offset. It only
+# has to beat the containment/no-go tolerances — the candidate is still proven geometrically.
+BYPASS_MARGIN_M = max(2.0 * COVER_TOL_M, 1.0)
+# Bounded candidate generation (the planner stays lightweight and deterministic — no visibility
+# graph, no general search): at most this many exclusion bodies contribute bypass candidates to
+# one transition, nearest first.
+MAX_BYPASS_BODIES = 2
+
 # Provenance for the finalized package (PART 11): names the exact, reproducible algorithm at
 # each pipeline stage so the thesis run is explainable. Not a version the upload contract reads.
 GENERATION_ALGORITHM = {
-    "coverage": "ported-scout-boustrophedon-v1",
+    # The ported boustrophedon lane family (count, spacing, sweep order, angle), clipped to the
+    # approved region in the SURVEY FRAME so an exclusion removes lane length instead of bending
+    # the lane around itself. See the SURVEY-FRAME COVERAGE GENERATION banner.
+    "coverage": "survey-frame-boustrophedon-v1",
+    "coverage_lane_family": "ported-scout-boustrophedon-v1",
     "fragment_ordering": "row-aware-projection-v1",
+    "coverage_transitions": "survey-frame-orthogonal-v1",
     "safe_connector": "bounded-grid-a-star-v1",
     "connector_simplification": "safe-line-of-sight-v1",
     "cleanup": "semantic-path-cleanup-v1",
@@ -907,6 +990,31 @@ class _NavGrid:
             nav = nav.difference(self.nogo)
         self.navigable = nav
 
+        # THE REGION GENERATION BUILDS IN. `navigable` is the approved region and is what the
+        # mission ships and what validation proves against; `buildable` is that same region
+        # pulled in by WIRE_MARGIN_M, and it is what every `require_inside=True` decision here
+        # is made against. The two are separated because geometry built FLUSH against the
+        # approved edge does not survive the 7-decimal wire round trip — see WIRE_MARGIN_M.
+        # This only ever makes generation more conservative: `buildable ⊂ navigable`, so a leg
+        # this grid calls safe is inside the approved region with room to spare, and no
+        # clearance the operator configured is reinterpreted.
+        buildable = nav
+        if not nav.is_empty:
+            shrunk = nav.buffer(-WIRE_MARGIN_M)
+            if not shrunk.is_empty:
+                buildable = shrunk
+        self.buildable = buildable
+
+        # WHERE COVERAGE LANES ARE CLIPPED — see COVERAGE_EDGE_INSET_M. Strictly inside
+        # `buildable`, so the survey-frame transition joining two lane ends is certifiable and
+        # stays aligned instead of losing to the generic A* fallback.
+        coverage = buildable
+        if not nav.is_empty:
+            shrunk = nav.buffer(-COVERAGE_EDGE_INSET_M)
+            if not shrunk.is_empty:
+                coverage = shrunk
+        self.coverage = coverage
+
         # Connected components with real area (a sliver from a buffer artefact is ignored).
         if isinstance(nav, MultiPolygon):
             comps = [g for g in nav.geoms if g.area > 1.0]
@@ -982,9 +1090,12 @@ class _NavGrid:
                 "A safe connector could not be computed at the required resolution — the "
                 "navigable area is too large for the chosen lane spacing. Increase the lane "
                 "spacing or reduce the survey area.")
-        # A cell is free (0) when its centre is inside the navigable region (already excludes
-        # no-go and shore). A small buffer keeps cells exactly on the clipped inset edge free.
-        nav = self.navigable.buffer(COVER_TOL_M)
+        # A cell is free (0) when its centre is inside the region generation may build in
+        # (already excludes no-go and shore). This is `buildable`, NOT `navigable.buffer(+tol)`:
+        # a free cell whose centre sat half a metre outside the approved region put raw A*
+        # vertices there, and LOS compression keeps a vertex it cannot shortcut past — which is
+        # how a connector came to hold a point 30 cm outside the geometry it ships with.
+        nav = self.buildable
         grid = []
         for r in range(rows):
             y = miny + r * step
@@ -994,9 +1105,16 @@ class _NavGrid:
         self._bounds = (minx, miny, maxx, maxy, cols, rows)
 
     def _seg_covered(self, line_proj):
-        """True when a projected segment stays inside the navigable region (within tol)."""
-        outside = line_proj.difference(self.navigable.buffer(COVER_TOL_M))
-        return outside.is_empty or outside.length < CONNECTOR_EPS_M
+        """True when a projected segment stays inside the region generation may build in.
+
+        Held to `buildable` (navigable pulled in by WIRE_MARGIN_M) with NO length slack. The
+        old `navigable.buffer(+COVER_TOL_M)` with a CONNECTOR_EPS_M slack accepted a leg up to
+        half a metre outside the approved region and up to a metre of it outside altogether;
+        the operator never saw it, and Scout — which proves containment exactly — rejected the
+        finished package. A candidate this rejects is not repaired here: it simply loses to the
+        next candidate, or falls through to the A* connector, or fails closed."""
+        outside = line_proj.difference(self.buildable)
+        return outside.is_empty or outside.length < TOLERANCE
 
     def _seg_clears_nogo(self, line_proj):
         """True when a projected SEGMENT clears the buffered no-go exclusion (`self.nogo`,
@@ -1420,62 +1538,14 @@ def _turn_angle_deg(a, b, c):
     return math.degrees(math.acos(cos))
 
 
-def _lane_runs_proj(proj_pts, reversal_deg=135.0):
-    """Split a projected coverage polyline into monotone lane runs at sweep reversals (a turn
-    ≥ reversal_deg is a lane U-turn / fragment boundary). Returns a list of (start, end) index
-    pairs — the coverage-fragment decomposition used for the fragment-count / reorder metrics."""
-    n = len(proj_pts)
-    if n < 2:
-        return []
-    runs = []
-    start = 0
-    for i in range(1, n - 1):
-        if _turn_angle_deg(proj_pts[i - 1], proj_pts[i], proj_pts[i + 1]) >= reversal_deg:
-            runs.append((start, i))
-            start = i
-    runs.append((start, n - 1))
-    return runs
-
-
-def _fragment_summaries(proj_pts, deg_pts, runs, pass_kind):
-    """Per-lane-run coverage-fragment metadata (PART 3): the sweep coordinate (perpendicular
-    offset along the sweep axis, so rows sort monotonically), along-run length, endpoints and
-    point count. row_index ranks fragments by sweep coordinate — when the EXECUTION order (the
-    list order here) matches the row_index order, coverage advances monotonically through the
-    sweep with no cross-row scramble, which is what the ordering tests assert."""
-    if not runs:
-        return []
-    s0, e0 = runs[0]
-    dx, dy = proj_pts[e0][0] - proj_pts[s0][0], proj_pts[e0][1] - proj_pts[s0][1]
-    mag = math.hypot(dx, dy)
-    nx, ny = (-dy / mag, dx / mag) if mag > TOLERANCE else (0.0, 1.0)  # unit sweep axis
-    out = []
-    for fi, (s, e) in enumerate(runs):
-        seg = proj_pts[s:e + 1]
-        length = sum(math.hypot(seg[k + 1][0] - seg[k][0], seg[k + 1][1] - seg[k][1])
-                     for k in range(len(seg) - 1))
-        cx = sum(p[0] for p in seg) / len(seg)
-        cy = sum(p[1] for p in seg) / len(seg)
-        out.append({"pass_kind": pass_kind, "fragment_index": fi,
-                    "sweep_coordinate": cx * nx + cy * ny,
-                    "point_count": e - s + 1, "length_m": round(length, 2),
-                    "start": [round(deg_pts[s][0], 7), round(deg_pts[s][1], 7)],
-                    "end": [round(deg_pts[e][0], 7), round(deg_pts[e][1], 7)]})
-    # Normalise the sweep coordinate to metres from the first row (the raw UTM projection is a
-    # ~3.5M-magnitude northing that obscures the relative row spacing the metric is about).
-    base = min(f["sweep_coordinate"] for f in out)
-    for f in out:
-        f["sweep_coordinate"] = round(f["sweep_coordinate"] - base, 2)
-    for rank, i in enumerate(sorted(range(len(out)), key=lambda i: out[i]["sweep_coordinate"])):
-        out[i]["row_index"] = rank
-    return out
-
-
-def _route_quality(proj_pts, coverage_runs):
+def _route_quality(proj_pts):
     """Objective, inspectable route-quality diagnostics from the FINAL projected route (PART 7):
-    backtracking events (single-vertex near-reversals that a clean boustrophedon never needs),
-    the minimum leg length, and how many consecutive coverage lane runs regress along the sweep
-    (a fragment-ordering scramble). No vague score — every number is directly re-derivable."""
+    backtracking events (single-vertex near-reversals that a clean boustrophedon never needs) and
+    the minimum leg length. No vague score — every number is directly re-derivable.
+
+    Fragment counting and sweep ordering are NOT derived here: the coverage generator reports the
+    lane fragments it actually emitted (see _survey_frame_coverage), which is exact — inferring
+    them from turn angles only worked while every lane turn was a ~180° reversal."""
     backtracks = 0
     min_leg = None
     for i in range(len(proj_pts) - 1):
@@ -1490,28 +1560,439 @@ def _route_quality(proj_pts, coverage_runs):
             cx, cy = proj_pts[i + 1]
             if math.hypot(cx - ax, cy - ay) < BACKTRACK_RETURN_M:  # returns to ~origin: a spike
                 backtracks += 1
-
-    # Fragment reorders: project each lane run's centroid onto the axis perpendicular to the
-    # first run's direction (the sweep axis) and count consecutive runs that move BACKWARD.
-    reorders = 0
-    if len(coverage_runs) >= 2:
-        s0, e0 = coverage_runs[0]
-        dx = proj_pts[e0][0] - proj_pts[s0][0]
-        dy = proj_pts[e0][1] - proj_pts[s0][1]
-        mag = math.hypot(dx, dy)
-        if mag > TOLERANCE:
-            nx, ny = -dy / mag, dx / mag  # unit normal = sweep axis
-            prev = None
-            for s, e in coverage_runs:
-                cx = sum(proj_pts[k][0] for k in range(s, e + 1)) / (e - s + 1)
-                cy = sum(proj_pts[k][1] for k in range(s, e + 1)) / (e - s + 1)
-                sweep = cx * nx + cy * ny
-                if prev is not None and sweep < prev - CLEANUP_MIN_SPACING_M:
-                    reorders += 1
-                prev = sweep
     return {"backtracking_events": backtracks,
-            "minimum_segment_length_m": round(min_leg, 2) if min_leg is not None else None,
-            "fragment_reorders": reorders}
+            "minimum_segment_length_m": round(min_leg, 2) if min_leg is not None else None}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# SURVEY-FRAME COVERAGE GENERATION
+#
+# WHY THIS EXISTS (and what it replaced)
+# --------------------------------------
+# The ported Scout generator handles a no-go zone by cutting the coverage polyline where it
+# enters the obstacle and then BRIDGING the two cut ends ALONG THE OBSTACLE BOUNDARY
+# (_create_augmented_obstacle_tracks + _find_bridging_path + _stitch_segments). With an
+# operator no-go clearance in play the obstacle handed to it is the ROUND buffered exclusion, so
+# the bridge is a chain of ~1 m chords tracing a buffer arc: geometrically safe, but a rounded,
+# constantly-turning "coverage" leg with no stable sonar heading.
+#
+# This generator produces the same lane family, at the same spacing, in the same survey frame —
+# but it treats the exclusion as what it is: space REMOVED from the surveyable region. Each
+# nominal lane is clipped against the approved region, the surviving pieces stay STRAIGHT and
+# parallel to U, and the transitions between them are built from U/V-parallel legs. Nothing ever
+# follows an exclusion boundary for coverage.
+#
+# The safety geometry is untouched: every candidate leg is proven with the SAME
+# _NavGrid.segment_is_safe against the SAME `grid.navigable` (shoreline-inset boundary MINUS the
+# buffered no-go exclusion). Survey-frame alignment is a PREFERENCE ORDER over candidates, never
+# a relaxation of a check — an aligned leg that cuts the clearance is rejected like any other.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+def _min_useful_fragment_m(lane_spacing_m):
+    """The minimum USEFUL coverage-fragment length for a given lane spacing — see
+    MIN_FRAGMENT_LANE_FRACTION for why the rule is `max(cleanup spacing, spacing/4)` and not a
+    free-standing constant."""
+    return max(CLEANUP_MIN_SPACING_M,
+               MIN_FRAGMENT_LANE_FRACTION * abs(float(lane_spacing_m or 0.0)))
+
+
+def _survey_align_class(a_proj, b_proj, angle_deg, tol_deg=SURVEY_ALIGN_TOL_DEG):
+    """Classify one projected leg against the survey frame of `angle_deg`:
+
+        "U"      parallel to the survey angle (a coverage lane)
+        "V"      perpendicular to it (a cross-lane transition)
+        "short"  below ALIGN_MIN_LEG_M — no meaningful heading, not classified either way
+        "other"  an arbitrary-angle leg
+
+    Bearings are metric (projected UTM, not lon/lat) and compared modulo 180°, because a lane
+    flown in either direction lies on the same axis."""
+    dx, dy = b_proj[0] - a_proj[0], b_proj[1] - a_proj[1]
+    if math.hypot(dx, dy) < ALIGN_MIN_LEG_M:
+        return "short"
+    brg = math.degrees(math.atan2(dx, dy)) % 180.0
+    for axis, ref in (("U", float(angle_deg) % 180.0),
+                      ("V", (float(angle_deg) + 90.0) % 180.0)):
+        d = abs(brg - ref) % 180.0
+        if min(d, 180.0 - d) <= tol_deg:
+            return axis
+    return "other"
+
+
+def _rotator(angle_deg_ccw, origin):
+    """A point rotator with shapely.affinity.rotate's exact convention (counter-clockwise, in
+    degrees, about `origin`), so the metre arithmetic below happens in EXACTLY the frame the
+    polygon clipping is done in."""
+    ca = math.cos(math.radians(angle_deg_ccw))
+    sa = math.sin(math.radians(angle_deg_ccw))
+    ox, oy = origin
+
+    def fn(x, y):
+        dx, dy = x - ox, y - oy
+        return (ox + ca * dx - sa * dy, oy + sa * dx + ca * dy)
+    return fn
+
+
+class _SurveyFrame:
+    """One coverage pass's survey frame: the rotated coordinate system in which the survey angle
+    lies on the axes, so rot-frame +x is U (along a lane) and rot-frame +y is V (across lanes).
+
+    Constructed exactly as the ported _generate_boustrophedon_path does — rotate by -(90° −
+    survey_angle) about the shoreline-inset polygon's centroid — so lane placement and the
+    meaning of `lane_spacing_m` are unchanged. Everything here is derived from the `grid`, so the
+    frame can never disagree with the geometry the safety checks use."""
+
+    def __init__(self, grid, angle_deg):
+        self.grid = grid
+        self.angle_deg = float(angle_deg)
+        self.math_angle = (90.0 - self.angle_deg) % 360.0
+        c = grid.inset.centroid
+        self.origin = (c.x, c.y)
+        self._to_rot = _rotator(-self.math_angle, self.origin)
+        self._from_rot = _rotator(self.math_angle, self.origin)
+        # The inset (shoreline-clearance) polygon defines the lane family's extent, and
+        # `grid.coverage` (inset MINUS the buffered exclusion, pulled in far enough that a lane
+        # end is strictly interior to the region `segment_is_safe` proves against) defines what
+        # survives the clip.
+        self.inset_rot = rotate(grid.inset, -self.math_angle, origin=c)
+        self.nav_rot = rotate(grid.coverage, -self.math_angle, origin=c)
+        # Per-exclusion-body survey-frame extents, for local bypass candidates. Per BODY, not one
+        # union box: two zones at opposite ends of the survey must not fuse into one huge box.
+        self.exclusion_boxes = []
+        if grid.nogo is not None and not grid.nogo.is_empty:
+            bodies = (grid.nogo.geoms if isinstance(grid.nogo, MultiPolygon) else [grid.nogo])
+            for body in bodies:
+                if body.is_empty:
+                    continue
+                self.exclusion_boxes.append(
+                    rotate(body, -self.math_angle, origin=c).bounds)
+
+    # ── coordinate plumbing ──────────────────────────────────────────────────────────────
+    def deg_to_rot(self, pt_deg):
+        return self._to_rot(*self.grid.to_proj.transform(pt_deg[0], pt_deg[1]))
+
+    def rot_to_proj(self, pt_rot):
+        return self._from_rot(*pt_rot)
+
+    def rot_to_deg(self, pt_rot):
+        x, y = self._from_rot(*pt_rot)
+        return list(self.grid.to_deg.transform(x, y))
+
+    def bypass_boxes_for(self, a_rot, b_rot):
+        """The exclusion bodies whose survey-frame extent is local to the a→b transition, nearest
+        first and capped at MAX_BYPASS_BODIES. Bounded by construction — this is local candidate
+        generation, not a search over the whole region."""
+        lo_x, hi_x = min(a_rot[0], b_rot[0]), max(a_rot[0], b_rot[0])
+        lo_y, hi_y = min(a_rot[1], b_rot[1]), max(a_rot[1], b_rot[1])
+        m = BYPASS_MARGIN_M
+        near = []
+        for (bx0, by0, bx1, by1) in self.exclusion_boxes:
+            if bx1 < lo_x - m or bx0 > hi_x + m or by1 < lo_y - m or by0 > hi_y + m:
+                continue  # not local to this transition
+            cx, cy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+            near.append((math.hypot(cx - a_rot[0], cy - a_rot[1]), (bx0, by0, bx1, by1)))
+        near.sort(key=lambda e: (round(e[0], 3), e[1]))
+        return [b for _, b in near[:MAX_BYPASS_BODIES]]
+
+
+def _chain_reversals(dirs):
+    """How many near-reversals (≥ BACKTRACK_ANGLE_DEG) a sequence of unit heading vectors makes.
+    Used only to RANK equally-safe, equally-aligned transition candidates: given a choice between
+    two orthogonal bend orders of identical length, the one that does not double back is the one
+    a survey vessel should fly."""
+    n = 0
+    for (x1, y1), (x2, y2) in zip(dirs, dirs[1:]):
+        cos = max(-1.0, min(1.0, x1 * x2 + y1 * y2))
+        if math.degrees(math.acos(cos)) >= BACKTRACK_ANGLE_DEG:
+            n += 1
+    return n
+
+
+def _unit(a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    m = math.hypot(dx, dy)
+    return (dx / m, dy / m) if m > TOLERANCE else None
+
+
+def _rot_path_len(pts_rot):
+    return sum(math.hypot(pts_rot[i + 1][0] - pts_rot[i][0], pts_rot[i + 1][1] - pts_rot[i][1])
+               for i in range(len(pts_rot) - 1))
+
+
+def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None):
+    """The transition a→b between two coverage fragments, preferring survey-frame-aligned
+    geometry. Returns (coords_deg, category).
+
+    CONNECTOR PRIORITY (each tier's candidates are proven before the next tier is considered):
+
+      1. "direct"      the straight segment, when it is ALREADY U- or V-aligned and safe;
+      2. "orthogonal"  a two-leg L in the survey frame. BOTH bend orders are generated (U→V and
+                       V→U) and both are validated, because one can cut the buffered exclusion or
+                       leave the inset while the other does not — the order is never assumed;
+      3. "bypass"      bounded families of survey-frame staircases stepping around a LOCAL
+                       exclusion body's survey-frame extent — three legs (V→U→V, U→V→U) first,
+                       then five legs ("around the block") for a body that is tilted in this
+                       frame. This is what replaces the old arc-following bridge: every leg is
+                       U- or V-parallel, so a lane the exclusion split is rejoined with straight
+                       survey-frame geometry instead of a traced buffer arc;
+      4. "fallback"    the existing generic _NavGrid.safe_connector (bounded grid A* + safe
+                       line-of-sight compression), used ONLY when no aligned candidate is safe;
+      5. fail closed   safe_connector raises ConnectorError, which generation does not swallow.
+
+    Within a tier, safe candidates are ranked by (near-reversals, length, generation order) — so
+    the choice is deterministic and identical inputs always produce an identical route.
+
+    EVERY candidate leg is checked with the grid's own segment_is_safe(require_inside=True)
+    (memoised): the same predicate, the same tolerances and the same `grid.navigable`
+    (shoreline-inset MINUS buffered no-go exclusion) the previous generator was held to. Alignment
+    only decides which safe candidate is PREFERRED; it never lets an unsafe leg through."""
+    grid = frame.grid
+    a_rot, b_rot = frame.deg_to_rot(a_deg), frame.deg_to_rot(b_deg)
+    du, dv = b_rot[0] - a_rot[0], b_rot[1] - a_rot[1]
+
+    # ── tier 1: the direct segment, but only when it is already an axis of the survey frame ──
+    direct_ok = (abs(dv) <= ALIGN_MIN_LEG_M or abs(du) <= ALIGN_MIN_LEG_M
+                 or _survey_align_class(frame.rot_to_proj(a_rot), frame.rot_to_proj(b_rot),
+                                        frame.angle_deg) in ("U", "V", "short"))
+    tiers = [[("direct", [a_rot, b_rot])] if direct_ok else []]
+
+    # ── tier 2: two-leg orthogonal L, both bend orders ───────────────────────────────────────
+    ortho = []
+    if abs(du) > ALIGN_MIN_LEG_M and abs(dv) > ALIGN_MIN_LEG_M:
+        ortho.append(("orthogonal", [a_rot, (b_rot[0], a_rot[1]), b_rot]))   # U first, then V
+        ortho.append(("orthogonal", [a_rot, (a_rot[0], b_rot[1]), b_rot]))   # V first, then U
+    tiers.append(ortho)
+
+    # ── tier 3: bounded survey-frame staircases around a local exclusion body ────────────────
+    # Two families, tried in order of cost. Both are generated from the body's survey-frame
+    # bounding extent only — a couple of arithmetic candidates per body, no search.
+    stairs = []
+    around = []
+    for (bx0, by0, bx1, by1) in frame.bypass_boxes_for(a_rot, b_rot):
+        m = BYPASS_MARGIN_M
+        # (a) three legs. V→U→V: step across V clear of the body, run the long leg along U, step
+        # back. This is the shape that rejoins the two halves of a lane an exclusion cut in two,
+        # and U→V→U is the same shape with the axes swapped for a body that blocks the V step.
+        for yo in sorted([by1 + m, by0 - m], key=lambda y: abs(y - a_rot[1])):
+            stairs.append(("bypass", [a_rot, (a_rot[0], yo), (b_rot[0], yo), b_rot]))
+        for xo in sorted([bx1 + m, bx0 - m], key=lambda x: abs(x - a_rot[0])):
+            stairs.append(("bypass", [a_rot, (xo, a_rot[1]), (xo, b_rot[1]), b_rot]))
+        # (b) five legs, "around the block". A fragment ends ON the exclusion boundary, and that
+        # boundary is almost never parallel to the survey frame — a no-go zone is drawn at
+        # whatever angle the operator drew it, and the round buffer curves at the corners. So the
+        # (a) step that leaves A along V at A's own U coordinate can clip the body a few metres
+        # further along, which is exactly what happens when the body is tilted in this frame.
+        # This family backs each V step off to a U coordinate OUTSIDE the body's whole U extent
+        # first, which is clear of it for every V — still five straight U/V-parallel legs.
+        xa = bx1 + m if a_rot[0] >= (bx0 + bx1) / 2.0 else bx0 - m
+        xb = bx1 + m if b_rot[0] >= (bx0 + bx1) / 2.0 else bx0 - m
+        for yo in sorted([by1 + m, by0 - m], key=lambda y: abs(y - a_rot[1])):
+            around.append(("bypass", [a_rot, (xa, a_rot[1]), (xa, yo),
+                                      (xb, yo), (xb, b_rot[1]), b_rot]))
+    tiers.append(stairs)
+    tiers.append(around)
+
+    for tier in tiers:
+        best = None
+        for idx, (category, pts_rot) in enumerate(tier):
+            pts_deg = _dedup([frame.rot_to_deg(p) for p in pts_rot])
+            if len(pts_deg) < 2:
+                continue
+            # The memoised predicate: candidate variants share legs (the same V step appears in
+            # several staircases), so the same probe is asked for repeatedly within one transition.
+            if not all(grid._seg_safe_cached(p, q, True)
+                       for p, q in zip(pts_deg, pts_deg[1:])):
+                continue
+            dirs = [d for d in (_unit(pts_rot[i], pts_rot[i + 1])
+                                for i in range(len(pts_rot) - 1)) if d]
+            if in_dir:
+                dirs.insert(0, in_dir)
+            if out_dir:
+                dirs.append(out_dir)
+            key = (_chain_reversals(dirs), round(_rot_path_len(pts_rot), 3), idx)
+            if best is None or key < best[0]:
+                best = (key, category, pts_deg)
+        if best is not None:
+            return best[2], best[1]
+
+    # ── tier 4/5: the existing generic safe connector, or a hard ConnectorError ───────────────
+    return grid.safe_connector(a_deg, b_deg, require_inside=True), "fallback"
+
+
+def _lane_fragments(frame, spacing):
+    """The nominal lawnmower lane family, CLIPPED to the approved region, as STRAIGHT fragments.
+
+    The lane family itself is the ported generator's, unchanged — `max(1, int(extent/spacing))`
+    lanes spaced `spacing` metres apart along V across the shoreline-inset polygon's survey-frame
+    extent — so `lane_spacing_m` keeps its exact current meaning and a plan with no no-go zone
+    generates the same lanes it did before.
+
+    What changed is the CLIP. Each nominal lane is intersected with `grid.coverage` (the inset
+    polygon MINUS the buffered no-go exclusion, pulled in by the wire margin), so an exclusion
+    simply REMOVES surveyable space and leaves one or more straight, U-parallel pieces on that
+    lane. A piece is reduced to its two extreme endpoints, which is exact: the intersection of a
+    line with a polygon is a set of disjoint COLLINEAR runs, so a run's endpoints describe it
+    completely and no interior vertex from an exclusion arc can survive into the coverage
+    geometry.
+
+    Clipping flush against `grid.navigable` would put every lane endpoint EXACTLY on the approved
+    boundary, and the cross-lane transition between two such endpoints then runs ALONG that
+    boundary — which serializes to a leg lying millimetres OUTSIDE the polygon it was clipped
+    from, and that is what Scout rejects. See WIRE_MARGIN_M.
+
+    Returns (fragments, skipped) where `skipped` records the fragments dropped by the
+    minimum-useful-fragment rule (count + total length, so the loss is reported, not hidden)."""
+    minx, miny, maxx, maxy = frame.inset_rot.bounds
+    width = maxx - minx
+    height = maxy - miny
+    sep = abs(spacing) if spacing > 1e-6 else 0.1
+    min_useful = _min_useful_fragment_m(sep)
+
+    # The ported lane offsets, verbatim (numpy included) — lane COUNT and POSITIONS must not move.
+    y_coords = np.linspace(miny + sep / 2, maxy - sep / 2, num=max(1, int(height / sep)))
+    if not y_coords.size:
+        y_coords = np.array([(miny + maxy) / 2])
+
+    nav = frame.nav_rot.buffer(0)
+    fragments = []
+    skipped = {"count": 0, "length_m": 0.0}
+    row = -1
+    for y in y_coords:
+        row += 1
+        scan = LineString([(minx - width * 1.1, y), (maxx + width * 1.1, y)])
+        try:
+            clipped = nav.intersection(scan)
+        except Exception:
+            continue
+        if clipped.is_empty:
+            continue
+        pieces = []
+        if isinstance(clipped, LineString):
+            pieces = [clipped]
+        elif isinstance(clipped, (MultiLineString, GeometryCollection)):
+            pieces = [g for g in clipped.geoms if isinstance(g, LineString)]
+        runs = []
+        for piece in pieces:
+            xs = [c[0] for c in piece.coords]
+            if not xs:
+                continue
+            x0, x1 = min(xs), max(xs)
+            if x1 - x0 <= TOLERANCE:
+                continue
+            runs.append((x0, x1))
+        runs.sort()
+        keep = []
+        for (x0, x1) in runs:
+            if x1 - x0 < min_useful:
+                skipped["count"] += 1
+                skipped["length_m"] += (x1 - x0)
+                continue
+            keep.append((x0, x1))
+        for along, (x0, x1) in enumerate(keep):
+            fragments.append({
+                "row": row, "along_index": along, "sweep": float(y),
+                "rot": [(x0, float(y)), (x1, float(y))],
+                "length_m": x1 - x0,
+            })
+    return fragments, skipped
+
+
+def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
+    """Generate ONE coverage pass: straight, survey-angle-aligned lane fragments joined by
+    survey-frame-aligned transitions. Returns (coords_deg, diagnostics).
+
+    Sweep order is the ported generator's and is deliberately unchanged: lanes in increasing V
+    (sweep) order, fragments within a lane in increasing U order, traversal direction alternating
+    per lane (boustrophedon). Coverage therefore still advances monotonically through the sweep
+    with no cross-row scramble — the existing ordering guarantee — and this change is confined to
+    the GEOMETRY of the fragments and the transitions between them.
+
+    Fragments an exclusion split apart are NOT joined straight through the forbidden gap: they are
+    separate coverage pieces, and the transition between them is built by _aligned_transition,
+    which must prove every leg safe or fail closed.
+
+    Raises ConnectorError (via the generic fallback) when a transition cannot be made safe at
+    all — generation refuses rather than emitting an unsafe leg."""
+    frame = _SurveyFrame(grid, angle_deg)
+    fragments, skipped = _lane_fragments(frame, spacing)
+    diag = {
+        "pass_kind": pass_kind,
+        "angle_deg": float(angle_deg) % 360.0,
+        "fragment_count": len(fragments),
+        "transition_counts": {"direct": 0, "orthogonal": 0, "bypass": 0, "fallback": 0},
+        "skipped_short_fragment_count": skipped["count"],
+        "skipped_short_fragment_length_m": round(skipped["length_m"], 2),
+        "minimum_useful_fragment_m": round(_min_useful_fragment_m(spacing), 2),
+        "fragments": [],
+    }
+    if not fragments:
+        return [], diag
+
+    # Boustrophedon traversal, faithful to the ported generator: the along-U direction flips on
+    # every lane that actually PRODUCED coverage (not on every nominal lane offset — a lane offset
+    # that falls outside the region contributes nothing and must not consume a direction flip, or
+    # the next lane gets entered at its far end and the sweep pays a full lane-length jump). When
+    # a lane runs right-to-left its fragments are visited right-to-left too, so the cursor always
+    # continues from the nearest end.
+    ordered = []
+    forward = True
+    for row in sorted({f["row"] for f in fragments}):
+        row_frags = [f for f in fragments if f["row"] == row]
+        for frag in (row_frags if forward else list(reversed(row_frags))):
+            a, b = frag["rot"][0], frag["rot"][1]
+            ordered.append({**frag, "entry_rot": a if forward else b,
+                            "exit_rot": b if forward else a,
+                            "dir": (1.0, 0.0) if forward else (-1.0, 0.0)})
+        forward = not forward
+
+    coords = []
+    base_sweep = min(f["sweep"] for f in ordered)
+    for i, frag in enumerate(ordered):
+        entry = frame.rot_to_deg(frag["entry_rot"])
+        exit_ = frame.rot_to_deg(frag["exit_rot"])
+        if not coords:
+            coords.append(entry)
+        else:
+            path, category = _aligned_transition(
+                frame, coords[-1], entry,
+                in_dir=ordered[i - 1]["dir"], out_dir=frag["dir"])
+            diag["transition_counts"][category] += 1
+            coords.extend(path[1:])
+        coords.append(exit_)
+        diag["fragments"].append({
+            "pass_kind": pass_kind, "fragment_index": i, "point_count": 2,
+            "sweep_coordinate": round(frag["sweep"] - base_sweep, 2),
+            "length_m": round(frag["length_m"], 2),
+            "start": [round(entry[0], 7), round(entry[1], 7)],
+            "end": [round(exit_[0], 7), round(exit_[1], 7)],
+        })
+
+    # row_index ranks fragments by sweep coordinate; the execution order above is already sweep
+    # order, so the ranks come out as the identity — which is what the ordering tests assert.
+    for rank, idx in enumerate(sorted(range(len(diag["fragments"])),
+                                      key=lambda k: diag["fragments"][k]["sweep_coordinate"])):
+        diag["fragments"][idx]["row_index"] = rank
+    prev = None
+    reorders = 0
+    for f in diag["fragments"]:
+        if prev is not None and f["sweep_coordinate"] < prev - CLEANUP_MIN_SPACING_M:
+            reorders += 1
+        prev = f["sweep_coordinate"]
+    diag["fragment_reorders"] = reorders
+    return _dedup(coords), diag
+
+
+def _fragment_anchors(diag):
+    """The lane-fragment endpoints of a coverage pass, as cleanup anchors. A fragment boundary is
+    a semantic coverage point — a survey line begins or ends there, frequently right on the
+    exclusion edge — so the shared cleanup must preserve it rather than merge it into a
+    neighbouring point or shortcut across it."""
+    if not diag:
+        return None
+    pts = []
+    for f in diag.get("fragments") or []:
+        pts.append(f["start"])
+        pts.append(f["end"])
+    return pts or None
 
 
 def _route_waypoints(coords):
@@ -1765,16 +2246,23 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
             f"regions. Survey generation currently requires one connected navigable region — "
             f"split the survey into separate missions, or adjust the clearance / no-go zones.")
 
-    # The BUFFERED exclusion, derived once, handed to the ported generators (which take zones
-    # as degree rings). This is what makes the no-go clearance apply to the coverage lanes
-    # themselves and not only to the connectors _NavGrid routes. The operator's ORIGINAL rings
-    # are untouched and are what `planning_inputs.no_go_zones` carries.
+    # The BUFFERED exclusion as drawable rings. Derived ONCE from the grid, so the exclusion the
+    # coverage lanes are clipped against, the exclusion every connector is validated against and
+    # the exclusion the Plan page draws are the same geometry. The operator's ORIGINAL rings are
+    # untouched and are what `planning_inputs.no_go_zones` carries.
     exclusion_rings = grid.exclusion_rings_deg()
 
-    # Coverage passes: the ported lawnmower, then every UNSAFE internal hop repaired inside
-    # the navigable region (this is the fix for outside-polygon lane connectors).
-    primary_raw = _dedup(run_lawnmower_with_obstacles(
-        boundary, spacing, inp["primary_angle_deg"], clearance, exclusion_rings or None))
+    # ── Coverage passes ──────────────────────────────────────────────────────────────────
+    # Survey-frame coverage: the ported lane family, clipped to the approved region into straight
+    # U-parallel fragments, joined by survey-frame-aligned transitions (see _survey_frame_coverage).
+    # `repair_path` still runs behind it as defence in depth — it re-checks every emitted hop and
+    # repairs (or fails on) anything unsafe, exactly as before.
+    #
+    # DUAL PASS: each pass builds its OWN _SurveyFrame from its own angle, so the secondary pass's
+    # fragments and transitions are orthogonal in the secondary frame (survey_angle + 90° by
+    # default). No first-pass orientation can leak into the second pass's connector geometry.
+    primary_raw, primary_diag = _survey_frame_coverage(
+        grid, spacing, inp["primary_angle_deg"], pass_kind="primary")
     if len(primary_raw) < 2:
         raise ValueError(
             "No coverage route could be generated — the navigable area may be too small "
@@ -1783,16 +2271,30 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     primary_coords = grid.repair_path(primary_raw)
 
     secondary_coords = None
+    secondary_diag = None
     intersections = []
     if inp["dual_pass"]:
-        secondary_raw = _dedup(run_lawnmower_with_obstacles(
-            boundary, spacing, inp["secondary_angle_deg"], clearance, exclusion_rings or None))
+        secondary_raw, secondary_diag = _survey_frame_coverage(
+            grid, spacing, inp["secondary_angle_deg"], pass_kind="secondary")
         if len(secondary_raw) < 2:
             warnings.append("Dual pass requested, but the secondary pass produced no route; "
                             "only the primary pass was generated.")
+            secondary_diag = None
         else:
             secondary_coords = grid.repair_path(secondary_raw)
             intersections = _pass_intersections(primary_coords, secondary_coords)
+
+    coverage_diags = [d for d in (primary_diag, secondary_diag) if d]
+    # The minimum-useful-fragment rule is a COVERAGE decision, so it is stated to the operator
+    # rather than only counted — see MIN_FRAGMENT_LANE_FRACTION.
+    skipped_n = sum(d["skipped_short_fragment_count"] for d in coverage_diags)
+    if skipped_n:
+        skipped_m = round(sum(d["skipped_short_fragment_length_m"] for d in coverage_diags), 2)
+        warnings.append(
+            f"{skipped_n} coverage fragment(s) shorter than "
+            f"{primary_diag['minimum_useful_fragment_m']} m ({skipped_m} m of survey line in "
+            f"total) were left out where the no-go clearance or the shoreline clipped a lane to a "
+            f"sliver — they would have cost more turns than sonar coverage.")
 
     survey_entry = primary_coords[0]
     coverage_end = (secondary_coords[-1] if secondary_coords else primary_coords[-1])
@@ -1827,7 +2329,7 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     pseq = [0]
     raw_segment_pts = [0]   # summed pre-cleanup segment points, for the route-quality metric
 
-    def new_seg(kind, coords, planning_only=False):
+    def new_seg(kind, coords, planning_only=False, anchors=None):
         raw = _dedup(coords)
         if planning_only:
             pseq[0] += 1
@@ -1841,7 +2343,12 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         # PART 6 segment-specific policy: aggressive LOS for generated connectors, operator
         # waypoints preserved as anchors on approach/return, conservative dedup+collinear only
         # for coverage. require_inside matches the segment's own connector safety policy.
-        anchors = approach if kind == "approach" else returns if kind == "return_approach" else None
+        # Coverage passes supply their lane-fragment endpoints as anchors: a fragment boundary is
+        # a semantic point (a survey line starts or ends there, often on the exclusion edge), so
+        # cleanup must never merge or shortcut across it.
+        if anchors is None:
+            anchors = (approach if kind == "approach"
+                       else returns if kind == "return_approach" else None)
         cleaned = grid.clean_path(
             raw, require_inside=(kind in _REQUIRE_INSIDE_KINDS),
             anchors=anchors, aggressive=(kind in _AGGRESSIVE_KINDS))
@@ -1941,12 +2448,14 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
                         "directly at the survey entry.")
 
     # 2. PRIMARY COVERAGE
-    segments.append(new_seg("primary", primary_coords))
+    segments.append(new_seg("primary", primary_coords,
+                            anchors=_fragment_anchors(primary_diag)))
 
     # 3. PASS TRANSITION + SECONDARY COVERAGE
     if secondary_coords:
         connect(primary_coords[-1], secondary_coords[0], "pass_transition", require_inside=True)
-        segments.append(new_seg("secondary", secondary_coords))
+        segments.append(new_seg("secondary", secondary_coords,
+                                anchors=_fragment_anchors(secondary_diag)))
 
     # 4. RETURN CONNECTOR + RETURN APPROACH + FINAL HOME CONNECTOR
     #
@@ -2048,17 +2557,31 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
 
     # ── Route-quality diagnostics (PART 7) — objective, inspectable, no vague score ─────────
     route_proj = [grid.to_proj.transform(c[0], c[1]) for c in route_coords]
-    full_q = _route_quality(route_proj, [])
-    coverage_fragment_count = 0
-    fragment_reorders = 0
-    coverage_fragments = []
+    full_q = _route_quality(route_proj)
+    # Coverage fragments come from the GENERATOR, which knows exactly which lane pieces it emitted
+    # and at what sweep offset — more precise than re-deriving them from turn angles in the
+    # flattened route, and unaffected by the survey-frame turns now being 90° rather than 180°.
+    coverage_fragment_count = sum(d["fragment_count"] for d in coverage_diags)
+    fragment_reorders = sum(d["fragment_reorders"] for d in coverage_diags)
+    coverage_fragments = [f for d in coverage_diags for f in d["fragments"]]
+    # ── Survey-frame alignment of the FINAL coverage geometry (post-cleanup) ─────────────────
+    # Each coverage segment is classified against ITS OWN pass angle. Sub-metre legs carry no
+    # meaningful heading and are counted in neither bucket (see ALIGN_MIN_LEG_M).
+    pass_angle = {"primary": inp["primary_angle_deg"], "secondary": inp["secondary_angle_deg"]}
+    aligned_n = 0
+    unaligned_n = 0
     for s in segments:
-        if s["kind"] in _COVERAGE_KINDS:
-            pp = [grid.to_proj.transform(c[0], c[1]) for c in s["coordinates"]]
-            runs = _lane_runs_proj(pp)
-            coverage_fragment_count += len(runs)
-            fragment_reorders += _route_quality(pp, runs)["fragment_reorders"]
-            coverage_fragments.extend(_fragment_summaries(pp, s["coordinates"], runs, s["kind"]))
+        if s["kind"] not in _COVERAGE_KINDS:
+            continue
+        pp = [grid.to_proj.transform(c[0], c[1]) for c in s["coordinates"]]
+        for i in range(len(pp) - 1):
+            cls = _survey_align_class(pp[i], pp[i + 1], pass_angle[s["kind"]])
+            if cls in ("U", "V"):
+                aligned_n += 1
+            elif cls == "other":
+                unaligned_n += 1
+    transition_totals = {k: sum(d["transition_counts"][k] for d in coverage_diags)
+                         for k in ("direct", "orthogonal", "bypass", "fallback")}
     final_seg_pts = sum(s.get("final_point_count", len(s["coordinates"])) for s in segments)
     los_removed = grid.raw_connector_pts - grid.final_connector_pts
     seg_removed = raw_segment_pts[0] - final_seg_pts
@@ -2076,6 +2599,19 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "backtracking_events": full_q["backtracking_events"],
         "minimum_segment_length_m": full_q["minimum_segment_length_m"],
         "cleanup_applied": True,
+        # ── Survey-frame coverage diagnostics ────────────────────────────────────────────
+        # How regular the coverage headings actually are, and how the transitions were built.
+        # Objective and re-derivable: every number here is a count over the emitted geometry, not
+        # a score. `non_survey_aligned_segment_count` is the one to watch — it is the count of
+        # arbitrary-angle coverage legs, which is what the rounded no-go bypasses used to produce.
+        "survey_aligned_segment_count": aligned_n,
+        "non_survey_aligned_segment_count": unaligned_n,
+        "orthogonal_transition_count": transition_totals["orthogonal"] + transition_totals["bypass"],
+        "fallback_connector_count": transition_totals["fallback"],
+        "skipped_short_fragment_count": skipped_n,
+        "skipped_short_fragment_length_m": round(
+            sum(d["skipped_short_fragment_length_m"] for d in coverage_diags), 2),
+        "minimum_useful_fragment_m": round(_min_useful_fragment_m(spacing), 2),
         "coverage_fragments": coverage_fragments,
     }
     metrics["route_quality"] = route_quality
@@ -2800,6 +3336,38 @@ def check_mission_geometry(*, segments, route_waypoints, navigable_geometry, no_
              f"route leg(s) {_elide(leg_nogo)} (waypoint N → N+1) cross the no-go exclusion "
              f"(the drawn zones plus a {checks['no_go_clearance_m']} m no-go clearance)",
              legs=leg_nogo[:_MAX_OFFENDERS])
+
+    # ── SCOUT PARITY: every leg EXACTLY covered, no tolerance at all ──────────────────────────
+    # The checks above are the operator-facing ones and carry COVER_TOL_M so projection noise at
+    # the inset edge does not read as a fault. Scout does not have that tolerance: it must prove
+    # every approved waypoint and segment is retraceable inside `navigable_geometry ∪
+    # home_corridor` for a safe return to be provable, and it proves it with exact containment.
+    #
+    # A route that passes the tolerant checks but fails this one is EXACTLY the package Scout
+    # answers with HTTP 400 ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY — after the Pixhawk upload has
+    # already been verified, leaving the vehicle holding a mission Scout will not plan a return
+    # for. So it is a failure HERE, before Finish & Upload, and not a warning.
+    #
+    # `covers` is the exact predicate, not a buffered approximation: a leg lying ON the boundary
+    # IS covered (touching is inside, consistently, on both sides), a leg a millimetre outside is
+    # not. There is nothing to tune — the generator's job is to produce geometry that survives
+    # the 7-decimal wire round trip (see WIRE_MARGIN_M), not this check's job to absorb it.
+    exact_outside = []
+    for i, (a, b) in enumerate(zip(coords, coords[1:])):
+        try:
+            if not approved.covers(proj_line([a, b])):
+                exact_outside.append(i + 1)
+        except Exception:                                     # pragma: no cover - defensive
+            exact_outside.append(i + 1)
+    checks["route_legs_exactly_within_approved"] = not exact_outside
+    if exact_outside:
+        fail("ROUTE_OUTSIDE_NAVIGABLE_GEOMETRY",
+             f"route segment(s) {_elide(exact_outside)} (waypoint N → N+1) are not fully "
+             f"contained by the approved geometry that ships with them (navigable geometry"
+             + (" plus the approved Home corridor)" if corridor is not None else ")")
+             + " — every approved waypoint and segment must be retraceable inside it for a safe "
+               "return to be provable, so this route cannot be uploaded",
+             legs=exact_outside[:_MAX_OFFENDERS])
 
     # ── per-SEGMENT coverage, with the kind-specific rule ────────────────────────────────────
     # The EXECUTION segments and the PLANNING-ONLY approved transit legs are swept together and

@@ -162,7 +162,146 @@ export const START_BLOCK_TEXT = {
 // The Start transaction sets Home to the launch position and verifies it as one of its own
 // phases. Before Start, therefore, an unverified Home is not a defect to fix — it is a step that
 // has not happened yet, and this is how the card says so.
-export const HOME_DURING_START_NOTE = "Home will be set during Start";
+export const HOME_DURING_START_NOTE = "Home will be set and verified during Start";
+
+// The secondary detail. RTL genuinely is unavailable until a Home is verified — that is Scout's
+// interlock and this station does not argue with it — but before Start it is a step that has not
+// happened yet, exactly like the Home it depends on. Stated as a sequence, never as a fault.
+export const RTL_AFTER_HOME_NOTE = "RTL becomes available after Home verification";
+
+// ---- THREE READINESS LAYERS, KEPT APART --------------------------------------------------
+//
+// Scout answers four different questions and this station used to read them as one:
+//
+//   start_eligible   may the guarded Start TRANSACTION be entered?      (mission_execution)
+//   home verified    has a runtime Home been set and proven?            (home_status.verified)
+//   ready_for_auto   would Scout accept an AUTO command RIGHT NOW?      (home_status)
+//   ready_for_rtl    would Scout accept an RTL command RIGHT NOW?       (home_status)
+//
+// A healthy, fully prepared mission sitting on the slipway has start_eligible TRUE and the other
+// three FALSE, because the Start transaction is what sets and verifies Home — the AUTO and RTL
+// interlocks close as a RESULT of pressing Start, not as a precondition for being allowed to.
+// Reading `ready_for_rtl:false` as a Start blocker told the operator to go and perform, by hand,
+// the one step the button was about to perform under Scout's own guard. So these three are
+// DISPLAYED, side by side with the Start control, and none of them ever reaches startGate().
+//
+// Nothing here is computed: every verdict is Scout's own field, and the only thing this function
+// decides is which SENTENCE describes the state Scout reported.
+export const READINESS_LAYER = { HOME: "home", AUTO: "auto", RTL: "rtl" };
+
+// The pre-Start wordings. Both are about a step that has not happened YET — they are not
+// failures, they carry no warning tone, and neither withholds anything.
+export const AUTO_WAITING_FOR_START_TEXT = "Waiting for Start Home setup";
+export const RTL_WAITING_FOR_HOME_TEXT = "Waiting for verified Home";
+// Scout's status is the LAST ONE IT SENT, not a current fact. A stale readiness flag is not an
+// answer to "may I do this now?", so it is never rendered as one.
+const LAST_KNOWN_TEXT = "Last known — not confirmed";
+const NOT_REPORTED_TEXT = "Not reported";
+
+const LAYER_LABEL = {
+  home: "Home",
+  auto: "AUTO readiness",
+  rtl: "RTL readiness",
+};
+
+/**
+ * The three readiness layers, as three independent lines.
+ *
+ * SEPARATION IS THE WHOLE POINT. This function returns display rows and NOTHING a gate consumes:
+ * `startGate()` (lib/mission-execution.js) never sees its output, so no combination of unverified
+ * Home, `ready_for_auto:false` and `ready_for_rtl:false` can withhold Start while Scout itself
+ * reports `start_eligible:true`. That invariant is asserted in tests/start-readiness-layers.test.mjs.
+ *
+ * Every input is TRI-STATE where Scout's own field is, and the three "no" cases are deliberately
+ * different sentences:
+ *
+ *   not reported   Scout said nothing. Never presented as Scout answering "no".
+ *   stale          Scout's last word, not a current one. Never presented as permission.
+ *   false          Scout's actual refusal. Before Start it is the pending step; AFTER Home has
+ *                  been verified it is a real gap and reads as one, with Scout's own reason.
+ *
+ * @param opts.homeState   homeStatus().state — 'unknown'|'unverified'|'pending'|'verified'
+ * @param opts.homeReported  whether Scout reported a home_status block at all
+ * @param opts.homeStale   Scout's Home status is the last-known one, not a current one
+ * @param opts.readyForAuto / opts.readyForRtl  Scout's own flags (null = not reported)
+ * @param opts.homeReason  Scout's own sentence about why Home is not verified
+ * @param opts.homeRequiredBeforeStart  Scout EXPLICITLY declares it will not enter the Start
+ *                         transaction without an already-verified Home (the only case in which
+ *                         an unverified Home is a warning rather than a pending step)
+ * @returns {{ home, auto, rtl, rows }} rows = [home, auto, rtl], each
+ *          { key, label, text, tone, title } with tone null = neutral.
+ */
+export function readinessLayers({
+  homeState = null, homeReported = false, homeStale = false,
+  readyForAuto = null, readyForRtl = null, homeReason = null,
+  homeRequiredBeforeStart = false,
+} = {}) {
+  const state = str(homeState);
+  const verified = state === "verified";
+  const reported = homeReported === true;
+  const stale = homeStale === true;
+  const reason = str(homeReason);
+  const layer = (key, text, tone, title) => ({ key, label: LAYER_LABEL[key], text, tone, title });
+
+  // ---- Home itself -------------------------------------------------------------------------
+  let home;
+  if (!reported) {
+    home = layer(READINESS_LAYER.HOME, NOT_REPORTED_TEXT, "idle",
+      "Scout has not reported a Home status for this vehicle. Nothing is claimed about Home, " +
+      "in either direction.");
+  } else if (stale) {
+    home = layer(READINESS_LAYER.HOME, LAST_KNOWN_TEXT, "idle",
+      reason || "Scout has not confirmed Home status recently, so the last one it sent is shown " +
+      "as last known rather than as current.");
+  } else if (verified) {
+    home = layer(READINESS_LAYER.HOME, "Verified", "ok",
+      "Scout has set and verified a runtime Home for this deployment site.");
+  } else if (state === "pending") {
+    home = layer(READINESS_LAYER.HOME, "Setting…", null,
+      "A Set Home request is in flight. Scout's own status decides the result.");
+  } else if (homeRequiredBeforeStart) {
+    home = layer(READINESS_LAYER.HOME, "Not verified", "warn",
+      "This Scout declares that it requires an already-verified Home before it will enter the " +
+      "Start transaction." + (reason ? ` Scout reports: ${reason}` : ""));
+  } else {
+    // NEUTRAL. The Start transaction owns this step, so it is pending, not broken.
+    home = layer(READINESS_LAYER.HOME, "Not verified", null,
+      `${HOME_DURING_START_NOTE}.` + (reason ? ` Scout reports: ${reason}` : ""));
+  }
+
+  // ---- AUTO / RTL: the same shape, different subject ---------------------------------------
+  const interlock = (key, flag, readyText, waitingText, unavailableText, afterHomeNote) => {
+    if (!reported || flag === null || flag === undefined) {
+      return layer(key, NOT_REPORTED_TEXT, "idle",
+        `Scout has not reported ${key === READINESS_LAYER.AUTO ? "ready_for_auto" : "ready_for_rtl"}` +
+        " for this vehicle.");
+    }
+    if (stale) {
+      return layer(key, LAST_KNOWN_TEXT, "idle",
+        "Scout's last reported readiness, not a current one — it is not permission to act now.");
+    }
+    if (flag === true) {
+      return layer(key, readyText, "ok",
+        `Scout reports this vehicle would accept ${key === READINESS_LAYER.AUTO ? "AUTO" : "RTL"} now.`);
+    }
+    if (!verified) {
+      // The pending step, not a fault: Home has not been set yet, and Start is what sets it.
+      return layer(key, waitingText, null, `${afterHomeNote}. This is not a Start blocker — the ` +
+        "Start transaction sets and verifies Home under Scout's own guard as one of its phases.");
+    }
+    // Home IS verified and Scout still refuses. Now it is a real gap, and it says so.
+    return layer(key, unavailableText, "warn",
+      reason || `Scout reports Home is verified but ${key === READINESS_LAYER.AUTO
+        ? "ready_for_auto" : "ready_for_rtl"} is false, and gave no reason.`);
+  };
+
+  const auto = interlock(READINESS_LAYER.AUTO, readyForAuto, "Ready",
+    AUTO_WAITING_FOR_START_TEXT, "Not ready", HOME_DURING_START_NOTE);
+  const rtl = interlock(READINESS_LAYER.RTL, readyForRtl, "Available",
+    RTL_WAITING_FOR_HOME_TEXT, "Unavailable", RTL_AFTER_HOME_NOTE);
+
+  return { home, auto, rtl, rows: [home, auto, rtl] };
+}
 
 /**
  * The pre-start presentation verdict, derived from the STABLE gate.

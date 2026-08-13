@@ -347,9 +347,10 @@ test("the card body carries no paragraph — every long explanation is a title t
   // The bound is an UPPER limit; sliceOf still stops at the function's own closing brace, so
   // raising it as the card grows keeps the guard reading exactly one function. (It was 8000
   // until the card gained its completion, replacement-conflict, authority and battery slots,
-  // 14000 until the ENERGY/RISK/ADVICE live rows gained their contract commentary, and 17000
-  // until the Full Refresh note gained its reprove-outcome headline mapping.)
-  const render = sliceOf("function renderAgentMission", 20000);
+  // 14000 until the ENERGY/RISK/ADVICE live rows gained their contract commentary, 17000
+  // until the Full Refresh note gained its reprove-outcome headline mapping, and 20000 until
+  // the card gained the three separate Home / AUTO / RTL readiness layers.)
+  const render = sliceOf("function renderAgentMission", 24000);
   // Every text slot the card renders must be paired with a title attribute.
   for (const pair of [/class="amx-h" title=/, /class="amx-note\$\{[\s\S]*?\}" title=/,
     /class="amx-result [\s\S]*?" title=/,

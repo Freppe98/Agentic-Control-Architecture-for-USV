@@ -234,6 +234,7 @@ import { asText } from "./format.js";
 // labels describe. The dependency runs one way only: mission-readiness.js imports nothing here.
 import {
   READINESS, CHECKING_TEXT, START_BLOCK, START_BLOCK_TEXT, HOME_DURING_START_NOTE,
+  RTL_AFTER_HOME_NOTE, readinessLayers,
   startPhase, isStartTransactionState,
 } from "./mission-readiness.js";
 
@@ -1965,6 +1966,12 @@ const READINESS_CHIP = {
  * @param opts.homeVerified       tri-state override for "is Home verified" when the caller has a
  *                                better source than Scout's mission-execution status (the fleet
  *                                payload's continuously-reported home_status).
+ * @param opts.homeState / homeReported / homeStale / homeReason / readyForAuto / readyForRtl
+ *                                Scout's own home_status fields (lib/home.js homeStatus), used
+ *                                for the THREE SEPARATE readiness layers below. They are DISPLAY
+ *                                ONLY: none of them reaches the gate, so `ready_for_auto:false`
+ *                                and `ready_for_rtl:false` can never withhold a Start that Scout
+ *                                itself declares eligible.
  * @param opts.preflight          the INFORMATIONAL one-shot preflight note (preflightNote), or
  *                                null. Shown as a note; it never affects buttons.
  * @returns {{ chip, tone, headline, headlineTitle, detail, rows, blocker, buttons, working,
@@ -1981,6 +1988,8 @@ export function missionCardView(status, {
   missionId = null, unavailableDetail = null, readiness = null,
   starting = false, homeVerified = null, preflight = null,
   stopping = false, stopResult = null,
+  homeState = null, homeReported = null, homeStale = false, homeReason = null,
+  readyForAuto = null, readyForRtl = null,
 } = {}) {
   const S = status && status.present !== undefined ? status : normalizeStatus(status);
   const ctl = lifecycleControls(S, { busy, startBlocked, startBlockedReason });
@@ -1996,6 +2005,11 @@ export function missionCardView(status, {
     headline: null, headlineTitle: asText(ctl.notice), rows: [], blocker: null,
     buttons: ctl.buttons, working: false, startPhase: null, checking: false, checkingText: null,
     home: null, info: null, stop: ctl.stop, complete: ctl.complete,
+    // The THREE readiness layers (Home / AUTO / RTL), shown beside the Start control so the
+    // operator can see WHICH readiness is missing instead of one merged verdict. Set only in the
+    // pre-start branch below — a running mission is watched, not re-qualified — and never
+    // consumed by any gate.
+    readinessLayers: null,
     // A finished run's second line and its one next action (see the COMPLETED_HOLD branch).
     completionNote: null, nextAction: null,
     // Set when a NEW mission cannot start because the PREVIOUS run still owns the vehicle.
@@ -2161,16 +2175,44 @@ export function missionCardView(status, {
     // as one of its own phases, so an unverified Home here is a step that has not happened yet —
     // not a defect, and (unless Scout explicitly declares otherwise) not a reason to withhold
     // Start. It is stated once, neutrally, instead of being repeated as a warning.
+    //
+    // ONLY IN A PRE-START RESTING STATE. "Home will be set and verified during Start" is a
+    // promise about a step that is still AHEAD. Once Scout reports FAILED or SUSPENDED — which
+    // is where a Start that could not establish Home lands — the promise is false, and repeating
+    // it beside the actual Home-verification failure would tell the operator that the thing that
+    // just failed is about to happen. There, the failure is the whole message.
+    const preStart = READINESS_CHIP_STATES.includes(state);
     const verified = homeVerified === true || homeVerified === false
       ? homeVerified : isObj(S.home.verified);
-    if (!verified) {
+    if (!verified && preStart) {
       out.home = S.home.requiredBeforeStart
         ? { text: "Home must be verified before Start", tone: "warn",
             title: "This Scout declares that it requires an already-verified Home before it will " +
               "enter the Start transaction." }
         : { text: HOME_DURING_START_NOTE, tone: null,
-            title: START_HOME_NOTE };
+            // The secondary detail belongs here and only here: RTL genuinely does become
+            // available after Home verification, and saying so beside the Home line is what
+            // stops "RTL Home unavailable" from being read as a reason Start is withheld.
+            title: `${START_HOME_NOTE} ${RTL_AFTER_HOME_NOTE}.` };
     }
+
+    // THE THREE LAYERS, side by side. Derived from Scout's own home_status when the caller
+    // supplied it; falling back to the mission-execution status' verified_home block otherwise,
+    // in which case only the Home line can be answered and AUTO/RTL read "Not reported" rather
+    // than borrowing a verdict Scout never gave for them.
+    //
+    // Pre-start only, for the same reason as the note above: these three describe what a Start
+    // still has to establish. After a failure the card's business is the failure.
+    if (preStart) out.readinessLayers = readinessLayers({
+      homeState: str(homeState) || (verified ? "verified" : "unverified"),
+      // Without the caller's flag the ONLY Home evidence is Scout's own verified_home block, and
+      // its absence is genuinely "nothing reported" — not "Scout says no".
+      homeReported: homeReported == null ? isObj(S.home.verified) : homeReported === true,
+      homeStale: homeStale === true,
+      readyForAuto, readyForRtl,
+      homeReason: asText(homeReason),
+      homeRequiredBeforeStart: S.home.requiredBeforeStart === true,
+    });
   }
 
   // The one-shot preflight, as INFORMATION. It is never a button state and never a blocker: the
