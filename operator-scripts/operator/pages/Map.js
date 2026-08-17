@@ -1817,6 +1817,14 @@ export function Map(root) {
     // evidence, Scout's code and the phase detail are the tooltip. Every other transaction keeps
     // the one-word outcome line.
     const startFail = res && res.action === "start" ? mx.startFailure(res.view) : null;
+    // A Start whose HTTP verdict was LOST is reported from the backend's ONE reconciling read of
+    // Scout's canonical status, not from the fact that the local client stopped waiting. Scout's
+    // Start is a bounded multi-phase transaction; "Unknown — reconciling" beside a vehicle the
+    // very same read just reported RUNNING in AUTO is a worse answer than the read itself.
+    // Nothing is softened: a reconciliation that says READY, mission_mismatch, failed — or that
+    // could not be read at all — never reaches here, because startFailure() keeps those.
+    const startReconciled = res && res.action === "start" && !startFail
+      ? mx.reconciledStart(res.view) : null;
     // ACCEPTED BUT NOT VERIFIED is its own outcome on this line. The backend re-reads Scout's
     // canonical status after an accepted Pause/Resume and can answer "Scout accepted it but
     // reports RUNNING in AUTO, not PAUSED in LOITER" — which must NOT read as a green "Accepted".
@@ -1829,6 +1837,10 @@ export function Map(root) {
     const resultNote = stopHandled ? "" : startFail
       ? `<div class="amx-result warn" title="${escAttr([startFail.detail, mx.transactionSummary(res.view)].filter(Boolean).join(" — "))}">
            <b>${esc(startFail.title)}</b>: ${esc(startFail.text)}
+         </div>`
+      : startReconciled && startReconciled.text
+        ? `<div class="amx-result ${startReconciled.tone}" title="${escAttr([startReconciled.detail, mx.transactionSummary(res.view)].filter(Boolean).join(" — "))}">
+           <b>${esc(res.label)}</b>: ${esc(startReconciled.text)}
          </div>`
       : res
         ? `<div class="amx-result ${unverified ? "warn" : res.view.outcome === "accepted" ? "ok" : res.view.outcome === "pending" ? "" : "warn"}" title="${escAttr(res.view.outcome === "pending" ? "" : mx.transactionSummary(res.view))}">

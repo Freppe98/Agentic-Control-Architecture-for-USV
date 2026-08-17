@@ -59,13 +59,41 @@ OUTCOME_FAILED = "failed"
 SUBSYSTEM = "mission-execution"
 BASE_PATH = "/agent/mission_execution"
 
+# ── The Start read budget (the ONE route that needs its own) ───────────────────────────────
+# Start is not a short supervisory write. It is ONE BOUNDED SCOUT TRANSACTION, and Scout's own
+# bounds are what set this number:
+#
+#   start_proof_timeout_s        15 s   verified LOITER / launch-hold proof
+#   mode verification                   verified AUTO
+#   start_progression_timeout_s  10 s   progression confirmation before RUNNING
+#   operation_timeout_s          60 s   the CEILING on the whole transaction
+#
+# A healthy Start therefore takes as long as the vehicle takes — a real run measured 12.0 s end
+# to end, and Scout is entitled to 60. The shared WRITE_READ_TIMEOUT (12 s) sat *inside* that
+# window, so the operator's HTTP client gave up while Scout was still working, the transport
+# reported `unknown`, and the UI printed "Mission could not start: No response from Scout" about
+# a mission that entered RUNNING and AUTO. The client must not be the first thing to quit.
+#
+# 65 s = Scout's operation_timeout_s (60) + a 5 s margin for the response itself. It is a BOUND,
+# not an absence of one: past it, Scout has exceeded its own ceiling and `unknown` is the honest
+# answer again. Nothing else on the Local Agent transport is affected — this budget is passed per
+# call, so status reads stay on READ_TIMEOUT and pause/resume/stop/rearm stay on
+# WRITE_READ_TIMEOUT.
+START_READ_TIMEOUT = 65.0
+
 # Scout's mission-execution states, verbatim. The operator never invents one and never orders
 # them into a private FSM — this tuple exists so an UNRECOGNIZED state is displayed as-is and
 # flagged, rather than silently bucketed into a state the operator would act on.
 STATES = (
     "NOT_READY", "NOT_STARTED", "READY",
-    "START_REQUESTED", "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED",
+    # The Start transaction, in Scout's own order. ARMING / VERIFYING_ARMED / CONFIRMING_PROGRESSION
+    # are steps Scout reports and this station did not recognize: a reconciling read that landed on
+    # one of them fell through to "start outcome undetermined" — an UNDECIDED transaction reported
+    # as an unanswered one — instead of "Scout is still processing".
+    "START_REQUESTED", "ARMING", "VERIFYING_ARMED",
+    "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED",
     "SETTING_HOME", "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO",
+    "CONFIRMING_PROGRESSION",
     "RUNNING",
     "PAUSE_REQUESTED", "PAUSED", "RESUME_REQUESTED",
     "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
@@ -134,8 +162,9 @@ EFFECTIVE_REPLANNING = "REPLANNING"
 # States in which Scout is MID-TRANSACTION — it is still deciding the outcome of a start, pause
 # or resume. A reconciling read that lands here answers "not yet decided", not success or failure.
 IN_TRANSACTION_STATES = frozenset({
-    "START_REQUESTED", "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME",
-    "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO",
+    "START_REQUESTED", "ARMING", "VERIFYING_ARMED",
+    "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME",
+    "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "CONFIRMING_PROGRESSION",
     "PAUSE_REQUESTED", "RESUME_REQUESTED",
 }) | STOP_IN_TRANSACTION_STATES
 
@@ -296,20 +325,25 @@ def get_status(base):
 
 
 # ── Writes (one explicit operator intent each; never issued by a poll) ────────────────────
-def _op(operation, base, json_body=None):
+def _op(operation, base, json_body=None, *, read_timeout=None):
     return scout_replan.write(
         f"mission_execution.{operation}", base, f"{BASE_PATH}/{operation}", "POST", json_body,
         subsystem=SUBSYSTEM,
         conflict_error=("Scout refused the mission-execution operation: precondition, lifecycle "
-                        "state, replanning ownership or write arbitration"))
+                        "state, replanning ownership or write arbitration"),
+        read_timeout=read_timeout)
 
 
 def post_start(base, mission_id=None):
     """Start the mission. Body carries the mission id the OPERATOR believes is active, so Scout
     can fail closed with MISSION_ID_MISMATCH rather than starting the wrong route; Scout treats
-    the body as optional, so an absent id is sent as an empty body rather than a guess."""
+    the body as optional, so an absent id is sent as an empty body rather than a guess.
+
+    The ONLY route with its own read budget (START_READ_TIMEOUT): Scout's Start is a bounded
+    multi-phase transaction and the operator must not give up inside Scout's own bound. Every
+    other operation keeps the shared short write budget."""
     body = {"mission_id": mission_id} if mission_id else {}
-    return _op("start", base, body)
+    return _op("start", base, body, read_timeout=START_READ_TIMEOUT)
 
 
 def post_pause(base):

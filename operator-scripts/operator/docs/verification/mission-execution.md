@@ -10,8 +10,9 @@ Routes consumed: `GET|POST /agent/mission_execution/{status,start,pause,resume,r
 ## Automated
 
 ```powershell
-python -m unittest tests.test_mission_execution     # 49 tests
-node --test tests/mission-execution.test.mjs        # 62 tests
+python -m unittest tests.test_mission_execution     # 60 tests
+node --test tests/mission-execution.test.mjs        # 64 tests
+node --test tests/mission-control.test.mjs          # 107 tests
 python scripts/_baseline_checks.py                  # route table + api.js endpoint resolution
 ```
 
@@ -145,6 +146,67 @@ summary: state=null  can_start=null  final_loiter_verified=null
 The Agent page shows **"Mission lifecycle not supported by this Scout version"** and offers no
 action. `POST .../start` against the same Scout returns 404 → `supported:false`. Nothing is
 fabricated.
+
+## A Start that WORKED, reported as "No response from Scout"
+
+Live run `run-20260814-102907-usv-2-0f3ebd6c`. Scout completed the whole Start transaction and
+entered `RUNNING` / `AUTO`; the experiment recorder timed it end to end:
+
+| Elapsed | Scout |
+| --- | --- |
+| 0.045 s | `MISSION_START_REQUESTED` |
+| 1.745 s | `START_HOLD_CONFIRMED` |
+| 2.093 s | `STARTING_AUTO` |
+| 3.772 s | AUTO verified · `CONFIRMING_PROGRESSION` |
+| 12.005 s | `RUNNING` — *"Original mission started and progressing under AUTO (C)."* |
+
+The Map showed **"Mission could not start: No response from Scout"**, and the next status poll
+then showed the mission running.
+
+**Cause — one number.** `POST /agent/mission_execution/start` went out on the shared Local Agent
+write budget, `scout_replan.WRITE_READ_TIMEOUT = 12.0 s`. Scout answered at 12.005 s. The client
+gave up 5 ms early, the transport reported `unknown` with *"No response from Scout — outcome
+unknown, reconcile with a read"*, and `startFailure()` shortened that message to the card's one
+line. Nothing about the vehicle was wrong; the operator's own HTTP client was the first thing in
+the system to quit. 12 s was never a defensible budget for this route: Scout's Start is a bounded
+transaction with `start_proof_timeout_s` 15 s, mode verification, `start_progression_timeout_s`
+10 s, all under an `operation_timeout_s` ceiling of 60 s.
+
+**Fixed in two places, neither of which is a new mechanism.**
+
+1. **A Start-specific read budget.** `scout_replan.write()` takes an optional per-call
+   `read_timeout`; `scout_mission_execution.post_start()` is the only caller that passes one
+   (`START_READ_TIMEOUT = 65.0 s` — Scout's own 60 s ceiling plus a 5 s margin). It is still a
+   bound, not an infinite wait, and the CONNECT budget stays 3 s: a Scout that will not accept a
+   socket in 3 s is unreachable however long its transactions run. Every other call on the
+   transport is untouched — reads 8 s, pause / resume / stop / rearm and the replanning writes
+   12 s.
+2. **A lost verdict is answered by the reconciling read, not by the timeout.** The backend already
+   reconciled once (`mission_lifecycle._run_operation` → `scout_mission_execution.reconcile`, a
+   READ of `GET /agent/mission_execution/status`, never a resend). That verdict was computed,
+   returned — and then ignored by the card. `reconciledStart()` now reads it:
+   `running` / `completed` → the mission started; `in_progress` → Scout is still completing it;
+   anything else (`ready`, `not_started`, `mission_mismatch`, `failed`, `suspended`, `unknown`) is
+   unchanged and still shown as the failure it is. A reconciling read that itself fails resolves
+   `unknown`, which is the genuine "No response from Scout" — that case is deliberately preserved.
+
+Scout's Start states `ARMING`, `VERIFYING_ARMED` and `CONFIRMING_PROGRESSION` were also missing
+from the operator's vocabulary, so a reconciling read that landed on one of them answered "start
+outcome undetermined" — an *undecided* transaction reported as an *unanswered* one. They are now
+in `STATES` / `IN_TRANSACTION_STATES` (and their JS mirrors, with progress labels).
+
+| Situation | Before | After |
+| --- | --- | --- |
+| Scout answers at 12.0 s | client timeout → "Mission could not start: No response from Scout" | Start accepted, `RUNNING` |
+| Verdict lost, status reads `RUNNING` | "Mission could not start" | "Mission started — confirmed by reading Scout's status" |
+| Verdict lost, status reads `CONFIRMING_PROGRESSION` | "Mission could not start" | "Start in progress — Scout is still completing it" |
+| Verdict lost, status unreadable | "No response from Scout" | unchanged — "No response from Scout" |
+| Scout reports `AUTO_NOT_VERIFIED` | failure | unchanged — failure, with Scout's code |
+
+Regressions: `tests.test_mission_execution.TestStartReadBudget` (the 12.005 s Scout succeeds under
+the Start budget and still fails under the generic one; every other route keeps its budget),
+`TestUnknownAndReconciliation.test_every_step_of_scouts_start_transaction_reconciles_to_in_progress`,
+and section A3b of `tests/mission-control.test.mjs` for the presentation rule.
 
 ## NOT verified — requires hardware bench time
 

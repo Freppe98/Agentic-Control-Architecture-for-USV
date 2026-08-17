@@ -45,6 +45,13 @@ import requests
 # Bounded, distinct connect/read timeouts (seconds). A supervisory op must never hang the
 # operator UI; when Scout is slow we return `unknown`/`unavailable` and let a later GET
 # reconcile. Writes get a longer read budget than reads because a package PUT can be large.
+#
+# THESE ARE THE BUDGET FOR A SHORT SUPERVISORY CALL, and they stay that way. A route whose Scout
+# side is a LONG BOUNDED TRANSACTION (mission-execution Start: verified LOITER → Home → package
+# sync → verified AUTO → progression confirmation, tens of seconds by contract) must not be
+# covered by raising THIS number — that would spend the same budget on every config PATCH,
+# package PUT and status read on the link. Such a route passes its OWN `read_timeout` to write()
+# instead; see scout_mission_execution.START_READ_TIMEOUT for the one that does.
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 8.0
 WRITE_READ_TIMEOUT = 12.0
@@ -129,17 +136,26 @@ def read(operation, base, path, *, subsystem="replanning"):
 
 
 def write(operation, base, path, method, json_body=None, *, subsystem="replanning",
-          conflict_error="Scout refused: a replanning transaction is active"):
+          conflict_error="Scout refused: a replanning transaction is active",
+          read_timeout=None):
     """A PUT/PATCH/POST/DELETE proxy with the three-state outcome model. A transport failure
     (timeout / dropped connection) or an ambiguous 5xx is `unknown` — the write MAY have
     landed (Scout's stores are idempotent), so we never call it a failure; a later GET
     reconciles. A definite 4xx is `rejected`, with Scout's error code preserved (409
-    TRANSACTION_ACTIVE included, flagged so the UI does not read it as a network fault)."""
+    TRANSACTION_ACTIVE included, flagged so the UI does not read it as a network fault).
+
+    `read_timeout` overrides WRITE_READ_TIMEOUT for THIS call only, and exists for exactly one
+    reason: a Scout route whose bounded transaction legitimately runs longer than a short
+    supervisory write. Giving up before Scout's OWN bound expires manufactures an `unknown` for
+    an operation that was going to succeed — which is what the operator then reads as a failed
+    Start. The CONNECT timeout is deliberately NOT overridable: a Scout that will not accept a
+    TCP connection in 3 s is unreachable, however long its transactions take."""
     out = _base_result(operation, base)
     url = base.rstrip("/") + path
+    read_budget = WRITE_READ_TIMEOUT if read_timeout is None else float(read_timeout)
     try:
         resp = requests.request(method, url, json=json_body,
-                                timeout=(CONNECT_TIMEOUT, WRITE_READ_TIMEOUT))
+                                timeout=(CONNECT_TIMEOUT, read_budget))
     except requests.RequestException as exc:
         # No verdict from Scout. UNKNOWN, never a definite failure — reconcile with a GET.
         out.update(reachable=False, outcome=OUTCOME_UNKNOWN,

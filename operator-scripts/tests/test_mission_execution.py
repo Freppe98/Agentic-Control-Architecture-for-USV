@@ -58,11 +58,17 @@ class FakeLA:
 
     def __init__(self):
         self.calls = []                 # [(method, url, json_body)]
+        self.timeouts = []              # [(method, url, (connect, read))] — the budget per call
         self.responses = {}             # {(METHOD, suffix): FakeResp | Exception | [seq]}
         self.default = FakeResp({}, 200)
 
     def set(self, method, suffix, resp):
         self.responses[(method, suffix)] = resp
+
+    def timeout_for(self, method, suffix):
+        """The (connect, read) budget the transport used for the LAST call to `suffix`."""
+        got = [t for (m, u, t) in self.timeouts if m == method and u.endswith(suffix)]
+        return got[-1] if got else None
 
     def _resolve(self, method, url, json_body=None):
         self.calls.append((method, url, json_body))
@@ -78,9 +84,11 @@ class FakeLA:
         return self.default
 
     def get(self, url, **kw):
+        self.timeouts.append(("GET", url, kw.get("timeout")))
         return self._resolve("GET", url)
 
     def request(self, method, url, **kw):
+        self.timeouts.append((method, url, kw.get("timeout")))
         return self._resolve(method, url, kw.get("json"))
 
     def urls(self, method=None):
@@ -606,6 +614,26 @@ class TestUnknownAndReconciliation(MissionExecutionTestCase):
         d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
         self.assertEqual(d["reconciliation"]["resolved"], "in_progress")
 
+    def test_every_step_of_scouts_start_transaction_reconciles_to_in_progress(self):
+        """A reconciling read that lands INSIDE Scout's Start transaction answers "not yet
+        decided" — for EVERY step Scout reports, not just the ones this station happened to know.
+
+        ARMING / VERIFYING_ARMED / CONFIRMING_PROGRESSION were missing from the operator's state
+        vocabulary, so a Start whose reply was lost while Scout was confirming progression fell
+        through to "start outcome undetermined" — an undecided transaction reported as an
+        unanswered one, which is what the UI then rendered as a failed Start. No active operation
+        id is set here: the STATE alone must be enough."""
+        for state in ("START_REQUESTED", "ARMING", "VERIFYING_ARMED", "START_HOLD_REQUESTED",
+                      "START_HOLD_CONFIRMED", "SETTING_HOME", "VERIFYING_HOME",
+                      "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "CONFIRMING_PROGRESSION"):
+            self.set_op("start", real_requests.Timeout("boom"))
+            self.set_status_sequence(
+                FakeResp(status_body(), 200),      # preflight: startable
+                FakeResp(status_body(state=state, active_operation_id=None), 200))
+            d = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start").json()
+            self.assertEqual(d["reconciliation"]["resolved"], "in_progress", state)
+            self.assertIn(state, d["reconciliation"]["detail"], state)
+
     def test_a_failed_reconciling_read_stays_unknown(self):
         self.set_op("start", real_requests.Timeout("boom"))
         self.set_status_sequence(
@@ -763,12 +791,103 @@ class TestOperationLogging(MissionExecutionTestCase):
                          .json()["operations"], [])
 
 
+# ── 6b. The Start read budget (the ONE route with its own) ──────────────────────────────
+class SlowLA(FakeLA):
+    """A Local Agent whose Start takes `start_duration_s` to answer.
+
+    It raises the REAL ReadTimeout exactly when the CALLER'S OWN read budget is shorter than that
+    duration — which is what a real HTTP client does, without a test that actually waits twelve
+    seconds. Everything else behaves like the ordinary fake."""
+
+    def __init__(self, start_duration_s):
+        super().__init__()
+        self.start_duration_s = start_duration_s
+
+    def request(self, method, url, **kw):
+        timeout = kw.get("timeout")
+        read_budget = timeout[1] if isinstance(timeout, tuple) else timeout
+        if (url.endswith("/agent/mission_execution/start")
+                and read_budget is not None and read_budget < self.start_duration_s):
+            self.timeouts.append((method, url, timeout))
+            self.calls.append((method, url, kw.get("json")))
+            raise real_requests.ReadTimeout(
+                f"read timed out after {read_budget}s; Scout answers at {self.start_duration_s}s")
+        return super().request(method, url, **kw)
+
+
+class TestStartReadBudget(MissionExecutionTestCase):
+    """The live failure this class exists for: a Start that Scout completed in 12.0 s — LOITER
+    hold at 1.7 s, AUTO at 2.1 s, verified progression at 3.8 s, RUNNING at 12.0 s — was reported
+    to the operator as "Mission could not start: No response from Scout", because the operator's
+    own HTTP client gave up at the shared 12 s write budget while Scout was still working."""
+
+    def test_start_gets_a_read_budget_that_covers_scouts_bounded_transaction(self):
+        self.set_op("start", FakeResp(op_body("start"), 200))
+        self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start")
+        self.assertEqual(self.fake.timeout_for("POST", "/mission_execution/start"),
+                         (scout_replan.CONNECT_TIMEOUT, mx.START_READ_TIMEOUT))
+        # Long enough for Scout's OWN ceiling (operation_timeout_s = 60 s) plus a margin…
+        self.assertGreaterEqual(mx.START_READ_TIMEOUT, 60.0 + 1.0)
+        # …and still a BOUND, not an infinite wait: past Scout's own ceiling, `unknown` is honest.
+        self.assertLessEqual(mx.START_READ_TIMEOUT, 90.0)
+        # The CONNECT budget is untouched — a Scout that will not accept a socket in 3 s is
+        # unreachable however long its transactions run.
+        self.assertEqual(scout_replan.CONNECT_TIMEOUT, 3.0)
+
+    def test_a_start_that_answers_after_twelve_seconds_is_not_timed_out(self):
+        """THE REGRESSION. Scout answers at 12.0 s; the Operator must still be listening, and the
+        operator must be shown a started mission — not an unknown, not a reconciliation."""
+        self.fake = SlowLA(12.005)          # the live run's measured end-to-end Start
+        scout_replan.requests = self.fake
+        self.set_status(status_body())
+        self.set_op("start", FakeResp(op_body("start"), 200))
+        r = self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/start")
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertEqual(d["outcome"], mx.OUTCOME_ACCEPTED)
+        self.assertIs(d["ok"], True)
+        self.assertIsNone(d["reconciliation"], "nothing was lost, so nothing needs reconciling")
+        self.assertEqual(d["resulting_state"], "RUNNING")
+
+    def test_the_same_start_would_have_timed_out_on_the_generic_write_budget(self):
+        """Proof that the budget is the cause and not a coincidence: the identical 12 s Scout,
+        called with the SHARED write budget, still fails — as it did in the live run."""
+        self.fake = SlowLA(12.005)          # the live run's measured end-to-end Start
+        scout_replan.requests = self.fake
+        out = scout_replan.write("mission_execution.start", SCOUT_BASE,
+                                 "/agent/mission_execution/start", "POST", {},
+                                 subsystem="mission-execution")
+        self.assertEqual(out["outcome"], mx.OUTCOME_UNKNOWN)
+        self.assertIn("No response from Scout", out["error"])
+
+    def test_every_other_local_agent_call_keeps_its_short_budget(self):
+        """The Start budget is passed PER CALL. Nothing else on the Local Agent transport — not
+        the other lifecycle writes, not the replanning writes, not a single read — pays for it."""
+        self.set_status(status_body(state="RUNNING", mode="AUTO", can_start=False,
+                                    can_pause=True, can_resume=True, can_stop=True))
+        for op in ("pause", "resume", "stop", "rearm"):
+            self.set_op(op, FakeResp(op_body(op), 200))
+            self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/{op}")
+            self.assertEqual(self.fake.timeout_for("POST", f"/mission_execution/{op}"),
+                             (scout_replan.CONNECT_TIMEOUT, scout_replan.WRITE_READ_TIMEOUT), op)
+        self.client.get(f"/api/vehicles/{SCOUT_VID}/mission-execution/status")
+        self.assertEqual(self.fake.timeout_for("GET", "/mission_execution/status"),
+                         (scout_replan.CONNECT_TIMEOUT, scout_replan.READ_TIMEOUT))
+        scout_replan.patch_config(SCOUT_BASE, {"dry_run": False})
+        self.assertEqual(self.fake.timeout_for("PATCH", "/agent/replan/config"),
+                         (scout_replan.CONNECT_TIMEOUT, scout_replan.WRITE_READ_TIMEOUT))
+        self.assertEqual((scout_replan.CONNECT_TIMEOUT, scout_replan.READ_TIMEOUT,
+                          scout_replan.WRITE_READ_TIMEOUT), (3.0, 8.0, 12.0))
+
+
 # ── 7. The client's own derivations (pure, no HTTP) ─────────────────────────────────────
 class TestClientDerivations(unittest.TestCase):
     def test_every_scout_state_is_represented(self):
-        for s in ("NOT_READY", "READY", "START_REQUESTED", "START_HOLD_REQUESTED",
+        for s in ("NOT_READY", "READY", "START_REQUESTED", "ARMING", "VERIFYING_ARMED",
+                  "START_HOLD_REQUESTED",
                   "START_HOLD_CONFIRMED", "SETTING_HOME", "VERIFYING_HOME",
-                  "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "RUNNING", "PAUSE_REQUESTED",
+                  "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "CONFIRMING_PROGRESSION",
+                  "RUNNING", "PAUSE_REQUESTED",
                   "PAUSED", "RESUME_REQUESTED", "RETURNING_HOME", "HOME_ARRIVAL_PENDING",
                   "FINAL_HOLD_REQUESTED", "COMPLETED_HOLD", "SUSPENDED", "FAILED"):
             self.assertIn(s, mx.STATES, s)

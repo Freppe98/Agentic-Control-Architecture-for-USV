@@ -26,8 +26,13 @@ import { FSM_ACTIVE_ORDER } from "./replan.js";
 // Scout's mission-execution states, verbatim and complete.
 export const STATES = [
   "NOT_READY", "NOT_STARTED", "READY",
-  "START_REQUESTED", "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED",
+  // Scout's Start transaction, in its own order. ARMING / VERIFYING_ARMED /
+  // CONFIRMING_PROGRESSION are steps Scout reports and this build used to display raw and flag as
+  // unrecognized — the wrong answer for a step of a transaction the operator is watching.
+  "START_REQUESTED", "ARMING", "VERIFYING_ARMED",
+  "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED",
   "SETTING_HOME", "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO",
+  "CONFIRMING_PROGRESSION",
   "RUNNING",
   "PAUSE_REQUESTED", "PAUSED", "RESUME_REQUESTED",
   "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
@@ -122,8 +127,9 @@ export const EXPLICIT_REPLAN_STATES = new Set([EFFECTIVE_REPLANNING, ...FSM_ACTI
 // SUSPENDED / FAILED) — the transaction steps AND the return phase, which is likewise not a state
 // the operator may act on.
 export const TRANSITIONAL_STATES = [
-  "START_REQUESTED", "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME",
-  "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO",
+  "START_REQUESTED", "ARMING", "VERIFYING_ARMED",
+  "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME",
+  "VERIFYING_HOME", "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "CONFIRMING_PROGRESSION",
   "PAUSE_REQUESTED", "RESUME_REQUESTED",
   ...STOP_IN_TRANSACTION_STATES,
   "RETURNING_HOME", "HOME_ARRIVAL_PENDING", "FINAL_HOLD_REQUESTED",
@@ -136,12 +142,15 @@ export const REARMABLE_STATES = ["COMPLETED_HOLD", "SUSPENDED", "FAILED"];
 // performing, so the operator can see where a Start actually stalled.
 export const TRANSITION_LABELS = {
   START_REQUESTED: "Preparing start…",
+  ARMING: "Arming…",
+  VERIFYING_ARMED: "Verifying armed…",
   START_HOLD_REQUESTED: "Requesting launch hold…",
   START_HOLD_CONFIRMED: "Launch hold verified",
   SETTING_HOME: "Setting launch Home…",
   VERIFYING_HOME: "Verifying Home…",
   SYNCHRONIZING_PACKAGE: "Synchronizing mission package…",
   STARTING_AUTO: "Starting AUTO…",
+  CONFIRMING_PROGRESSION: "Confirming mission progression…",
   PAUSE_REQUESTED: "Pausing mission…",
   RESUME_REQUESTED: "Resuming mission…",
   ...STOP_TRANSITION_LABELS,
@@ -1881,6 +1890,54 @@ const START_FAILURE_RULES = [
   [/position/i, "Position is stale or invalid."],
 ];
 
+// ---- A Start whose HTTP verdict was lost, and the read that answered it --------------------
+//
+// A LOCAL CLIENT TIMEOUT IS NOT A FAILED START. Scout's Start is one bounded transaction that
+// legitimately runs for tens of seconds (verified LOITER → Home → package sync → verified AUTO →
+// progression confirmation), and when its HTTP reply does not reach us the backend does not
+// guess: mission_lifecycle._run_operation performs exactly ONE reconciling READ of Scout's
+// canonical status (GET /agent/mission_execution/status) and returns that verdict under
+// `reconciliation`. It is the authoritative answer to "did the Start take effect", and reading
+// past it is what put "Mission could not start: No response from Scout" on the card of a vehicle
+// that was, at that moment, RUNNING in AUTO.
+//
+// The verdicts are Scout's state, narrowed by scout_mission_execution.reconcile():
+//   running / completed  the run is under way (or already past this operation) — the Start WORKED
+//   in_progress          Scout is still inside its own Start transaction — UNDECIDED, not failed
+//   ready / not_started / mission_mismatch / failed / suspended / unknown
+//                        a definite negative answer, or no answer at all — unchanged, still shown
+//                        as the failure it is. In particular `unknown` covers the reconciling read
+//                        ITSELF failing, which is the genuine "no response from Scout" case.
+export const RECONCILED_STARTED = ["running", "completed"];
+export const RECONCILED_IN_PROGRESS = ["in_progress"];
+
+/**
+ * How the backend's ONE reconciling read answered a Start whose transport verdict was lost.
+ * Returns null unless the outcome is `unknown` AND a reconciliation is present — so it can never
+ * soften an outcome Scout actually reported.
+ *
+ * @param view  interpretTransaction() output for the start operation
+ * @returns {{ resolved, detail, started, inProgress, text, tone }|null}
+ */
+export function reconciledStart(view) {
+  if (!isObj(view) || str(view.outcome) !== OUTCOME.UNKNOWN) return null;
+  const rec = isObj(view.reconciliation) ? view.reconciliation : null;
+  if (!rec) return null;
+  const resolved = str(rec.resolved);
+  const started = RECONCILED_STARTED.includes(resolved);
+  const inProgress = RECONCILED_IN_PROGRESS.includes(resolved);
+  const detail = asText(rec.detail);
+  return {
+    resolved, detail, started, inProgress,
+    // Both sentences state WHERE the fact came from. The operator is being told that the reply
+    // was lost and that Scout's own status was read to settle it — not handed a plain "Accepted"
+    // for a verdict that never arrived.
+    text: started ? "Mission started — confirmed by reading Scout's status"
+      : inProgress ? "Start in progress — Scout is still completing it" : null,
+    tone: started ? "ok" : inProgress ? "" : "warn",
+  };
+}
+
 /**
  * ONE compact, actionable error for a Start that did not happen, plus the full evidence for the
  * tooltip. Returns null for a Start that is still running or that succeeded.
@@ -1896,6 +1953,11 @@ export function startFailure(view) {
   if (!isObj(view)) return null;
   const outcome = str(view.outcome);
   if (!outcome || outcome === OUTCOME.ACCEPTED || outcome === "pending") return null;
+  // The verdict was lost, and the reconciling read says the mission is running or that Scout is
+  // still working on it. There is no failure to report — the card follows the next authoritative
+  // status poll, exactly as it does for a Start whose reply did arrive.
+  const rec = reconciledStart(view);
+  if (rec && (rec.started || rec.inProgress)) return null;
 
   const blockers = Array.isArray(view.blockers) ? view.blockers.map(asText).filter(Boolean) : [];
   const code = str(view.code);

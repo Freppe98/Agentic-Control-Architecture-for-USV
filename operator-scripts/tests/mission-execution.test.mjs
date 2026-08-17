@@ -52,8 +52,10 @@ test("every Scout mission-execution state, including the whole STOP sequence, is
   // for a state we have never heard of and the WRONG one for a step of Scout's own stop
   // transaction, which the operator must be able to read as progress.
   for (const s of ["NOT_READY", "NOT_STARTED", "READY", "START_REQUESTED",
+    "ARMING", "VERIFYING_ARMED",
     "START_HOLD_REQUESTED", "START_HOLD_CONFIRMED", "SETTING_HOME", "VERIFYING_HOME",
-    "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "RUNNING", "PAUSE_REQUESTED", "PAUSED",
+    "SYNCHRONIZING_PACKAGE", "STARTING_AUTO", "CONFIRMING_PROGRESSION",
+    "RUNNING", "PAUSE_REQUESTED", "PAUSED",
     "RESUME_REQUESTED", "STOP_REQUESTED", "STOP_HOLD_REQUESTED", "STOP_HOLD_CONFIRMED",
     "STOP_VERIFYING_MISSION", "STOP_RESTORING_ORIGINAL", "STOP_REWINDING",
     "STOP_VERIFYING_REWIND", "STOP_RESETTING", "STOP_VERIFYING_RESET",
@@ -63,7 +65,7 @@ test("every Scout mission-execution state, including the whole STOP sequence, is
     assert.equal(isUnknownState(s), false, s);
     assert.notEqual(stateLabel(s), "Unknown", s);
   }
-  assert.equal(STATES.length, 31);
+  assert.equal(STATES.length, 34);
 });
 
 test("REPLANNING is an effective-state OVERLAY, never a stored state", () => {
@@ -85,12 +87,15 @@ test("a state this build does not know is flagged, not silently bucketed", () =>
 test("every transitional state has the mandated progress label", () => {
   const expected = {
     START_REQUESTED: "Preparing start…",
+    ARMING: "Arming…",
+    VERIFYING_ARMED: "Verifying armed…",
     START_HOLD_REQUESTED: "Requesting launch hold…",
     START_HOLD_CONFIRMED: "Launch hold verified",
     SETTING_HOME: "Setting launch Home…",
     VERIFYING_HOME: "Verifying Home…",
     SYNCHRONIZING_PACKAGE: "Synchronizing mission package…",
     STARTING_AUTO: "Starting AUTO…",
+    CONFIRMING_PROGRESSION: "Confirming mission progression…",
     PAUSE_REQUESTED: "Pausing mission…",
     RESUME_REQUESTED: "Resuming mission…",
     RETURNING_HOME: "Returning to Home",

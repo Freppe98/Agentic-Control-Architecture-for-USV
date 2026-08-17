@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import {
   lifecycleControls, stopAvailability, pauseAvailability, resumeAvailability, missionCardView,
   normalizeStatus, interpretTransaction, transactionSummary, outcomeLabel, startFailure,
-  stopOutcomeView, stopPhase, stopEvidenceDetail, startGate,
+  reconciledStart, stopOutcomeView, stopPhase, stopEvidenceDetail, startGate,
   OUTCOME, STATES, STOPPED_STATES, STOPPABLE_STATES, STOP_TRANSITION_LABELS,
 } from "../operator/lib/mission-execution.js";
 import { deploymentReadiness } from "../operator/lib/home.js";
@@ -302,6 +302,105 @@ test("a FAILED pause/resume leaves the operator a usable error, never a silent n
   assert.match(outcomeLabel(unavailable.outcome), /unavailable/i);
   // A failed operation is never dressed up as a start failure banner on another operation.
   assert.equal(startFailure(null), null);
+});
+
+// ── A3b. A Start whose HTTP verdict was LOST is reported from the reconciling read ───────
+//
+// The live defect: Scout completed a Start in 12.0 s and entered RUNNING / AUTO, the operator's
+// own HTTP client gave up first, and the card said "Mission could not start: No response from
+// Scout" about a mission that was running. The transport budget is fixed in the backend; these
+// pin the presentation rule, which has to hold whatever the budget is — a lost verdict is
+// answered by the backend's ONE reconciling read of Scout's canonical status, never by the fact
+// that the local client stopped waiting.
+const lostVerdict = (reconciliation) => interpretTransaction({ status: 202, data: {
+  outcome: "unknown", operation: "start", mission_id: "msn-329c2faff137",
+  error: "No response from Scout — outcome unknown, reconcile with a read: ReadTimeout",
+  reconciliation, phases: [], authority: { required: "LOCAL_AGENT", verified: true } } });
+
+test("a lost Start verdict that reconciles to RUNNING is a started mission, not a failure", () => {
+  const view = lostVerdict({ attempted: true, operation: "start", resolved: "running",
+    state: "RUNNING", mode: "AUTO", mission_id: "msn-329c2faff137", mission_id_match: true,
+    detail: "Scout reports RUNNING in mode AUTO" });
+  assert.equal(startFailure(view), null, "no failure banner for a mission that is running");
+  const rec = reconciledStart(view);
+  assert.equal(rec.started, true);
+  assert.equal(rec.inProgress, false);
+  assert.equal(rec.tone, "ok");
+  assert.match(rec.text, /started/i);
+  assert.doesNotMatch(rec.text, /could not start|no response/i);
+  // The evidence stays available in full — the tooltip still says where the answer came from.
+  assert.match(transactionSummary(view), /reconciled: running/);
+});
+
+test("a lost Start verdict mid-transaction is IN PROGRESS, not a failed Start", () => {
+  // Scout's own Start steps, including the three this build previously did not recognize.
+  for (const state of ["ARMING", "VERIFYING_ARMED", "START_HOLD_CONFIRMED", "STARTING_AUTO",
+    "CONFIRMING_PROGRESSION"]) {
+    const view = lostVerdict({ attempted: true, operation: "start", resolved: "in_progress",
+      state, detail: `Scout is still processing (${state})` });
+    assert.equal(startFailure(view), null, state);
+    const rec = reconciledStart(view);
+    assert.equal(rec.inProgress, true, state);
+    assert.equal(rec.started, false, state);
+    assert.match(rec.text, /in progress/i, state);
+    assert.doesNotMatch(rec.text, /could not start/i, state);
+    // …and every one of them is a state this build knows and shows as a step.
+    assert.equal(STATES.includes(state), true, state);
+  }
+});
+
+test("a lost Start verdict whose reconciling READ also failed is a genuine no-response", () => {
+  // Scout is unreachable: the write got no verdict AND the status endpoint answered nothing.
+  // This is the one case that must still read as a connection failure, unchanged.
+  const view = lostVerdict({ attempted: true, operation: "start", resolved: "unknown",
+    status_outcome: "unavailable", supported: true, reachable: false, state: null,
+    detail: "Mission-execution status could not be read — the operation's outcome stays UNKNOWN "
+      + "and must not be resent blindly" });
+  const fail = startFailure(view);
+  assert.notEqual(fail, null);
+  assert.equal(fail.title, "Mission could not start");
+  assert.match(fail.text, /No response from Scout/);
+  assert.equal(reconciledStart(view).started, false);
+  assert.equal(reconciledStart(view).text, null);
+});
+
+test("a lost Start verdict that reconciles to a NEGATIVE answer stays a failure", () => {
+  // Scout is resting where it started, or running something else. Both are definite answers, and
+  // neither may be softened by the fact that reconciliation ran.
+  for (const [resolved, detail] of [
+    ["ready", "Scout is still READY — the start did not take effect"],
+    ["not_started", "Scout reports STOPPED — the operation did not take effect"],
+    ["mission_mismatch", "Scout reports mission msn-OTHER, not the expected msn-329c2faff137"],
+    ["failed", "AUTO_NOT_VERIFIED"],
+  ]) {
+    const view = lostVerdict({ attempted: true, operation: "start", resolved, detail });
+    assert.notEqual(startFailure(view), null, resolved);
+    assert.equal(reconciledStart(view).text, null, resolved);
+  }
+});
+
+test("a DEFINITE Scout Start failure is still shown as a failure", () => {
+  // Untouched by any of the above: Scout answered, and its answer was that the vehicle-level
+  // start failed. Reconciliation never runs here, and there is nothing to reinterpret.
+  const failed = interpretTransaction({ status: 200, data: {
+    outcome: "failed", operation: "start",
+    error: { code: "AUTO_NOT_VERIFIED", message: "mode never read back as AUTO" },
+    phases: [], authority: {} } });
+  const fail = startFailure(failed);
+  assert.equal(fail.title, "Mission could not start");
+  assert.match(fail.detail, /AUTO_NOT_VERIFIED/);
+  assert.equal(reconciledStart(failed), null, "an answered operation is never 'reconciled'");
+  const rejected = interpretTransaction({ status: 409, data: {
+    outcome: "blocked", operation: "start", error_code: "START_PRECONDITIONS_NOT_MET",
+    blockers: ["Mission record VERIFIED: No active mission record"], phases: [], authority: {} } });
+  assert.equal(startFailure(rejected).blocked, true);
+});
+
+test("the Map renders the reconciled Start verdict instead of the bare unknown", () => {
+  assert.match(mapSrc, /mx\.reconciledStart\(res\.view\)/);
+  // It is reached only for a Start, and only when there is no failure to show.
+  assert.match(mapSrc, /res\.action === "start" && !startFail/);
+  assert.match(mapSrc, /startReconciled && startReconciled\.text/);
 });
 
 // ── A4. Take Control stays reachable for the whole of a LOCAL_AGENT run ──────────────────
