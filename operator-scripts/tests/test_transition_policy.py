@@ -23,7 +23,7 @@ Three things must therefore be true at once, and each is pinned below:
     region, the same tolerances. It can neither leave the navigable region nor touch the buffered
     no-go geometry (TestDirectTransitIsHeldToTheSamePredicate).
   * COVERAGE IS UNTOUCHED. The clipped fragments, their order and their flown DIRECTION are
-    byte-identical to the aligned-only baseline. That is what `allow_direct_transit=False` in the
+    byte-identical to the aligned-only baseline. That is what `optimize_transit=False` in the
     BCD cell-entry probe buys: without it, a probe that suddenly answers "direct_transit" for both
     candidate entries stops discriminating and the cell entry bit — hence some cells' sweep
     direction — moves for reasons unrelated to buildability (TestCoverageIsUnchanged,
@@ -63,8 +63,8 @@ def _gen_aligned_only(inp):
     behaviour, reproduced through the public switch rather than from a stored golden file."""
     real = planning._aligned_transition
 
-    def aligned_only(frame, a, b, in_dir=None, out_dir=None, allow_direct_transit=True):
-        return real(frame, a, b, in_dir=in_dir, out_dir=out_dir, allow_direct_transit=False)
+    def aligned_only(frame, a, b, in_dir=None, out_dir=None, optimize_transit=True):
+        return real(frame, a, b, in_dir=in_dir, out_dir=out_dir, optimize_transit=False)
 
     planning._aligned_transition = aligned_only
     try:
@@ -169,25 +169,35 @@ class TestTierZeroAcceptance(unittest.TestCase):
         self.assertEqual([[float(c) for c in p] for p in path],
                          [[float(c) for c in a], [float(c) for c in b]])
 
-    def test_an_unsafe_direct_leg_falls_through_to_the_existing_hierarchy(self):
+    def test_an_unsafe_direct_leg_is_never_taken_direct(self):
         a, b = self._across_the_exclusion_pair()
         self.assertFalse(self.grid.segment_is_safe(a, b, require_inside=True),
                          "precondition: the direct leg must cross the exclusion")
 
         path, category = planning._aligned_transition(self.frame, a, b)
         self.assertNotEqual(category, "direct_transit")
-        self.assertIn(category, ("direct", "orthogonal", "bypass", "fallback"))
+        self.assertIn(category, ("shortest_safe_transit", "direct", "orthogonal", "bypass",
+                                 "fallback"))
         self.assertGreater(len(path), 2, "an unsafe direct must be replaced by a routed path")
+        for p, q in zip(path, path[1:]):
+            self.assertTrue(self.grid.segment_is_safe(p, q, require_inside=True))
+
+    def test_with_optimisation_suppressed_it_falls_through_to_the_aligned_hierarchy(self):
+        """The pre-F2/F4 hierarchy is still intact underneath and still answers."""
+        a, b = self._across_the_exclusion_pair()
+        path, category = planning._aligned_transition(self.frame, a, b, optimize_transit=False)
+        self.assertIn(category, ("direct", "orthogonal", "bypass", "fallback"))
+        self.assertGreater(len(path), 2)
         for p, q in zip(path, path[1:]):
             self.assertTrue(self.grid.segment_is_safe(p, q, require_inside=True))
 
     def test_suppressing_the_tier_restores_the_previous_answer(self):
         a, b = self._clear_water_pair()
         _, with_tier0 = planning._aligned_transition(self.frame, a, b)
-        _, without = planning._aligned_transition(self.frame, a, b, allow_direct_transit=False)
+        _, without = planning._aligned_transition(self.frame, a, b, optimize_transit=False)
         self.assertEqual(with_tier0, "direct_transit")
         self.assertNotEqual(without, "direct_transit",
-                            "allow_direct_transit=False must reach the aligned tiers")
+                            "optimize_transit=False must reach the aligned tiers")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -417,12 +427,12 @@ class TestTheBcdEntryProbeIgnoresTierZero(unittest.TestCase):
         seen = []
         real = planning._aligned_transition
 
-        def spy(frame, a, b, in_dir=None, out_dir=None, allow_direct_transit=True):
+        def spy(frame, a, b, in_dir=None, out_dir=None, optimize_transit=True):
             caller = sys._getframe(1).f_code.co_name
             if caller == "_unaligned_entry":
-                seen.append(allow_direct_transit)
+                seen.append(optimize_transit)
             return real(frame, a, b, in_dir=in_dir, out_dir=out_dir,
-                        allow_direct_transit=allow_direct_transit)
+                        optimize_transit=optimize_transit)
 
         planning._aligned_transition = spy
         try:
@@ -478,7 +488,12 @@ class TestTheTransitsActuallyImprove(unittest.TestCase):
             total += math.hypot(bp[0] - ap[0], bp[1] - ap[1])
         return total, len(trans)
 
-    def test_transit_distance_and_waypoints_never_increase(self):
+    def test_transit_distance_never_increases_and_points_are_only_traded_for_distance(self):
+        """Transit DISTANCE is the quantity the optimisation tiers minimise, and it may never
+        grow. Waypoint count is a different quantity and is allowed to move in either direction:
+        tier 0 removes L corners (large reductions), while tier 0b can spend a corner to cut a
+        detour short. What must never happen is paying waypoints for nothing, so an increase is
+        only legal alongside a strict distance reduction."""
         for name, inp in MATRIX:
             with self.subTest(case=name):
                 grid = planning._NavGrid(
@@ -488,11 +503,13 @@ class TestTheTransitsActuallyImprove(unittest.TestCase):
                 new, old = _gen(inp), _gen_aligned_only(inp)
                 n_len, _ = self._transit_metrics(new, grid)
                 o_len, _ = self._transit_metrics(old, grid)
-                self.assertLessEqual(n_len, o_len + 0.5,
-                                     f"[{name}] transit distance grew")
-                self.assertLessEqual(new["metrics"]["waypoint_count"],
-                                     old["metrics"]["waypoint_count"],
-                                     f"[{name}] waypoint count grew")
+                self.assertLessEqual(n_len, o_len + 0.5, f"[{name}] transit distance grew")
+                n_wp = new["metrics"]["waypoint_count"]
+                o_wp = old["metrics"]["waypoint_count"]
+                if n_wp > o_wp:
+                    self.assertLess(n_len, o_len - planning.F4_MIN_GAIN_M,
+                                    f"[{name}] {n_wp - o_wp} waypoint(s) were added without a "
+                                    f"real distance saving")
 
 
 if __name__ == "__main__":

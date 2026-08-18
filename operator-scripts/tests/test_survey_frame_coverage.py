@@ -299,11 +299,16 @@ class TestRectangularNoGoInTheMiddle(unittest.TestCase):
         self.assertEqual(_arc_runs(_coverage_legs(self.pkg, self.grid)), 0,
                          "the coverage path still traces a rounded exclusion boundary")
 
-    def test_transitions_are_survey_frame_orthogonal(self):
+    def test_transitions_are_built_by_the_bounded_tiers_not_the_generic_a_star(self):
         rq = self.pkg["route_quality"]
-        self.assertGreater(rq["orthogonal_transition_count"], 0)
+        built = (rq["direct_transit_transition_count"]
+                 + rq["shortest_safe_transition_count"]
+                 + rq["aligned_direct_transition_count"]
+                 + rq["orthogonal_transition_count"])
+        self.assertGreater(built, 0, "the exclusion must force real transitions")
         self.assertEqual(rq["fallback_connector_count"], 0,
-                         "no aligned transition could be found where one exists")
+                         "a transition fell through to the generic A* where a bounded tier "
+                         "could have answered")
 
     def test_safety_geometry_is_unchanged(self):
         _assert_legs_safe(self, self.pkg, self.grid)
@@ -441,7 +446,7 @@ class TestAlignedTransition(unittest.TestCase):
     pinned rather than inferred from a whole mission.
 
     These cases pin the ALIGNED tiers (1-4), so they call the generator with
-    `allow_direct_transit=False` - the same switch the BCD cell-entry probe uses. Without it the
+    `optimize_transit=False` - the same switch the BCD cell-entry probe uses. Without it the
     direct-safe tier 0 would answer first wherever a straight leg is safe and the orthogonal /
     bypass ordering below it would never be exercised. Tier 0 has its own coverage in
     tests/test_transition_policy.py."""
@@ -450,7 +455,7 @@ class TestAlignedTransition(unittest.TestCase):
 
     def _aligned(self, a, b, **kw):
         """_aligned_transition with tier 0 suppressed - see the class docstring."""
-        return planning._aligned_transition(self.frame, a, b, allow_direct_transit=False, **kw)
+        return planning._aligned_transition(self.frame, a, b, optimize_transit=False, **kw)
 
     def setUp(self):
         self.inp = _inputs(no_go_zones=[CENTER_ZONE])
@@ -803,9 +808,13 @@ class TestCurrentUiRegression(unittest.TestCase):
         self.assertGreater(with_zone_m, 0.8 * no_zone_m,
                            "far more coverage was lost than the exclusion actually occupies")
 
-    def test_transitions_are_survey_frame_orthogonal_and_need_no_fallback(self):
+    def test_transitions_are_built_by_the_bounded_tiers_and_need_no_fallback(self):
         rq = self.pkg["route_quality"]
-        self.assertGreater(rq["orthogonal_transition_count"], 0)
+        built = (rq["direct_transit_transition_count"]
+                 + rq["shortest_safe_transition_count"]
+                 + rq["aligned_direct_transition_count"]
+                 + rq["orthogonal_transition_count"])
+        self.assertGreater(built, 0)
         self.assertEqual(rq["fallback_connector_count"], 0)
 
     def test_the_no_go_buffer_is_fully_respected(self):
@@ -824,7 +833,7 @@ class TestCurrentUiRegression(unittest.TestCase):
         alg = self.pkg["generation_algorithm"]
         self.assertEqual(alg["coverage"], "survey-frame-boustrophedon-v1")
         self.assertEqual(alg["coverage_transitions"],
-                         "direct-safe-first-survey-frame-orthogonal-v2")
+                         "shortest-safe-local-direct-first-survey-frame-orthogonal-v3")
         self.assertEqual(alg["coverage_lane_family"], "ported-scout-boustrophedon-v1")
 
 

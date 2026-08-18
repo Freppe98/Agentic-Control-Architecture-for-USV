@@ -329,7 +329,7 @@ class TestAlignmentGateAgreesWithTheClassifier(unittest.TestCase):
     leg. These tests pin the two sides together.
 
     They probe the ALIGNED TIERS specifically, so they call _aligned_transition with
-    `allow_direct_transit=False` - the same switch the BCD cell-entry probe uses. The tier-0
+    `optimize_transit=False` - the same switch the BCD cell-entry probe uses. The tier-0
     direct-safe candidate would otherwise answer first for every one of these clear-water
     offsets and the tier-1 gate below it would never be reached. Tier 0 is covered by
     tests/test_transition_policy.py.
@@ -339,7 +339,7 @@ class TestAlignmentGateAgreesWithTheClassifier(unittest.TestCase):
         grid = _grid("rectangle, no obstacle")
         return planning._SurveyFrame(grid, 0.0), grid
 
-    def _transition_for(self, du, dv, allow_direct_transit=False):
+    def _transition_for(self, du, dv, optimize_transit=False):
         """Build a transition across a clear region with the given survey-frame offsets."""
         frame, grid = self._frame_and_grid()
         centre = frame.deg_to_rot(list(grid.to_deg.transform(*grid.coverage.centroid.coords[0])))
@@ -349,7 +349,7 @@ class TestAlignmentGateAgreesWithTheClassifier(unittest.TestCase):
         cls = planning._survey_align_class(frame.rot_to_proj(a_rot), frame.rot_to_proj(b_rot),
                                            frame.angle_deg)
         path, category = planning._aligned_transition(
-            frame, a_deg, b_deg, allow_direct_transit=allow_direct_transit)
+            frame, a_deg, b_deg, optimize_transit=optimize_transit)
         return cls, category, path
 
     def test_a_small_offset_the_classifier_still_calls_aligned_is_accepted_direct(self):

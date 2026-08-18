@@ -53,6 +53,7 @@ route-only shape mission_contract.py hashes and POST /api/commands (MISSION_UPLO
 """
 
 import hashlib
+import heapq
 import json
 import math
 from datetime import datetime, timezone
@@ -861,6 +862,33 @@ BYPASS_MARGIN_M = max(2.0 * COVER_TOL_M, 1.0)
 # one transition, nearest first.
 MAX_BYPASS_BODIES = 2
 
+# ── F4: bounded shortest-safe inter-fragment transit ──────────────────────────────────────
+# When the straight A→B is NOT safe, a short detour around the one thing blocking it is usually
+# far shorter than the survey-frame L or staircase that currently replaces it (measured on the
+# operator's own large polygon: 110.1→78.2 m, 160.6→114.5 m, 162.6→116.3 m). The detour is found
+# with a LOCAL visibility graph, and every one of these constants exists to keep that search
+# bounded — this is deliberately not a general path planner.
+#
+# LOCAL_MARGIN: how far outside the A/B bounding box a corner may sit and still be considered.
+# A transit that needs to reach further than this around an obstacle is not a "short detour"; it
+# is exactly the case the existing bypass/A* tiers already handle.
+F4_LOCAL_MARGIN_M = 15.0
+# How far inside the buildable region the candidate corners are placed. Strictly greater than
+# COVER_TOL_M so a corner is clear of the tolerance band `_seg_covered` / `_seg_clears_nogo`
+# measure against, and therefore cannot itself be the reason a leg is rejected.
+F4_VERTEX_INSET_M = COVER_TOL_M + 0.1
+# The corner ring is simplified before use. A buffered no-go is a ROUND polygon with dozens of
+# near-collinear arc vertices; without this they would fill the candidate budget with points that
+# describe the same corner. Douglas-Peucker at this tolerance keeps the genuine corners.
+F4_VERTEX_SIMPLIFY_M = 0.5
+# Hard cap on the local candidate set, so the graph is O(1) in the size of the survey area.
+# 24 corners => at most 26 nodes => at most 325 undirected pair probes per transition, all
+# memoised through the same `_seg_safe_cached` the rest of generation uses.
+F4_MAX_LOCAL_VERTICES = 24
+# The minimum saving that justifies replacing a proven aligned candidate. Small, but non-zero:
+# a near-tie must not churn the route hash for a few centimetres.
+F4_MIN_GAIN_M = 0.5
+
 # Provenance for the finalized package (PART 11): names the exact, reproducible algorithm at
 # each pipeline stage so the thesis run is explainable. Not a version the upload contract reads.
 GENERATION_ALGORITHM = {
@@ -874,11 +902,12 @@ GENERATION_ALGORITHM = {
     # a strict global (row, along_index) order, which forced a trip around the exclusion and back
     # on every lane an exclusion split.
     "fragment_ordering": "boustrophedon-cellular-decomposition-v1",
-    # Inter-fragment transits try the straight leg FIRST at any heading, accepted only by the
-    # same authoritative safety predicate, and fall through to the unchanged survey-frame
-    # orthogonal/bypass/A* hierarchy when it is not safe (see _aligned_transition tier 0).
+    # Inter-fragment transits try the straight leg FIRST at any heading; when it is unsafe, a
+    # BOUNDED LOCAL detour is searched and taken only if it beats the aligned candidate. Both are
+    # accepted solely by the same authoritative safety predicate, and the unchanged survey-frame
+    # orthogonal/bypass/A* hierarchy remains underneath (see _aligned_transition tiers 0 and 0b).
     # Coverage lanes themselves remain strictly survey-frame aligned.
-    "coverage_transitions": "direct-safe-first-survey-frame-orthogonal-v2",
+    "coverage_transitions": "shortest-safe-local-direct-first-survey-frame-orthogonal-v3",
     "safe_connector": "bounded-grid-a-star-v1",
     "connector_simplification": "safe-line-of-sight-v1",
     "cleanup": "semantic-path-cleanup-v1",
@@ -1046,6 +1075,16 @@ class _NavGrid:
         self.connector_len_before_m = 0.0
         self.connector_len_after_m = 0.0
         self.astar_connector_count = 0
+        # F4 (bounded shortest-safe transit) instrumentation. Counted on the grid for the same
+        # reason the connector counters are: one generation, one place, and the route-quality
+        # layer reads them at the end rather than threading a return value through every tier.
+        self.shortest_safe_count = 0
+        self.shortest_safe_len_m = 0.0
+        self.shortest_safe_saved_m = 0.0
+        self.f4_candidate_vertices = 0     # summed local candidates offered, for the perf budget
+        self.f4_edge_probes = 0            # summed safety probes the local graph asked for
+        self.f4_invocations = 0
+        self._f4_corners_proj = None       # lazily built once per generation
 
     @property
     def empty(self):
@@ -1404,6 +1443,144 @@ class _NavGrid:
         self.connector_len_after_m += self._proj_len_m(simplified)
         return simplified
 
+    # ── F4: bounded shortest-safe transit ────────────────────────────────────────────────
+    def _f4_corners(self):
+        """The corner set the local detour search may route through, in PROJECTED metres.
+
+        Built ONCE per generation, from `buildable` shrunk by F4_VERTEX_INSET_M. That single
+        shrink yields exactly the two families of corners a detour ever needs, and yields them
+        already PROVEN to be strictly inside the region every leg is judged against:
+
+          * the OUTER ring pulled inward  — the corners of a concave shoreline;
+          * the INNER rings pushed outward — the corners of the buffered no-go exclusion,
+            because `buildable` carries the exclusion as a hole.
+
+        Deriving both from the same shrink is what makes the offset trustworthy: there is no
+        centroid-direction heuristic that a concave vertex could defeat, and no candidate can be
+        rejected later for being marginally outside. The ring is simplified first — a buffered
+        no-go is round, and its arc vertices would otherwise fill the whole candidate budget
+        while describing a single corner."""
+        if self._f4_corners_proj is not None:
+            return self._f4_corners_proj
+        pts = []
+        region = self.buildable
+        if region is not None and not region.is_empty:
+            try:
+                shrunk = region.buffer(-F4_VERTEX_INSET_M)
+                if not shrunk.is_empty:
+                    shrunk = shrunk.simplify(F4_VERTEX_SIMPLIFY_M, preserve_topology=True)
+                    polys = (shrunk.geoms if isinstance(shrunk, MultiPolygon) else [shrunk])
+                    for poly in polys:
+                        if poly.is_empty:
+                            continue
+                        for ring in [poly.exterior] + list(poly.interiors):
+                            pts.extend((float(x), float(y)) for x, y in list(ring.coords)[:-1])
+            except Exception:
+                pts = []
+        # Deterministic order, de-duplicated at centimetre resolution.
+        seen, out = set(), []
+        for x, y in pts:
+            k = (round(x, 2), round(y, 2))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append((x, y))
+        out.sort(key=lambda q: (round(q[0], 3), round(q[1], 3)))
+        self._f4_corners_proj = out
+        return out
+
+    def f4_local_vertices(self, a_deg, b_deg):
+        """The corners LOCAL to one a→b transit: inside the a/b bounding box grown by
+        F4_LOCAL_MARGIN_M, nearest to the a–b line first, capped at F4_MAX_LOCAL_VERTICES.
+
+        Bounded by construction and independent of how large the survey area is — a corner on
+        the far side of the polygon can never enter this set. A detour that would need to reach
+        further than the margin is not the short local detour this tier exists for; it is left
+        to the bypass / A* tiers that already handle it."""
+        ax, ay = self.to_proj.transform(a_deg[0], a_deg[1])
+        bx, by = self.to_proj.transform(b_deg[0], b_deg[1])
+        m = F4_LOCAL_MARGIN_M
+        lo_x, hi_x = min(ax, bx) - m, max(ax, bx) + m
+        lo_y, hi_y = min(ay, by) - m, max(ay, by) + m
+        seg = LineString([(ax, ay), (bx, by)])
+        near = []
+        for (x, y) in self._f4_corners():
+            if x < lo_x or x > hi_x or y < lo_y or y > hi_y:
+                continue
+            near.append((round(seg.distance(Point(x, y)), 4), round(x, 3), round(y, 3), (x, y)))
+        near.sort()
+        return [q for _d, _rx, _ry, q in near[:F4_MAX_LOCAL_VERTICES]]
+
+    def shortest_safe_transit(self, a_deg, b_deg, limit_m=None):
+        """The shortest path a→b through the LOCAL corner set whose every leg is accepted by
+        the authoritative predicate, or None.
+
+        Deterministic Dijkstra over {a, b} ∪ local corners. An edge exists only when
+        `_seg_safe_cached(u, v, True)` accepts it — the SAME predicate, the same region
+        (`buildable` = shoreline-inset MINUS buffered no-go, minus the wire margin) and the same
+        tolerances every other tier is held to. No new geometry test exists and nothing is
+        relaxed; this tier can only ever propose a path that the existing predicate already
+        calls safe.
+
+        `limit_m` prunes the search: a partial path already longer than the aligned candidate it
+        would have to beat cannot win, so it is dropped rather than expanded.
+
+        The result is then run through the grid's own `_compress_los`, which re-proves every
+        retained hop, so a corner the graph routed through but does not need is removed."""
+        self.f4_invocations += 1
+        corners = self.f4_local_vertices(a_deg, b_deg)
+        self.f4_candidate_vertices += len(corners)
+        if not corners:
+            return None
+        nodes = [[float(a_deg[0]), float(a_deg[1])], [float(b_deg[0]), float(b_deg[1])]]
+        nodes.extend(list(self.to_deg.transform(x, y)) for (x, y) in corners)
+        n = len(nodes)
+        proj = [self.to_proj.transform(c[0], c[1]) for c in nodes]
+
+        def leg_m(i, j):
+            return math.hypot(proj[j][0] - proj[i][0], proj[j][1] - proj[i][1])
+
+        dist = [float("inf")] * n
+        prev = [None] * n
+        dist[0] = 0.0
+        # (cost, node) — the node index breaks cost ties, and neighbours are always scanned in
+        # index order, so an identical input yields an identical path.
+        pq = [(0.0, 0)]
+        done = [False] * n
+        while pq:
+            d, i = heapq.heappop(pq)
+            if done[i]:
+                continue
+            done[i] = True
+            if i == 1:
+                break
+            for j in range(n):
+                if j == i or done[j]:
+                    continue
+                nd = d + leg_m(i, j)
+                if nd >= dist[j] or (limit_m is not None and nd > limit_m):
+                    continue
+                self.f4_edge_probes += 1
+                if not self._seg_safe_cached(nodes[i], nodes[j], True):
+                    continue
+                dist[j] = nd
+                prev[j] = i
+                heapq.heappush(pq, (nd, j))
+        if dist[1] == float("inf"):
+            return None
+        path, k = [], 1
+        while k is not None:
+            path.append(nodes[k])
+            k = prev[k]
+        path = _dedup(list(reversed(path)))
+        if len(path) < 2:
+            return None
+        # Re-proved shortcutting: drop any corner the straight hop can skip safely.
+        path = self._compress_los(path, True)
+        if not all(self._seg_safe_cached(p, q, True) for p, q in zip(path, path[1:])):
+            return None          # defensive: never emit a path this grid does not accept
+        return path
+
     def repair_path(self, coords_deg):
         """Walk an ordered coverage path and replace every UNSAFE straight hop with a safe
         connector, leaving safe hops (the scan lines themselves) untouched. This is what
@@ -1727,15 +1904,17 @@ def _rot_path_len(pts_rot):
 
 
 def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None,
-                       allow_direct_transit=True):
+                       optimize_transit=True):
     """The transition a→b between two coverage fragments. Returns (coords_deg, category).
 
     CONNECTOR PRIORITY (each tier's candidates are proven before the next tier is considered):
 
-      0. "direct_transit"  the straight segment whenever it is SAFE, at ANY heading. See
+      0.  "direct_transit"        the straight segment whenever it is SAFE, at ANY heading. See
                        DIRECT-SAFE-FIRST below for why a transition is not held to the
-                       survey-frame alignment the coverage lanes are. Suppressed by
-                       `allow_direct_transit=False`;
+                       survey-frame alignment the coverage lanes are;
+      0b. "shortest_safe_transit" when the straight segment is NOT safe: the shortest path
+                       through a BOUNDED LOCAL corner set, taken only when it beats the best
+                       aligned candidate by F4_MIN_GAIN_M. See SHORTEST-SAFE below;
       1. "direct"      the straight segment, when it is ALREADY U- or V-aligned and safe;
       2. "orthogonal"  a two-leg L in the survey frame. BOTH bend orders are generated (U→V and
                        V→U) and both are validated, because one can cut the buffered exclusion or
@@ -1781,19 +1960,39 @@ def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None,
     reportable as transit, never as an arbitrary-angle coverage lane. See the coverage/transition
     split in the route-quality alignment metrics.
 
-    `allow_direct_transit=False` restores the pre-F2 aligned-only behaviour. That is not a
-    preference switch — it is required by the BCD cell-entry probe, which asks "could this cell
-    entry be BUILT from survey-frame legs, or would it drop to the A* fallback?". With tier 0
-    live the answer would be "direct_transit" for both candidate entries, the probe would stop
-    discriminating, and the entry bit — hence some cells' sweep DIRECTION — would move for
-    reasons that have nothing to do with buildability. Coverage ordering must not depend on how
-    transits are drawn, so the probe keeps the old semantics explicitly."""
+    SHORTEST-SAFE (tier 0b)
+    -----------------------
+    Tier 0 leaves one case open: the straight leg is unsafe, so a survey-frame L or staircase
+    replaces it — and that replacement is often far longer than the obstruction requires.
+    Measured on the operator's own large planning polygon, three transits accounted for most of
+    the remaining visible detour: 110.1 m for a 78.2 m gap, 160.6 m for 114.5 m, 162.6 m for
+    109.5 m. In two of the three the straight leg missed by leaving the approved region at a
+    shoreline concavity, once by barely two metres.
+
+    So when tier 0 declines, the aligned tiers below are evaluated FIRST — exactly as before,
+    producing exactly the candidate they produce today — and only then is a bounded local detour
+    searched, with that candidate's length as the bar to beat. The aligned candidate is retained
+    unless the detour wins by F4_MIN_GAIN_M, so a near-tie never churns the route hash.
+
+    The search is `_NavGrid.shortest_safe_transit`: Dijkstra over {a, b} plus at most
+    F4_MAX_LOCAL_VERTICES corners drawn from the a/b bounding box grown by F4_LOCAL_MARGIN_M.
+    It is local and capped by construction, so its cost does not grow with the survey area, and
+    every edge is admitted only by the same `_seg_safe_cached(..., True)` as every other tier.
+
+    `optimize_transit=False` restores the pre-F2 aligned-only behaviour by suppressing BOTH
+    optimisation tiers. That is not a preference switch — it is required by the BCD cell-entry
+    probe, which asks "could this cell entry be BUILT from survey-frame legs, or would it drop to
+    the A* fallback?". With the optimisation tiers live the answer would be "direct_transit" (or
+    a detour) for both candidate entries, the probe would stop discriminating, and the entry
+    bit — hence some cells' sweep DIRECTION — would move for reasons that have nothing to do
+    with buildability. Coverage ordering must not depend on how transits are drawn, so the probe
+    keeps the old semantics explicitly."""
     grid = frame.grid
     a_rot, b_rot = frame.deg_to_rot(a_deg), frame.deg_to_rot(b_deg)
     du, dv = b_rot[0] - a_rot[0], b_rot[1] - a_rot[1]
 
     # ── tier 0: the straight segment at ANY heading, when the authoritative predicate accepts it ─
-    if allow_direct_transit and grid._seg_safe_cached(a_deg, b_deg, True):
+    if optimize_transit and grid._seg_safe_cached(a_deg, b_deg, True):
         pts = _dedup([list(a_deg), list(b_deg)])
         if len(pts) == 2:
             return pts, "direct_transit"
@@ -1858,6 +2057,10 @@ def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None,
     tiers.append(stairs)
     tiers.append(around)
 
+    # The aligned tiers are evaluated EXACTLY as before and produce EXACTLY the candidate they
+    # produce today. Nothing here is skipped or reordered — the result is simply held rather than
+    # returned immediately, so tier 0b knows what it would have to beat before it searches.
+    chosen = None
     for tier in tiers:
         best = None
         for idx, (category, pts_rot) in enumerate(tier):
@@ -1879,9 +2082,30 @@ def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None,
             if best is None or key < best[0]:
                 best = (key, category, pts_deg)
         if best is not None:
-            return best[2], best[1]
+            chosen = (best[2], best[1])
+            break
+
+    # ── tier 0b: a bounded LOCAL detour, but only if it beats what the aligned tiers found ───
+    # Run before the generic A* so the priority order reads 0 → 0b → aligned → A*, and so the
+    # A* is not paid for and then discarded (which would also colour the connector counters).
+    if optimize_transit:
+        bar = None if chosen is None else grid._proj_len_m(chosen[0]) - F4_MIN_GAIN_M
+        if bar is None or bar > 0:
+            detour = grid.shortest_safe_transit(a_deg, b_deg, limit_m=bar)
+            if detour is not None:
+                d_len = grid._proj_len_m(detour)
+                if chosen is None or d_len <= bar:
+                    grid.shortest_safe_count += 1
+                    grid.shortest_safe_len_m += d_len
+                    if chosen is not None:
+                        grid.shortest_safe_saved_m += grid._proj_len_m(chosen[0]) - d_len
+                    return detour, "shortest_safe_transit"
+    if chosen is not None:
+        return chosen
 
     # ── tier 4/5: the existing generic safe connector, or a hard ConnectorError ───────────────
+    # Unchanged, including its fail-closed behaviour: if no safe connector exists, generation
+    # still refuses rather than emitting something unproven.
     return grid.safe_connector(a_deg, b_deg, require_inside=True), "fallback"
 
 
@@ -2131,8 +2355,8 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
         "same_lane_bridge_count": 0,
         "cell_handover_count": 0,
         "transition_vertices": [],
-        "transition_counts": {"direct_transit": 0, "direct": 0, "orthogonal": 0,
-                              "bypass": 0, "fallback": 0},
+        "transition_counts": {"direct_transit": 0, "shortest_safe_transit": 0, "direct": 0,
+                              "orthogonal": 0, "bypass": 0, "fallback": 0},
         "skipped_short_fragment_count": skipped["count"],
         "skipped_short_fragment_length_m": round(skipped["length_m"], 2),
         "minimum_useful_fragment_m": round(_min_useful_fragment_m(spacing), 2),
@@ -2233,13 +2457,14 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
                 ALIGNED-ONLY, DELIBERATELY. This asks a question about BUILDABILITY — can this
                 cell entry be made out of survey-frame legs at all, or is the end unreachable
                 without the generic grid A*? — and the answer has to stay a property of the
-                GEOMETRY, not of how transits happen to be drawn. `allow_direct_transit=False`
-                therefore pins the probe to the tiers that existed before direct-safe-first.
-                With tier 0 live both candidate entries would answer "direct_transit" wherever a
-                straight leg is safe, the probe would stop discriminating between them, and the
-                entry bit — which fixes the sweep DIRECTION of the cell and every cell after it —
-                would move on cases that have nothing to do with buildability. Coverage ordering
-                must not depend on transit drawing, so the two are kept explicitly separate.
+                GEOMETRY, not of how transits happen to be drawn. `optimize_transit=False`
+                therefore pins the probe to the tiers that existed before the transit
+                optimisation tiers were added. With tier 0 / 0b live both candidate entries would
+                answer "direct_transit" (or a local detour) wherever one is available, the probe
+                would stop discriminating between them, and the entry bit — which fixes the sweep
+                DIRECTION of the cell and every cell after it — would move on cases that have
+                nothing to do with buildability. Coverage ordering must not depend on transit
+                drawing, so the two are kept explicitly separate.
 
                 Only ONE of the two probed entries is actually used, and reaching the fallback
                 tier runs the grid A*, which bumps the grid's connector counters (those feed the
@@ -2255,7 +2480,7 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
                     _, category = _aligned_transition(
                         frame, cursor_deg, entry_deg, in_dir=cursor_dir,
                         out_dir=(1.0, 0.0) if entry_forward else (-1.0, 0.0),
-                        allow_direct_transit=False)
+                        optimize_transit=False)
                 except ConnectorError:
                     category = "fallback"       # not routable at all from this end
                 finally:
@@ -3029,8 +3254,8 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     aligned_n = align["coverage_aligned"]
     unaligned_n = align["coverage_unaligned"]
     transition_totals = {k: sum(d["transition_counts"][k] for d in coverage_diags)
-                         for k in ("direct_transit", "direct", "orthogonal", "bypass",
-                                   "fallback")}
+                         for k in ("direct_transit", "shortest_safe_transit", "direct",
+                                   "orthogonal", "bypass", "fallback")}
     final_seg_pts = sum(s.get("final_point_count", len(s["coordinates"])) for s in segments)
     los_removed = grid.raw_connector_pts - grid.final_connector_pts
     seg_removed = raw_segment_pts[0] - final_seg_pts
@@ -3083,6 +3308,12 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "non_survey_aligned_segment_count": unaligned_n,
         # How the transitions were built, by tier of _aligned_transition.
         "direct_transit_transition_count": transition_totals["direct_transit"],
+        # Transits where the straight leg was unsafe and a bounded LOCAL detour beat the aligned
+        # candidate (tier 0b). `saved` is measured against the aligned candidate it replaced, so
+        # the improvement is stated rather than implied.
+        "shortest_safe_transition_count": transition_totals["shortest_safe_transit"],
+        "shortest_safe_transition_distance_m": round(grid.shortest_safe_len_m, 2),
+        "shortest_safe_saved_distance_m": round(grid.shortest_safe_saved_m, 2),
         "aligned_direct_transition_count": transition_totals["direct"],
         "orthogonal_transition_count": transition_totals["orthogonal"] + transition_totals["bypass"],
         "fallback_connector_count": transition_totals["fallback"],

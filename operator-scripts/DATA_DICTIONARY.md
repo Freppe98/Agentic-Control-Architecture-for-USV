@@ -168,6 +168,9 @@ charged legitimate transit geometry to the coverage contract.
 | `survey_aligned_segment_count` | int | Compatibility alias of `survey_aligned_coverage_segment_count` | > 0 |
 | `non_survey_aligned_segment_count` | int | Compatibility alias of `non_survey_aligned_coverage_segment_count`. **COVERAGE FRAGMENTS ONLY** — before the split it summed the whole coverage polyline; the difference is exactly the transition legs, now reported above | **0** |
 | `direct_transit_transition_count` | int | Transitions taken as one straight leg at any heading (`_aligned_transition` tier 0) | any |
+| `shortest_safe_transition_count` | int | Transitions where the straight leg was unsafe and a **bounded local detour** (tier 0b) beat the survey-frame candidate | any |
+| `shortest_safe_transition_distance_m` | m | Total emitted length of those detours | — |
+| `shortest_safe_saved_distance_m` | m | How much shorter they are than the aligned candidates they replaced | — |
 | `aligned_direct_transition_count` | int | Transitions taken straight *because* they were already U/V-aligned (tier 1) | any |
 | `orthogonal_transition_count` | int | Transitions built as a survey-frame L or bypass staircase (tiers 2–3) | any |
 | `fallback_connector_count` | int | Transitions that reached the generic grid-A* connector (tier 4) | **0** normally |
@@ -184,3 +187,11 @@ The safety predicate is identical for every tier and every leg: `_NavGrid.segmen
 require_inside=True)` against `buildable` (shoreline-inset boundary MINUS the buffered no-go
 exclusion, minus the wire margin). Alignment only ever decides which *already-safe* candidate is
 preferred; it never admits an unsafe leg.
+
+**Tier 0b (`shortest_safe_transit`) is bounded, not a general planner.** It is reached only when
+the straight leg fails the predicate. The aligned tiers are evaluated first and produce exactly
+the candidate they always produced; the detour is searched over at most `F4_MAX_LOCAL_VERTICES`
+corners drawn from the a/b bounding box grown by `F4_LOCAL_MARGIN_M`, and is taken only when it
+beats that candidate by `F4_MIN_GAIN_M` — so a near-tie never churns the route hash. Corners come
+from `buildable` shrunk by `F4_VERTEX_INSET_M`, which yields both the concave-shoreline corners
+and the buffered-exclusion corners already proven to be strictly inside the approved region.
