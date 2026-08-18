@@ -145,3 +145,42 @@ Effective **control authority** (`GET /api/control_authority/{id}` → `authorit
 | `heartbeat_interval_s` | int | config | Configuration | on save | yes | |
 | `units` / `coord_format` / `base_layer` | enum | config | Map, Vehicle | on save | yes | |
 | `alert_rules` | object | config | Events/bell | on save | yes | which conditions ring the bell |
+
+## Route quality — survey-frame alignment (`mission_package.route_quality`)
+
+Produced by `planning.generate_survey`. Every field is a plain count or length over the geometry
+that was actually emitted — no scores, no estimates.
+
+**The distinction these fields exist to make.** A `primary` / `secondary` segment is *not* all
+coverage. It is the clipped survey lane fragments — the sonar passes — with the inter-fragment
+**transitions** concatenated between them. Only the fragments carry the survey-frame contract: a
+sonar pass must run parallel to the survey angle, because a stable heading at a fixed lane spacing
+is what makes the swaths overlap. A transition is the vessel repositioning between two *finished*
+fragments and takes the shortest heading its safety proof allows. Counting the two together
+charged legitimate transit geometry to the coverage contract.
+
+| Field | Type | Meaning | Expected |
+|---|---|---|---|
+| `survey_aligned_coverage_segment_count` | int | Survey FRAGMENT legs on the U or V axis of their own pass frame | > 0 |
+| `non_survey_aligned_coverage_segment_count` | int | Survey FRAGMENT legs at an arbitrary heading — **arbitrary-angle sonar geometry** | **0** |
+| `survey_aligned_transition_count` | int | Inter-fragment TRANSIT legs that happen to lie on a survey axis | any |
+| `non_survey_aligned_transition_count` | int | Inter-fragment TRANSIT legs at an arbitrary heading | any — **not** a defect |
+| `survey_aligned_segment_count` | int | Compatibility alias of `survey_aligned_coverage_segment_count` | > 0 |
+| `non_survey_aligned_segment_count` | int | Compatibility alias of `non_survey_aligned_coverage_segment_count`. **COVERAGE FRAGMENTS ONLY** — before the split it summed the whole coverage polyline; the difference is exactly the transition legs, now reported above | **0** |
+| `direct_transit_transition_count` | int | Transitions taken as one straight leg at any heading (`_aligned_transition` tier 0) | any |
+| `aligned_direct_transition_count` | int | Transitions taken straight *because* they were already U/V-aligned (tier 1) | any |
+| `orthogonal_transition_count` | int | Transitions built as a survey-frame L or bypass staircase (tiers 2–3) | any |
+| `fallback_connector_count` | int | Transitions that reached the generic grid-A* connector (tier 4) | **0** normally |
+| `coverage_fragment_length_m` | m | Geodesic length of the survey FRAGMENTS alone | — |
+| `in_coverage_transition_length_m` | m | Geodesic length of the transitions inside the coverage segments | — |
+
+**Accounting note.** `metrics.coverage_length_m` is the length of the whole `primary`/`secondary`
+polyline, so it *includes* the inter-fragment transits: `coverage_length_m ==
+coverage_fragment_length_m + in_coverage_transition_length_m`. On real operator polygons the
+transit share is 20–35 % of that figure. The Plan page still labels `coverage_length_m` as
+"Coverage length"; splitting the display is tracked separately and is not part of this change.
+
+The safety predicate is identical for every tier and every leg: `_NavGrid.segment_is_safe(...,
+require_inside=True)` against `buildable` (shoreline-inset boundary MINUS the buffered no-go
+exclusion, minus the wire margin). Alignment only ever decides which *already-safe* candidate is
+preferred; it never admits an unsafe leg.

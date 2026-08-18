@@ -869,8 +869,16 @@ GENERATION_ALGORITHM = {
     # the lane around itself. See the SURVEY-FRAME COVERAGE GENERATION banner.
     "coverage": "survey-frame-boustrophedon-v1",
     "coverage_lane_family": "ported-scout-boustrophedon-v1",
-    "fragment_ordering": "row-aware-projection-v1",
-    "coverage_transitions": "survey-frame-orthogonal-v1",
+    # Fragments are grouped into cells at the sweep's critical points and each cell is covered
+    # completely, lane-monotonic and alternating, before the next (see _bcd_cells). This replaced
+    # a strict global (row, along_index) order, which forced a trip around the exclusion and back
+    # on every lane an exclusion split.
+    "fragment_ordering": "boustrophedon-cellular-decomposition-v1",
+    # Inter-fragment transits try the straight leg FIRST at any heading, accepted only by the
+    # same authoritative safety predicate, and fall through to the unchanged survey-frame
+    # orthogonal/bypass/A* hierarchy when it is not safe (see _aligned_transition tier 0).
+    # Coverage lanes themselves remain strictly survey-frame aligned.
+    "coverage_transitions": "direct-safe-first-survey-frame-orthogonal-v2",
     "safe_connector": "bounded-grid-a-star-v1",
     "connector_simplification": "safe-line-of-sight-v1",
     "cleanup": "semantic-path-cleanup-v1",
@@ -1718,12 +1726,16 @@ def _rot_path_len(pts_rot):
                for i in range(len(pts_rot) - 1))
 
 
-def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None):
-    """The transition a→b between two coverage fragments, preferring survey-frame-aligned
-    geometry. Returns (coords_deg, category).
+def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None,
+                       allow_direct_transit=True):
+    """The transition a→b between two coverage fragments. Returns (coords_deg, category).
 
     CONNECTOR PRIORITY (each tier's candidates are proven before the next tier is considered):
 
+      0. "direct_transit"  the straight segment whenever it is SAFE, at ANY heading. See
+                       DIRECT-SAFE-FIRST below for why a transition is not held to the
+                       survey-frame alignment the coverage lanes are. Suppressed by
+                       `allow_direct_transit=False`;
       1. "direct"      the straight segment, when it is ALREADY U- or V-aligned and safe;
       2. "orthogonal"  a two-leg L in the survey frame. BOTH bend orders are generated (U→V and
                        V→U) and both are validated, because one can cut the buffered exclusion or
@@ -1744,20 +1756,75 @@ def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None):
     EVERY candidate leg is checked with the grid's own segment_is_safe(require_inside=True)
     (memoised): the same predicate, the same tolerances and the same `grid.navigable`
     (shoreline-inset MINUS buffered no-go exclusion) the previous generator was held to. Alignment
-    only decides which safe candidate is PREFERRED; it never lets an unsafe leg through."""
+    only decides which safe candidate is PREFERRED; it never lets an unsafe leg through.
+
+    DIRECT-SAFE-FIRST (tier 0)
+    --------------------------
+    A COVERAGE LANE must be parallel to the survey angle: it is the sonar pass, and a stable
+    heading at a fixed lane spacing is what makes the swaths overlap. A TRANSITION is not a
+    sonar pass — it is the vessel moving from the end of one finished fragment to the start of
+    the next — so holding it to the same axes buys nothing acoustically and costs real distance.
+
+    Measured on the operator's own large planning polygon, forcing transitions onto U/V made the
+    route fly BACK ALONG a lane it had just surveyed (154–241 m of exact retrace per survey
+    angle) and emit two 90° corners where a straight leg needs none, while a straight leg between
+    the same two fragment ends was already provably safe in 17–25 of every ~22–29 transitions.
+
+    So the straight segment is now tried FIRST, at whatever heading it happens to have. Nothing
+    about safety changes: acceptance is `grid._seg_safe_cached(a, b, True)` — the SAME
+    authoritative predicate every other tier is held to, against the same `buildable` region
+    (shoreline-inset MINUS the buffered no-go exclusion, pulled in by the wire margin). No new
+    geometry predicate exists, and no tolerance is relaxed. When the straight segment is not safe
+    this returns nothing and tiers 1–4 run exactly as before, so no fallback is removed.
+
+    The category is DELIBERATELY DISTINCT from "direct": an arbitrary-angle transit leg must be
+    reportable as transit, never as an arbitrary-angle coverage lane. See the coverage/transition
+    split in the route-quality alignment metrics.
+
+    `allow_direct_transit=False` restores the pre-F2 aligned-only behaviour. That is not a
+    preference switch — it is required by the BCD cell-entry probe, which asks "could this cell
+    entry be BUILT from survey-frame legs, or would it drop to the A* fallback?". With tier 0
+    live the answer would be "direct_transit" for both candidate entries, the probe would stop
+    discriminating, and the entry bit — hence some cells' sweep DIRECTION — would move for
+    reasons that have nothing to do with buildability. Coverage ordering must not depend on how
+    transits are drawn, so the probe keeps the old semantics explicitly."""
     grid = frame.grid
     a_rot, b_rot = frame.deg_to_rot(a_deg), frame.deg_to_rot(b_deg)
     du, dv = b_rot[0] - a_rot[0], b_rot[1] - a_rot[1]
 
+    # ── tier 0: the straight segment at ANY heading, when the authoritative predicate accepts it ─
+    if allow_direct_transit and grid._seg_safe_cached(a_deg, b_deg, True):
+        pts = _dedup([list(a_deg), list(b_deg)])
+        if len(pts) == 2:
+            return pts, "direct_transit"
+
     # ── tier 1: the direct segment, but only when it is already an axis of the survey frame ──
-    direct_ok = (abs(dv) <= ALIGN_MIN_LEG_M or abs(du) <= ALIGN_MIN_LEG_M
-                 or _survey_align_class(frame.rot_to_proj(a_rot), frame.rot_to_proj(b_rot),
-                                        frame.angle_deg) in ("U", "V", "short"))
+    # `_survey_align_class` is the ONE authority on whether a leg is survey-frame aligned, and it
+    # is the same predicate the route-quality contract counts violations with. This gate used to
+    # ALSO admit any segment whose du or dv fell under ALIGN_MIN_LEG_M, which is a different and
+    # much weaker test: a 1 m sideways step across a 5 m lane gap is 11.3° off the V axis, well
+    # outside the 5° tolerance, yet the shortcut let it through as "direct". That admitted legs
+    # the contract counts as arbitrary-angle coverage — a latent inconsistency that stayed hidden
+    # only because the previous traversal happened never to pair lane ends in the offending band.
+    #
+    # A genuinely degenerate hop is still accepted: the classifier answers "short" below
+    # ALIGN_MIN_LEG_M, which is exactly the case the shortcut existed to cover. Everything else
+    # now falls through to the orthogonal / bypass tiers. Strictly narrower than before — this can
+    # only reject candidates it used to accept, never accept one it used to reject.
+    direct_ok = _survey_align_class(frame.rot_to_proj(a_rot), frame.rot_to_proj(b_rot),
+                                    frame.angle_deg) in ("U", "V", "short")
     tiers = [[("direct", [a_rot, b_rot])] if direct_ok else []]
 
     # ── tier 2: two-leg orthogonal L, both bend orders ───────────────────────────────────────
+    # Generated whenever a real L exists (both offsets non-degenerate). The guard used to demand
+    # both offsets exceed ALIGN_MIN_LEG_M, which was the mirror image of the tier-1 shortcut: a
+    # transition with a sub-metre du was expected to have been swallowed by tier 1 as "direct".
+    # Now that tier 1 only accepts genuinely aligned segments, that same transition must have an
+    # L to fall through to, or it would skip to the bypass/A* tiers and emit exactly the
+    # arbitrary-angle geometry this change removes. The short leg of such an L classifies as
+    # "short", so the alignment contract still holds.
     ortho = []
-    if abs(du) > ALIGN_MIN_LEG_M and abs(dv) > ALIGN_MIN_LEG_M:
+    if abs(du) > TOLERANCE and abs(dv) > TOLERANCE:
         ortho.append(("orthogonal", [a_rot, (b_rot[0], a_rot[1]), b_rot]))   # U first, then V
         ortho.append(("orthogonal", [a_rot, (a_rot[0], b_rot[1]), b_rot]))   # V first, then U
     tiers.append(ortho)
@@ -1896,15 +1963,157 @@ def _lane_fragments(frame, spacing):
     return fragments, skipped
 
 
+def _fragments_overlap_in_u(f, g):
+    """Do two lane fragments overlap along U (the along-lane axis)?
+
+    This is the SLICE CONNECTIVITY test of the boustrophedon decomposition: two fragments on
+    ADJACENT sweep rows belong to the same connected piece of surveyable water exactly when
+    their U intervals overlap. A shared endpoint is not an overlap (two fragments that merely
+    touch at a corner are not a continuation), so the comparison is strict."""
+    fu0, fu1 = f["rot"][0][0], f["rot"][1][0]
+    gu0, gu1 = g["rot"][0][0], g["rot"][1][0]
+    return (min(fu1, gu1) - max(fu0, gu0)) > TOLERANCE
+
+
+def _bcd_cells(fragments):
+    """Boustrophedon CELLULAR DECOMPOSITION of the clipped lane fragments (Choset).
+
+    WHY THIS EXISTS
+    ---------------
+    The traversal this replaced ordered fragments by the flat key (row, along_index): EVERY
+    fragment of lane N had to be flown before lane N+1. Where an exclusion splits a lane in two
+    that is a demand the geometry cannot satisfy cheaply — the route has to leave the left
+    fragment, travel all the way AROUND the exclusion, fly the right fragment, and come back
+    around again on the next lane. The result was one long bypass staircase per split lane, its
+    cross-lane legs sweeping repeatedly up and down beside the obstacle and crossing water that
+    was already surveyed. The bypasses were individually safe and individually shortest; the
+    ORDER that demanded them was the defect.
+
+    THE RULE
+    --------
+    Fragments are grouped into CELLS at the sweep's critical points. Walking the sweep rows in
+    increasing V, a fragment CONTINUES its predecessor's cell when the connection is
+    one-to-one — it overlaps exactly one fragment on the previous row, and that fragment
+    overlaps exactly one fragment on this row. Anything else is a critical point:
+
+        1 fragment  -> 2+ fragments   an exclusion (or a concavity) SPLITS the free space
+        2+ fragments -> 1 fragment    the free space MERGES again past the obstacle
+        0 fragments -> 1+             a new region opens (also when the sweep row index is not
+                                      contiguous, i.e. a whole lane fell outside the region)
+
+    and every fragment involved opens a new cell. Each cell is therefore a maximal run of
+    surveyable water whose sweep topology never changes — precisely the region a plain
+    boustrophedon covers without ever needing to cross an obstacle.
+
+    WHAT THIS IS NOT
+    ----------------
+    Not a nearest-neighbour heuristic, not a TSP, not an optimizer: it is a topological
+    grouping followed by the SAME lane-monotonic alternating traversal as before, applied per
+    cell. Cell membership depends only on the clipped geometry, so identical inputs always
+    produce identical cells.
+
+    Returns a list of cells, each a list of the fragment dicts belonging to it, with the cells
+    ordered deterministically by (first sweep row, then lowest U) — stable geometric keys, no
+    tie broken by iteration order."""
+    by_row = {}
+    for f in fragments:
+        by_row.setdefault(f["row"], []).append(f)
+    for r in by_row:
+        by_row[r].sort(key=lambda f: f["rot"][0][0])
+    rows = sorted(by_row)
+
+    cells = []          # every cell ever opened, in the order it was opened
+    open_cell = {}      # (row, along_index) of a fragment on the PREVIOUS row -> its cell
+
+    def fid(f):
+        return (f["row"], f["along_index"])
+
+    for k, r in enumerate(rows):
+        cur = by_row[r]
+        # Only a CONTIGUOUS previous sweep row can continue a cell. A gap in the row indices
+        # means a whole nominal lane produced no coverage (fully excluded, or outside the
+        # region), which is itself a topology break — the fragments after the gap start fresh.
+        prev = by_row[rows[k - 1]] if k > 0 and rows[k - 1] == r - 1 else []
+        back = {fid(f): [p for p in prev if _fragments_overlap_in_u(p, f)] for f in cur}
+        fwd = {fid(p): [f for f in cur if _fragments_overlap_in_u(p, f)] for p in prev}
+
+        new_open = {}
+        for f in cur:
+            conns = back[fid(f)]
+            if len(conns) == 1 and len(fwd[fid(conns[0])]) == 1:
+                cell = open_cell.get(fid(conns[0]))
+                if cell is None:            # defensive: predecessor never opened a cell
+                    cell = []
+                    cells.append(cell)
+            else:
+                cell = []                   # split, merge, or a newly opened region
+                cells.append(cell)
+            cell.append(f)
+            new_open[fid(f)] = cell
+        open_cell = new_open
+
+    cells = [c for c in cells if c]
+    cells.sort(key=lambda c: (min(f["row"] for f in c),
+                              min(f["rot"][0][0] for f in c)))
+    return cells
+
+
+def _cell_key(cell):
+    """The stable geometric sort key of a cell: lowest sweep row, then lowest U."""
+    return (min(f["row"] for f in cell), min(f["rot"][0][0] for f in cell))
+
+
+def _bcd_traversal_order(cells):
+    """The order the cells are covered in, and which way each one is swept.
+
+    ORDER — cells in ascending (lowest sweep row, lowest U). Stable geometric keys, nothing
+    measured, no optimizer. For a lane split by an exclusion this sequences the region the way a
+    sweep naturally meets it: everything below the obstacle, then the near column, then the far
+    column, then everything above.
+
+    DIRECTION — the sweep of a cell is monotonic, but the SIGN is chosen: a cell is entered at
+    whichever of its two ends is nearest, in sweep rows, to the row the route just finished on.
+    This is what makes the ordering work. The two columns beside an obstacle occupy the SAME rows,
+    so after the near column is swept upwards the route stands at the top of it; entering the far
+    column at its bottom would mean travelling the full height of the obstacle twice. Entering it
+    at its TOP instead makes the hand-over a single short hop over the obstacle's end, which
+    _aligned_transition can build from U/V legs like any other lane turn. The far column is then
+    swept back down, ending next to the cell above — which is again a short, buildable hop.
+
+    Ties resolve to ascending, so the choice is deterministic. Only sweep-row INDICES are
+    compared; no geometry is measured and no candidate transition is costed, so this is still a
+    topological rule and not a nearest-neighbour search.
+
+    Returns [(cell, ascending), ...]."""
+    order = []
+    last_row = None
+    for cell in sorted(cells, key=_cell_key):
+        lo = min(f["row"] for f in cell)
+        hi = max(f["row"] for f in cell)
+        if last_row is None:
+            ascending = True
+        else:
+            ascending = abs(lo - last_row) <= abs(hi - last_row)
+        order.append((cell, ascending))
+        last_row = hi if ascending else lo
+    return order
+
+
 def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
     """Generate ONE coverage pass: straight, survey-angle-aligned lane fragments joined by
     survey-frame-aligned transitions. Returns (coords_deg, diagnostics).
 
-    Sweep order is the ported generator's and is deliberately unchanged: lanes in increasing V
-    (sweep) order, fragments within a lane in increasing U order, traversal direction alternating
-    per lane (boustrophedon). Coverage therefore still advances monotonically through the sweep
-    with no cross-row scramble — the existing ordering guarantee — and this change is confined to
-    the GEOMETRY of the fragments and the transitions between them.
+    Traversal is a boustrophedon over the CELLS of the sweep (see _bcd_cells): the fragments are
+    grouped into maximal regions whose sweep topology does not change, each cell is covered
+    completely before the route moves to the next, and WITHIN a cell the order is exactly what it
+    always was — lanes in increasing V (sweep) order, fragments within a lane in increasing U
+    order, traversal direction alternating per lane.
+
+    That is the one semantic that changed. Coverage advances monotonically through the sweep
+    WITHIN EACH CELL rather than globally, because global row monotonicity is what forced the
+    route to bridge around an exclusion on every lane it split. Everything else is untouched:
+    the lane family, the lane spacing, the clipping, the survey-frame alignment of every leg, and
+    the safety predicate each transition must satisfy.
 
     Fragments an exclusion split apart are NOT joined straight through the forbidden gap: they are
     separate coverage pieces, and the transition between them is built by _aligned_transition,
@@ -1918,7 +2127,12 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
         "pass_kind": pass_kind,
         "angle_deg": float(angle_deg) % 360.0,
         "fragment_count": len(fragments),
-        "transition_counts": {"direct": 0, "orthogonal": 0, "bypass": 0, "fallback": 0},
+        "cell_count": 0,
+        "same_lane_bridge_count": 0,
+        "cell_handover_count": 0,
+        "transition_vertices": [],
+        "transition_counts": {"direct_transit": 0, "direct": 0, "orthogonal": 0,
+                              "bypass": 0, "fallback": 0},
         "skipped_short_fragment_count": skipped["count"],
         "skipped_short_fragment_length_m": round(skipped["length_m"], 2),
         "minimum_useful_fragment_m": round(_min_useful_fragment_m(spacing), 2),
@@ -1927,22 +2141,165 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
     if not fragments:
         return [], diag
 
-    # Boustrophedon traversal, faithful to the ported generator: the along-U direction flips on
-    # every lane that actually PRODUCED coverage (not on every nominal lane offset — a lane offset
-    # that falls outside the region contributes nothing and must not consume a direction flip, or
-    # the next lane gets entered at its far end and the sweep pays a full lane-length jump). When
-    # a lane runs right-to-left its fragments are visited right-to-left too, so the cursor always
-    # continues from the nearest end.
+    # Boustrophedon traversal, PER CELL. Within a cell this is exactly the traversal the ported
+    # generator performs: the along-U direction flips on every lane that actually PRODUCED
+    # coverage (not on every nominal lane offset — a lane offset that falls outside the region
+    # contributes nothing and must not consume a direction flip, or the next lane gets entered at
+    # its far end and the sweep pays a full lane-length jump). When a lane runs right-to-left its
+    # fragments are visited right-to-left too, so the cursor always continues from the nearest end.
+    #
+    # The alternation deliberately CARRIES ACROSS a cell boundary rather than resetting: the last
+    # lane of one cell and the first lane of the next are then flown in opposite directions, so
+    # the route enters the new cell at the end nearest the cursor instead of paying a full
+    # lane-length jump to re-enter "forwards".
+    cells = _bcd_cells(fragments)
+    cell_plan = _bcd_traversal_order(cells)
     ordered = []
     forward = True
-    for row in sorted({f["row"] for f in fragments}):
-        row_frags = [f for f in fragments if f["row"] == row]
-        for frag in (row_frags if forward else list(reversed(row_frags))):
-            a, b = frag["rot"][0], frag["rot"][1]
-            ordered.append({**frag, "entry_rot": a if forward else b,
-                            "exit_rot": b if forward else a,
-                            "dir": (1.0, 0.0) if forward else (-1.0, 0.0)})
-        forward = not forward
+    for cell_index, (cell, ascending) in enumerate(cell_plan):
+        rows_in_cell = sorted({f["row"] for f in cell}, reverse=not ascending)
+        # WHICH SIDE A NEW CELL IS ENTERED FROM.
+        #
+        # Inside a cell the along-U direction simply alternates row by row, so a cell has exactly
+        # ONE free bit: which way its first row is flown. That bit also fixes which side the cell
+        # LEAVES from, because the alternation then runs to the end of the cell — with an even
+        # number of rows the cell exits on the side it was entered from, with an odd number on the
+        # opposite side.
+        #
+        # Deciding the bit on entry cost alone is what left the central-obstacle fixture with a
+        # 180° reversal: the left column there has six rows, so entering it at the near (left) end
+        # also made it EXIT on the left, and the hand-over to the right column then had to retrace
+        # ~80 m back along the lane it had just flown. Deciding it on exit alone would simply move
+        # the same problem to the entry.
+        #
+        # Distance alone cannot separate the two bits. On the central-obstacle fixture the two
+        # options come out at 198.5 m against 198.6 m — a dead heat — because entering the far
+        # side costs almost exactly what leaving on the near side saves. What actually differs is
+        # the HEADING the cell is left on: leaving the left column while flying leftwards means
+        # the hand-over to the right column has to turn round and run back along the lane just
+        # surveyed (the 180° reversal), whereas leaving it flying rightwards hands over in the
+        # direction of travel and never doubles back.
+        #
+        # Ahead of both sits a hard constraint: the hand-over INTO this cell has to be one
+        # _aligned_transition can actually build. A column beside an obstacle is entered at one of
+        # its two ends, and those ends are not interchangeable — one is typically a short hop over
+        # the end of the exclusion, while the other is the full width of the column away and can
+        # leave the region entirely. When the aligned tiers cannot reach the chosen end the
+        # transition drops to the generic grid-A* fallback and emits arbitrary-angle geometry, so
+        # a bit that merely reads better on distance can cost the survey-frame alignment contract.
+        #
+        # So the bit is chosen on buildability first, then reversal, then distance:
+        #
+        #   1. can the hand-over into this cell be built from survey-frame legs (no A* fallback)?
+        #   2. does the direction the LAST row is flown already point towards the next cell?
+        #   3. |entry_U - where the route currently stands|
+        #      + |exit_U - where the next cell will be picked up|
+        #
+        # Term 1 probes the two candidate entry points with the same _aligned_transition the route
+        # will use — two bounded, memoised probes per cell, not a search. Terms 2/3 are dropped
+        # for the last cell, which has nowhere to hand over to. The next
+        # cell's pick-up point is estimated by the midpoint of its own first row — an estimate is
+        # sufficient because it only has to say which SIDE that cell lies on, and the midpoint
+        # avoids a circular dependency on that cell's own entry bit.
+        #
+        # This compares two small keys built from lane-end U coordinates, once per cell. Fragment
+        # order inside a cell remains strictly lane-monotonic and alternating, so this is a choice
+        # of entry side and not a nearest-neighbour ordering of fragments, and there is no search.
+        # Exact ties keep the running alternation, so generation stays deterministic.
+        if ordered and rows_in_cell:
+            first_row = sorted([f for f in cell if f["row"] == rows_in_cell[0]],
+                               key=lambda f: f["rot"][0][0])
+            last_row = sorted([f for f in cell if f["row"] == rows_in_cell[-1]],
+                              key=lambda f: f["rot"][0][0])
+            cursor_u = ordered[-1]["exit_rot"][0]
+            next_u = None
+            if cell_index + 1 < len(cell_plan):
+                nxt, nxt_ascending = cell_plan[cell_index + 1]
+                nxt_rows = [f["row"] for f in nxt]
+                nxt_first = min(nxt_rows) if nxt_ascending else max(nxt_rows)
+                nxt_ends = [f["rot"][e][0] for f in nxt if f["row"] == nxt_first
+                            for e in (0, 1)]
+                next_u = (min(nxt_ends) + max(nxt_ends)) / 2.0
+            # The last row runs the same way as the first only when the row count is odd.
+            same_side = (len(rows_in_cell) % 2) == 1
+
+            cursor_deg = frame.rot_to_deg(ordered[-1]["exit_rot"])
+            cursor_dir = ordered[-1]["dir"]
+            entry_sweep = first_row[0]["sweep"]
+
+            def _unaligned_entry(entry_forward, entry_u):
+                """Would the hand-over into this cell fall through to the A* fallback?
+
+                ALIGNED-ONLY, DELIBERATELY. This asks a question about BUILDABILITY — can this
+                cell entry be made out of survey-frame legs at all, or is the end unreachable
+                without the generic grid A*? — and the answer has to stay a property of the
+                GEOMETRY, not of how transits happen to be drawn. `allow_direct_transit=False`
+                therefore pins the probe to the tiers that existed before direct-safe-first.
+                With tier 0 live both candidate entries would answer "direct_transit" wherever a
+                straight leg is safe, the probe would stop discriminating between them, and the
+                entry bit — which fixes the sweep DIRECTION of the cell and every cell after it —
+                would move on cases that have nothing to do with buildability. Coverage ordering
+                must not depend on transit drawing, so the two are kept explicitly separate.
+
+                Only ONE of the two probed entries is actually used, and reaching the fallback
+                tier runs the grid A*, which bumps the grid's connector counters (those feed the
+                route-quality connector metrics and the raw waypoint count). The counters are
+                therefore snapshotted and restored around the probe, so measuring a candidate can
+                never colour the diagnostics of the route that gets built. The safety cache is
+                deliberately left warm — it is a pure memo of the same predicate."""
+                entry_deg = frame.rot_to_deg((entry_u, entry_sweep))
+                counters = (grid.astar_connector_count, grid.raw_connector_pts,
+                            grid.final_connector_pts, grid.connector_len_before_m,
+                            grid.connector_len_after_m)
+                try:
+                    _, category = _aligned_transition(
+                        frame, cursor_deg, entry_deg, in_dir=cursor_dir,
+                        out_dir=(1.0, 0.0) if entry_forward else (-1.0, 0.0),
+                        allow_direct_transit=False)
+                except ConnectorError:
+                    category = "fallback"       # not routable at all from this end
+                finally:
+                    (grid.astar_connector_count, grid.raw_connector_pts,
+                     grid.final_connector_pts, grid.connector_len_before_m,
+                     grid.connector_len_after_m) = counters
+                return 1 if category == "fallback" else 0
+
+            def _entry_key(entry_forward):
+                entry_u = (first_row[0]["rot"][0][0] if entry_forward
+                           else first_row[-1]["rot"][1][0])
+                exit_forward = entry_forward if same_side else not entry_forward
+                exit_u = (last_row[-1]["rot"][1][0] if exit_forward
+                          else last_row[0]["rot"][0][0])
+                distance = abs(entry_u - cursor_u)
+                turns_back = 0
+                if next_u is not None:
+                    distance += abs(exit_u - next_u)
+                    # The hand-over doubles back whenever the heading the cell is left on points
+                    # away from the next cell. Ignored when the next cell is level with the exit
+                    # (nothing to point towards), so the comparison stays a pure tie there.
+                    heading = 1.0 if exit_forward else -1.0
+                    towards = next_u - exit_u
+                    if abs(towards) > TOLERANCE and (heading * towards) < 0:
+                        turns_back = 1
+                return (_unaligned_entry(entry_forward, entry_u), turns_back, distance)
+
+            key_fwd, key_bwd = _entry_key(True), _entry_key(False)
+            if key_fwd < key_bwd:
+                forward = True
+            elif key_bwd < key_fwd:
+                forward = False
+        for row in rows_in_cell:
+            row_frags = sorted([f for f in cell if f["row"] == row],
+                               key=lambda f: f["rot"][0][0])
+            for frag in (row_frags if forward else list(reversed(row_frags))):
+                a, b = frag["rot"][0], frag["rot"][1]
+                ordered.append({**frag, "cell_index": cell_index,
+                                "cell_ascending": ascending,
+                                "entry_rot": a if forward else b,
+                                "exit_rot": b if forward else a,
+                                "dir": (1.0, 0.0) if forward else (-1.0, 0.0)})
+            forward = not forward
+    diag["cell_count"] = len(cells)
 
     coords = []
     base_sweep = min(f["sweep"] for f in ordered)
@@ -1957,41 +2314,138 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
                 in_dir=ordered[i - 1]["dir"], out_dir=frag["dir"])
             diag["transition_counts"][category] += 1
             coords.extend(path[1:])
+            # The BEND POINTS of a transition are semantic turn points in exactly the sense a
+            # fragment boundary is: each one is the corner where a proven U leg becomes a proven
+            # V leg. Cleanup must not merge one into its neighbour — a fragment end and the bend
+            # a fraction of a metre from it (fragment ends sit COVERAGE_EDGE_INSET_M inside the
+            # region, so that gap is routinely sub-metre) would collapse to a single point, and
+            # the L it belonged to would become one arbitrary-angle diagonal. Recorded here and
+            # handed to cleanup as anchors, so the survey-frame alignment the transition was
+            # built to satisfy survives the cleanup that follows.
+            for p in path[1:-1]:
+                diag["transition_vertices"].append([round(p[0], 7), round(p[1], 7)])
+            # A transition between two fragments of the SAME nominal lane means the route left one
+            # half of a split lane, went around the exclusion and came back to the other half.
+            # WITHIN a cell that is the oscillation the decomposition exists to remove, and the
+            # count must be zero. BETWEEN cells it is the single, intended hand-over from one
+            # column beside an obstacle to the other — the sweep has to cross the obstacle exactly
+            # once, and doing it at a shared lane end is the cheapest place. The two are counted
+            # separately so the guarantee is measured on the real route and not blurred.
+            if ordered[i - 1]["row"] == frag["row"]:
+                if ordered[i - 1]["cell_index"] == frag["cell_index"]:
+                    diag["same_lane_bridge_count"] += 1
+                else:
+                    diag["cell_handover_count"] += 1
         coords.append(exit_)
         diag["fragments"].append({
             "pass_kind": pass_kind, "fragment_index": i, "point_count": 2,
+            "cell_index": frag["cell_index"],
+            "cell_ascending": frag["cell_ascending"],
             "sweep_coordinate": round(frag["sweep"] - base_sweep, 2),
             "length_m": round(frag["length_m"], 2),
             "start": [round(entry[0], 7), round(entry[1], 7)],
             "end": [round(exit_[0], 7), round(exit_[1], 7)],
         })
 
-    # row_index ranks fragments by sweep coordinate; the execution order above is already sweep
-    # order, so the ranks come out as the identity — which is what the ordering tests assert.
+    # row_index ranks fragments by sweep coordinate across the WHOLE pass. It is a description of
+    # where a fragment sits in the sweep, not of when it is flown — with a cellular decomposition
+    # those are deliberately no longer the same thing.
     for rank, idx in enumerate(sorted(range(len(diag["fragments"])),
                                       key=lambda k: diag["fragments"][k]["sweep_coordinate"])):
         diag["fragments"][idx]["row_index"] = rank
-    prev = None
+    # `fragment_reorders` counts fragments visited out of sweep order WITHIN A CELL, in that
+    # cell's own sweep direction. Global sweep monotonicity is no longer the correct semantic:
+    # moving to a lower sweep row to begin the next cell is the whole point of the decomposition
+    # and is not a scramble, and a cell entered from above is legitimately swept downwards.
+    # Inside a cell, coverage must still advance monotonically — that guarantee is unchanged.
     reorders = 0
+    prev_by_cell = {}
     for f in diag["fragments"]:
-        if prev is not None and f["sweep_coordinate"] < prev - CLEANUP_MIN_SPACING_M:
-            reorders += 1
-        prev = f["sweep_coordinate"]
+        c = f["cell_index"]
+        prev = prev_by_cell.get(c)
+        if prev is not None:
+            delta = f["sweep_coordinate"] - prev
+            if not f["cell_ascending"]:
+                delta = -delta
+            if delta < -CLEANUP_MIN_SPACING_M:
+                reorders += 1
+        prev_by_cell[c] = f["sweep_coordinate"]
     diag["fragment_reorders"] = reorders
     return _dedup(coords), diag
 
 
+def _coverage_leg_split(segments, coverage_diags, grid, pass_angle):
+    """Classify every leg of the COVERAGE segments as a survey FRAGMENT leg or a TRANSITION leg,
+    and return the survey-frame alignment tallies for each, separately.
+
+    WHY THE SPLIT EXISTS
+    --------------------
+    A `primary`/`secondary` segment is not all coverage. It is the concatenation of the clipped
+    lane fragments — the actual sonar passes — and the inter-fragment transitions that carry the
+    vessel from one to the next. Tallying alignment over the whole polyline therefore charged a
+    transit leg to the COVERAGE contract: a straight, provably safe, arbitrary-angle hop between
+    two finished fragments was reported as an arbitrary-angle survey lane, which it is not.
+
+    The split is exact, not inferred from geometry. `_survey_frame_coverage` records the two
+    endpoints of every fragment it emitted, and those endpoints are cleanup ANCHORS (see
+    _fragment_anchors), so they survive into the final coordinates unchanged and at full
+    precision. A leg is a fragment leg exactly when its endpoint pair IS a recorded fragment's
+    (start, end) — everything else in the segment is, by construction, transition.
+
+    Returns {"coverage_aligned", "coverage_unaligned", "transition_aligned",
+             "transition_unaligned", "coverage_fragment_leg_m", "transition_leg_m"}."""
+    pairs = set()
+    for d in coverage_diags or []:
+        for f in d.get("fragments") or []:
+            pairs.add((_rk(f["start"]), _rk(f["end"])))
+    out = {"coverage_aligned": 0, "coverage_unaligned": 0,
+           "transition_aligned": 0, "transition_unaligned": 0,
+           "coverage_fragment_leg_m": 0.0, "transition_leg_m": 0.0}
+    for seg in segments:
+        if seg["kind"] not in _COVERAGE_KINDS:
+            continue
+        cs = seg["coordinates"]
+        angle = pass_angle[seg["kind"]]
+        for i in range(len(cs) - 1):
+            a, b = cs[i], cs[i + 1]
+            ap = grid.to_proj.transform(a[0], a[1])
+            bp = grid.to_proj.transform(b[0], b[1])
+            fragment = (_rk(a), _rk(b)) in pairs
+            # Geodesic, via the same _path_length_m every other length metric uses, so these two
+            # numbers add up to `metrics.coverage_length_m` exactly rather than approximately.
+            out["coverage_fragment_leg_m" if fragment else "transition_leg_m"] +=                 _path_length_m([a, b])
+            cls = _survey_align_class(ap, bp, angle)
+            if cls == "short":
+                continue        # no meaningful heading — counted in neither bucket
+            key = ("coverage_" if fragment else "transition_") + (
+                "aligned" if cls in ("U", "V") else "unaligned")
+            out[key] += 1
+    out["coverage_fragment_leg_m"] = round(out["coverage_fragment_leg_m"], 2)
+    out["transition_leg_m"] = round(out["transition_leg_m"], 2)
+    return out
+
+
 def _fragment_anchors(diag):
-    """The lane-fragment endpoints of a coverage pass, as cleanup anchors. A fragment boundary is
-    a semantic coverage point — a survey line begins or ends there, frequently right on the
-    exclusion edge — so the shared cleanup must preserve it rather than merge it into a
-    neighbouring point or shortcut across it."""
+    """The semantic points of a coverage pass, as cleanup anchors.
+
+    Two kinds, and both must survive cleanup intact:
+
+      * LANE-FRAGMENT ENDPOINTS — a survey line begins or ends there, frequently right on the
+        exclusion edge;
+      * TRANSITION BEND POINTS — the corner where a proven U leg becomes a proven V leg. A
+        fragment end and the bend next to it are routinely less than a metre apart (fragment ends
+        sit COVERAGE_EDGE_INSET_M inside the region), so without this the near-duplicate merge
+        would drop the bend and turn the L into one arbitrary-angle diagonal.
+
+    So cleanup may still remove genuinely redundant points, but never a point that carries the
+    survey-frame geometry the generator proved safe."""
     if not diag:
         return None
     pts = []
     for f in diag.get("fragments") or []:
         pts.append(f["start"])
         pts.append(f["end"])
+    pts.extend(diag.get("transition_vertices") or [])
     return pts or None
 
 
@@ -2563,25 +3017,20 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     # flattened route, and unaffected by the survey-frame turns now being 90° rather than 180°.
     coverage_fragment_count = sum(d["fragment_count"] for d in coverage_diags)
     fragment_reorders = sum(d["fragment_reorders"] for d in coverage_diags)
+    coverage_cell_count = sum(d["cell_count"] for d in coverage_diags)
+    same_lane_bridges = sum(d["same_lane_bridge_count"] for d in coverage_diags)
+    cell_handovers = sum(d["cell_handover_count"] for d in coverage_diags)
     coverage_fragments = [f for d in coverage_diags for f in d["fragments"]]
     # ── Survey-frame alignment of the FINAL coverage geometry (post-cleanup) ─────────────────
     # Each coverage segment is classified against ITS OWN pass angle. Sub-metre legs carry no
     # meaningful heading and are counted in neither bucket (see ALIGN_MIN_LEG_M).
     pass_angle = {"primary": inp["primary_angle_deg"], "secondary": inp["secondary_angle_deg"]}
-    aligned_n = 0
-    unaligned_n = 0
-    for s in segments:
-        if s["kind"] not in _COVERAGE_KINDS:
-            continue
-        pp = [grid.to_proj.transform(c[0], c[1]) for c in s["coordinates"]]
-        for i in range(len(pp) - 1):
-            cls = _survey_align_class(pp[i], pp[i + 1], pass_angle[s["kind"]])
-            if cls in ("U", "V"):
-                aligned_n += 1
-            elif cls == "other":
-                unaligned_n += 1
+    align = _coverage_leg_split(segments, coverage_diags, grid, pass_angle)
+    aligned_n = align["coverage_aligned"]
+    unaligned_n = align["coverage_unaligned"]
     transition_totals = {k: sum(d["transition_counts"][k] for d in coverage_diags)
-                         for k in ("direct", "orthogonal", "bypass", "fallback")}
+                         for k in ("direct_transit", "direct", "orthogonal", "bypass",
+                                   "fallback")}
     final_seg_pts = sum(s.get("final_point_count", len(s["coordinates"])) for s in segments)
     los_removed = grid.raw_connector_pts - grid.final_connector_pts
     seg_removed = raw_segment_pts[0] - final_seg_pts
@@ -2596,18 +3045,53 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "connector_length_after_m": round(grid.connector_len_after_m, 2),
         "coverage_fragment_count": coverage_fragment_count,
         "fragment_reorders": fragment_reorders,
+        # Boustrophedon cellular decomposition (see _bcd_cells). `coverage_cell_count` is how many
+        # topologically distinct regions the sweep was split into — 1 whenever nothing splits a
+        # lane. `same_lane_obstacle_bridge_count` is the property the decomposition exists to
+        # remove: a same-lane trip around an exclusion and back, WITHIN one cell.
+        # `coverage_cell_handover_count` is the separate, intended crossing from one column beside
+        # an obstacle to the other. Both are measured on the generated route, not assumed.
+        "coverage_cell_count": coverage_cell_count,
+        "same_lane_obstacle_bridge_count": same_lane_bridges,
+        "coverage_cell_handover_count": cell_handovers,
         "backtracking_events": full_q["backtracking_events"],
         "minimum_segment_length_m": full_q["minimum_segment_length_m"],
         "cleanup_applied": True,
-        # ── Survey-frame coverage diagnostics ────────────────────────────────────────────
-        # How regular the coverage headings actually are, and how the transitions were built.
-        # Objective and re-derivable: every number here is a count over the emitted geometry, not
-        # a score. `non_survey_aligned_segment_count` is the one to watch — it is the count of
-        # arbitrary-angle coverage legs, which is what the rounded no-go bypasses used to produce.
+        # ── Survey-frame alignment: COVERAGE FRAGMENTS and TRANSITIONS, counted SEPARATELY ──
+        # A `primary`/`secondary` segment holds both the sonar passes and the transits between
+        # them, and only the passes are bound by the survey-frame contract — a transit is the
+        # vessel repositioning, at whatever heading is shortest and safe. Counting the two
+        # together charged a legitimate transit to the coverage contract, so they are now split
+        # by `_coverage_leg_split` using the generator's own recorded fragment endpoints (exact,
+        # not inferred). Every number is still a plain count over emitted geometry, not a score.
+        #
+        # `non_survey_aligned_coverage_segment_count` is THE one to watch: arbitrary-angle SURVEY
+        # geometry, which is what the rounded no-go bypasses used to produce, and which must be 0.
+        "survey_aligned_coverage_segment_count": aligned_n,
+        "non_survey_aligned_coverage_segment_count": unaligned_n,
+        # The transit half. Informational, and EXPECTED to be non-zero: it counts the
+        # direct-safe-first transitions (see _aligned_transition tier 0), each one proven with the
+        # same authoritative predicate as every other leg. It is not a contract violation.
+        "survey_aligned_transition_count": align["transition_aligned"],
+        "non_survey_aligned_transition_count": align["transition_unaligned"],
+        # COMPATIBILITY. Both keys keep their names and their meaning is now stated exactly:
+        # COVERAGE FRAGMENTS ONLY. Before the split they summed the whole coverage polyline; the
+        # difference is precisely the transition legs, which are reported above instead. Every
+        # existing consumer asserts `non_survey_aligned_segment_count == 0`, which this preserves
+        # and in fact tightens — it can no longer be satisfied or broken by transit geometry.
         "survey_aligned_segment_count": aligned_n,
         "non_survey_aligned_segment_count": unaligned_n,
+        # How the transitions were built, by tier of _aligned_transition.
+        "direct_transit_transition_count": transition_totals["direct_transit"],
+        "aligned_direct_transition_count": transition_totals["direct"],
         "orthogonal_transition_count": transition_totals["orthogonal"] + transition_totals["bypass"],
         "fallback_connector_count": transition_totals["fallback"],
+        # ── Coverage vs transit ACCOUNTING inside the coverage segments ──────────────────
+        # `metrics.coverage_length_m` is the length of the whole primary/secondary polyline, so
+        # it includes the inter-fragment transits. These two numbers say exactly how it divides,
+        # so the accounting is visible rather than implied. (Reported, not yet acted on.)
+        "coverage_fragment_length_m": align["coverage_fragment_leg_m"],
+        "in_coverage_transition_length_m": align["transition_leg_m"],
         "skipped_short_fragment_count": skipped_n,
         "skipped_short_fragment_length_m": round(
             sum(d["skipped_short_fragment_length_m"] for d in coverage_diags), 2),

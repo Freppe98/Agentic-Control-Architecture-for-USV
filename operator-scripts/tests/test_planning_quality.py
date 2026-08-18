@@ -275,17 +275,43 @@ class TestRouteQualityRegression(unittest.TestCase):
                              rq["raw_waypoint_count"] - rq["final_waypoint_count"])
             self.assertTrue(rq["cleanup_applied"])
 
-    def test_coverage_ordering_is_monotonic_by_sweep_row(self):
-        # No excessive cross-row jumping: fragment execution order matches sweep-row order, so
-        # there are no reorders (an explicit safe detour would be the only allowed exception).
+    def test_coverage_ordering_is_monotonic_by_sweep_row_within_each_cell(self):
+        # REPLACES an earlier assertion that execution order matched sweep-row order GLOBALLY.
+        # Coverage is now ordered by boustrophedon cellular decomposition: the fragments are
+        # grouped into cells at the sweep's critical points and each cell is covered completely
+        # before the next. Returning to a lower sweep row to begin the next cell is the whole
+        # point of that — it is what stops the route bridging around an exclusion on every lane
+        # it splits — so global monotonicity is no longer the correct semantic.
+        #
+        # What must still hold, and is asserted here, is that WITHIN a cell coverage advances
+        # monotonically through the sweep in that cell's own direction, with no cross-row
+        # scramble.
         for name in self.FIXTURES:
             rq = self._gen(name)["route_quality"]
             self.assertEqual(rq["fragment_reorders"], 0,
-                             f"[{name}] coverage fragments visited out of sweep-row order")
+                             f"[{name}] coverage fragments visited out of sweep-row order "
+                             f"within a cell")
             frs = rq["coverage_fragments"]
-            self.assertEqual([f["fragment_index"] for f in frs],
-                             sorted(range(len(frs)), key=lambda i: frs[i]["row_index"]),
-                             f"[{name}] execution order disagrees with sweep-row order")
+            self.assertTrue(frs, f"[{name}] no coverage fragments were reported")
+            by_cell = {}
+            for f in frs:
+                by_cell.setdefault((f["pass_kind"], f["cell_index"]), []).append(f)
+            for (pass_kind, cell), members in by_cell.items():
+                # Execution order within a cell is contiguous …
+                idxs = [f["fragment_index"] for f in members]
+                self.assertEqual(idxs, sorted(idxs),
+                                 f"[{name}] {pass_kind} cell {cell} fragments are not in "
+                                 f"execution order")
+                self.assertEqual(idxs, list(range(idxs[0], idxs[0] + len(idxs))),
+                                 f"[{name}] {pass_kind} cell {cell} was interleaved with another "
+                                 f"cell instead of being covered completely")
+                # … and its sweep coordinates are monotonic in the cell's own direction.
+                sweeps = [f["sweep_coordinate"] for f in members]
+                ascending = members[0]["cell_ascending"]
+                expected = sorted(sweeps) if ascending else sorted(sweeps, reverse=True)
+                self.assertEqual(sweeps, expected,
+                                 f"[{name}] {pass_kind} cell {cell} is not sweep-monotonic "
+                                 f"(ascending={ascending})")
 
     def test_generation_is_byte_equivalent_and_hash_stable(self):
         for name in self.FIXTURES:

@@ -97,7 +97,10 @@ def _classify(a_proj, b_proj, angle_deg, tol=ANGLE_TOL_DEG):
 
 
 def _coverage_legs(pkg, grid, kinds=("primary", "secondary")):
-    """[(kind, a_proj, b_proj)] for every leg of every coverage segment of a package."""
+    """[(kind, a_proj, b_proj)] for EVERY leg of every coverage segment - survey fragments AND
+    the transits between them. Use this for properties both must satisfy (safety, no arc
+    following); use `_fragment_legs` for the survey-frame ALIGNMENT contract, which binds the
+    survey fragments only."""
     out = []
     for s in pkg["segments"]:
         if s["kind"] not in kinds:
@@ -105,6 +108,40 @@ def _coverage_legs(pkg, grid, kinds=("primary", "secondary")):
         pp = [grid.to_proj.transform(c[0], c[1]) for c in s["coordinates"]]
         out.extend((s["kind"], pp[i], pp[i + 1]) for i in range(len(pp) - 1))
     return out
+
+
+def _split_coverage_legs(pkg, grid, kinds=("primary", "secondary"), pairs=None):
+    """(fragment_legs, transition_legs), each [(kind, a_proj, b_proj)].
+
+    A coverage segment is fragments AND transits concatenated. Only the FRAGMENTS are sonar
+    passes and only they are bound by the survey-frame alignment contract; a transit is the
+    vessel repositioning between two finished fragments and may take any safe heading. The
+    split keys off the generator's own recorded fragment endpoints - which are cleanup anchors
+    and so survive verbatim - so it is exact rather than inferred from geometry.
+
+    `pairs` overrides where those endpoints come from. A fleet CHILD package carries no
+    `route_quality` (its coverage is assembled from pre-clipped fleet survey lines, not from
+    _survey_frame_coverage), so its caller supplies the line endpoints instead."""
+    if pairs is None:
+        pairs = {(tuple(f["start"]), tuple(f["end"]))
+                 for f in pkg["route_quality"]["coverage_fragments"]}
+    frags, trans = [], []
+    for s in pkg["segments"]:
+        if s["kind"] not in kinds:
+            continue
+        cs = s["coordinates"]
+        for i in range(len(cs) - 1):
+            a, b = cs[i], cs[i + 1]
+            key = ((round(a[0], 7), round(a[1], 7)), (round(b[0], 7), round(b[1], 7)))
+            leg = (s["kind"], grid.to_proj.transform(a[0], a[1]),
+                   grid.to_proj.transform(b[0], b[1]))
+            (frags if key in pairs else trans).append(leg)
+    return frags, trans
+
+
+def _fragment_legs(pkg, grid, kinds=("primary", "secondary"), pairs=None):
+    """[(kind, a_proj, b_proj)] for the SURVEY FRAGMENT legs only - the sonar passes."""
+    return _split_coverage_legs(pkg, grid, kinds, pairs)[0]
 
 
 def _arc_runs(legs, max_leg_m=3.0, min_run=3, drift_lo=3.0, drift_hi=60.0):
@@ -212,12 +249,14 @@ class TestNoNoGoZone(unittest.TestCase):
             self.assertAlmostEqual(g, 5.0, delta=0.6, msg=f"lane spacing drifted to {g} m")
 
     def test_every_coverage_leg_is_survey_frame_aligned(self):
-        legs = _coverage_legs(self.pkg, self.grid)
-        self.assertGreater(len(legs), 20)
+        legs = _fragment_legs(self.pkg, self.grid)
+        self.assertGreater(len(legs), 15)
         for kind, a, b in legs:
             self.assertIn(_classify(a, b, 42), ("U", "V", "short"),
                           f"{kind} leg at {_bearing(a, b):.1f}° is not survey-frame aligned")
-        self.assertEqual(self.pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        rq = self.pkg["route_quality"]
+        self.assertEqual(rq["non_survey_aligned_coverage_segment_count"], 0)
+        self.assertEqual(rq["non_survey_aligned_segment_count"], 0)   # same, compat name
 
     def test_geometry_contract_holds(self):
         self.assertTrue(self.pkg["geometry_check"]["ok"])
@@ -250,10 +289,11 @@ class TestRectangularNoGoInTheMiddle(unittest.TestCase):
             self.assertEqual(f["point_count"], 2)
 
     def test_no_arbitrary_angle_coverage_leg(self):
-        for kind, a, b in _coverage_legs(self.pkg, self.grid):
+        for kind, a, b in _fragment_legs(self.pkg, self.grid):
             self.assertIn(_classify(a, b, 42), ("U", "V", "short"),
                           f"{kind} leg at {_bearing(a, b):.1f}° is not survey-frame aligned")
-        self.assertEqual(self.pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            self.pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
 
     def test_no_curved_bypass(self):
         self.assertEqual(_arc_runs(_coverage_legs(self.pkg, self.grid)), 0,
@@ -294,39 +334,47 @@ class TestSurveyAngles(unittest.TestCase):
 
     def test_case_3_rotated_angle_42_is_not_snapped_to_north_east(self):
         pkg, grid = self._run(42)
-        legs = [(a, b) for _, a, b in _coverage_legs(pkg, grid)
-                if _classify(a, b, 42) != "short"]
-        us = [(a, b) for a, b in legs if _classify(a, b, 42) == "U"]
-        vs = [(a, b) for a, b in legs if _classify(a, b, 42) == "V"]
+        frag_legs = [(a, b) for _, a, b in _fragment_legs(pkg, grid)
+                     if _classify(a, b, 42) != "short"]
+        us = [(a, b) for a, b in frag_legs if _classify(a, b, 42) == "U"]
         self.assertGreater(len(us), 10, "expected long coverage legs at ≈42°")
-        self.assertGreater(len(vs), 5, "expected cross-lane transitions at ≈132°")
+        self.assertEqual(len(us), len(frag_legs),
+                         "every survey fragment must lie on the U axis of its own frame")
         for a, b in us:
             self.assertLessEqual(_axis_delta(_bearing(a, b), 42), ANGLE_TOL_DEG)
-        for a, b in vs:
-            self.assertLessEqual(_axis_delta(_bearing(a, b), 132), ANGLE_TOL_DEG)
-        # Nothing sits on a geographic axis: 42/132 are far from 0/90, so a single leg near
-        # north or east would prove a snap to the projection grid.
-        for a, b in legs:
+        # Cross-lane MOVEMENT still happens on every lane turn. It is asserted from the
+        # transition tally rather than from leg bearings, because a transit is free to take the
+        # short direct heading instead of the 132° V axis - see _aligned_transition tier 0.
+        rq = pkg["route_quality"]
+        moves = (rq["direct_transit_transition_count"] + rq["aligned_direct_transition_count"]
+                 + rq["orthogonal_transition_count"])
+        self.assertGreater(moves, 5, "expected cross-lane transitions between the fragments")
+        # Nothing sits on a geographic axis: 42/132 are far from 0/90, so a single FRAGMENT near
+        # north or east would prove a snap to the projection grid. (A transit legitimately may
+        # run at any heading, so the snap test is a statement about the survey lanes.)
+        for a, b in frag_legs:
             brg = _bearing(a, b)
             self.assertGreater(min(_axis_delta(brg, 0.0), _axis_delta(brg, 90.0)), 20.0,
                                f"a coverage leg at {brg:.1f}° looks snapped to N/E")
 
     def test_case_4_angle_0_is_axis_aligned_in_the_projected_frame(self):
         pkg, grid = self._run(0)
-        for _kind, a, b in _coverage_legs(pkg, grid):
+        for _kind, a, b in _fragment_legs(pkg, grid):
             self.assertIn(_classify(a, b, 0), ("U", "V", "short"),
                           f"a coverage leg at {_bearing(a, b):.1f}° is not axis aligned")
-        self.assertEqual(pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
         self.assertTrue(any(_axis_delta(_bearing(a, b), 0.0) <= ANGLE_TOL_DEG
                             and math.hypot(b[0] - a[0], b[1] - a[1]) > 20
-                            for _k, a, b in _coverage_legs(pkg, grid)),
+                            for _k, a, b in _fragment_legs(pkg, grid)),
                         "expected long lanes running ≈north at survey angle 0")
 
     def test_case_5_angle_90_swaps_the_orientation(self):
         pkg, grid = self._run(90)
-        for _kind, a, b in _coverage_legs(pkg, grid):
+        for _kind, a, b in _fragment_legs(pkg, grid):
             self.assertIn(_classify(a, b, 90), ("U", "V", "short"))
-        self.assertEqual(pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
         # The LANES (not every leg — a bypass step is a long V leg by design) run ≈east/west.
         brgs = _fragment_bearings(pkg, grid, "primary")
         self.assertTrue(brgs)
@@ -359,10 +407,12 @@ class TestIrregularAndRoundedExclusions(unittest.TestCase):
                           Polygon([(c[0], c[1]) for c in IRREGULAR_ZONE]).buffer(0))
         self.assertAlmostEqual(grid.nogo.area, drawn.buffer(5.0).area, delta=1.0)
         # …and no coverage leg follows any of its arbitrary-heading edges.
-        for kind, a, b in _coverage_legs(pkg, grid):
+        for kind, a, b in _fragment_legs(pkg, grid):
             self.assertIn(_classify(a, b, 42), ("U", "V", "short"),
                           f"{kind} leg at {_bearing(a, b):.1f}° traces the zone outline")
-        self.assertEqual(pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
+        # NO leg - fragment or transit - may follow the rounded buffer boundary.
         self.assertEqual(_arc_runs(_coverage_legs(pkg, grid)), 0)
         _assert_legs_safe(self, pkg, grid)
 
@@ -374,10 +424,11 @@ class TestIrregularAndRoundedExclusions(unittest.TestCase):
         ring = pkg["no_go_exclusion_rings"][0]
         self.assertGreater(len(ring), 30, "expected a rounded, many-vertex exclusion boundary")
         # …yet every coverage leg stays straight and on a survey axis.
-        for kind, a, b in _coverage_legs(pkg, grid):
+        for kind, a, b in _fragment_legs(pkg, grid):
             self.assertIn(_classify(a, b, 42), ("U", "V", "short"),
                           f"{kind} leg at {_bearing(a, b):.1f}° follows the arc")
-        self.assertEqual(pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
         self.assertEqual(_arc_runs(_coverage_legs(pkg, grid)), 0,
                          "the coverage path is still following the buffer arc")
         _assert_legs_safe(self, pkg, grid)
@@ -387,9 +438,19 @@ class TestIrregularAndRoundedExclusions(unittest.TestCase):
 @requires_geometry
 class TestAlignedTransition(unittest.TestCase):
     """The connector priority itself, exercised directly on _aligned_transition so each tier is
-    pinned rather than inferred from a whole mission."""
+    pinned rather than inferred from a whole mission.
+
+    These cases pin the ALIGNED tiers (1-4), so they call the generator with
+    `allow_direct_transit=False` - the same switch the BCD cell-entry probe uses. Without it the
+    direct-safe tier 0 would answer first wherever a straight leg is safe and the orthogonal /
+    bypass ordering below it would never be exercised. Tier 0 has its own coverage in
+    tests/test_transition_policy.py."""
 
     ANGLE = 42.0
+
+    def _aligned(self, a, b, **kw):
+        """_aligned_transition with tier 0 suppressed - see the class docstring."""
+        return planning._aligned_transition(self.frame, a, b, allow_direct_transit=False, **kw)
 
     def setUp(self):
         self.inp = _inputs(no_go_zones=[CENTER_ZONE])
@@ -418,7 +479,7 @@ class TestAlignedTransition(unittest.TestCase):
         b = self._rot(x1 + 8.0, 30.0)     # right of it, SAME lane → the direct leg cuts through
         self.assertFalse(self.grid.segment_is_safe(a, b, require_inside=True),
                          "fixture invalid: the direct connector must cross the exclusion")
-        path, category = planning._aligned_transition(self.frame, a, b)
+        path, category = self._aligned(a, b)
         self.assertNotEqual([list(a), list(b)], [list(p) for p in path],
                             "the direct connector was emitted even though it crosses the no-go")
         self.assertIn(category, ("orthogonal", "bypass"))
@@ -433,7 +494,7 @@ class TestAlignedTransition(unittest.TestCase):
         u_then_v_corner = self._rot(x_span * 0.5, y_span * 0.5)
         self.assertFalse(self.grid.point_clears_nogo(u_then_v_corner),
                          "fixture invalid: the U-first bend point must be inside the exclusion")
-        path, category = planning._aligned_transition(self.frame, a, b)
+        path, category = self._aligned(a, b)
         self.assertEqual(category, "orthogonal")
         self.assertEqual(len(path), 3, "expected a two-leg orthogonal transition")
         self._legs_are_safe_and_aligned(path)
@@ -444,7 +505,7 @@ class TestAlignedTransition(unittest.TestCase):
         # …and the mirror image picks the OTHER order, proving neither is hard-coded.
         a2 = self._rot(x_span * 0.5, -12.0)
         b2 = self._rot(x_span + 12.0, y_span * 0.5)
-        path2, category2 = planning._aligned_transition(self.frame, a2, b2)
+        path2, category2 = self._aligned(a2, b2)
         self.assertEqual(category2, "orthogonal")
         bend2 = self.frame.deg_to_rot(path2[1])
         self.assertAlmostEqual(bend2[0], self.frame.deg_to_rot(b2)[0], delta=0.5,
@@ -458,7 +519,7 @@ class TestAlignedTransition(unittest.TestCase):
         y_span = self.box[3] - self.box[1]
         a = self._rot(-6.0, y_span * 0.5)
         b = self._rot(x_span + 6.0, y_span * 0.5)
-        path, category = planning._aligned_transition(self.frame, a, b)
+        path, category = self._aligned(a, b)
         self.assertIn(category, ("bypass", "fallback"))
         for p, q in zip(path, path[1:]):
             self.assertTrue(self.grid.segment_is_safe(p, q, require_inside=True))
@@ -494,7 +555,7 @@ class TestAlignedTransition(unittest.TestCase):
             b = self.frame.rot_to_deg(nxt["rot"][1])    # end of the next lane, also on the edge
             if planning._close(a, b):
                 continue
-            path, _category = planning._aligned_transition(self.frame, a, b)
+            path, _category = self._aligned(a, b)
             for p, q in zip(path, path[1:]):
                 lp = transform(self.grid.to_proj.transform, LineString([p, q]))
                 self.assertTrue(self.grid._seg_covered(lp),
@@ -513,7 +574,7 @@ class TestAlignedTransition(unittest.TestCase):
         self.assertTrue(self.grid.point_clears_nogo(a))
         self.assertTrue(self.grid.point_clears_nogo(b))
         self.assertFalse(self.grid.segment_is_safe(a, b, require_inside=True))
-        path, _c = planning._aligned_transition(self.frame, a, b)
+        path, _c = self._aligned(a, b)
         self.assertGreater(len(path), 2)
         # …and check_mission_geometry independently refuses a hand-built crossing segment.
         result = planning.check_mission_geometry(
@@ -616,17 +677,17 @@ class TestDualPass(unittest.TestCase):
                                  f"a secondary fragment runs at {brg:.1f}°, not ≈120°")
 
     def test_no_first_pass_orientation_leaks_into_the_second_pass(self):
-        # Every leg of each coverage segment is aligned to THAT segment's frame.
-        for s in self.pkg["segments"]:
-            if s["kind"] not in ("primary", "secondary"):
-                continue
-            angle = 30.0 if s["kind"] == "primary" else 120.0
-            pp = [self.grid.to_proj.transform(c[0], c[1]) for c in s["coordinates"]]
-            for i in range(len(pp) - 1):
-                self.assertIn(_classify(pp[i], pp[i + 1], angle), ("U", "V", "short"),
-                              f"{s['kind']} leg at {_bearing(pp[i], pp[i+1]):.1f}° is not "
+        # Every survey FRAGMENT is aligned to THAT segment's own frame. Transits between
+        # fragments are excluded on purpose - they carry no survey heading to leak.
+        for kind, angle in (("primary", 30.0), ("secondary", 120.0)):
+            legs = _fragment_legs(self.pkg, self.grid, kinds=(kind,))
+            self.assertTrue(legs, f"expected {kind} fragments")
+            for _k, a, b in legs:
+                self.assertIn(_classify(a, b, angle), ("U", "V", "short"),
+                              f"{kind} leg at {_bearing(a, b):.1f}° is not "
                               f"aligned to its own {angle}° frame")
-        self.assertEqual(self.pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            self.pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
 
     def test_both_passes_split_around_the_exclusion_independently(self):
         frags = self.pkg["route_quality"]["coverage_fragments"]
@@ -672,10 +733,12 @@ class TestE2LikeMission(unittest.TestCase):
         self.assertTrue(v["ok"], f"validation failed: {v['errors']}")
 
     def test_coverage_is_lawnmower_aligned_around_the_no_go(self):
-        for kind, a, b in _coverage_legs(self.pkg, self.grid):
+        for kind, a, b in _fragment_legs(self.pkg, self.grid):
             self.assertIn(_classify(a, b, 42), ("U", "V", "short"),
                           f"{kind} leg at {_bearing(a, b):.1f}° is not survey-frame aligned")
-        self.assertEqual(self.pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        self.assertEqual(
+            self.pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
+        # No leg of the segment - fragment or transit - may trace the buffered exclusion arc.
         self.assertEqual(_arc_runs(_coverage_legs(self.pkg, self.grid)), 0)
 
     def test_transit_geometry_is_untouched_by_the_survey_frame_rule(self):
@@ -714,11 +777,15 @@ class TestCurrentUiRegression(unittest.TestCase):
         self.legs = _coverage_legs(self.pkg, self.grid)
 
     def test_no_coverage_leg_follows_the_rounded_obstacle_geometry(self):
+        # Arc-following is forbidden for EVERY leg of the coverage segment, transits included...
         self.assertEqual(_arc_runs(self.legs), 0,
                          "the coverage path still traces the buffered exclusion boundary")
-        self.assertEqual(self.pkg["route_quality"]["non_survey_aligned_segment_count"], 0)
+        # ...while an arbitrary HEADING is a defect only for the survey fragments.
+        self.assertEqual(
+            self.pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
         offenders = [(round(_bearing(a, b), 1), round(math.hypot(b[0] - a[0], b[1] - a[1]), 1))
-                     for _k, a, b in self.legs if _classify(a, b, 42) == "other"]
+                     for _k, a, b in _fragment_legs(self.pkg, self.grid)
+                     if _classify(a, b, 42) == "other"]
         self.assertEqual(offenders, [], f"arbitrary-angle coverage legs: {offenders[:10]}")
 
     def test_coverage_legs_are_straight_and_parallel_to_the_survey_angle(self):
@@ -756,7 +823,8 @@ class TestCurrentUiRegression(unittest.TestCase):
     def test_provenance_names_the_survey_frame_generator(self):
         alg = self.pkg["generation_algorithm"]
         self.assertEqual(alg["coverage"], "survey-frame-boustrophedon-v1")
-        self.assertEqual(alg["coverage_transitions"], "survey-frame-orthogonal-v1")
+        self.assertEqual(alg["coverage_transitions"],
+                         "direct-safe-first-survey-frame-orthogonal-v2")
         self.assertEqual(alg["coverage_lane_family"], "ported-scout-boustrophedon-v1")
 
 
@@ -793,9 +861,21 @@ class TestFleetConsistency(unittest.TestCase):
 
     def test_child_coverage_is_survey_frame_aligned(self):
         grid = _grid(self.inp)
+        # A child's SURVEY LINES are the sonar passes; the hops between them are transit and,
+        # like a single-vehicle mission's, may take any safe heading. The line endpoints come
+        # from the fleet plan itself, since a child package carries no route_quality.
+        pairs = set()
+        for ln in self.plan["survey_lines"]:
+            cs = ln["coordinates"]
+            a = (round(cs[0][0], 7), round(cs[0][1], 7))
+            b = (round(cs[-1][0], 7), round(cs[-1][1], 7))
+            pairs.add((a, b))
+            pairs.add((b, a))       # a line is flown in whichever direction the sweep needs
         for vp in self.plan["vehicles"]:
             pkg = vp["mission_package"]
-            for kind, a, b in _coverage_legs(pkg, grid):
+            legs = _fragment_legs(pkg, grid, pairs=pairs)
+            self.assertTrue(legs, f"{vp['vehicle_id']} covered no survey line")
+            for kind, a, b in legs:
                 self.assertIn(_classify(a, b, 42), ("U", "V", "short"),
                               f"{vp['vehicle_id']} {kind} leg at {_bearing(a, b):.1f}° "
                               f"is not survey-frame aligned")
