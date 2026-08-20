@@ -56,6 +56,7 @@ import hashlib
 import heapq
 import json
 import math
+import time
 from datetime import datetime, timezone
 
 import mission_contract  # stdlib-only (hashlib/json) — safe even when geometry deps absent
@@ -889,6 +890,57 @@ F4_MAX_LOCAL_VERTICES = 24
 # a near-tie must not churn the route hash for a few centimetres.
 F4_MIN_GAIN_M = 0.5
 
+# ── F5: BCD CELL-ORDER AND CELL-ORIENTATION OPTIMISATION ─────────────────────────────────
+# F2/F4 draw the SHORTEST SAFE line between two coverage fragments. They cannot fix the choice
+# of WHICH fragment comes next — and on the operator's own large polygon that choice, not the
+# drawing, was what remained: the cells were covered in a fixed geometric key order
+# (east region → the column south of the obstacle → the column north of it → west region), so
+# the route crossed the whole survey twice and the survey ENTRY connector ran 196.7 m from the
+# approach to a cell on the far side. This tier chooses the cell ORDER and each cell's
+# ORIENTATION above F2/F4; the transitions themselves are still drawn by F2/F4, unchanged.
+#
+# COVERAGE IS NOT TOUCHED. The lane family, the clip, the cells and their membership are inputs
+# here. A cell is still covered by the same lane-monotonic alternating boustrophedon — the
+# optimiser only picks which of the four legal traversals of that same pattern is flown, and in
+# what order the cells are taken. See _cell_traversal_states.
+#
+# EXACT UP TO THIS MANY CELLS. Cell count is a property of the sweep TOPOLOGY, not of lane
+# spacing: the eight regression geometries produce 1–7 cells, and the operator's large polygon
+# produces 4 at every spacing from 5 m down to 1 m. Below the threshold the search is an exact
+# Held-Karp DP over (visited set, current cell, current orientation) and the result is globally
+# optimal for the cost below; above it a deterministic topology-aware heuristic runs instead, so
+# an unusually fragmented survey degrades gracefully rather than hanging. 9 cells is
+# 2^9·9·4·9·4 ≈ 663k DP steps — still a fraction of a second — while 12 would be ~9.4M.
+BCD_EXACT_MAX_CELLS = 9
+# Above the exact threshold: how many extra non-adjacent cells (nearest by centroid) join each
+# cell's candidate successor set, so the heuristic keeps a bounded, deterministic branching
+# factor instead of considering every remaining cell.
+BCD_HEURISTIC_EXTRA_NEIGHBOURS = 3
+# Bounded deterministic local improvement (segment-reversal / re-orientation sweeps) after the
+# heuristic construction. Bounded so the optimiser can never become the slow part.
+BCD_LOCAL_IMPROVEMENT_PASSES = 4
+# ── the cost terms ───────────────────────────────────────────────────────────────────────
+# DISTANCE IS THE OBJECTIVE. Everything below is a small deterministic nudge expressed in
+# metres, scaled by the operator's own lane spacing so it means the same thing at every scale,
+# and deliberately far smaller than the distances being compared (a lane is tens to hundreds of
+# metres, these are one or two lane spacings).
+#
+# TOPOLOGY. Two cells are adjacent when they meet across a sweep row in the decomposition — a
+# split or a merge (see _bcd_adjacency). A hand-over between adjacent cells is a lane-to-lane
+# hop; one between unrelated cells crosses ground the survey has already covered. Distance
+# usually says this by itself; the penalty is what breaks the case where it does not, and it is
+# NOT large enough to buy back a genuinely longer route.
+BCD_TOPOLOGY_PENALTY_LANES = 2.0
+# REVERSAL. Leaving a cell on a heading that points away from the next one means turning round
+# and running back along the lane just surveyed. Ranked, never forbidden.
+BCD_REVERSAL_PENALTY_LANES = 1.0
+# FALLBACK IS A CONTRACT TERM, NOT A PREFERENCE. A hand-over that drops to the generic grid A*
+# emits arbitrary-angle geometry, which the survey-frame alignment contract counts as a defect
+# (route_quality.fallback_connector_count is asserted at zero). The penalty is large enough to
+# be lexicographic in practice — no realistic distance saving can buy one — while keeping the
+# DP a plain additive minimisation.
+BCD_FALLBACK_PENALTY_M = 1.0e5
+
 # Provenance for the finalized package (PART 11): names the exact, reproducible algorithm at
 # each pipeline stage so the thesis run is explainable. Not a version the upload contract reads.
 GENERATION_ALGORITHM = {
@@ -901,7 +953,11 @@ GENERATION_ALGORITHM = {
     # completely, lane-monotonic and alternating, before the next (see _bcd_cells). This replaced
     # a strict global (row, along_index) order, which forced a trip around the exclusion and back
     # on every lane an exclusion split.
-    "fragment_ordering": "boustrophedon-cellular-decomposition-v1",
+    # Cells are grouped by _bcd_cells (unchanged), then the ORDER they are covered in and the
+    # ORIENTATION each is covered with are chosen by an exact/topology-aware search over the
+    # real safe transition distances between them (see _bcd_cell_plan). Coverage geometry is an
+    # input to that search and is never modified by it.
+    "fragment_ordering": "bcd-cell-order-orientation-optimised-v2",
     # Inter-fragment transits try the straight leg FIRST at any heading; when it is unsafe, a
     # BOUNDED LOCAL detour is searched and taken only if it beats the aligned candidate. Both are
     # accepted solely by the same authoritative safety predicate, and the unchanged survey-frame
@@ -1980,13 +2036,16 @@ def _aligned_transition(frame, a_deg, b_deg, in_dir=None, out_dir=None,
     every edge is admitted only by the same `_seg_safe_cached(..., True)` as every other tier.
 
     `optimize_transit=False` restores the pre-F2 aligned-only behaviour by suppressing BOTH
-    optimisation tiers. That is not a preference switch — it is required by the BCD cell-entry
-    probe, which asks "could this cell entry be BUILT from survey-frame legs, or would it drop to
-    the A* fallback?". With the optimisation tiers live the answer would be "direct_transit" (or
-    a detour) for both candidate entries, the probe would stop discriminating, and the entry
-    bit — hence some cells' sweep DIRECTION — would move for reasons that have nothing to do
-    with buildability. Coverage ordering must not depend on how transits are drawn, so the probe
-    keeps the old semantics explicitly."""
+    optimisation tiers. It exists so the aligned-only baseline stays reachable and comparable —
+    the regression suites generate against it to prove the coverage CONTENT is independent of how
+    transits are drawn. It is not used in generation.
+
+    An earlier BCD cell-entry probe did use it, to ask "could this entry be BUILT from
+    survey-frame legs at all?" while the entry bit was decided on buildability. The cell order and
+    orientation are now decided on measured DISTANCE (see _bcd_cell_plan), and the honest distance
+    is the one the vessel really travels — so the ordering costs candidates through the full tier
+    hierarchy, deliberately. What replaced the old invariant is stronger and is what always
+    mattered: the coverage content cannot depend on the transit policy, only the ORDER may."""
     grid = frame.grid
     a_rot, b_rot = frame.deg_to_rot(a_deg), frame.deg_to_rot(b_deg)
     du, dv = b_rot[0] - a_rot[0], b_rot[1] - a_rot[1]
@@ -2287,57 +2346,758 @@ def _cell_key(cell):
     return (min(f["row"] for f in cell), min(f["rot"][0][0] for f in cell))
 
 
-def _bcd_traversal_order(cells):
-    """The order the cells are covered in, and which way each one is swept.
+def _bcd_adjacency(cells):
+    """The BCD TOPOLOGY GRAPH: which cells meet each other in the decomposition.
 
-    ORDER — cells in ascending (lowest sweep row, lowest U). Stable geometric keys, nothing
-    measured, no optimizer. For a lane split by an exclusion this sequences the region the way a
-    sweep naturally meets it: everything below the obstacle, then the near column, then the far
-    column, then everything above.
+    Two cells are ADJACENT when a fragment of one and a fragment of the other sit on
+    CONSECUTIVE sweep rows and overlap along U — i.e. they are two sides of the same critical
+    point. That is exactly the split/merge relation `_bcd_cells` used to close one cell and open
+    another: the cell below an obstacle is adjacent to both columns beside it, each column is
+    adjacent to the cell above where the free space merges again, and the two columns are NOT
+    adjacent to each other, because between them lies the obstacle rather than a shared sweep
+    boundary.
 
-    DIRECTION — the sweep of a cell is monotonic, but the SIGN is chosen: a cell is entered at
-    whichever of its two ends is nearest, in sweep rows, to the row the route just finished on.
-    This is what makes the ordering work. The two columns beside an obstacle occupy the SAME rows,
-    so after the near column is swept upwards the route stands at the top of it; entering the far
-    column at its bottom would mean travelling the full height of the obstacle twice. Entering it
-    at its TOP instead makes the hand-over a single short hop over the obstacle's end, which
-    _aligned_transition can build from U/V legs like any other lane turn. The far column is then
-    swept back down, ending next to the cell above — which is again a short, buildable hop.
+    Deliberately not "every cell is a neighbour of every other". The graph exists to say which
+    hand-overs are a lane-to-lane hop across a shared boundary and which cross the survey; a
+    complete graph would say nothing. `_fragments_overlap_in_u` is the same slice-connectivity
+    predicate the decomposition itself is built from, so the topology can never disagree with
+    the cells it describes.
 
-    Ties resolve to ascending, so the choice is deterministic. Only sweep-row INDICES are
-    compared; no geometry is measured and no candidate transition is costed, so this is still a
-    topological rule and not a nearest-neighbour search.
-
-    Returns [(cell, ascending), ...]."""
-    order = []
-    last_row = None
-    for cell in sorted(cells, key=_cell_key):
-        lo = min(f["row"] for f in cell)
-        hi = max(f["row"] for f in cell)
-        if last_row is None:
-            ascending = True
-        else:
-            ascending = abs(lo - last_row) <= abs(hi - last_row)
-        order.append((cell, ascending))
-        last_row = hi if ascending else lo
-    return order
+    Returns [frozenset(neighbour cell ids), ...] indexed by cell id (position in `cells`)."""
+    by_row = {}
+    for ci, cell in enumerate(cells):
+        for f in cell:
+            by_row.setdefault(f["row"], []).append((ci, f))
+    adj = [set() for _ in cells]
+    for row in sorted(by_row):
+        nxt = by_row.get(row + 1)
+        if not nxt:
+            continue
+        for ci, f in by_row[row]:
+            for cj, g in nxt:
+                if ci != cj and _fragments_overlap_in_u(f, g):
+                    adj[ci].add(cj)
+                    adj[cj].add(ci)
+    return [frozenset(s) for s in adj]
 
 
-def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
+def _cell_traversal_states(cell):
+    """The legal boustrophedon traversals of ONE cell — the same coverage, flown four ways.
+
+    A cell is covered lane by lane through the sweep, the along-U direction flipping on every
+    lane. That pattern has exactly two free bits:
+
+        ascending          which end of the sweep the cell is entered at (lowest row or highest)
+        first_row_forward  which way the FIRST lane of the cell is flown
+
+    and the two bits together fix everything else, including which corner the cell is LEFT at
+    (the alternation runs to the end: with an odd number of rows the cell exits on the side it
+    was entered from, with an even number on the opposite side). Four combinations, four
+    entry/exit corners, one identical set of coverage fragments.
+
+    The four states are two REVERSE PAIRS: reversing a state's fragment sequence end to end, and
+    swapping each fragment's entry and exit, produces another of the four. FORWARD and REVERSE in
+    the task's sense are those two members of a pair; both bits are enumerated so that all four
+    corners are available to the optimiser, which is strictly more choice than reversal alone and
+    never less.
+
+    NOTHING GEOMETRIC IS CREATED HERE. Each state reuses the fragment dicts `_lane_fragments`
+    produced — same `rot` endpoints, same lengths, same rows — and only records which end of each
+    is the entry and which the exit. Coverage distance is therefore identical across all four
+    states, and is returned so the caller can assert it rather than assume it.
+
+    THE LANE-TURN LADDER IS NOT. What DOES differ between states is the repositioning BETWEEN
+    consecutive lanes (`internal_transit_m`). The alternation makes each turn at one end of the
+    lane pair or the other, so the two members of a reverse pair turn at the SAME set of ends and
+    the other pair turns at the COMPLEMENTARY set — the value therefore takes at most TWO distinct
+    values over the four states, one per pair. On a cell whose two U-boundaries mirror each other
+    (a plain rectangle) the two sets are equal and all four agree; on a slanted, concave or
+    obstacle-cut cell they do not. Measured across the regression matrix and every operator draft
+    the spread reaches 51.1 m on one cell. See `_bcd_cell_plan` for why the objective
+    deliberately does not spend it.
+
+    Returns four state dicts in a fixed order: (ascending, first_row_forward) =
+    (T,T), (T,F), (F,T), (F,F)."""
+    states = []
+    for ascending in (True, False):
+        rows_in_cell = sorted({f["row"] for f in cell}, reverse=not ascending)
+        for first_row_forward in (True, False):
+            seq = []
+            forward = first_row_forward
+            for row in rows_in_cell:
+                row_frags = sorted([f for f in cell if f["row"] == row],
+                                   key=lambda f: f["rot"][0][0])
+                for frag in (row_frags if forward else list(reversed(row_frags))):
+                    a, b = frag["rot"][0], frag["rot"][1]
+                    seq.append({**frag,
+                                "cell_ascending": ascending,
+                                "entry_rot": a if forward else b,
+                                "exit_rot": b if forward else a,
+                                "dir": (1.0, 0.0) if forward else (-1.0, 0.0)})
+                forward = not forward
+            states.append({
+                "ascending": ascending,
+                "first_row_forward": first_row_forward,
+                "fragments": seq,
+                "entry_rot": seq[0]["entry_rot"],
+                "exit_rot": seq[-1]["exit_rot"],
+                "in_dir": seq[0]["dir"],
+                "out_dir": seq[-1]["dir"],
+                "coverage_m": sum(f["length_m"] for f in seq),
+                # The in-cell repositioning between consecutive fragments, measured straight in
+                # the survey frame — NOT the emitted ladder, which F2/F4 draw and which appears in
+                # route_quality as in_coverage_transition_length_m. DIAGNOSTIC ONLY: nothing in
+                # `_bcd_cost_model` reads it, so it can never move the objective. It is NOT
+                # invariant across the four states (see the ladder note above); the cell plan
+                # reports the chosen value and the omitted spread so the choice stays auditable.
+                "internal_transit_m": sum(
+                    math.hypot(seq[k + 1]["entry_rot"][0] - seq[k]["exit_rot"][0],
+                               seq[k + 1]["entry_rot"][1] - seq[k]["exit_rot"][1])
+                    for k in range(len(seq) - 1)),
+            })
+    return states
+
+
+# Every counter a costing probe can touch. A probe measures a candidate that mostly will NOT be
+# built, so it must leave the grid's accounting exactly as it found it — the connector metrics
+# describe the route that was emitted, not the search that chose it.
+_GRID_PROBE_COUNTERS = ("raw_connector_pts", "final_connector_pts", "connector_len_before_m",
+                        "connector_len_after_m", "astar_connector_count", "shortest_safe_count",
+                        "shortest_safe_len_m", "shortest_safe_saved_m", "f4_candidate_vertices",
+                        "f4_edge_probes", "f4_invocations")
+
+
+def _transition_oracle(frame):
+    """Costed access to the transition policy the route is actually drawn with.
+
+    A candidate hand-over is costed by ASKING `_aligned_transition` for it — the same tiers, in
+    the same order, against the same authoritative safety predicate: F2 direct-safe first, then
+    F4's bounded local detour, then the survey-frame aligned tiers, then the generic A*
+    fallback, then a hard refusal. So the number the optimiser minimises is the number of metres
+    the vessel will really travel, not a straight-line stand-in that would be wrong exactly where
+    it matters (the straight line between two cells beside an obstacle is the one path that is
+    NOT available).
+
+    Two properties this must have, and does:
+
+      * COUNTER-NEUTRAL. Reaching the fallback tier runs the grid A*, and F4 bumps the detour
+        counters; both feed route_quality. Only one of the many candidates costed is ever built,
+        so every counter is snapshotted and restored around the probe. The safety cache is
+        deliberately left warm — it is a pure memo of the same predicate, and warming it is what
+        keeps the search affordable.
+      * MEMOISED. The DP asks for the same (exit corner → entry corner) pair from many partial
+        sequences; the underlying tiers are pure, so the first answer is the only one computed.
+
+    Returns (cost_fn, stats) where cost_fn(a_deg, b_deg, in_dir, out_dir) → (metres, category,
+    point_count) and an unroutable pair answers (inf, "unroutable", 0)."""
+    grid = frame.grid
+    memo = {}
+    stats = {"evaluations": 0, "cache_hits": 0}
+
+    def cost(a_deg, b_deg, in_dir, out_dir):
+        key = (_rk(a_deg), _rk(b_deg), in_dir, out_dir)
+        hit = memo.get(key)
+        if hit is not None:
+            stats["cache_hits"] += 1
+            return hit
+        # TIER 0, SHORT-CIRCUITED. When the straight segment is safe, `_aligned_transition`
+        # returns exactly that segment — so asking the same authoritative predicate directly is
+        # the SAME decision at a fraction of the cost, and it skips building the aligned
+        # candidate families and F4's local graph for the many hand-overs that never needed
+        # them. Only a genuinely blocked pair pays for the full policy.
+        if grid._seg_safe_cached(a_deg, b_deg, True):
+            value = (grid._proj_len_m([list(a_deg), list(b_deg)]), "direct_transit", 2)
+            stats["evaluations"] += 1
+            memo[key] = value
+            return value
+        saved = {name: getattr(grid, name) for name in _GRID_PROBE_COUNTERS}
+        try:
+            path, category = _aligned_transition(frame, a_deg, b_deg,
+                                                 in_dir=in_dir, out_dir=out_dir)
+            value = (grid._proj_len_m(path), category, len(path))
+        except ConnectorError:
+            value = (float("inf"), "unroutable", 0)
+        finally:
+            for name, was in saved.items():
+                setattr(grid, name, was)
+        stats["evaluations"] += 1
+        memo[key] = value
+        return value
+
+    return cost, stats
+
+
+def _boundary_oracle(grid):
+    """Costed access to the SURVEY-ENTRY and RETURN connectors, for the ordering's boundary
+    conditions.
+
+    The first cell is not free to be chosen on inter-cell distance alone: the route has to REACH
+    it from the end of the approach, and that leg is a real, executed connector. Likewise the
+    last cell's exit corner decides how far the return connector has to run. Both are costed with
+    `_NavGrid.safe_connector` — the very function `generate_survey` builds those two segments
+    with — so the boundary term is the same metres the route will pay, not an approximation.
+
+    The approach and return geometry themselves are untouched by this: their waypoints are an
+    INPUT here, read only to say where the survey is entered from and left towards.
+
+    Counter-neutral for the same reason as `_transition_oracle`, and memoised."""
+    memo = {}
+    stats = {"evaluations": 0}
+
+    def cost(a_deg, b_deg):
+        if a_deg is None or b_deg is None:
+            return 0.0
+        key = (_rk(a_deg), _rk(b_deg))
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        saved = {name: getattr(grid, name) for name in _GRID_PROBE_COUNTERS}
+        try:
+            value = grid._proj_len_m(grid.safe_connector(a_deg, b_deg, require_inside=True))
+        except ConnectorError:
+            value = float("inf")
+        finally:
+            for name, was in saved.items():
+                setattr(grid, name, was)
+        stats["evaluations"] += 1
+        memo[key] = value
+        return value
+
+    return cost, stats
+
+
+def _bcd_cost_model(frame, cells, spacing, entry_anchor=None, exit_anchor=None):
+    """Everything the cell-ordering search minimises, as one bundle of callables.
+
+    Separated from the search so that WHAT is optimised and HOW it is searched for cannot drift
+    apart — the exact search, the heuristic and the tests all cost a candidate sequence through
+    this one definition. Returns:
+
+        adjacency / states  the BCD topology graph and the four traversals of each cell
+        step_detail(i,si,j,sj)  -> (cost, real metres, the tier that drew it)
+        step / enter / leave    the measured costs the objective is the sum of
+        step_lb / enter_lb / leave_lb
+                            admissible LOWER BOUNDS on those three, computed from the corner
+                            geometry alone: straight-line distance (no safe path is shorter)
+                            plus the topology and reversal penalties, which are exactly known
+                            from the corners and so are not under-estimated at all. The fallback
+                            penalty is deliberately left out — it cannot be known without drawing
+                            the transition, and omitting it only weakens the bound, never breaks
+                            it. `lb <= true` everywhere is the single property the exact search
+                            relies on to probe fewer candidates without changing its answer.
+        transition_stats / boundary_stats
+                            how many distinct measurements were actually taken."""
+    lane = abs(float(spacing or 0.0)) or 1.0
+    topology_penalty = BCD_TOPOLOGY_PENALTY_LANES * lane
+    reversal_penalty = BCD_REVERSAL_PENALTY_LANES * lane
+    adjacency = _bcd_adjacency(cells)
+    states = [_cell_traversal_states(cell) for cell in cells]
+    transition_cost, tstats = _transition_oracle(frame)
+    boundary_cost, bstats = _boundary_oracle(frame.grid)
+
+    def deg(pt_rot):
+        return frame.rot_to_deg(pt_rot)
+
+    def penalties(i, si, j, sj, category):
+        penalty = 0.0
+        if category == "fallback":
+            penalty += BCD_FALLBACK_PENALTY_M
+        if j not in adjacency[i]:
+            penalty += topology_penalty
+        heading = _unit(states[i][si]["exit_rot"], states[j][sj]["entry_rot"])
+        if heading is not None:
+            penalty += reversal_penalty * _chain_reversals(
+                [states[i][si]["out_dir"], heading, states[j][sj]["in_dir"]])
+        return penalty
+
+    def step_detail(i, si, j, sj):
+        """Leaving cell i in state si and picking cell j up in state sj:
+        (cost, real metres, the tier that drew it)."""
+        a, b = states[i][si], states[j][sj]
+        metres, category, _pts = transition_cost(deg(a["exit_rot"]), deg(b["entry_rot"]),
+                                                 a["out_dir"], b["in_dir"])
+        if math.isinf(metres):
+            return float("inf"), metres, category
+        return metres + penalties(i, si, j, sj, category), metres, category
+
+    def step(i, si, j, sj):
+        return step_detail(i, si, j, sj)[0]
+
+    def step_lb(i, si, j, sj):
+        ax, ay = states[i][si]["exit_rot"]
+        bx, by = states[j][sj]["entry_rot"]
+        return math.hypot(bx - ax, by - ay) + penalties(i, si, j, sj, None)
+
+    def enter(i, si):
+        return boundary_cost(entry_anchor, deg(states[i][si]["entry_rot"]))
+
+    def leave(i, si):
+        return boundary_cost(deg(states[i][si]["exit_rot"]), exit_anchor)
+
+    def _anchor_lb(anchor, pt_rot):
+        if anchor is None:
+            return 0.0
+        return frame.grid._proj_len_m([list(anchor), deg(pt_rot)])
+
+    def enter_lb(i, si):
+        return _anchor_lb(entry_anchor, states[i][si]["entry_rot"])
+
+    def leave_lb(i, si):
+        return _anchor_lb(exit_anchor, states[i][si]["exit_rot"])
+
+    return {"adjacency": adjacency, "states": states,
+            "step_detail": step_detail, "step": step, "step_lb": step_lb,
+            "enter": enter, "leave": leave, "enter_lb": enter_lb, "leave_lb": leave_lb,
+            "transition_stats": tstats, "boundary_stats": bstats}
+
+
+def _bcd_cell_plan(frame, cells, spacing, entry_anchor=None, exit_anchor=None):
+    """WHICH CELL IS COVERED WHEN, AND WHICH WAY ROUND. Returns (plan, diagnostics).
+
+    THE PROBLEM THIS SOLVES
+    -----------------------
+    `_bcd_cells` says what the cells ARE. Until this existed, the order they were covered in was
+    their geometric sort key — lowest sweep row, then lowest U — and each cell's sweep direction
+    was picked from local terms one cell at a time. On the operator's large polygon that produced
+    east region → column south of the obstacle → column north of it → west region: a sequence
+    whose hand-overs are 119.8 m + 29.0 m + 78.3 m, entered by a 196.7 m survey-entry connector
+    from an approach that ended beside a completely different cell. Every leg of that was
+    individually the shortest safe path available; the ORDER is what made them long.
+
+    WHAT IS OPTIMISED
+    -----------------
+    Exactly two things, and nothing else:
+
+        * the order the cells are visited in — each exactly once;
+        * which of its four legal boustrophedon traversals each cell is flown with
+          (see _cell_traversal_states).
+
+    Coverage geometry is an INPUT. The fragments, their coordinates, their lengths, the lane
+    spacing, the survey angle and cell membership are all fixed before this runs and are not
+    consulted for anything except their endpoints. A cell is still covered completely, lane by
+    lane, alternating, before the route moves on: this chooses among whole-cell traversals, never
+    among fragments.
+
+    THE COST
+    --------
+        Σ safe transition distance between consecutive cells
+      + safe distance from the survey entry anchor into the first cell
+      + safe distance out of the last cell to the return anchor
+      + a small deterministic penalty for a hand-over between cells the decomposition does not
+        make adjacent, and for one that has to double back on the heading the cell was left on
+      + a large penalty for a hand-over that can only be drawn by the generic A* fallback
+
+    Distances come from the real tiers (`_transition_oracle`, `_boundary_oracle`), so this
+    minimises metres the mission actually flies. The penalties are lane-spacing multiples — one
+    or two lane widths against transitions of tens to hundreds of metres — so distance dominates
+    by construction; the fallback term is the exception and is deliberately lexicographic,
+    because arbitrary-angle A* geometry in a hand-over is a contract violation rather than a
+    slightly worse route.
+
+    WHAT THE COST DELIBERATELY LEAVES OUT
+    -------------------------------------
+    The IN-CELL lane-turn ladder. A cell's four traversals cover identical fragments but do not
+    all turn at the same lane ends, so the repositioning inside a cell varies between them (see
+    `_cell_traversal_states`). That variation is real and is flown, but it is not spent here, for
+    two reasons. It is a WITHIN-cell property, so folding it in would let a cheaper turn ladder
+    buy a longer hand-over or a longer survey-entry connector — trading a term the cell plan owns
+    against terms it was created to fix. And measured over the whole regression matrix and every
+    operator draft it does not pay: on all eight operator drafts the plan chosen WITHOUT it is
+    already optimal for total route WITH it counted (regret 0.00 m, the accepted 150° draft
+    included); only anchorless synthetic fixtures, where the boundary terms vanish and the
+    objective has nothing left to discriminate on, show a gap (worst 55.3 m, 3.3% of route).
+    `in_cell_transit_spread_m` in the diagnostics reports how much was on the table, so the
+    omission is auditable rather than assumed harmless.
+
+    TOPOLOGY, NOT AN UNRESTRICTED TSP
+    ---------------------------------
+    The adjacency graph enters twice: as the penalty above, and — above the exact threshold — as
+    the candidate successor set each cell offers. It is a strong preference rather than a hard
+    constraint on purpose. Making it hard would forbid the one hand-over the decomposition
+    genuinely needs, the single crossing from one column beside an obstacle to the other, and
+    would reproduce the very sequence this replaces.
+
+    EXACT, OR BOUNDED
+    -----------------
+    Up to BCD_EXACT_MAX_CELLS the search is an exact Held-Karp DP over
+    (visited set, current cell, current orientation) — globally optimal for the cost above and
+    reproducible. Beyond it, a deterministic topology-aware construction (cheapest admissible
+    successor over both cells and orientations) followed by bounded segment-reversal improvement.
+    Observed cell counts on every fixture and every operator draft are 1–7, and cell count does
+    not grow with lane spacing, so the exact path is the one that runs in practice.
+
+    `plan` is [(cell_id, state), ...] with cell_id indexing `cells`."""
+    n = len(cells)
+    model = _bcd_cost_model(frame, cells, spacing, entry_anchor, exit_anchor)
+    adjacency, states = model["adjacency"], model["states"]
+    step_detail, step, enter, leave = (model["step_detail"], model["step"],
+                                       model["enter"], model["leave"])
+    step_lb, enter_lb, leave_lb = model["step_lb"], model["enter_lb"], model["leave_lb"]
+    tstats, bstats = model["transition_stats"], model["boundary_stats"]
+
+    if n <= BCD_EXACT_MAX_CELLS:
+        order, combo, mode = _bcd_exact_plan(n, step, enter, leave,
+                                             step_lb, enter_lb, leave_lb)
+    else:
+        order, combo, mode = _bcd_heuristic_plan(n, cells, adjacency, step, enter, leave, step_lb)
+
+    plan = [(order[k], states[order[k]][combo[k]]) for k in range(n)]
+    legs = []
+    inter_m = 0.0
+    non_adjacent = 0
+    for k in range(n - 1):
+        i, j = order[k], order[k + 1]
+        _cost, metres, category = step_detail(i, combo[k], j, combo[k + 1])
+        adjacent = j in adjacency[i]
+        non_adjacent += 0 if adjacent else 1
+        inter_m += metres
+        legs.append({"from_cell": i, "to_cell": j, "adjacent": adjacent,
+                     "length_m": round(metres, 2), "category": category})
+    entry_m = enter(order[0], combo[0])
+    exit_m = leave(order[-1], combo[-1])
+    diag = {
+        "mode": mode,
+        "cell_count": n,
+        "orientation_states_per_cell": 4,
+        "adjacency": [sorted(adjacency[i]) for i in range(n)],
+        "cell_order": list(order),
+        "cell_orientations": [{"cell_id": order[k],
+                               "ascending": states[order[k]][combo[k]]["ascending"],
+                               "first_row_forward":
+                                   states[order[k]][combo[k]]["first_row_forward"]}
+                              for k in range(n)],
+        "handovers": legs,
+        # The in-cell lane-turn ladder: what the chosen traversals spend on repositioning
+        # between consecutive lanes, and the total range the four traversals of each cell offer.
+        # Straight-line in the survey frame (the EMITTED ladder is drawn by F2/F4 and is
+        # route_quality.in_coverage_transition_length_m - inter_cell_transit_length_m). Neither
+        # is an input to the search — they record the size of the term the cost leaves out, so a
+        # geometry where it grows is visible instead of silent. See THE COST above.
+        "in_cell_transit_m": round(
+            sum(states[order[k]][combo[k]]["internal_transit_m"] for k in range(n)), 2),
+        "in_cell_transit_spread_m": round(
+            sum(max(st["internal_transit_m"] for st in states[i])
+                - min(st["internal_transit_m"] for st in states[i]) for i in range(n)), 2),
+        "inter_cell_transit_m": round(inter_m, 2),
+        "largest_inter_cell_transit_m": round(max((l["length_m"] for l in legs), default=0.0), 2),
+        "non_adjacent_handover_count": non_adjacent,
+        "entry_boundary_m": round(entry_m, 2) if math.isfinite(entry_m) else None,
+        "return_boundary_m": round(exit_m, 2) if math.isfinite(exit_m) else None,
+        "transition_evaluations": tstats["evaluations"],
+        "transition_cache_hits": tstats["cache_hits"],
+        "boundary_evaluations": bstats["evaluations"],
+    }
+    return plan, diag
+
+
+def _held_karp(n, step, enter, leave, bound=None, improve=None):
+    """Held-Karp over (visited set, current cell, current orientation), with an optional bound.
+
+    `dp[mask][(i, si)]` is the cheapest way to have covered exactly the cells in `mask`, finishing
+    inside cell i flown in state si. The boundary conditions sit at the two ends: the entry
+    connector is the seed of every one-cell state, and the return connector is added once at the
+    full mask. Both are therefore optimised over rather than bolted on, which is the whole point
+    of including them — the first cell is chosen knowing where the vehicle enters the survey, and
+    the last knowing where it must leave for.
+
+    `bound(cost_so_far, mask, i, si, j, sj)` may answer True to say a partial sequence provably
+    cannot beat a known achievable tour; the caller supplies it and owns its admissibility, and
+    `improve(total)` is called back with every complete tour found so that bound can tighten as
+    the search runs. States
+    are expanded in sorted (cell, orientation) order and ties are kept at the first sequence
+    found, so equal-cost plans always resolve to the same one and the route hash is stable.
+
+    Returns (order, combo, best_total) or (None, None, inf) when no complete tour survives."""
+    full = (1 << n) - 1
+    dp = [{} for _ in range(1 << n)]
+    for i in range(n):
+        for si in range(4):
+            c = enter(i, si)
+            if math.isfinite(c):
+                dp[1 << i][(i, si)] = (c, None)
+    for mask in range(1 << n):
+        cur = dp[mask]
+        if not cur:
+            continue
+        rest = [j for j in range(n) if not (mask >> j) & 1]
+        if not rest:
+            continue
+        for (i, si), (cost_so_far, _back) in sorted(cur.items()):
+            for j in rest:
+                nmask = mask | (1 << j)
+                nxt = dp[nmask]
+                for sj in range(4):
+                    if bound is not None and bound(cost_so_far, mask, i, si, j, sj):
+                        continue
+                    add = step(i, si, j, sj)
+                    if not math.isfinite(add):
+                        continue
+                    total = cost_so_far + add
+                    key = (j, sj)
+                    have = nxt.get(key)
+                    if have is None or total < have[0] - 1e-9:
+                        nxt[key] = (total, (mask, i, si))
+                        # A complete sequence is an ACHIEVABLE tour, so it tightens the bound
+                        # the rest of the search is pruned against — the earlier the incumbent
+                        # improves, the fewer candidates ever have to be measured.
+                        if improve is not None and nmask == full:
+                            improve(total + leave(j, sj))
+    best_key, best_total = None, None
+    for (i, si), (cost_so_far, _back) in sorted(dp[full].items()):
+        total = cost_so_far + leave(i, si)
+        if not math.isfinite(total):
+            continue
+        if best_total is None or total < best_total - 1e-9:
+            best_total, best_key = total, (i, si)
+    if best_key is None:
+        return None, None, float("inf")
+    order, combo = [], []
+    mask, key = full, best_key
+    while key is not None:
+        i, si = key
+        order.append(i)
+        combo.append(si)
+        back = dp[mask][key][1]
+        mask = None if back is None else back[0]
+        key = None if back is None else (back[1], back[2])
+    order.reverse()
+    combo.reverse()
+    return order, combo, best_total
+
+
+def _bcd_completion_bounds(n, step_lb, leave_lb):
+    """`hlb[mask][(i, si)]` — the cheapest LOWER-BOUND cost of covering every cell NOT in `mask`,
+    starting from cell i flown in state si, and then leaving the survey.
+
+    A backward Held-Karp over the bound alone: pure arithmetic, not one safety probe, not one
+    transition drawn. It is what makes the exact search cheap — for any partial sequence it says
+    precisely how little the REST could conceivably cost, so a branch whose measured cost so far
+    plus that remainder already loses to a known achievable tour can be abandoned before its next
+    hand-over is ever measured. Because every term under-estimates, no branch that could have won
+    is ever abandoned.
+
+    The same table also yields the bound-optimal tour itself (each entry keeps the successor that
+    achieved it), which is measured once to seed the incumbent."""
+    full = (1 << n) - 1
+    hlb = [dict() for _ in range(1 << n)]
+    for i in range(n):
+        for si in range(4):
+            hlb[full][(i, si)] = (leave_lb(i, si), None)
+    for mask in range(full - 1, -1, -1):
+        rest = [j for j in range(n) if not (mask >> j) & 1]
+        cur = hlb[mask]
+        for i in range(n):
+            if not (mask >> i) & 1:
+                continue                     # you can only stand in a cell already covered
+            for si in range(4):
+                best = None
+                for j in rest:
+                    nxt = hlb[mask | (1 << j)]
+                    for sj in range(4):
+                        ahead = nxt.get((j, sj))
+                        if ahead is None:
+                            continue
+                        v = step_lb(i, si, j, sj) + ahead[0]
+                        if best is None or v < best[0] - 1e-12:
+                            best = (v, (j, sj))
+                if best is not None:
+                    cur[(i, si)] = best
+    return hlb
+
+
+def _bcd_exact_plan(n, step, enter, leave, step_lb, enter_lb, leave_lb):
+    """The globally optimal cell order + orientation for the cost in `_bcd_cell_plan`.
+
+    THE SEARCH IS EXACT; THE BOUND ONLY DECIDES WHAT GETS MEASURED. A plain Held-Karp would ask
+    the transition oracle for every one of the n·(n-1)·16 cell/orientation pairs, and each answer
+    is a real safety-proven path (F2, or F4's local Dijkstra, or an aligned staircase) — on a
+    seven-cell survey that is 672 measurements and about a second, for a decision that ends up
+    using six of them. So the search runs in three stages, and its answer is identical to the
+    plain one:
+
+      1. A backward Held-Karp on the LOWER BOUND alone (`_bcd_completion_bounds`) — straight-line
+         distance plus the exactly-known topology and reversal penalties. No oracle calls at all.
+         It gives both a bound-optimal sequence and, for every partial sequence, the least the
+         remainder could cost.
+      2. That bound-optimal sequence is MEASURED for real. Its true cost is achievable, so it is a
+         valid upper bound on the optimum and becomes the incumbent to beat. On the eight
+         regression geometries the bound is within a metre of the truth, so this is usually
+         already the answer — it just has not been proved yet.
+      3. Held-Karp on the TRUE measured costs, with a branch abandoned as soon as
+         `measured cost so far + bound on the next hop + bound on everything still to come`
+         exceeds the incumbent, which tightens further every time a complete sequence is found.
+         Nothing that could have won is discarded, and what is never reached is never measured.
+
+    The result is whichever of the incumbent and stage 3 is cheaper, which is the true optimum.
+
+    A survey where no complete sequence can be routed at all falls back to the stable geometric
+    cell order rather than refusing: generation still has to produce a route, and every transition
+    it emits is proven safe by `_aligned_transition` regardless of the order it is asked for."""
+    hlb = _bcd_completion_bounds(n, step_lb, leave_lb)
+    seed = None
+    for i in range(n):
+        for si in range(4):
+            head = hlb[1 << i].get((i, si))
+            if head is None:
+                continue
+            v = enter_lb(i, si) + head[0]
+            if seed is None or v < seed[0] - 1e-12:
+                seed = (v, i, si)
+    if seed is None:                                     # not even the bound admits a sequence
+        return list(range(n)), [0] * n, "geometric-fallback"
+    lb_order, lb_combo = [seed[1]], [seed[2]]
+    mask, key = 1 << seed[1], (seed[1], seed[2])
+    while True:
+        nxt = hlb[mask][key][1]
+        if nxt is None:
+            break
+        lb_order.append(nxt[0])
+        lb_combo.append(nxt[1])
+        mask |= 1 << nxt[0]
+        key = nxt
+
+    def true_total(order, combo):
+        total = enter(order[0], combo[0])
+        for k in range(n - 1):
+            total += step(order[k], combo[k], order[k + 1], combo[k + 1])
+        return total + leave(order[-1], combo[-1])
+
+    lb_true = true_total(lb_order, lb_combo)
+    incumbent = [lb_true]
+
+    def improve(total):
+        if total < incumbent[0]:
+            incumbent[0] = total
+
+    def bound(cost_so_far, mask, i, si, j, sj):
+        if not math.isfinite(incumbent[0]):
+            return False
+        ahead = hlb[mask | (1 << j)].get((j, sj))
+        if ahead is None:
+            return True                                  # no way to finish from there at all
+        return cost_so_far + step_lb(i, si, j, sj) + ahead[0] > incumbent[0] + 1e-9
+
+    order, combo, total = _held_karp(n, step, enter, leave, bound=bound, improve=improve)
+    if order is None or total > lb_true - 1e-9:
+        return lb_order, lb_combo, "exact-held-karp"
+    return order, combo, "exact-held-karp"
+
+
+def _bcd_heuristic_plan(n, cells, adjacency, step, enter, leave, step_lb):
+    """Deterministic topology-aware construction + bounded improvement, for surveys with more
+    cells than the exact search is affordable for.
+
+    CONSTRUCTION. Start from the (cell, orientation) the survey is cheapest to enter at, then
+    repeatedly take the cheapest admissible successor, scored with a one-step LOOKAHEAD: the
+    measured hand-over into the candidate PLUS the cheapest LOWER BOUND on a hand-over out of it
+    to anything still unvisited (or the return connector, when it would be last). Lookahead is
+    what stops the construction walking into a corner it then has to cross the survey to escape;
+    bounding it rather than measuring it keeps the construction linear in oracle calls.
+
+    ADMISSIBLE SUCCESSORS are the candidate's BCD neighbours plus the
+    BCD_HEURISTIC_EXTRA_NEIGHBOURS nearest remaining cells by centroid, so the branching factor
+    is bounded and the topology is what mostly decides where the route goes next. If that set is
+    empty (every neighbour already covered) the whole remaining set is admissible, so the
+    construction can never dead-end.
+
+    IMPROVEMENT. Bounded passes of segment reversal (2-opt on the cell order) and per-cell
+    re-orientation, each accepted only on a strict improvement, so it terminates and is
+    reproducible."""
+    centroids = []
+    for cell in cells:
+        us = [f["rot"][e][0] for f in cell for e in (0, 1)]
+        vs = [f["sweep"] for f in cell]
+        centroids.append((sum(us) / len(us), sum(vs) / len(vs)))
+
+    def near(i, remaining):
+        pool = sorted(remaining, key=lambda j: (round(math.hypot(centroids[j][0] - centroids[i][0],
+                                                                 centroids[j][1] - centroids[i][1]),
+                                                      3), j))
+        allowed = [j for j in pool if j in adjacency[i]]
+        allowed += [j for j in pool if j not in adjacency[i]][:BCD_HEURISTIC_EXTRA_NEIGHBOURS]
+        return allowed or pool
+
+    start = min(((enter(i, si), i, si) for i in range(n) for si in range(4)),
+                key=lambda t: (round(t[0], 6), t[1], t[2]))
+    order, combo = [start[1]], [start[2]]
+    remaining = set(range(n)) - {start[1]}
+    while remaining:
+        i, si = order[-1], combo[-1]
+        best = None
+        for j in near(i, remaining):
+            for sj in range(4):
+                add = step(i, si, j, sj)
+                if not math.isfinite(add):
+                    continue
+                after = remaining - {j}
+                if after:
+                    ahead = min((step_lb(j, sj, k, sk) for k in near(j, after)
+                                 for sk in range(4)), default=float("inf"))
+                else:
+                    ahead = leave(j, sj)
+                if not math.isfinite(ahead):
+                    ahead = 0.0
+                key = (round(add + ahead, 6), round(add, 6), j, sj)
+                if best is None or key < best[0]:
+                    best = (key, j, sj)
+        if best is None:
+            j = min(remaining)
+            best = ((0.0, 0.0, j, 0), j, 0)
+        order.append(best[1])
+        combo.append(best[2])
+        remaining.discard(best[1])
+
+    def total(order_, combo_):
+        t = enter(order_[0], combo_[0])
+        for k in range(n - 1):
+            t += step(order_[k], combo_[k], order_[k + 1], combo_[k + 1])
+        return t + leave(order_[-1], combo_[-1])
+
+    best_total = total(order, combo)
+    for _ in range(BCD_LOCAL_IMPROVEMENT_PASSES):
+        improved = False
+        for a in range(n - 1):
+            for b in range(a + 1, n):
+                cand_order = order[:a] + order[a:b + 1][::-1] + order[b + 1:]
+                cand_combo = combo[:a] + combo[a:b + 1][::-1] + combo[b + 1:]
+                for pos in range(n):
+                    for s in range(4):
+                        trial = list(cand_combo)
+                        trial[pos] = s
+                        t = total(cand_order, trial)
+                        if t < best_total - 1e-6:
+                            order, combo, best_total, improved = cand_order, trial, t, True
+        if not improved:
+            break
+    return order, combo, "topology-aware-heuristic"
+
+
+def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary",
+                           entry_anchor=None, exit_anchor=None):
     """Generate ONE coverage pass: straight, survey-angle-aligned lane fragments joined by
     survey-frame-aligned transitions. Returns (coords_deg, diagnostics).
 
     Traversal is a boustrophedon over the CELLS of the sweep (see _bcd_cells): the fragments are
     grouped into maximal regions whose sweep topology does not change, each cell is covered
     completely before the route moves to the next, and WITHIN a cell the order is exactly what it
-    always was — lanes in increasing V (sweep) order, fragments within a lane in increasing U
-    order, traversal direction alternating per lane.
+    always was — lanes in sweep order, fragments within a lane in increasing U order, traversal
+    direction alternating per lane. Coverage advances monotonically through the sweep WITHIN EACH
+    CELL rather than globally, because global row monotonicity is what forced the route to bridge
+    around an exclusion on every lane it split.
 
-    That is the one semantic that changed. Coverage advances monotonically through the sweep
-    WITHIN EACH CELL rather than globally, because global row monotonicity is what forced the
-    route to bridge around an exclusion on every lane it split. Everything else is untouched:
-    the lane family, the lane spacing, the clipping, the survey-frame alignment of every leg, and
-    the safety predicate each transition must satisfy.
+    WHICH cell is covered when, and which of the four legal traversals of it is flown, is chosen
+    by `_bcd_cell_plan` from the real safe transition distances between the cells. That is the one
+    semantic that changed most recently, and it changes ORDER ONLY — the lane family, the lane
+    spacing, the survey angle, the clipping, the fragments themselves, cell membership, the
+    survey-frame alignment of every coverage leg and the safety predicate every transition must
+    satisfy are all untouched.
+
+    `entry_anchor` / `exit_anchor` are the boundary conditions of that ordering: the planning
+    coordinate the survey is ENTERED from (the end of the approach chain, or the planning Home)
+    and the one it is left TOWARDS (the first return waypoint, or Home). They are read only — no
+    approach or return geometry is generated, moved or reordered here — and they exist so the
+    first cell is not chosen in ignorance of where the vehicle arrives from, nor the last in
+    ignorance of where it must leave for. Omitting them simply drops those two terms.
 
     Fragments an exclusion split apart are NOT joined straight through the forbidden gap: they are
     separate coverage pieces, and the transition between them is built by _aligned_transition,
@@ -2365,166 +3125,34 @@ def _survey_frame_coverage(grid, spacing, angle_deg, pass_kind="primary"):
     if not fragments:
         return [], diag
 
-    # Boustrophedon traversal, PER CELL. Within a cell this is exactly the traversal the ported
-    # generator performs: the along-U direction flips on every lane that actually PRODUCED
-    # coverage (not on every nominal lane offset — a lane offset that falls outside the region
-    # contributes nothing and must not consume a direction flip, or the next lane gets entered at
-    # its far end and the sweep pays a full lane-length jump). When a lane runs right-to-left its
-    # fragments are visited right-to-left too, so the cursor always continues from the nearest end.
+    # WHICH CELL, WHEN, AND WHICH WAY ROUND — chosen by _bcd_cell_plan.
     #
-    # The alternation deliberately CARRIES ACROSS a cell boundary rather than resetting: the last
-    # lane of one cell and the first lane of the next are then flown in opposite directions, so
-    # the route enters the new cell at the end nearest the cursor instead of paying a full
-    # lane-length jump to re-enter "forwards".
+    # WITHIN a cell nothing changed: the fragments are flown lane by lane through the sweep, the
+    # along-U direction flipping on every lane that actually PRODUCED coverage (not on every
+    # nominal lane offset — a lane offset falling outside the region contributes nothing and must
+    # not consume a direction flip). That is exactly the ported generator's boustrophedon, and it
+    # is what keeps the survey Manhattan: straight parallel passes at the survey angle, at the
+    # configured lane spacing, alternating deterministically.
+    #
+    # What the plan decides is the two whole-cell bits the sweep leaves free — the ORDER the cells
+    # are covered in, and which of the four legal traversals of that same pattern each cell is
+    # flown with — and it decides them on the REAL safe transition distances between the cells
+    # plus the survey-entry and return connectors the route will actually pay for. Coverage
+    # fragments are an input to that choice and are never altered by it.
+    #
+    # The along-U alternation therefore no longer has to CARRY ACROSS a cell boundary to make a
+    # hand-over cheap: every cell's entry corner is chosen outright, which is strictly more
+    # freedom than inheriting the running direction, and the hand-over is measured rather than
+    # assumed.
     cells = _bcd_cells(fragments)
-    cell_plan = _bcd_traversal_order(cells)
+    cell_plan, plan_diag = _bcd_cell_plan(frame, cells, spacing,
+                                          entry_anchor=entry_anchor, exit_anchor=exit_anchor)
     ordered = []
-    forward = True
-    for cell_index, (cell, ascending) in enumerate(cell_plan):
-        rows_in_cell = sorted({f["row"] for f in cell}, reverse=not ascending)
-        # WHICH SIDE A NEW CELL IS ENTERED FROM.
-        #
-        # Inside a cell the along-U direction simply alternates row by row, so a cell has exactly
-        # ONE free bit: which way its first row is flown. That bit also fixes which side the cell
-        # LEAVES from, because the alternation then runs to the end of the cell — with an even
-        # number of rows the cell exits on the side it was entered from, with an odd number on the
-        # opposite side.
-        #
-        # Deciding the bit on entry cost alone is what left the central-obstacle fixture with a
-        # 180° reversal: the left column there has six rows, so entering it at the near (left) end
-        # also made it EXIT on the left, and the hand-over to the right column then had to retrace
-        # ~80 m back along the lane it had just flown. Deciding it on exit alone would simply move
-        # the same problem to the entry.
-        #
-        # Distance alone cannot separate the two bits. On the central-obstacle fixture the two
-        # options come out at 198.5 m against 198.6 m — a dead heat — because entering the far
-        # side costs almost exactly what leaving on the near side saves. What actually differs is
-        # the HEADING the cell is left on: leaving the left column while flying leftwards means
-        # the hand-over to the right column has to turn round and run back along the lane just
-        # surveyed (the 180° reversal), whereas leaving it flying rightwards hands over in the
-        # direction of travel and never doubles back.
-        #
-        # Ahead of both sits a hard constraint: the hand-over INTO this cell has to be one
-        # _aligned_transition can actually build. A column beside an obstacle is entered at one of
-        # its two ends, and those ends are not interchangeable — one is typically a short hop over
-        # the end of the exclusion, while the other is the full width of the column away and can
-        # leave the region entirely. When the aligned tiers cannot reach the chosen end the
-        # transition drops to the generic grid-A* fallback and emits arbitrary-angle geometry, so
-        # a bit that merely reads better on distance can cost the survey-frame alignment contract.
-        #
-        # So the bit is chosen on buildability first, then reversal, then distance:
-        #
-        #   1. can the hand-over into this cell be built from survey-frame legs (no A* fallback)?
-        #   2. does the direction the LAST row is flown already point towards the next cell?
-        #   3. |entry_U - where the route currently stands|
-        #      + |exit_U - where the next cell will be picked up|
-        #
-        # Term 1 probes the two candidate entry points with the same _aligned_transition the route
-        # will use — two bounded, memoised probes per cell, not a search. Terms 2/3 are dropped
-        # for the last cell, which has nowhere to hand over to. The next
-        # cell's pick-up point is estimated by the midpoint of its own first row — an estimate is
-        # sufficient because it only has to say which SIDE that cell lies on, and the midpoint
-        # avoids a circular dependency on that cell's own entry bit.
-        #
-        # This compares two small keys built from lane-end U coordinates, once per cell. Fragment
-        # order inside a cell remains strictly lane-monotonic and alternating, so this is a choice
-        # of entry side and not a nearest-neighbour ordering of fragments, and there is no search.
-        # Exact ties keep the running alternation, so generation stays deterministic.
-        if ordered and rows_in_cell:
-            first_row = sorted([f for f in cell if f["row"] == rows_in_cell[0]],
-                               key=lambda f: f["rot"][0][0])
-            last_row = sorted([f for f in cell if f["row"] == rows_in_cell[-1]],
-                              key=lambda f: f["rot"][0][0])
-            cursor_u = ordered[-1]["exit_rot"][0]
-            next_u = None
-            if cell_index + 1 < len(cell_plan):
-                nxt, nxt_ascending = cell_plan[cell_index + 1]
-                nxt_rows = [f["row"] for f in nxt]
-                nxt_first = min(nxt_rows) if nxt_ascending else max(nxt_rows)
-                nxt_ends = [f["rot"][e][0] for f in nxt if f["row"] == nxt_first
-                            for e in (0, 1)]
-                next_u = (min(nxt_ends) + max(nxt_ends)) / 2.0
-            # The last row runs the same way as the first only when the row count is odd.
-            same_side = (len(rows_in_cell) % 2) == 1
-
-            cursor_deg = frame.rot_to_deg(ordered[-1]["exit_rot"])
-            cursor_dir = ordered[-1]["dir"]
-            entry_sweep = first_row[0]["sweep"]
-
-            def _unaligned_entry(entry_forward, entry_u):
-                """Would the hand-over into this cell fall through to the A* fallback?
-
-                ALIGNED-ONLY, DELIBERATELY. This asks a question about BUILDABILITY — can this
-                cell entry be made out of survey-frame legs at all, or is the end unreachable
-                without the generic grid A*? — and the answer has to stay a property of the
-                GEOMETRY, not of how transits happen to be drawn. `optimize_transit=False`
-                therefore pins the probe to the tiers that existed before the transit
-                optimisation tiers were added. With tier 0 / 0b live both candidate entries would
-                answer "direct_transit" (or a local detour) wherever one is available, the probe
-                would stop discriminating between them, and the entry bit — which fixes the sweep
-                DIRECTION of the cell and every cell after it — would move on cases that have
-                nothing to do with buildability. Coverage ordering must not depend on transit
-                drawing, so the two are kept explicitly separate.
-
-                Only ONE of the two probed entries is actually used, and reaching the fallback
-                tier runs the grid A*, which bumps the grid's connector counters (those feed the
-                route-quality connector metrics and the raw waypoint count). The counters are
-                therefore snapshotted and restored around the probe, so measuring a candidate can
-                never colour the diagnostics of the route that gets built. The safety cache is
-                deliberately left warm — it is a pure memo of the same predicate."""
-                entry_deg = frame.rot_to_deg((entry_u, entry_sweep))
-                counters = (grid.astar_connector_count, grid.raw_connector_pts,
-                            grid.final_connector_pts, grid.connector_len_before_m,
-                            grid.connector_len_after_m)
-                try:
-                    _, category = _aligned_transition(
-                        frame, cursor_deg, entry_deg, in_dir=cursor_dir,
-                        out_dir=(1.0, 0.0) if entry_forward else (-1.0, 0.0),
-                        optimize_transit=False)
-                except ConnectorError:
-                    category = "fallback"       # not routable at all from this end
-                finally:
-                    (grid.astar_connector_count, grid.raw_connector_pts,
-                     grid.final_connector_pts, grid.connector_len_before_m,
-                     grid.connector_len_after_m) = counters
-                return 1 if category == "fallback" else 0
-
-            def _entry_key(entry_forward):
-                entry_u = (first_row[0]["rot"][0][0] if entry_forward
-                           else first_row[-1]["rot"][1][0])
-                exit_forward = entry_forward if same_side else not entry_forward
-                exit_u = (last_row[-1]["rot"][1][0] if exit_forward
-                          else last_row[0]["rot"][0][0])
-                distance = abs(entry_u - cursor_u)
-                turns_back = 0
-                if next_u is not None:
-                    distance += abs(exit_u - next_u)
-                    # The hand-over doubles back whenever the heading the cell is left on points
-                    # away from the next cell. Ignored when the next cell is level with the exit
-                    # (nothing to point towards), so the comparison stays a pure tie there.
-                    heading = 1.0 if exit_forward else -1.0
-                    towards = next_u - exit_u
-                    if abs(towards) > TOLERANCE and (heading * towards) < 0:
-                        turns_back = 1
-                return (_unaligned_entry(entry_forward, entry_u), turns_back, distance)
-
-            key_fwd, key_bwd = _entry_key(True), _entry_key(False)
-            if key_fwd < key_bwd:
-                forward = True
-            elif key_bwd < key_fwd:
-                forward = False
-        for row in rows_in_cell:
-            row_frags = sorted([f for f in cell if f["row"] == row],
-                               key=lambda f: f["rot"][0][0])
-            for frag in (row_frags if forward else list(reversed(row_frags))):
-                a, b = frag["rot"][0], frag["rot"][1]
-                ordered.append({**frag, "cell_index": cell_index,
-                                "cell_ascending": ascending,
-                                "entry_rot": a if forward else b,
-                                "exit_rot": b if forward else a,
-                                "dir": (1.0, 0.0) if forward else (-1.0, 0.0)})
-            forward = not forward
+    for cell_id, state in cell_plan:
+        for frag in state["fragments"]:
+            ordered.append({**frag, "cell_index": cell_id})
     diag["cell_count"] = len(cells)
+    diag["cell_plan"] = plan_diag
 
     coords = []
     base_sweep = min(f["sweep"] for f in ordered)
@@ -2940,8 +3568,22 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     # DUAL PASS: each pass builds its OWN _SurveyFrame from its own angle, so the secondary pass's
     # fragments and transitions are orthogonal in the secondary frame (survey_angle + 90° by
     # default). No first-pass orientation can leak into the second pass's connector geometry.
+    # THE ORDERING'S BOUNDARY CONDITIONS. Where the survey is entered from, and where it is left
+    # towards, are what the survey-entry and return connectors are built between — so the cell
+    # ORDER has to know them or the first cell can be chosen on the far side of the survey from
+    # the approach (196.7 m of survey-entry connector on the operator's own large polygon, for a
+    # cell that could have been entered in 40.5 m). These are read-only inputs: no approach or
+    # return waypoint is generated, moved or reordered by the ordering.
+    survey_entry_anchor = (approach[-1] if approach else home)
+    survey_exit_anchor = (returns[0] if returns else home)
     primary_raw, primary_diag = _survey_frame_coverage(
-        grid, spacing, inp["primary_angle_deg"], pass_kind="primary")
+        grid, spacing, inp["primary_angle_deg"], pass_kind="primary",
+        entry_anchor=survey_entry_anchor,
+        # DUAL PASS: the primary hands over to the SECONDARY pass, not to the return chain, and
+        # where the secondary begins is not known until the primary has been ordered. Rather than
+        # guess, the primary is ordered on its entry boundary alone and the secondary picks up the
+        # primary's real end point below — no circular dependency, and no invented anchor.
+        exit_anchor=None if inp["dual_pass"] else survey_exit_anchor)
     if len(primary_raw) < 2:
         raise ValueError(
             "No coverage route could be generated — the navigable area may be too small "
@@ -2954,7 +3596,8 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
     intersections = []
     if inp["dual_pass"]:
         secondary_raw, secondary_diag = _survey_frame_coverage(
-            grid, spacing, inp["secondary_angle_deg"], pass_kind="secondary")
+            grid, spacing, inp["secondary_angle_deg"], pass_kind="secondary",
+            entry_anchor=primary_coords[-1], exit_anchor=survey_exit_anchor)
         if len(secondary_raw) < 2:
             warnings.append("Dual pass requested, but the secondary pass produced no route; "
                             "only the primary pass was generated.")
@@ -3279,6 +3922,24 @@ def generate_survey(raw_inputs, max_route_waypoints=None):
         "coverage_cell_count": coverage_cell_count,
         "same_lane_obstacle_bridge_count": same_lane_bridges,
         "coverage_cell_handover_count": cell_handovers,
+        # WHICH CELL WAS COVERED WHEN, AND WHY (see _bcd_cell_plan). Per pass: the adjacency
+        # graph the ordering was constrained by, the order and orientation chosen, and every
+        # inter-cell hand-over with the distance and the tier that drew it. Reported so the
+        # sequence is inspectable and re-derivable rather than an unexplained property of the
+        # emitted route — the whole point of ordering by measured cost is that the measurements
+        # can be shown.
+        "coverage_cell_plans": [
+            {"pass_kind": d["pass_kind"], **{k: v for k, v in d["cell_plan"].items()}}
+            for d in coverage_diags if d.get("cell_plan")],
+        "inter_cell_transit_length_m": round(
+            sum(d["cell_plan"]["inter_cell_transit_m"]
+                for d in coverage_diags if d.get("cell_plan")), 2),
+        "largest_inter_cell_transit_m": round(
+            max((d["cell_plan"]["largest_inter_cell_transit_m"]
+                 for d in coverage_diags if d.get("cell_plan")), default=0.0), 2),
+        "non_adjacent_cell_handover_count": sum(
+            d["cell_plan"]["non_adjacent_handover_count"]
+            for d in coverage_diags if d.get("cell_plan")),
         "backtracking_events": full_q["backtracking_events"],
         "minimum_segment_length_m": full_q["minimum_segment_length_m"],
         "cleanup_applied": True,

@@ -22,12 +22,12 @@ Three things must therefore be true at once, and each is pinned below:
   * SAFETY IS UNCHANGED. A direct transit is not a new permission — the same predicate, the same
     region, the same tolerances. It can neither leave the navigable region nor touch the buffered
     no-go geometry (TestDirectTransitIsHeldToTheSamePredicate).
-  * COVERAGE IS UNTOUCHED. The clipped fragments, their order and their flown DIRECTION are
-    byte-identical to the aligned-only baseline. That is what `optimize_transit=False` in the
-    BCD cell-entry probe buys: without it, a probe that suddenly answers "direct_transit" for both
-    candidate entries stops discriminating and the cell entry bit — hence some cells' sweep
-    direction — moves for reasons unrelated to buildability (TestCoverageIsUnchanged,
-    TestTheBcdEntryProbeIgnoresTierZero).
+  * COVERAGE IS UNTOUCHED. The clipped fragments — which lanes, where they run, how long they are
+    and which BCD cell each belongs to — are byte-identical to the aligned-only baseline
+    (TestCoverageIsUnchanged). Their visiting ORDER and flown DIRECTION are excluded from that
+    comparison on purpose: the cell order and each cell's orientation are chosen by MEASURING the
+    real hand-overs, so a cheaper transit policy legitimately makes a different — better —
+    sequence the cheapest one (TestTheCellOrderingMeasuresTheRealTransitions).
   * THE CONTRACT MEASURES THE RIGHT SET. An arbitrary-angle transit must never be reported as
     arbitrary-angle COVERAGE (TestTheAlignmentContractCountsCoverageOnly).
 """
@@ -78,6 +78,24 @@ def _fragment_signature(pkg):
     return [[f["fragment_index"], f["cell_index"], f["cell_ascending"], f["row_index"],
              f["start"], f["end"], f["length_m"]]
             for f in pkg["route_quality"]["coverage_fragments"]]
+
+
+def _coverage_content(pkg):
+    """WHAT is surveyed, with WHEN and WHICH WAY ROUND deliberately factored out.
+
+    Since the BCD cell ORDER and each cell's ORIENTATION are chosen from the measured cost of the
+    real hand-overs, the visiting order and the flown direction legitimately depend on how
+    transits are drawn — that is the whole mechanism. What may NOT depend on it is the coverage
+    itself, so this is the value that has to stay identical: which cell each fragment belongs to,
+    where it runs (as an unordered endpoint pair, because flying a lane the other way is the same
+    lane), which sweep row it sits on, and how long it is.
+
+    `sweep_coordinate` and not `row_index`: the latter is a RANK over the emitted list and so
+    breaks ties between two fragments of the SAME row by visiting order, which is precisely the
+    thing being factored out. The sweep coordinate is the row's geometry."""
+    return sorted([f["cell_index"], f["sweep_coordinate"], round(f["length_m"], 6),
+                   *sorted([tuple(f["start"]), tuple(f["end"])])]
+                  for f in pkg["route_quality"]["coverage_fragments"])
 
 
 def _split_legs(pkg, grid):
@@ -380,12 +398,18 @@ class TestCoverageIsUnchanged(unittest.TestCase):
                     self.assertIn(cls, ("U", "short"),
                                   f"[{name}] a survey fragment is not parallel to U")
 
-    def test_fragment_set_order_and_direction_match_the_aligned_only_baseline(self):
-        """9 + 10: identity, visiting ORDER and flown DIRECTION are all byte-identical."""
+    def test_the_coverage_content_matches_the_aligned_only_baseline(self):
+        """9 + 10: the surveyed geometry is byte-identical to the aligned-only baseline.
+
+        ORDER AND DIRECTION ARE DELIBERATELY EXCLUDED, and were not always. The BCD cell order
+        and each cell's orientation are now chosen by measuring the real hand-overs with the real
+        tiers, so a cheaper transit policy legitimately produces a different — better — visiting
+        order. What the policy must never do is move a fragment, split one, drop one or put one
+        in a different cell, and that is exactly what is compared here."""
         for name, inp in MATRIX:
             with self.subTest(case=name):
-                self.assertEqual(_fragment_signature(_gen(inp)),
-                                 _fragment_signature(_gen_aligned_only(inp)),
+                self.assertEqual(_coverage_content(_gen(inp)),
+                                 _coverage_content(_gen_aligned_only(inp)),
                                  f"[{name}] the transition policy moved coverage geometry")
 
     def test_the_total_survey_line_is_unchanged(self):
@@ -414,22 +438,33 @@ class TestCoverageIsUnchanged(unittest.TestCase):
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
 @requires_geometry
-class TestTheBcdEntryProbeIgnoresTierZero(unittest.TestCase):
-    """F3: cell-entry buildability is a property of the GEOMETRY, not of how transits are drawn.
+class TestTheCellOrderingMeasuresTheRealTransitions(unittest.TestCase):
+    """F5 REPLACED F3'S RULE, AND THIS RECORDS WHY.
 
-    `bcd:irregular boundary + 2 no-gos` is the case that proved this matters: with the probe
-    left on the new tier it flipped an entry bit and reversed the sweep direction of several
-    fragments, changing the route for a reason unrelated to buildability."""
+    F3 kept the BCD cell-entry bit blind to the direct-safe tier (`optimize_transit=False`), so
+    that coverage ordering could not depend on how transits happened to be drawn. That was the
+    right rule while the bit was decided on BUILDABILITY — "could this entry be made from
+    survey-frame legs at all?" — because tier 0 answers "direct_transit" for both candidates and
+    the probe stopped discriminating.
+
+    The cell ORDER and ORIENTATION are now decided on measured DISTANCE instead, and the honest
+    distance is the one the vessel will really travel: the tiers actually used, F2 then F4 then
+    the aligned families then A*. An aligned-only stand-in would systematically over-state exactly
+    the hand-overs F2/F4 exist to shorten and would choose the wrong sequence for it.
+
+    So ordering now DOES depend on the transit policy, on purpose. The invariant that replaced
+    the old one is the one that always mattered: the coverage CONTENT is independent of it
+    (TestCoverageIsUnchanged), and measuring a candidate that is not built must not colour the
+    reported route (below)."""
 
     CASE = "irregular boundary + 2 no-gos"
 
-    def test_the_probe_never_sees_a_direct_transit(self):
+    def test_the_ordering_costs_transitions_with_the_real_policy(self):
         seen = []
         real = planning._aligned_transition
 
         def spy(frame, a, b, in_dir=None, out_dir=None, optimize_transit=True):
-            caller = sys._getframe(1).f_code.co_name
-            if caller == "_unaligned_entry":
+            if sys._getframe(1).f_code.co_name == "cost":
                 seen.append(optimize_transit)
             return real(frame, a, b, in_dir=in_dir, out_dir=out_dir,
                         optimize_transit=optimize_transit)
@@ -439,17 +474,27 @@ class TestTheBcdEntryProbeIgnoresTierZero(unittest.TestCase):
             _gen(_inputs(self.CASE))
         finally:
             planning._aligned_transition = real
-        self.assertTrue(seen, "the fixture must actually run the cell-entry probe")
-        self.assertTrue(all(flag is False for flag in seen),
-                        "the BCD entry probe must suppress the direct-safe tier")
+        self.assertTrue(seen, "the fixture must actually cost candidate hand-overs")
+        self.assertTrue(all(flag is True for flag in seen),
+                        "the ordering must cost hand-overs with the policy the route is drawn "
+                        "with, not with a stand-in")
 
-    def test_the_entry_bit_is_identical_with_and_without_the_tier(self):
+    def test_costing_candidates_does_not_colour_the_reported_route(self):
+        """Most candidates are measured and discarded; none may reach the diagnostics."""
         pkg = _gen(_inputs(self.CASE))
-        base = _gen_aligned_only(_inputs(self.CASE))
-        self.assertEqual([f["cell_ascending"] for f in pkg["route_quality"]["coverage_fragments"]],
-                         [f["cell_ascending"]
-                          for f in base["route_quality"]["coverage_fragments"]])
-        self.assertEqual(_fragment_signature(pkg), _fragment_signature(base))
+        rq = pkg["route_quality"]
+        emitted = sum(len(s["coordinates"]) for s in pkg["segments"]
+                      if s["kind"] not in ("primary", "secondary"))
+        self.assertLessEqual(rq["final_connector_waypoint_count"], emitted)
+        self.assertLessEqual(rq["connector_length_after_m"], rq["connector_length_before_m"] + 1e-6)
+        self.assertEqual(rq["fallback_connector_count"], 0)
+        # The F4 accounting describes the route, so it can never exceed what the route contains.
+        self.assertLessEqual(rq["shortest_safe_transition_count"],
+                             rq["coverage_fragment_count"])
+
+    def test_the_coverage_content_is_identical_with_and_without_the_tier(self):
+        self.assertEqual(_coverage_content(_gen(_inputs(self.CASE))),
+                         _coverage_content(_gen_aligned_only(_inputs(self.CASE))))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

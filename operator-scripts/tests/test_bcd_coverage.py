@@ -298,6 +298,7 @@ class TestDeterminism(unittest.TestCase):
                 self.assertEqual(a["route_quality"], b["route_quality"])
 
     def test_the_cell_decomposition_itself_is_deterministic(self):
+        """The cells and their topology — the INPUT the ordering optimiser sees — never move."""
         for name in CASES:
             with self.subTest(name):
                 grid = _grid(name)
@@ -305,10 +306,12 @@ class TestDeterminism(unittest.TestCase):
                 frags, _ = planning._lane_fragments(frame, SPACING_M)
                 runs = []
                 for _ in range(3):
-                    plan = planning._bcd_traversal_order(planning._bcd_cells(frags))
+                    cells = planning._bcd_cells(frags)
+                    adjacency = planning._bcd_adjacency(cells)
                     runs.append([(sorted(f["row"] for f in cell),
-                                  sorted(round(f["rot"][0][0], 6) for f in cell), asc)
-                                 for cell, asc in plan])
+                                  sorted(round(f["rot"][0][0], 6) for f in cell),
+                                  sorted(adjacency[i]))
+                                 for i, cell in enumerate(cells)])
                 self.assertEqual(runs[0], runs[1])
                 self.assertEqual(runs[1], runs[2])
 
@@ -329,10 +332,9 @@ class TestAlignmentGateAgreesWithTheClassifier(unittest.TestCase):
     leg. These tests pin the two sides together.
 
     They probe the ALIGNED TIERS specifically, so they call _aligned_transition with
-    `optimize_transit=False` - the same switch the BCD cell-entry probe uses. The tier-0
-    direct-safe candidate would otherwise answer first for every one of these clear-water
-    offsets and the tier-1 gate below it would never be reached. Tier 0 is covered by
-    tests/test_transition_policy.py.
+    `optimize_transit=False`. The tier-0 direct-safe candidate would otherwise answer first for
+    every one of these clear-water offsets and the tier-1 gate below it would never be reached.
+    Tier 0 is covered by tests/test_transition_policy.py.
     """
 
     def _frame_and_grid(self):
@@ -404,18 +406,20 @@ class TestAlignmentGateAgreesWithTheClassifier(unittest.TestCase):
 
 @requires_geometry
 class TestCellEntryOrientation(unittest.TestCase):
-    """The one free bit per cell: which way its first row is flown.
+    """Which corner each cell is entered at.
 
-    That bit fixes both which side the cell is entered from and — through the row-by-row
-    alternation — which side it is left on. It is chosen on three deterministic local terms, in
-    order: whether the hand-over INTO the cell can be built from survey-frame legs at all,
-    whether the heading the cell is LEFT on already points at the next cell, and finally the
-    combined entry+exit U distance.
+    A cell's traversal has two free bits — which end of the sweep it starts at, and which way its
+    first lane is flown — and together they fix which corner it is entered at and, through the
+    row-by-row alternation, which corner it is left at. Both bits are chosen by
+    `planning._bcd_cell_plan` along with the cell ORDER, from the measured cost of the real
+    hand-overs; the choice itself is pinned in tests/test_bcd_cell_order.py. What is pinned HERE
+    is what the choice must never cost: an A* hand-over, a polluted diagnostic, or a route that
+    moves between runs.
     """
 
     def test_no_hand_over_falls_through_to_the_astar_fallback(self):
-        # The first term exists to keep this at zero: a fallback hand-over emits arbitrary-angle
-        # geometry and breaks the survey-frame alignment contract.
+        # The fallback term in the ordering cost exists to keep this at zero: a fallback
+        # hand-over emits arbitrary-angle geometry and breaks the alignment contract.
         for name in CASES:
             with self.subTest(name):
                 rq = _gen(name)["route_quality"]
@@ -425,9 +429,10 @@ class TestCellEntryOrientation(unittest.TestCase):
                                  f"[{name}] an arbitrary-angle coverage leg was emitted")
 
     def test_probing_a_candidate_entry_does_not_colour_the_reported_metrics(self):
-        # Choosing the entry side probes BOTH candidates with _aligned_transition, and reaching
-        # its fallback tier runs the grid A*, which bumps the grid's connector counters. Only one
-        # candidate is ever used, so the probe must leave those counters exactly as it found them.
+        # Choosing the order and the corners measures MANY candidate hand-overs with
+        # _aligned_transition, and reaching its fallback tier runs the grid A*, which bumps the
+        # grid's connector counters. Almost none of those candidates is built, so a measurement
+        # must leave every counter exactly as it found it.
         for name in SPLIT_CASES:
             with self.subTest(name):
                 pkg = _gen(name)

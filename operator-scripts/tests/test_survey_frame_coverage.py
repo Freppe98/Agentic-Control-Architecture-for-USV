@@ -144,10 +144,18 @@ def _fragment_legs(pkg, grid, kinds=("primary", "secondary"), pairs=None):
     return _split_coverage_legs(pkg, grid, kinds, pairs)[0]
 
 
-def _arc_runs(legs, max_leg_m=3.0, min_run=3, drift_lo=3.0, drift_hi=60.0):
-    """Count arc-following runs: `min_run`+ consecutive SHORT legs whose heading creeps in one
-    direction — the exact signature of a path tracing a rounded buffer boundary."""
-    runs = 0
+def _arc_run_lengths(legs, max_leg_m=3.0, min_run=3, drift_lo=3.0, drift_hi=60.0):
+    """The travelled length of each arc-following run: `min_run`+ consecutive SHORT legs whose
+    heading creeps in one direction — the signature of a path tracing a rounded buffer boundary.
+
+    LENGTH, not just a count, because the two things that shape matches are not the same defect.
+    A path that BRIDGES along an exclusion arc (what the ported generator did, and what this file
+    exists to keep out) traces tens of metres of buffer as dozens of ~1 m chords. A bounded F4
+    detour that steps round the corner of an exclusion at a lane turn produces the same local
+    shape over a few metres and is exactly what F4 is for — it is a proven-safe transit, not
+    coverage, and it never follows the arc beyond the obstruction. Measuring the span separates
+    them; counting alone cannot."""
+    spans = []
     i = 0
     n = len(legs)
     while i < n - 1:
@@ -166,11 +174,17 @@ def _arc_runs(legs, max_leg_m=3.0, min_run=3, drift_lo=3.0, drift_hi=60.0):
             sign = delta > 0
             j += 1
         if j - i + 1 >= min_run:
-            runs += 1
+            spans.append(sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                             for _k, a, b in legs[i:j + 1]))
             i = j + 1
         else:
             i += 1
-    return runs
+    return spans
+
+
+def _arc_runs(legs, **kw):
+    """How many arc-following runs, of any length."""
+    return len(_arc_run_lengths(legs, **kw))
 
 
 def _fragment_bearings(pkg, grid, pass_kind):
@@ -417,8 +431,20 @@ class TestIrregularAndRoundedExclusions(unittest.TestCase):
                           f"{kind} leg at {_bearing(a, b):.1f}° traces the zone outline")
         self.assertEqual(
             pkg["route_quality"]["non_survey_aligned_coverage_segment_count"], 0)
-        # NO leg - fragment or transit - may follow the rounded buffer boundary.
-        self.assertEqual(_arc_runs(_coverage_legs(pkg, grid)), 0)
+        # NO COVERAGE leg may follow the rounded buffer boundary — a survey pass is straight.
+        self.assertEqual(_arc_runs(_fragment_legs(pkg, grid)), 0)
+        # And no TRANSIT may bridge ALONG it either. A transit is allowed to step round the
+        # obstruction — that is what the bounded detour tier does at a lane turn whose straight
+        # hop is blocked, and it is local by construction — but it must never trace the arc the
+        # way the ported generator's bridge did, which ran the LENGTH of the exclusion.
+        #
+        # The two are separated by an order of magnitude, so the ceiling is not a fitted number:
+        # the detour this fixture produces spans 6.0 m (a 5.98 m path where the straight hop is
+        # 5.03 m), while this zone is ~60 m across, which is what a boundary-following bridge
+        # would have to trace. Two lane spacings sits in the gap with margin either side.
+        for span in _arc_run_lengths(_coverage_legs(pkg, grid)):
+            self.assertLess(span, 2 * inp["lane_spacing_m"],
+                            f"a transit traced {span:.1f} m of the rounded exclusion boundary")
         _assert_legs_safe(self, pkg, grid)
 
     def test_case_7_rounded_buffered_exclusion(self):
@@ -446,10 +472,9 @@ class TestAlignedTransition(unittest.TestCase):
     pinned rather than inferred from a whole mission.
 
     These cases pin the ALIGNED tiers (1-4), so they call the generator with
-    `optimize_transit=False` - the same switch the BCD cell-entry probe uses. Without it the
-    direct-safe tier 0 would answer first wherever a straight leg is safe and the orthogonal /
-    bypass ordering below it would never be exercised. Tier 0 has its own coverage in
-    tests/test_transition_policy.py."""
+    `optimize_transit=False`. Without it the direct-safe tier 0 would answer first wherever a
+    straight leg is safe and the orthogonal / bypass ordering below it would never be exercised.
+    Tier 0 has its own coverage in tests/test_transition_policy.py."""
 
     ANGLE = 42.0
 

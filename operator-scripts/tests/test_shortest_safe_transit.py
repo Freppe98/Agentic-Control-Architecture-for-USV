@@ -23,9 +23,11 @@ It is NOT a general path planner and these tests hold it to that:
   * NO NEW PERMISSION. Every edge of the graph, and every leg of the emitted path, is admitted
     only by `_seg_safe_cached(..., True)` — the same predicate, region and tolerances as every
     other tier (TestEveryLegIsAuthoritativelySafe).
-  * COVERAGE-NEUTRAL. Fragments, their order, their flown direction and the BCD cells are
-    byte-identical to the pre-F4 baseline, which is what suppressing the tier in the cell-entry
-    probe buys (TestCoverageIsUntouched).
+  * COVERAGE-NEUTRAL. The surveyed geometry — the fragments, their coordinates, their lengths and
+    the BCD cells they belong to — is byte-identical to the pre-F4 baseline (TestCoverageIsUntouched).
+    Their visiting ORDER and flown DIRECTION deliberately are not: the cell order and orientation
+    are chosen by measuring the real hand-overs, so a cheaper transit makes a different sequence
+    the cheapest one. That is the mechanism, not a leak — see tests/test_bcd_cell_order.py.
 """
 
 import copy
@@ -84,16 +86,33 @@ def _fragment_signature(pkg):
             for f in pkg["route_quality"]["coverage_fragments"]]
 
 
+def _coverage_content(pkg):
+    """WHAT is surveyed, with WHEN and WHICH WAY ROUND factored out.
+
+    The BCD cell order and each cell's orientation are chosen from the MEASURED cost of the real
+    hand-overs, so they legitimately move when the transit policy changes — a cheaper transit
+    makes a different sequence the cheapest one. The coverage itself must not move, and this is
+    the value that pins it: cell membership, sweep row, length, and the endpoint pair unordered
+    (flying a lane the other way is the same lane)."""
+    return sorted([f["cell_index"], f["sweep_coordinate"], round(f["length_m"], 6),
+                   *sorted([tuple(f["start"]), tuple(f["end"])])]
+                  for f in pkg["route_quality"]["coverage_fragments"])
+
+
 def _transitions(inp):
-    """[(category, path, aligned_category, aligned_path)] for every real transition, by spying on
-    the tier so each decision can be compared against what it replaced."""
+    """[(category, path, aligned_category, aligned_path)] for every EMITTED transition, by spying
+    on the tier so each decision can be compared against what it replaced.
+
+    Emitted only — the caller frame is checked. The cell-ordering search asks the same tier to
+    COST candidate hand-overs it mostly never builds (`planning._transition_oracle`), and counting
+    those here would describe the search rather than the route."""
     out = []
     real = planning._aligned_transition
 
     def spy(frame, a, b, in_dir=None, out_dir=None, optimize_transit=True):
         got = real(frame, a, b, in_dir=in_dir, out_dir=out_dir,
                    optimize_transit=optimize_transit)
-        if optimize_transit:
+        if optimize_transit and sys._getframe(1).f_code.co_name == "_survey_frame_coverage":
             was = real(frame, a, b, in_dir=in_dir, out_dir=out_dir, optimize_transit=False)
             out.append((got[1], got[0], was[1], was[0], frame.grid))
         return got
@@ -444,8 +463,8 @@ class TestHarderGeometries(unittest.TestCase):
         for name in self.EXTRA:
             with self.subTest(case=name):
                 inp = self._inp(name)
-                self.assertEqual(_fragment_signature(_gen(inp)),
-                                 _fragment_signature(_gen_without_f4(inp)))
+                self.assertEqual(_coverage_content(_gen(inp)),
+                                 _coverage_content(_gen_without_f4(inp)))
 
     def test_multiple_exclusion_corners_are_all_available_to_one_transition(self):
         inp = self._inp("three exclusion corners in one box")
@@ -467,18 +486,18 @@ class TestHarderGeometries(unittest.TestCase):
 class TestCoverageIsUntouched(unittest.TestCase):
     """The invariant the whole change is subordinate to."""
 
-    def test_fragment_set_order_and_direction_match_the_pre_f4_baseline(self):
+    def test_coverage_content_matches_the_pre_f4_baseline(self):
         for name, inp in MATRIX:
             with self.subTest(case=name):
-                self.assertEqual(_fragment_signature(_gen(inp)),
-                                 _fragment_signature(_gen_without_f4(inp)),
+                self.assertEqual(_coverage_content(_gen(inp)),
+                                 _coverage_content(_gen_without_f4(inp)),
                                  f"[{name}] F4 moved coverage geometry")
 
-    def test_fragment_set_order_and_direction_also_match_the_aligned_only_baseline(self):
+    def test_coverage_content_also_matches_the_aligned_only_baseline(self):
         for name, inp in MATRIX:
             with self.subTest(case=name):
-                self.assertEqual(_fragment_signature(_gen(inp)),
-                                 _fragment_signature(_gen_aligned_only(inp)),
+                self.assertEqual(_coverage_content(_gen(inp)),
+                                 _coverage_content(_gen_aligned_only(inp)),
                                  f"[{name}] coverage drifted from the original BCD baseline")
 
     def test_cells_bridges_and_survey_line_are_unchanged(self):
@@ -495,12 +514,19 @@ class TestCoverageIsUntouched(unittest.TestCase):
                                        old["coverage_fragment_length_m"], delta=0.01)
                 self.assertEqual(new["non_survey_aligned_coverage_segment_count"], 0)
 
-    def test_the_bcd_entry_probe_never_sees_the_optimisation_tiers(self):
+    def test_the_cell_ordering_costs_hand_overs_with_the_detour_search_too(self):
+        """F5 supersedes the old rule that ordering must be blind to the optimisation tiers.
+
+        The cell order and orientation are chosen by MEASURING candidate hand-overs, and the
+        honest measurement is what the vessel will really travel — which for a blocked hand-over
+        is F4's detour, not the far longer aligned staircase it replaces. So the search is
+        deliberately entered while costing, at full optimisation, and the invariant that replaced
+        the old one is that costing a candidate cannot colour the emitted route (below)."""
         seen = []
         real = planning._aligned_transition
 
         def spy(frame, a, b, in_dir=None, out_dir=None, optimize_transit=True):
-            if sys._getframe(1).f_code.co_name == "_unaligned_entry":
+            if sys._getframe(1).f_code.co_name == "cost":
                 seen.append(optimize_transit)
             return real(frame, a, b, in_dir=in_dir, out_dir=out_dir,
                         optimize_transit=optimize_transit)
@@ -510,26 +536,32 @@ class TestCoverageIsUntouched(unittest.TestCase):
             _gen(_inputs("irregular boundary + 2 no-gos"))
         finally:
             planning._aligned_transition = real
-        self.assertTrue(seen, "the fixture must run the cell-entry probe")
-        self.assertTrue(all(flag is False for flag in seen),
-                        "the BCD entry probe must suppress BOTH optimisation tiers")
+        self.assertTrue(seen, "the fixture must actually cost candidate hand-overs")
+        self.assertTrue(all(flag is True for flag in seen),
+                        "the ordering must cost hand-overs with the real transition policy")
 
-    def test_the_probe_never_invokes_the_detour_search(self):
-        """Stronger than the flag check: the search itself is never entered from the probe."""
-        calls = []
+    def test_costing_a_candidate_leaves_the_detour_accounting_untouched(self):
+        """Most costed candidates are discarded, and F4 bumps grid counters that feed
+        route_quality — so a probe must restore every one of them."""
+        callers = []
         real = planning._NavGrid.shortest_safe_transit
 
         def spy(self, a, b, limit_m=None):
-            calls.append(sys._getframe(1).f_code.co_name)
+            callers.append(sys._getframe(2).f_code.co_name)
             return real(self, a, b, limit_m=limit_m)
 
         planning._NavGrid.shortest_safe_transit = spy
         try:
-            _gen(_inputs("irregular boundary + 2 no-gos"))
+            pkg = _gen(_inputs("irregular boundary + 2 no-gos"))
         finally:
             planning._NavGrid.shortest_safe_transit = real
-        self.assertTrue(calls, "the fixture must exercise the detour search")
-        self.assertNotIn("_unaligned_entry", calls)
+        self.assertTrue(callers, "the fixture must exercise the detour search")
+        self.assertIn("cost", callers,
+                      "the ordering must have costed candidates through the detour search")
+        rq = pkg["route_quality"]
+        self.assertLessEqual(rq["shortest_safe_transition_count"],
+                             rq["coverage_fragment_count"],
+                             "a discarded candidate leaked into the reported detour count")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -570,6 +602,9 @@ class TestContractAndDeterminism(unittest.TestCase):
         for name, inp in MATRIX:
             with self.subTest(case=name):
                 rq = _gen(inp)["route_quality"]
+                # EMITTED transitions only. The cell-ordering search costs many candidates that
+                # are never built (`_transition_oracle`), and those must not be counted here —
+                # the metric describes the route, not the search that chose it.
                 spied = [c for c, _p, _wc, _wp, _g in _transitions(inp)
                          if c == "shortest_safe_transit"]
                 self.assertEqual(rq["shortest_safe_transition_count"], len(spied))

@@ -195,3 +195,60 @@ corners drawn from the a/b bounding box grown by `F4_LOCAL_MARGIN_M`, and is tak
 beats that candidate by `F4_MIN_GAIN_M` — so a near-tie never churns the route hash. Corners come
 from `buildable` shrunk by `F4_VERTEX_INSET_M`, which yields both the concave-shoreline corners
 and the buffered-exclusion corners already proven to be strictly inside the approved region.
+
+### `metrics.route_quality` — BCD cell ORDER and ORIENTATION
+
+Produced by `planning._bcd_cell_plan`, one entry per coverage pass. The boustrophedon cellular
+decomposition (`_bcd_cells`) says *what* the cells are; these fields say **which cell was covered
+when, which way round, and what each hand-over between them cost**. They exist because the
+sequence is now chosen by measurement rather than by a fixed geometric key, and a measured
+decision has to be inspectable: every number below is re-derivable from the emitted route.
+
+| Field | Type | Meaning | Expected |
+|---|---|---|---|
+| `coverage_cell_plans[]` | list | One plan per coverage pass (`pass_kind`) | — |
+| `coverage_cell_plans[].mode` | str | `exact-held-karp` (globally optimal for the cost below), `topology-aware-heuristic` above `BCD_EXACT_MAX_CELLS` cells, or `geometric-fallback` when no complete sequence is routable | `exact-held-karp` normally |
+| `coverage_cell_plans[].cell_count` | int | Cells in this pass's decomposition | 1–7 observed |
+| `coverage_cell_plans[].orientation_states_per_cell` | int | Legal whole-cell traversals evaluated per cell | 4 |
+| `coverage_cell_plans[].adjacency` | list[list[int]] | The BCD topology graph: cell → the cells it meets across a sweep row (a split or a merge). **Never a clique** — the two columns beside one obstacle are not adjacent to each other | — |
+| `coverage_cell_plans[].cell_order` | list[int] | Cell ids in the order they are covered, each exactly once | a permutation |
+| `coverage_cell_plans[].cell_orientations[]` | list | Per visited cell: `cell_id`, `ascending` (which end of the sweep it is entered at), `first_row_forward` (which way its first lane is flown) | — |
+| `coverage_cell_plans[].handovers[]` | list | Per inter-cell hand-over: `from_cell`, `to_cell`, `adjacent`, `length_m`, and the `category` (tier) that drew it | — |
+| `coverage_cell_plans[].in_cell_transit_m` | m | The chosen traversals' WITHIN-cell lane-turn ladder — repositioning between consecutive lanes, straight-line in the survey frame. The **emitted** ladder is `in_coverage_transition_length_m − inter_cell_transit_length_m`; this is the search's own straight-line view of it | close to the emitted value |
+| `coverage_cell_plans[].in_cell_transit_spread_m` | m | How much in-cell ladder the four traversals of each cell differ by, summed over cells — i.e. the size of the term the cost function deliberately does **not** optimise. Reported so a geometry where it grows is visible rather than silent | 0 on symmetric cells; 35.1 m on the 150° operator draft |
+| `coverage_cell_plans[].inter_cell_transit_m` | m | Total hand-over distance between cells | — |
+| `coverage_cell_plans[].largest_inter_cell_transit_m` | m | The worst single hand-over — the number a long cross-survey diagonal shows up in | — |
+| `coverage_cell_plans[].non_adjacent_handover_count` | int | Hand-overs between cells the decomposition does not connect. One per obstacle is expected: the sweep has to cross it once | ≤ number of no-go zones |
+| `coverage_cell_plans[].entry_boundary_m` | m \| null | The survey-entry connector the chosen first cell costs, from the end of the approach chain (or planning Home). Equals the emitted `survey_entry_connector` length | — |
+| `coverage_cell_plans[].return_boundary_m` | m \| null | The return connector the chosen last cell costs, to the first return waypoint (or Home). Equals the emitted `return_connector` length | — |
+| `coverage_cell_plans[].transition_evaluations` | int | Distinct candidate hand-overs actually measured | ≪ `n·(n-1)·16` |
+| `coverage_cell_plans[].transition_cache_hits` | int | Repeat asks served from the memo | any |
+| `coverage_cell_plans[].boundary_evaluations` | int | Distinct entry/return connectors measured | ≤ `8n` |
+| `inter_cell_transit_length_m` | m | `inter_cell_transit_m` summed over passes | — |
+| `largest_inter_cell_transit_m` | m | Worst single hand-over across all passes | — |
+| `non_adjacent_cell_handover_count` | int | `non_adjacent_handover_count` summed over passes | — |
+
+**What is optimised.** The objective is the total NON-COVERAGE distance the ordering is
+responsible for: the inter-cell hand-overs plus the survey-entry and return connectors, each
+measured with the *same* transition policy the route is drawn with (tier 0 → tier 0b → aligned →
+A*). On top of the distance sit three small deterministic terms — `BCD_TOPOLOGY_PENALTY_LANES` (a
+hand-over between cells the decomposition does not connect), `BCD_REVERSAL_PENALTY_LANES` (leaving
+a cell on a heading that points away from the next one), and `BCD_FALLBACK_PENALTY_M` (a hand-over
+only the generic A* can draw, which is a contract violation rather than a slightly worse route, so
+its penalty is effectively lexicographic). The first two are lane-spacing multiples against
+distances of tens to hundreds of metres, so **distance dominates by construction**.
+
+**Coverage is an INPUT to this, never an output.** The lane family, the lane spacing, the survey
+angle, the clip, the fragments and cell membership are all fixed before the ordering runs. For
+identical planning input, before and after an ordering change, these are byte-identical: fragment
+count, every fragment's coordinates, total survey-line length, shoreline and no-go clearance, and
+which cell each fragment belongs to. What may change: the cell visitation order, the execution
+order of fragments between cells, the forward/reverse orientation of whole cells, the transition
+coordinates, the route waypoint count, the route hash and the total route length.
+
+**A cell is still covered by a plain lawnmower.** Each of the four evaluated traversals of a cell
+flies the *same* fragments, lane by lane through the sweep, with the along-U direction alternating
+per lane — straight parallel passes at the survey angle at the configured spacing. The ordering
+chooses among whole-cell traversals and among cells; it never reorders fragments within a cell and
+never introduces diagonal, curved or free-form coverage. Only TRANSIT between finished cells takes
+an arbitrary safe heading.
