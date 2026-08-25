@@ -1,5 +1,10 @@
 # Events verification
 
+> **Superseded by [`event-log.md`](event-log.md).** This records the first,
+> flattened-from-payload version of the Events page. The persistent server-side event
+> store and acknowledgement flag documented in `event-log.md` replaced it. Kept as a
+> dated historical record; not a description of current behavior.
+
 **Backend**
 - ✓ api.getEvents() (flattened per-vehicle payload events)
 

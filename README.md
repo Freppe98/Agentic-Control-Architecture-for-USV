@@ -324,6 +324,10 @@ Additional diagnostic information may include:
 
 The Map page retains last-known state during degradation and marks it stale instead of replacing useful information with empty values.
 
+Browser/operator visibility and Scout's onboard communication classification are separate observation points, not the same signal — a `PARTITIONED` link can exist while the Operator UI itself looks stale or briefly unavailable, and the reverse is also possible. The UI appearing offline is never treated as proof that Scout has classified the link `DISCONNECTED`.
+
+A successful communication-loss safety hold (Scout LOITER, verified `SAFE_HOLD`) is reported to the operator as mission execution `PAUSED`, retaining the mission for an explicit Resume or Stop. A failed or unproven hold is reported `SUSPENDED` and requires an explicit Rearm. In both cases, reconnection never resumes the mission automatically — see [Safety Principles](#safety-principles).
+
 ### Communication Experiments
 
 The Experiment page supports controlled network impairment parameters such as:
@@ -352,6 +356,8 @@ The Operator interface includes:
 - command history;
 - agent decision information;
 - event history.
+
+This multi-vehicle architecture and UI are groundwork for fleet operation; they are not a claim that coordinated multi-USV (swarm) behavior has been field-validated.
 
 ## Operator Interface
 
@@ -437,11 +443,11 @@ Agentic-Control-Architecture-for-USV/
 │   ├── package-lock.json
 │   └── .env.example
 │
-├── local-agent-scripts/
-│   └── Local Agent support and deployment scripts
-│
 ├── Scripts/
-│   └── General utility and development scripts
+│   └── Legacy/prototype development code (early Local Mission Agent FSM and
+│       adapter sketches), not used by the final Operator runtime — see
+│       Scripts/README.md. The final Scout LMA lives in the separate
+│       AqualityONE vehicle codebase (see below), not in this repository.
 │
 └── README.md
 ```
@@ -641,7 +647,9 @@ Remaining or future work includes:
 
 ## Important Limitations
 
-This repository contains a research prototype, not a certified marine control system.
+This repository contains a research prototype, not a certified marine control system. It offers conservative, best-effort safety behavior (fail-closed holds, verified readback, explicit authority) — not a formal safety guarantee or proof.
+
+Obstacle-aware replanning is architecture/planning-time groundwork only; it is not enabled as a runtime replanning behavior in the final system.
 
 Mission-planning backgrounds and aerial imagery may contain positional offsets. GNSS mission coordinates remain authoritative, while map imagery is treated as an operator aid.
 

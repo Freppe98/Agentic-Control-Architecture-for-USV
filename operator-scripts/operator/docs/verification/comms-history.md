@@ -27,4 +27,4 @@ First backend addition from `BACKEND_ROADMAP.md`. Operator-backend-owned (see `S
 
 **Next (per roadmap)**
 - #2 persistent event log — emit these comms transitions as acknowledgeable events
-- Frontend: wire the Map comms timeline + Autonomy decision-trace comms nodes to this endpoint (page work, resumes after backend #1–#3)
+- Frontend: wire the Map comms timeline + Agent page's decision-trace comms nodes to this endpoint (page work, resumes after backend #1–#3)

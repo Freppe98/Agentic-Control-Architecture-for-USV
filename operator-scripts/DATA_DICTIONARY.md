@@ -39,7 +39,7 @@ Every value/function slot must communicate **why** it is missing — never colla
 | **Not installed** | hardware/feature absent on this hull (usually `NOT_APPLICABLE`) |
 | **Unsupported by this vehicle** | vehicle model doesn't support it (usually `NOT_APPLICABLE`) |
 
-Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A) or "not wired yet" (that's BACKEND_GAP). **LAST_KNOWN must never turn OK into Warning** — health and communication stay independent. The operator must always be able to tell whether missing data is caused by comms, missing backend support, absent hardware, or a real fault — but "backend not implemented" is expressed as "unavailable", not as jargon. Every BACKEND_GAP is tracked with an owner and disposition in `BACKEND_ROADMAP.md`. Applied to new pages first (Autonomy, Vehicle, Video, Pilot); existing `noTelem()` slots migrate later in one system-wide pass.
+Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A) or "not wired yet" (that's BACKEND_GAP). **LAST_KNOWN must never turn OK into Warning** — health and communication stay independent. The operator must always be able to tell whether missing data is caused by comms, missing backend support, absent hardware, or a real fault — but "backend not implemented" is expressed as "unavailable", not as jargon. Every BACKEND_GAP is tracked with an owner and disposition in `BACKEND_ROADMAP.md`. Applied to new pages first (Agent, Vehicle, Video, Pilot); existing `noTelem()` slots migrate later in one system-wide pass.
 
 ## Identity & registry
 | Field | Type | Source | Pages | Freq | Opt | Notes |
@@ -57,10 +57,10 @@ Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A)
 | `comm_state` | enum `CONNECTED\|PARTITIONED\|DISCONNECTED\|UNKNOWN` | **derived** from `last_seen_age_s` vs thresholds | all | 1 s | no | The comms axis — never merged with health |
 | `last_seen` | ISO timestamp | server receive time | all | on packet | no | |
 | `last_seen_age_s` | seconds | **derived** (now − last_seen) | all (freshness) | 1 s | no | Drives "Last contact Xs" + stale dimming |
-| `connectivity` | string | `communication.connectivity` | Vehicle, Autonomy | on packet | yes | |
-| `operator_reachable` | bool | `communication.operator_reachable` | Vehicle, Autonomy | on packet | yes | |
-| `buffered_packets` | int | `communication.buffered_packets` | Vehicle, Autonomy | on packet | yes | store-and-forward depth |
-| `rssi` | dBm | **NO TELEM** (autopilot has it, not forwarded) | Vehicle, Video timeline, Autonomy | 1 s | yes | Show slot; add once logged |
+| `connectivity` | string | `communication.connectivity` | Vehicle, Agent | on packet | yes | |
+| `operator_reachable` | bool | `communication.operator_reachable` | Vehicle, Agent | on packet | yes | |
+| `buffered_packets` | int | `communication.buffered_packets` | Vehicle, Agent | on packet | yes | store-and-forward depth |
+| `rssi` | dBm | **NO TELEM** (autopilot has it, not forwarded) | Vehicle, Video timeline, Agent | 1 s | yes | Show slot; add once logged |
 | `latency_rtt` | ms | **NO TELEM** | Vehicle | 1 s | yes | |
 | `mavlink.heartbeat_age_s` | s | **derived** in `mavlink_evidence()` from Scout MAVLink fields | Vehicle (Diagnostics: Pixhawk heartbeat, Pixhawk card) | 1 s | yes | REAL HEARTBEAT age only — never inferred from GPS/arrival. Absent → NOT AVAILABLE. See BACKEND_ROADMAP → "Pixhawk heartbeat / MAVLink evidence" |
 | `mavlink.connected` / `last_msg_age_s` / `msg_rate_hz` / `parser_errors` | bool/s/Hz/int | `communication.mavlink_*` / `payload.mavlink.*` | Vehicle (Diagnostics: MAVLink) | 1 s | yes | MAVLink link state + freshness. Absent → NOT AVAILABLE |
@@ -87,17 +87,17 @@ Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A)
 | `coverage` | % | payload `coverage` | Map, Fleet, Mission | slow | yes | mission total vs per-vehicle `sector` |
 | `sector_swept` | % | per-vehicle coverage | Fleet, Vehicle, Mission | slow | yes | |
 
-## Autonomy (the "why" — mostly NEW, needs backend support)
+## Agent (the "why" — mostly NEW, needs backend support)
 | Field | Type | Source | Pages | Freq | Opt | Notes |
 |---|---|---|---|---|---|---|
-| `behavior_state` | string | agent (approx by `mission_state` today) | Autonomy, Fleet, Map | on change | no | Searching/Holding/Returning/Loitering |
-| `behavior_from` | string | agent decision log | Autonomy | on change | yes | previous state |
-| `decision_confidence` | % | **NO TELEM** — agent must emit | Autonomy | on eval | yes | certainty in the behavior choice |
-| `decision_rationale` | string | **NO TELEM** — agent must emit | Autonomy | on eval | yes | plain-language reason |
-| `active_constraints` | list<{name,met,value}> | **NO TELEM** — agent must emit | Autonomy | on eval | yes | decision inputs |
-| `next_transitions` | list<{to,condition}> | **NO TELEM** — agent must emit | Autonomy | on eval | yes | watch conditions |
-| `decision_trace` | list<{kind,state,ts,note}> | **needs comms-state transition logging** | Autonomy | append | yes | state-machine history |
-| `next_eval_s` | seconds | agent | Autonomy | 1 s | yes | countdown |
+| `behavior_state` | string | agent (approx by `mission_state` today) | Agent, Fleet, Map | on change | no | Searching/Holding/Returning/Loitering |
+| `behavior_from` | string | agent decision log | Agent | on change | yes | previous state |
+| `decision_confidence` | % | **NO TELEM** — agent must emit | Agent | on eval | yes | certainty in the behavior choice |
+| `decision_rationale` | string | **NO TELEM** — agent must emit | Agent | on eval | yes | plain-language reason |
+| `active_constraints` | list<{name,met,value}> | **NO TELEM** — agent must emit | Agent | on eval | yes | decision inputs |
+| `next_transitions` | list<{to,condition}> | **NO TELEM** — agent must emit | Agent | on eval | yes | watch conditions |
+| `decision_trace` | list<{kind,state,ts,note}> | **needs comms-state transition logging** | Agent | append | yes | state-machine history |
+| `next_eval_s` | seconds | agent | Agent | 1 s | yes | countdown |
 
 ## Health / systems (the fault axis — separate from comms)
 | Field | Type | Source | Pages | Freq | Opt | Notes |

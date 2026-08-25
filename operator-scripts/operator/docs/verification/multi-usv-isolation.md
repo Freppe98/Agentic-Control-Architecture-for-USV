@@ -151,7 +151,7 @@ has already ended.
 
 1. Start the Operator backend: `./run_operator_backend.ps1`.
 2. Start the Scout Local Agent; then start the SAR Local Agent.
-3. `curl http://127.0.0.1:8000/api/fleet/status` — both `usv-2` and `usv-3` are present and
+3. `curl http://127.0.0.1:8210/api/fleet/status` — both `usv-2` and `usv-3` are present and
    CONNECTED **in the same response**, each with its own battery/mode/position.
    `[FLEET] vehicles=3 connected=2 …` appears once in the backend log, not per poll.
 4. Open `/app#/map`, select Scout, leave it for ≥ 1 minute.

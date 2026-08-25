@@ -1,5 +1,9 @@
 # Autonomy verification
 
+> **Superseded by [`agent.md`](agent.md).** The page documented here was later renamed
+> **Agent** (the `#/autonomy` route key is kept internally, see `agent.md`). Kept as a
+> dated historical record of the first build; not a description of current behavior.
+
 First page built on the **Data Availability States** (lib/availability.js).
 
 **Backend**

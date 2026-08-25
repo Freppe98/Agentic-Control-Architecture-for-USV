@@ -74,10 +74,11 @@ is set — no return route was generated" and "Duration is an estimate only" not
 
 ## Manual test procedure
 
-1. `python -m uvicorn main:app --host 127.0.0.1 --port 8199` (or `run_operator_backend.ps1`).
-   Optionally POST a live vehicle to `/agent/status` (see `docs/verification/*`), else the
-   template roster (ids 1/2/3) is used.
-2. Open `http://127.0.0.1:8199/app/#/plan`.
+1. `./run_operator_backend.ps1` (binds `0.0.0.0:8210`; equivalently
+   `python -m uvicorn main:app --host 127.0.0.1 --port 8210`). Optionally POST a live
+   vehicle to `/agent/status` (see `docs/verification/*`), else the template roster
+   (ids 1/2/3) is used.
+2. Open `http://127.0.0.1:8210/app/#/plan`.
 3. **Vehicle:** pick a vehicle in the left "1 · Vehicle" select.
 4. **Survey area:** click **Draw boundary**, click ≥3 map points, then **Finish** (or
    double-click). Confirm draggable vertex handles appear and the state chip reads

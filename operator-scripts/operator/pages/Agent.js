@@ -1053,7 +1053,7 @@ export function Agent(root) {
        ${S.replanning.active
           ? `<div class="reason-note">${warnSvg}<span>The replanning controller owns the vehicle. Mission execution issues no competing mode command, and Start / Pause / Resume stay disabled until Scout hands control back.</span></div>`
           : ""}
-       <div class="reason-note">${gapSvg}<span>The mission is complete only when Scout reports <b>COMPLETED_HOLD</b> <i>and</i> <b>final_loiter_verified = true</b>. Reaching Home, or the persistence bar filling, is not completion. Replanning ending in SAFE_HOLD / SUSPENDED / FAILED / FALLBACK_RTL leaves mission execution SUSPENDED — the original mission is not resumed automatically.</span></div>`, false);
+       <div class="reason-note">${gapSvg}<span>The mission is complete only when Scout reports <b>COMPLETED_HOLD</b> <i>and</i> <b>final_loiter_verified = true</b>. Reaching Home, or the persistence bar filling, is not completion. A positively proven, hold-only <b>SAFE_HOLD</b> pauses mission execution in verified LOITER for explicit Resume or Stop. A failed or unproven hold, or a genuine replanning failure (<b>FAILED</b> / <b>FALLBACK_RTL</b>), leaves mission execution <b>SUSPENDED</b> — fail-closed, Rearm required. Either way, the original mission is never resumed automatically.</span></div>`, false);
   }
 
   // --- Lifecycle write trace (operation results, not poll-derived guesses) --------------------
