@@ -1,6 +1,6 @@
 # Agentic Control Architecture for Autonomous USVs
 
-Master’s thesis project developing and evaluating an agentic supervisory-control architecture for autonomous Uncrewed Surface Vehicles operating under intermittent communication.
+Master’s thesis project developing and evaluating an agentic supervisory-control architecture for Unamanned Surface Vehicles operating under intermittent communication.
 
 The system separates low-level vehicle control, onboard autonomy, and offboard mission supervision into explicit layers. Each USV has a Local Mission Agent that maintains situational awareness, evaluates communication and vehicle state, applies safety rules, and can continue operating when the Operator Station becomes unavailable.
 
