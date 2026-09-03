@@ -5,19 +5,21 @@ operator PC is hardcoded — the vehicle is told where to post at runtime.
 
 ## 0. Install dependencies (reproducible)
 
-The Plan page's survey generation needs the geometry stack (shapely / pyproj / numpy),
-so install from the pinned manifest rather than relying on packages already on the box:
+Run the installer, which creates `.venv` and installs the pinned manifest into it —
+this is the same entry point `run_operator_backend.ps1` expects (it refuses to start
+without a `.venv\Scripts\python.exe`):
 
 ```powershell
-python -m pip install -r requirements.txt
+.\install_operator.ps1
 ```
 
-Without them the station still runs, but the Plan page's `/api/planning/*` and
-`/api/missions/finalize` geometry answer an honest **503 planning_unavailable** instead
-of a route. Confirm the stack is present:
+The Plan page's survey generation needs the geometry stack (shapely / pyproj / numpy)
+from that manifest; without it the station still runs, but the Plan page's
+`/api/planning/*` and `/api/missions/finalize` geometry answer an honest
+**503 planning_unavailable** instead of a route. Confirm the stack is present:
 
 ```powershell
-python -c "import shapely, pyproj, numpy; print('planning deps OK')"
+.\.venv\Scripts\python.exe -c "import shapely, pyproj, numpy; print('planning deps OK')"
 ```
 
 ## 1. Start the backend on the operator PC

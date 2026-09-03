@@ -34,22 +34,22 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 ## Communication (the primary axis)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|
-| **comms-state transition log** | Map timeline, Autonomy trace, thesis metrics | Operator backend | B-field | on transition | C → `GET /api/comms/history/{id}` | (enables Timeline) | **P0** |
-| `rssi` | Vehicle, Video, Autonomy | USV → Agent | A-out | 1 s | A | No data received | P1 |
-| `connectivity` / `operator_reachable` / `buffered_packets` | Vehicle, Autonomy | Local Agent | A-out (partial today) | on packet | B | No data received | P1 |
+| **comms-state transition log** | Map timeline, Agent trace, thesis metrics | Operator backend | B-field | on transition | C → `GET /api/comms/history/{id}` | (enables Timeline) | **P0** |
+| `rssi` | Vehicle, Video, Agent | USV → Agent | A-out | 1 s | A | No data received | P1 |
+| `connectivity` / `operator_reachable` / `buffered_packets` | Vehicle, Agent | Local Agent | A-out (partial today) | on packet | B | No data received | P1 |
 | `latency_rtt` | Vehicle | Operator backend | B-field (measure ack round-trip) | 1 s | C | No data received | P2 |
 
-## Autonomy — agent cognition (thesis centerpiece)
+## Agent — agent cognition (thesis centerpiece)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|
-| `behavior_state` (explicit, not approx. from mission_state) | Autonomy, Fleet, Map | Local Agent | A-out | on change | B | live / last-known | **P0** |
-| `behavior_from` (previous state) | Autonomy | Local Agent | A-out | on change | B | Feature unavailable | **P0** |
-| `decision_confidence` | Autonomy | Local Agent | A-out | on eval | B | Feature unavailable | **P0** |
-| `decision_rationale` | Autonomy | Local Agent | A-out | on eval | B | Feature unavailable | **P0** |
-| `active_constraints` (met/unmet inputs) | Autonomy | Local Agent | A-out | on eval | B | Feature unavailable | P1 |
-| `next_transitions` (watch conditions) | Autonomy | Local Agent | A-out | on eval | B | Feature unavailable | P1 |
-| `decision_trace` | Autonomy | Local Agent + Operator backend | A-out + B-field (comms nodes from the log above) | append | B+C | Feature unavailable | P1 |
-| `next_eval_s` (countdown) | Autonomy | Local Agent | A-out | 1 s | B | Feature unavailable | P2 |
+| `behavior_state` (explicit, not approx. from mission_state) | Agent, Fleet, Map | Local Agent | A-out | on change | B | live / last-known | **P0** |
+| `behavior_from` (previous state) | Agent | Local Agent | A-out | on change | B | Feature unavailable | **P0** |
+| `decision_confidence` | Agent | Local Agent | A-out | on eval | B | Feature unavailable | **P0** |
+| `decision_rationale` | Agent | Local Agent | A-out | on eval | B | Feature unavailable | **P0** |
+| `active_constraints` (met/unmet inputs) | Agent | Local Agent | A-out | on eval | B | Feature unavailable | P1 |
+| `next_transitions` (watch conditions) | Agent | Local Agent | A-out | on eval | B | Feature unavailable | P1 |
+| `decision_trace` | Agent | Local Agent + Operator backend | A-out + B-field (comms nodes from the log above) | append | B+C | Feature unavailable | P1 |
+| `next_eval_s` (countdown) | Agent | Local Agent | A-out | 1 s | B | Feature unavailable | P2 |
 
 ## Mission
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
@@ -68,7 +68,7 @@ Cross-reference: field semantics live in [`DATA_DICTIONARY.md`](DATA_DICTIONARY.
 ## Command / control (reverse path)
 | Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
 |---|---|---|---|---|---|---|---|
-| command lifecycle (modes AUTO/MANUAL/HOLD/LOITER/GUIDED/RTL, ARM/DISARM, MISSION_PAUSE/RESUME, SET_HOME) | Map, Vehicle, Mission, Autonomy | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | state reported by vehicle | P1 · **backend done** (see `verification/commands.md`) |
+| command lifecycle (modes AUTO/MANUAL/HOLD/LOITER/GUIDED/RTL, ARM/DISARM, MISSION_PAUSE/RESUME, SET_HOME) | Map, Vehicle, Mission, Agent | Operator backend + Local Agent | B-field + A-out | on action | E → `POST /api/commands` | state reported by vehicle | P1 · **backend done** (see `verification/commands.md`) |
 | command status (requested → sent → acknowledged → confirmed / rejected / timed-out) | Map, Vehicle, Mission | Operator backend | B-field | on change | E→B | never optimistic | P1 · **backend done** (queue + comm-state gating + Agent result) |
 | **command & control panel** (Take Control→OPERATOR / Release→LOCAL_AGENT + 10 command buttons + queue, gated on Scout-confirmed authority, PENDING until effective) | Map, Vehicle | Scout Flask (authority) + Operator backend (queue) + Frontend | B-field | on action | E | Take Control / Release Control | P1 · **done** (see `verification/authority.md`, `verification/commands.md`) |
 
@@ -186,7 +186,7 @@ The Experiment page injects controlled comms impairment between the Operator Sta
 Architectural owners per [`SYSTEM_INFORMATION_MODEL.md`](SYSTEM_INFORMATION_MODEL.md). All three are Operator-backend-owned and shippable without hardware:
 
 1. ~~**Comms-state transition log — `GET /api/comms/history/{id}` (P0, Operator backend).**~~ ✅ **done** (see `verification/comms-history.md`)
-   The backend already derives `comm_state`; a 1 s monitor records per-vehicle transitions (state, `from`, `ts`) and exposes the history + per-state durations. **Unblocks three reserved features at once** — the Map comms Timeline, the Autonomy decision-trace comms nodes, and the thesis metric *total disconnected time*. Fully in `main.py`.
+   The backend already derives `comm_state`; a 1 s monitor records per-vehicle transitions (state, `from`, `ts`) and exposes the history + per-state durations. **Unblocks three reserved features at once** — the Map comms Timeline, the Agent page's decision-trace comms nodes, and the thesis metric *total disconnected time*. Fully in `main.py`.
 
 2. ~~**Persistent event log — `GET /api/events` + server-side store (P1, Operator backend).**~~ ✅ **done** (see `verification/event-log.md`)
    Real, permanent server-side store replacing the flattened-from-payload feed. **Comms-state transitions from #1 are emitted into this log as events** (PARTITIONED → caution, DISCONNECTED → warning, restored/first-contact → info), and vehicle-reported `payload.events` are ingested + deduped. Events carry stable ids and an `acknowledged` flag — ack is *design-ready* but `POST /api/events/{id}/ack` is deferred to its own P2 slot (would require wiring the Events page's session-local ack to the server).
@@ -194,7 +194,7 @@ Architectural owners per [`SYSTEM_INFORMATION_MODEL.md`](SYSTEM_INFORMATION_MODE
 3. **Live configuration API — `GET /api/config` (P1, Operator backend).** ← next
    Return the live thresholds (currently compiled constants) so Configuration is a genuine read, not a mirror of `main.py`. Cheap honesty win; sets up `POST /api/config` later.
 
-**Then** (cross-component, after #1–#3): **surface the agent reasoning already emitted.** Per the information model, `payload.agent.*` (`current_behaviour`, `decision_reason`, `autonomy_level`, `current_policy`) is already sent by the Local Agent but **dropped** in `normalize_agent_message` — forwarding it closes much of the Autonomy page with no agent change. `decision_confidence` / `next_eval_s` / `active_constraints` remain a genuine agent-contract addition.
+**Then** (cross-component, after #1–#3): **surface the agent reasoning already emitted.** Per the information model, `payload.agent.*` (`current_behaviour`, `decision_reason`, `autonomy_level`, `current_policy`) is already sent by the Local Agent but **dropped** in `normalize_agent_message` — forwarding it closes much of the Agent page with no agent change. `decision_confidence` / `next_eval_s` / `active_constraints` remain a genuine agent-contract addition.
 
 Anything touching `main.py` or the `POST /agent/status` schema is an outward-facing contract change — propose, get a green light, then implement.
 

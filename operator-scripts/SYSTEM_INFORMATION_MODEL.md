@@ -57,6 +57,6 @@ The roadmap's comms-transition log is the **operator-side** view (reachability a
 | Units / coord format / base layer | Frontend | localStorage | never sent to backend |
 
 ## Implications for backend work
-- **Forward before you invent.** `payload.agent.*` and `payload.communication.*` already carry more than the backend surfaces; forwarding them closes Autonomy gaps without any agent change.
+- **Forward before you invent.** `payload.agent.*` and `payload.communication.*` already carry more than the backend surfaces; forwarding them closes Agent-page gaps without any agent change.
 - **Respect owner boundaries.** The Operator Backend must not synthesize telemetry or reasoning — only relay (Vehicle/Agent), derive from arrival (comm-state), or store operator-side records (events, config, commands).
 - **Absent ≠ broken.** Under the reporting policy, missing groups are deliberate — render LAST_KNOWN / No data, never FAULT.

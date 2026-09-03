@@ -4180,7 +4180,7 @@ def comms_history(vehicle_id: str):
 
     Accepts the id in either form the rest of the system uses — '2' or 'usv-2' (the
     Scout's source id) — so callers don't have to guess. Powers the Map comms
-    timeline, the Autonomy decision-trace comms nodes, and the thesis 'total
+    timeline, the Agent page's decision-trace comms nodes, and the thesis 'total
     disconnected time' metric. Empty transitions => never contacted.
     """
     now = datetime.now(timezone.utc)
