@@ -1,0 +1,65 @@
+# Scout Local Agent -- runtime state and test artifacts. None of this belongs
+# in version control: every file here is generated at runtime (or by a test
+# run) and is machine/moment specific. Committing it caused real bleed --
+# a test run's command_ids leaked into command_results.json and got committed.
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Machine-specific operator endpoints (see local_config.example.py)
+local_config.py
+
+# Persisted command dedup / result state (see command_log.py, command_results.py)
+command_log.jsonl
+command_results.json
+
+# Outbound message buffer (see buffer.py / config.BUFFER_FILE)
+agent_buffer.jsonl
+
+# Authoritative most-recent mission-operation record (mission_operation_status.py)
+mission_operation_state.json
+mission_operation_state.json.tmp
+
+# Replanning lifecycle runtime state (planning_package.py / replan_controller.py).
+# The approved planning package and the controller's restart-safe status are
+# both runtime/per-deployment; a stale committed replan_status.json would be
+# read at startup as a real interrupted transaction (UNKNOWN_AFTER_RESTART).
+planning_package.json
+planning_package.json.tmp
+replan_status.json
+replan_status.json.tmp
+
+# Mission-execution controller's own restart-safe status store
+# (mission_execution_controller.py's StatusStore) -- same hazard as
+# replan_status.json above: a stale committed copy would be read at the next
+# startup as a real interrupted/prior operation. This file was tracked in
+# git for a period before this rule was added (a pre-existing instance of
+# the exact leak class this .gitignore describes at the top) and was
+# untracked (`git rm --cached`, working-tree copy left in place) as part of
+# the thesis-freeze cleanup -- confirmed safe first: StatusStore.load_into()
+# no-ops on a missing file (FileNotFoundError is caught), and every test
+# that exercises StatusStore points it at its own temp-dir path, never at
+# this file, so no code or test depends on a committed initial content.
+mission_execution_status.json
+mission_execution_status.json.tmp
+
+# Thesis Experiment Recorder output (experiment_recorder.py). Every run
+# bundle is generated at runtime (evidence for one specific experiment
+# trial) and is machine/moment specific -- never committed, same reasoning
+# as the runtime state above.
+experiment_runs/
+
+# Backups / swap / save files
+*.bak
+*.backup
+*.save
+*.orig
+*.swp
+*~
+
+# Generated data / logs
+*.log
+*.csv
