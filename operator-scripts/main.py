@@ -26,6 +26,7 @@ import scout_mission_execution
 import scout_replan
 import vehicle_registry
 import vehicle_telemetry
+import companion_telemetry
 
 
 @asynccontextmanager
@@ -42,6 +43,10 @@ async def lifespan(app):
     # "no approved mission" rather than a race against startup. Fails closed (see
     # _load_mission_store): a corrupt snapshot starts an EMPTY store, never a partial one.
     print(f"[MISSION STORE] {_load_mission_store()}")
+    # Restore companion-session ordering metadata (see companion_telemetry.py's OPERATOR
+    # RESTARTS section): ordering protection only, never companion identity/measurement/hazard
+    # data, which stays genuinely empty until Scout reports it again to THIS process.
+    print(f"[COMPANION SESSIONS] {_load_companion_sessions()}")
     # Background monitor: log comms-state transitions once per second.
     task = asyncio.create_task(_comms_monitor_loop())
     yield
@@ -189,6 +194,14 @@ last_known_groups = {}     # {vehicle_id: {group_name: dict}}
 # RECEIVER has to do this arithmetic — Scout cannot know which of its own sends never
 # arrived (see vehicle_telemetry.PacketLossEstimator for the window/reset semantics).
 packet_loss_by_id = {}     # {vehicle_id: vehicle_telemetry.PacketLossEstimator}
+
+# Companion (UAV) state reported BY a parent USV in its own packets (payload.companions,
+# schema companion-v2 — see companion_telemetry.py / COMPANION_CONTRACT.md). Keyed by the
+# PARENT's canonical id: a companion is not a fleet vehicle, has no command route, and is
+# only ever written by, and published on, its own parent's record. Deliberately NOT one of
+# vehicle_telemetry.CARRIED_GROUPS: its omission/clear semantics and per-measurement
+# observation times are its own.
+companion_state_by_id = {}  # {vehicle_id: companion_telemetry state}
 
 
 def packet_loss_estimator(cid):
@@ -373,6 +386,7 @@ def never_contacted_row(cid):
         "agent_summary": vehicle_telemetry.agent_summary({}),
         "link": vehicle_telemetry.link_block({}, None),
         "stale_groups": [],
+        "companions": companion_telemetry.empty_block(),
         "agent_status": {},
         "mission_upload": None,
         "fleet_info": {},
@@ -747,6 +761,12 @@ def normalize_agent_message(message: dict, cid=None, received_at=None) -> dict:
         # Which groups in THIS row came from a previous packet rather than this one, so the
         # UI can mark them last-known instead of presenting them as current.
         "stale_groups": stale_groups,
+        # Companion (UAV) state THIS vehicle reported, with every measurement aged from its own
+        # UAV-side observation time — never from this packet's arrival (companion_telemetry.py).
+        # Elapsed-time math inside that module runs on time.monotonic(), not wall clock, so an
+        # NTP step or manual clock change here cannot corrupt a freshness reading.
+        "companions": companion_telemetry.fleet_block(companion_state_by_id, usv_id,
+                                                       time.time(), time.monotonic()),
         # Agent reasoning (payload.agent.*) forwarded verbatim for the Agent page:
         # current_behaviour, decision_reason, current_policy, autonomy_level,
         # current_communication_state, current_mission_state, buffer_usage,
@@ -2896,6 +2916,84 @@ def _load_mission_store():
     return (f"restored {len(missions)} mission record(s) from {MISSION_STORE_PATH}; "
             f"active: {_active_missions_log_text()}")
 
+
+# ── Companion (UAV) snapshot-ordering persistence ─────────────────────────────────────────
+# ONE small, atomic JSON file holding ONLY {vehicle: {id, seq, generation}} per vehicle — the
+# ordering triplet companion_telemetry.py's replay protection needs to survive an OPERATOR
+# restart (see that module's OPERATOR RESTARTS section). Deliberately narrower even than the
+# mission store: no companion identity, no measurements, no hazards — those are live evidence
+# and a restored copy would be presenting stale data as current, which
+# companion_telemetry.seed_session() explicitly refuses to do. Shares the mission store's
+# runtime directory (already resolved with full test-isolation logic — see _resolve_runtime_dir
+# above) rather than inventing a second resolution mechanism; a separate FILE keeps the two
+# concerns apart on disk. Same atomic-write (temp file + os.replace) and fail-closed-on-load
+# conventions as _save_mission_store / _load_mission_store.
+COMPANION_SESSIONS_PATH = MISSION_STORE_DIR / "companion_sessions.json"
+
+
+def _save_companion_sessions():
+    """Persist companion-session ordering metadata atomically. Called only when ingest() signals
+    a NEW publisher generation was adopted (see receive_agent_status) — not on every packet, since
+    seq alone advancing within an unchanged generation needs no cross-restart protection (the
+    narrower residual gap this leaves is documented in COMPANION_CONTRACT.md's Limitations).
+    Never raises: a station that cannot write this file keeps running on its in-memory ordering
+    state, loudly, the same as _save_mission_store."""
+    try:
+        MISSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = COMPANION_SESSIONS_PATH.with_suffix(".json.tmp")
+        vehicles = companion_telemetry.session_snapshot(companion_state_by_id)
+        snapshot = {"version": companion_telemetry.SESSION_SNAPSHOT_VERSION,
+                   "saved_at": datetime.now(timezone.utc).isoformat(),
+                   "vehicles": {vehicle_slug(vid): rec for vid, rec in vehicles.items()}}
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, COMPANION_SESSIONS_PATH)
+        return True
+    except Exception as exc:
+        print(f"[COMPANION SESSIONS] could not write {COMPANION_SESSIONS_PATH}: {exc} - "
+              "continuing with in-memory ordering state; this restart will lose it")
+        return False
+
+
+def _load_companion_sessions():
+    """Restore companion-session ordering metadata at startup — ONLY the {id, seq, generation}
+    triplet per vehicle, via companion_telemetry.seed_session(), which never restores any
+    companion identity, measurement or hazard data (that always starts genuinely empty after a
+    restart — restored ordering protection must never present restored evidence as current).
+
+    Fails CLOSED: a missing, corrupt or unreadable file starts with NO persisted ordering state
+    (equivalent to first-ever-run for every vehicle) rather than a partially-loaded one. This
+    NARROWS replay protection for a publisher generation that was already retired before the
+    crash — a delayed packet from it could, in the worst case, be treated as unfamiliar-but-new
+    until Scout's next real packet re-establishes the current generation — but it never
+    fabricates or restores any companion data either way, matching _load_mission_store's own
+    fail-closed contract for a different kind of state."""
+    if not COMPANION_SESSIONS_PATH.exists():
+        return "no snapshot - starting with no persisted companion-session ordering state"
+    try:
+        with open(COMPANION_SESSIONS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        vehicles = companion_telemetry.validate_session_snapshot(data)
+    except Exception as exc:
+        print(f"[COMPANION SESSIONS] REFUSED {COMPANION_SESSIONS_PATH}: {exc}")
+        print("[COMPANION SESSIONS] starting with NO persisted ordering state — a retired "
+              "generation's replay protection from before this restart is not restored, but no "
+              "companion data is fabricated either way.")
+        return f"refused ({exc})"
+    restored = 0
+    for slug, rec in vehicles.items():
+        vid = canonical_id(slug)
+        if vid is None:
+            continue        # a vehicle no longer configured/known — nothing to restore it onto
+        companion_telemetry.seed_session(companion_state_by_id, vid, session_id=rec["id"],
+                                         seq=rec["seq"], generation=rec["generation"])
+        restored += 1
+    return (f"restored ordering state for {restored} vehicle(s) from {COMPANION_SESSIONS_PATH}"
+            if restored else "snapshot held no vehicles")
+
+
 # The command lifecycle → mission upload_status projection. QUEUED/SENT are both "queued"
 # from the mission's point of view; a verified read-back is the only VERIFIED.
 MISSION_UPLOAD_STATUSES = ("QUEUED", "ACCEPTED", "VERIFIED", "FAILED")
@@ -3856,9 +3954,26 @@ def vehicle_commands(vehicle_id: str):
             "generated_at": now.isoformat()}
 
 
+def _finite_only(value):
+    """The decoded packet with every non-finite float (NaN / ±Infinity) replaced by None.
+
+    Python's json accepts the non-standard NaN/Infinity tokens on the way IN, but the fleet
+    endpoint serializes with allow_nan=False on the way OUT — and each vehicle's packet is echoed
+    verbatim as `raw`. So one NaN anywhere in one vehicle's packet made GET /api/fleet/status
+    fail for the WHOLE fleet. A non-finite number is not a reading; None is how this station
+    spells absence, and every normalizer already treats it as such."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite_only(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite_only(v) for v in value]
+    return value
+
+
 @app.post("/agent/status")
 async def receive_agent_status(request: Request):
-    incoming = await request.json()
+    incoming = _finite_only(await request.json())
     now = datetime.now(timezone.utc)
     vid = extract_usv_id(incoming)
 
@@ -3929,6 +4044,19 @@ async def receive_agent_status(request: Request):
         # copy wholesale (see last_known_groups for why a deep merge would be wrong).
         if isinstance(payload, dict):
             vehicle_telemetry.observe_groups(last_known_groups, vid, payload)
+            # Optional companion block. Inside the accepted branch on purpose: a replayed older
+            # packet must not rewrite companion state any more than it may rewrite telemetry.
+            # Observations only — nothing here touches commands, missions or planning drafts.
+            # received_mono anchors this arrival on the monotonic clock so companion_telemetry's
+            # own elapsed-time math (min_age_s etc.) survives a wall-clock jump between now and
+            # the next poll — see companion_telemetry.py's EVIDENCE TIME section. A True return
+            # means a NEW publisher generation was just adopted — persist it immediately so a
+            # retired generation stays rejected even across an operator restart (see
+            # companion_telemetry.py's OPERATOR RESTARTS section and _save_companion_sessions).
+            if companion_telemetry.ingest(companion_state_by_id, vid, payload, packet_ts=msg_ts,
+                                          received_at=now.timestamp(), received_mono=time.monotonic(),
+                                          resolve_parent=canonical_id):
+                _save_companion_sessions()
         record_agent_changes(vid, payload, now)
         rec["packets"] = rec.get("packets", 0) + 1
         # The STREAK ends on recovery, but `last_reject` is deliberately NOT cleared: an

@@ -13,6 +13,8 @@ import { BatteryBar } from "../components/BatteryBar.js";
 // the clarity. AuthoritySeg is deliberately NOT imported here any more.
 import { StatusBadges } from "../components/StatusBadges.js";
 import { vehicleRows } from "../components/VehicleDock.js";
+import { CompanionPanel } from "../components/CompanionPanel.js";
+import { companionMapPlan, planSignature, fmtEvidenceAge } from "../lib/companion.js";
 import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
@@ -200,6 +202,15 @@ export function Map(root) {
   //   { record, model, fetchedAt, loading, note }
   const orig = {};
   let originalLayer = null;  // the reference geometry layer group (selected vehicle)
+  // Scout's UAV companion (companion-v1) — OBSERVATIONS ONLY, no command path. One Leaflet layer
+  // group per `${parentId}::${companionId}` (lib/companion.js companionMapPlan), rebuilt only when
+  // what it draws changes; tooltips read the latest poll live. Every parent's companions are drawn
+  // (like every vehicle marker), each strictly from its own row. `cmpOpenFor` is the parent whose
+  // companion panel is open — always the selected vehicle; any vehicle switch closes it.
+  const cmpLayers = {};            // key -> { layer, sig }
+  // A plain object, never the Map collection: inside this module `Map` is the page function itself.
+  const cmpLatest = {};            // key -> latest plan entry (live tooltips)
+  let cmpOpenFor = null;
   // Command types with a POST in flight right now — a synchronous guard against a rapid
   // double-press queuing a duplicate before the queue poll catches up (matters most for
   // LOITER, which has no confirmation modal to slow a double-click). Cleared per type in
@@ -291,6 +302,7 @@ export function Map(root) {
     `<div class="dock">
        <div class="dock-h"><span class="lbl">Vehicles</span><span class="lbl">Live</span></div>
        <div class="veh-list" id="veh-list"><div class="empty-state" style="padding:10px 12px">Connecting…</div></div>
+       <div class="pxm cmp-panel" id="cmp-panel" style="display:none" aria-live="polite"></div>
        <div class="pxm" id="pxm"></div>
        <div class="mprog" id="mprog"></div>
      </div>
@@ -325,6 +337,13 @@ export function Map(root) {
              <div class="li"><span class="li-ic nogo"></span>No-go zone (original plan)</div>
              <div class="li"><span class="li-ic navb"></span>Navigable area (original plan)</div>
            </div>
+           <div class="li-group">
+             <div class="li"><span class="li-ic uav"></span>UAV companion (reported via Scout)</div>
+             <div class="li"><span class="li-ic hzprop"></span>Hazard / exclusion proposed — not accepted</div>
+             <div class="li"><span class="li-ic hzacc"></span>Exclusion accepted by Scout</div>
+             <div class="li"><span class="li-ic hzdis"></span>Rejected or expired by Scout</div>
+             <div class="li"><span class="li-ic hzstale"></span>Faded / dashed = last known, not current</div>
+           </div>
          </div>
        </div>
        </div>
@@ -354,6 +373,9 @@ export function Map(root) {
   // Reference-geometry panes, all BELOW Leaflet's default overlayPane (400) so the live mission
   // route always draws over the approved plan — see REF_PANES for why the order matters.
   REF_PANES.forEach(([name, z]) => { map.createPane(name); map.getPane(name).style.zIndex = String(z); });
+  // Companion hazards sit above the original-plan reference (396) and below the live mission
+  // route (overlayPane, 400): an observation never paints over the route the vehicle is flying.
+  map.createPane("cmp-hazard"); map.getPane("cmp-hazard").style.zIndex = "398";
   // One shared resize/corner contract for every map in the station (lib/map-layout.js):
   // ResizeObserver on the stage → coalesced invalidateSize, plus the measured top-corner
   // extents that theme.css offsets the Leaflet controls, legend and toast from.
@@ -408,8 +430,14 @@ export function Map(root) {
 
   function renderDock() {
     const list = document.getElementById("veh-list");
-    list.innerHTML = vehicleRows(fleet, selId);
+    list.innerHTML = vehicleRows(fleet, selId, { companions: true });
     list.querySelectorAll(".vrow").forEach((el) => (el.onclick = () => select(canonicalVehicleId(el.dataset.id))));
+    // The companion chip opens its parent's companion panel (and selects that parent) — the row
+    // click underneath must not also fire.
+    list.querySelectorAll("[data-cmp-parent]").forEach((b) => (b.onclick = (e) => {
+      e.stopPropagation();
+      openCompanion(canonicalVehicleId(b.dataset.cmpParent));
+    }));
 
     // Mission progress for the SELECTED vehicle — real waypoint counts + remaining
     // distance/ETA from the Pixhawk mission readback (lib/mission.js), the same numbers
@@ -437,6 +465,148 @@ export function Map(root) {
       body = `<div class="no-telem-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>No mission loaded for the selected vehicle</div>`;
     }
     document.getElementById("mprog").innerHTML = `<div class="row"><span class="lbl">Mission progress</span></div>` + body;
+  }
+
+  // ---- UAV companion (reported via Scout) — read-only observations ----------
+  // Nothing here can command anything: no network request, no command, no mission or plan write. A
+  // hazard Scout accepted is DRAWN as Scout's exclusion; it is never folded into the operator's
+  // own mission, draft or approved geometry, and a replan outcome is only what Scout reported.
+  function openCompanion(parentId) {
+    if (parentId == null) return;
+    if (parentId !== selId) select(parentId);
+    cmpOpenFor = parentId;
+    renderCompanionPanel();
+  }
+  function closeCompanion() { cmpOpenFor = null; renderCompanionPanel(); }
+
+  function renderCompanionPanel() {
+    const box = document.getElementById("cmp-panel");
+    if (!box) return;
+    // Isolation: the panel only ever renders the SELECTED vehicle's own row.
+    const v = cmpOpenFor != null && cmpOpenFor === selId ? fleet.find((x) => x.id === cmpOpenFor) : null;
+    if (!v) { cmpOpenFor = null; box.style.display = "none"; box.innerHTML = ""; return; }
+    box.style.display = "";
+    box.innerHTML = CompanionPanel(v);
+    const close = box.querySelector("[data-cmp-close]");
+    if (close) close.onclick = closeCompanion;
+  }
+
+  // Proposed = amber dashed; accepted exclusion = solid magenta (deliberately NOT the original
+  // plan's no-go red — Scout's exclusion is a different fact from the approved plan's); dismissed
+  // = faint grey dotted. Stale halves the opacity; the tooltip then says LAST KNOWN in words.
+  const HZ_STYLE = {
+    proposed: { color: "#F2A93B", weight: 1.6, dashArray: "5 5", fillColor: "#F2A93B", fillOpacity: 0.10 },
+    accepted: { color: "#D946EF", weight: 2.2, fillColor: "#D946EF", fillOpacity: 0.20 },
+    dismissed: { color: "#8C9BAB", weight: 1.2, dashArray: "1 6", fillColor: "#8C9BAB", fillOpacity: 0.04 },
+  };
+  const HZ_HEAD = { proposed: "PROPOSED — NOT ACCEPTED", accepted: "EXCLUSION ACCEPTED BY SCOUT",
+                    dismissed: "DISMISSED BY SCOUT" };
+  function hzStyle(h) {
+    const s = { ...(HZ_STYLE[h.cls] || HZ_STYLE.proposed), pane: "cmp-hazard", interactive: true };
+    if (h.stale) { s.opacity = 0.5; s.fillOpacity = s.fillOpacity / 2; }
+    return s;
+  }
+  const tipRow = (k, v) => `<div class="wp-pop-row"><span>${k}</span><span>${v}</span></div>`;
+  // h.ageText / u.ageText come pre-formatted from lib/companion.js's evidenceView — "Ns ago",
+  // "at least Ns ago (delivery delay ~Ds)" when the delivery delay is notable, or "timing
+  // unknown" when the envelope carried no timestamp at all. Never re-derived here.
+  const clockTip = (v) => (v.clockAnomaly
+    ? '<div class="cmp-tip-note">⚠ clock mismatch — this envelope looks like it is from the future relative to the operator\'s clock.</div>' : "");
+  function hazardTip(key, hid) {
+    const e = cmpLatest[key];
+    const h = e && e.hazards.find((x) => x.id === hid);
+    if (!h) return "";
+    return `<div class="wp-pop"><div class="wp-pop-h">${esc(h.kind)} hazard${h.stale ? '<span class="wp-cur-tag cmp-lk-tag">LAST KNOWN</span>' : ""}</div>
+      <div class="cmp-tip-state hz-${h.cls}">${HZ_HEAD[h.cls]}</div>
+      ${tipRow("Scout", esc(h.dispositionText))}
+      ${tipRow("Replan", esc(h.replan.text))}
+      ${tipRow("Source", `${esc(h.source || "not reported")} via ${esc(e.parentName)}`)}
+      ${tipRow("Observed", esc(h.ageText))}
+      ${tipRow("Position", esc(h.uncertaintyText))}
+      ${tipRow("Revision", h.revision == null ? "—" : esc(h.revision))}
+      ${h.dispositionReason ? `<div class="cmp-tip-note">${esc(h.dispositionReason)}</div>` : ""}
+      ${clockTip(h)}</div>`;
+  }
+  function uavTip(key) {
+    const e = cmpLatest[key];
+    if (!e || !e.uav) return "";
+    const u = e.uav;
+    return `<div class="wp-pop"><div class="wp-pop-h">${esc(e.name)}${u.stale ? '<span class="wp-cur-tag cmp-lk-tag">LAST KNOWN</span>' : ""}</div>
+      ${tipRow("Via", esc(e.parentName))}
+      ${tipRow("Status", esc(e.status.label))}
+      ${tipRow("Position", esc(u.ageText))}
+      ${tipRow("Altitude", esc(u.altText || "not reported"))}
+      ${clockTip(u)}</div>`;
+  }
+  function uavIcon(entry) {
+    const u = entry.uav;
+    // The stale-marker tag shows the honest LOWER-BOUND age (minAgeS), never the delivery-delay-
+    // inclusive estimate — a short label has no room for "at least … (delivery delay …)", and a
+    // lower bound is the one number that is never an overstatement.
+    return L.divIcon({
+      className: "", iconSize: [30, 30], iconAnchor: [15, 15],
+      html: `<div class="uav-marker st-${entry.status.state}${u.stale ? " is-stale" : ""}">
+        ${u.headingDeg != null ? `<div class="uav-hdg" style="transform:rotate(${u.headingDeg}deg)"><span>▲</span></div>` : ""}
+        <div class="uav-body"></div>
+        <div class="uav-tag">${u.stale ? esc(fmtEvidenceAge(u.minAgeS) || "age ?") : esc(entry.type)}</div>
+      </div>`,
+    });
+  }
+  function buildCompanionLayer(entry) {
+    const layer = L.layerGroup();
+    entry.hazards.forEach((h) => {
+      const tip = () => hazardTip(entry.key, h.id);
+      if (h.exclusion) L.polygon(h.exclusion.ring, hzStyle(h)).bindTooltip(tip, { sticky: true, className: "cmp-tip" }).addTo(layer);
+      const g = h.geometry;
+      if (g && g.type === "polygon") {
+        L.polygon(g.ring, { ...hzStyle(h), dashArray: "2 4", fillOpacity: 0.06 }).bindTooltip(tip, { sticky: true, className: "cmp-tip" }).addTo(layer);
+      } else if (g && g.type === "point") {
+        // The uncertainty circle is the ONLY area drawn around a point observation — its radius
+        // is Scout's reported 95 % radius, never a padding the station invents.
+        if (h.uncertaintyM) {
+          L.circle([g.lat, g.lng], { ...hzStyle(h), radius: h.uncertaintyM, dashArray: "2 4" })
+            .bindTooltip(tip, { sticky: true, className: "cmp-tip" }).addTo(layer);
+        }
+        L.circleMarker([g.lat, g.lng], { ...hzStyle(h), radius: 4, dashArray: null, fillOpacity: h.stale ? 0.4 : 0.9 })
+          .bindTooltip(tip, { className: "cmp-tip" }).addTo(layer);
+      }
+    });
+    let uavMarker = null;
+    if (entry.uav) {
+      uavMarker = L.marker([entry.uav.lat, entry.uav.lng], { icon: uavIcon(entry), zIndexOffset: 400,
+        title: `${entry.name} via ${entry.parentName}` })
+        .bindTooltip(() => uavTip(entry.key), { direction: "top", offset: [0, -14], className: "cmp-tip" })
+        .on("click", () => openCompanion(entry.parentId)).addTo(layer);
+    }
+    layer.addTo(map);
+    return { layer, uavMarker };
+  }
+  function updateCompanionLayers() {
+    if (!map) return;
+    const keep = new Set();
+    companionMapPlan(fleet).forEach((entry) => {
+      keep.add(entry.key);
+      cmpLatest[entry.key] = entry;
+      const sig = planSignature(entry), cur = cmpLayers[entry.key];
+      if (cur && cur.sig === sig) {
+        // Same drawing, but the stale marker's age label moves with time: refresh that one icon
+        // in place (as the USV markers do every poll) rather than rebuilding the whole layer.
+        if (cur.uavMarker && entry.uav) cur.uavMarker.setIcon(uavIcon(entry));
+        return;
+      }
+      if (cur) map.removeLayer(cur.layer);
+      cmpLayers[entry.key] = { ...buildCompanionLayer(entry), sig };
+    });
+    clearCompanionLayers(keep);
+  }
+  // Remove every companion layer not in `keep` (all of them by default — page cleanup).
+  function clearCompanionLayers(keep = new Set()) {
+    Object.keys(cmpLayers).forEach((k) => {
+      if (keep.has(k)) return;
+      if (map) map.removeLayer(cmpLayers[k].layer);
+      delete cmpLayers[k];
+      delete cmpLatest[k];
+    });
   }
 
   // ---- Pixhawk mission (view-only readback + map overlay) ------------------
@@ -2329,12 +2499,15 @@ export function Map(root) {
       // tracked command id) across a switch.
       if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
       setHome = { phase: "idle", code: null, message: null, at: 0, cmdId: null };
+      // A companion panel belongs to ONE parent: never carry it onto another vehicle.
+      cmpOpenFor = null;
     }
     // Snap the map to the selected vehicle (only if it has a known position — a
     // never-contacted vehicle has none, so there is nothing to snap to).
     const v = fleet.find((x) => x.id === id);
     if (map && v && v.lat != null && v.lng != null) map.panTo([v.lat, v.lng]);
     renderDock(); renderPxm(); syncMissionOverlay(); renderInspector(); updateMarkers(); updateHomeMarker();
+    renderCompanionPanel();
     // The approved-plan reference follows the selected vehicle (per-USV, like every other
     // overlay) and is redrawn from THIS vehicle's own record.
     drawOriginalOverlay(id); renderReplanBanner();
@@ -2368,6 +2541,7 @@ export function Map(root) {
       noteRevisionEvidence(selId);
     }
     updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
+    updateCompanionLayers(); renderCompanionPanel();
     updateRibbon({ counts: counts() });
   }
 
@@ -2460,6 +2634,7 @@ export function Map(root) {
     authCtl.dispose();
     clearMissionOverlay();
     clearOriginalOverlay();
+    clearCompanionLayers();
     detachMapLayout();
     if (map) { map.remove(); map = null; }
   };

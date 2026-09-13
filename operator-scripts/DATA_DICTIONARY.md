@@ -119,6 +119,38 @@ Rules: ✕/fault means "expected but broken", never "not installed" (that's N/A)
 | `water_quality` | object | `measurements.water_quality` | Vehicle (Sensors) | 1 s | yes | shape TBD — show "streaming" until modeled |
 | `bathymetry` | object | `measurements.bathymetry` | Vehicle (Sensors) | 1 s | yes | |
 
+## Companions (UAV via Scout) — `companion-v2`
+Wire format Scout must send: **`COMPANION_CONTRACT.md`** (full reference) / **`SCOUT_INTEGRATION_HANDOFF.md`** (concise, for the Scout-side developer). Status: PROPOSED — operator side implemented, Scout side not yet. `companion-v1` was proposed but never adopted by any real Scout build; v2 is a deliberate, breaking revision (a v1-shaped block is rejected like any other unrecognised schema) that adds snapshot-level ordering and a three-number freshness model. A companion is not a fleet vehicle: it lives on its PARENT's row, is written only by the parent's own packets, and has no command path. Every fleet row (never-contacted included) carries `companions`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `companions.reported` / `cleared` | bool | has this vehicle ever sent a well-formed block / is the current set explicitly empty |
+| `companions.block_age_s` | s (monotonic) | since the last well-formed block (omission ≠ clear) |
+| `companions.session` | {id, seq, age_s} \| null | the accepted snapshot session/seq — see **Snapshot ordering** below |
+| `companions.rejections` | {count, by_reason, last_reason} | validation refusals, per reason |
+| `items[].companion_id` / `vehicle_type` / `display_name` | string | stable id; token (`UAV`); display only |
+| `items[].parent_id` | canonical id | always equals the row's `id` (enforced at ingest, re-checked in the UI) |
+| `items[].assignment_state` | `ASSIGNED\|UNASSIGNED\|UNKNOWN` | the dock chip appears only for ASSIGNED |
+| `items[].status_age_s` | s (monotonic) | since a Scout packet last LISTED this companion — the currency of every Scout claim below |
+| `items[].link` | {state, last_peer_contact: *freshness*\|null} | Scout's own Scout↔UAV link claim + freshness of the last peer contact. No RSSI. |
+| `items[].activity` | {state, task_id, route_revision} \| null | Scout-reported task |
+| `items[].position` | {lat, lng, heading_deg, altitude_m, altitude_ref, ...*freshness*} \| null | freshness fields merged in flat |
+| `items[].battery` / `inspection` | {remaining_pct \| progress_pct, ...*freshness*} \| null | inspection shown only when reported; never a coverage/safety claim |
+| `items[].hazards[]` | {hazard_id, revision, source, kind, observed: *freshness*, geometry, uncertainty_m, exclusion, disposition{state, reason, decided: *freshness*\|null}, replan{state, mission_revision, route_hash, reason, updated: *freshness*\|null}\|null} | geometry: `{type:"point",lat,lng}` or `{type:"polygon",ring_latlng:[[lat,lng],…]}` |
+| `items[].hazards_reported` / `hazards_age_s` | bool / s (monotonic) | whether a hazard list was ever sent; since it was last refreshed |
+
+**Freshness object** (`*freshness*` above) — replaces the old single `age_s`, everywhere a Scout-supplied timestamp is involved: `{observed_at, min_age_s, reporting_delay_s, estimated_age_s, freshness_quality, clock_anomaly}`.
+- `observed_at` — the source timestamp, Scout clock, preserved verbatim.
+- `min_age_s` — a mathematically guaranteed LOWER BOUND (Scout-clock delta + local **monotonic** elapsed time since receipt). Assumes zero delivery delay; can only understate the true age.
+- `reporting_delay_s` — an ESTIMATE of how long the envelope took to arrive (operator wall clock − Scout's envelope timestamp, clamped ≥ 0). Conflates real transit delay with any Scout↔operator clock offset — never proof.
+- `estimated_age_s` — `min_age_s + reporting_delay_s`, a best-effort correction. Exposed alongside `min_age_s`, never instead of it.
+- `freshness_quality` — `BOUNDED` (all three numbers valid) or `UNKNOWN` (no envelope timestamp — every number above is `null`, never a fabricated zero).
+- `clock_anomaly` — `true` when the envelope's own timestamp looks like it is from the future relative to the operator's wall clock at receipt (the two clocks disagree, or one jumped).
+
+**Snapshot ordering** — per-hazard `revision` protects one object's content; it says nothing about *membership* (a hazard can vanish from a list with no revision of its own). `companions.session {id, seq}` is the block-level ordering primitive: `seq` must strictly increase within a `session` on any content change including a removal. A block whose `seq` is behind the one already applied for its `session` is rejected wholesale (membership untouched), even though the *envelope* itself passed `main.py`'s own per-vehicle monotonic timestamp guard — that guard only proves the envelope is not a replay, not that the companion payload inside it is current. A different `session.id` is trusted as a genuine publisher restart (never ordered lexicographically against the old one) — see `companion_telemetry.py`'s `_apply_session` for the full, documented policy and its one acknowledged gap (an envelope with no timestamp defeats the outer guard entirely, and a session change then has no ordering protection — Scout must always send an envelope timestamp).
+
+UI states (`operator/lib/companion.js`): chip **ACTIVE / IDLE / STALE / LOST / UNKNOWN** in text + colour. STALE whenever Scout is not CONNECTED, has not listed the companion for > 15 s, reports DEGRADED, its last peer contact is > 15 s old (by the EFFECTIVE, delay-inclusive age — see `evidenceView`), or the evidence's freshness is UNKNOWN. A UAV position older than 10 s (effective age) is drawn stale. A hazard reads as an accepted exclusion **only** for `disposition.state = ACCEPTED`; a missing replan outcome reads "not reported". A notable reporting delay (> 5 s) is surfaced in the age text itself ("at least Ns ago (delivery delay ~Ds)"), never silently folded away.
+
 ## Events & notifications
 | Field | Type | Source | Pages | Freq | Opt | Notes |
 |---|---|---|---|---|---|---|

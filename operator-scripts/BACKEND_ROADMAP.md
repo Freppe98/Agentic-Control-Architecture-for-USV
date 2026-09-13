@@ -173,6 +173,16 @@ The Experiment page injects controlled comms impairment between the Operator Sta
 | camera feed / frame state (LIVE/FROZEN/NO SIGNAL) | Video, Pilot | USV camera → Agent | A-out (stream or snapshot URL) | 15–30 fps | A | No data received | P2 |
 | onboard dashboard embed + reachability | Pilot | Operator backend | B-field (needs `onboard_ip` + reach probe) | on nav | C | Feature unavailable | P2 |
 
+## Companions — UAV via Scout (`companion-v2`, proposed 2026-09-12, revised 2026-09-13)
+Contract: [`COMPANION_CONTRACT.md`](COMPANION_CONTRACT.md) (reference) / [`SCOUT_INTEGRATION_HANDOFF.md`](SCOUT_INTEGRATION_HANDOFF.md) (concise, for the Scout-side developer). **Operator side done** (ingest, snapshot session/seq ordering, three-number freshness model, validation, dock chip, panel, map overlays, opt-in fixture); **Scout side not started**. v2 is a deliberate breaking revision over the original v1 proposal — v1 lacked snapshot-level ordering and collapsed observation age into one number that could read "fresh" for an envelope that was actually delayed in transit; see `companion_telemetry.py`'s module docstring for the full rationale.
+
+| Slot | Pages | Owner | Disp. | Rate | Path | Operator label | Prio |
+|---|---|---|---|---|---|---|---|
+| `payload.companions` — assignment, link state + last peer contact, activity, position, battery, inspection, `session {id, seq}` | Map dock chip + companion panel, Map UAV marker | Local Agent (Scout) | A-out | with each status packet (~1 Hz); `seq` bumps on ANY content change | B | not reported / last known / timing unknown | P1 |
+| `companions.items[].hazards[]` + Scout `disposition` + `replan` outcome | Map hazard overlay, companion panel | Local Agent (Scout) | A-out | complete snapshot in each packet; per-hazard revision bump on change | B | Proposed · Accepted by Scout · Replanning … · not reported | P1 |
+| Scout-side clock-offset/delivery-delay evidence beyond the operator's own reporting_delay_s estimate | companion panel (age text) | Local Agent (Scout) | A-out, optional, not yet designed | — | — | (falls back to the operator's own conflated estimate) | P3 |
+| UAV↔Scout radio transport, UAV flight control, onboard perception, obstacle-replanning execution | — | Scout / UAV | outside the operator contract | — | — | — (no UI until real) | — |
+
 ## Drop / derive (should not become backend fields)
 - **`endurance` (min)** — F-derive from battery % and current draw when voltage/current land; no dedicated field.
 - **`compass declination`** — F-derive from lat/lng via a WMM table; not a telemetry field.

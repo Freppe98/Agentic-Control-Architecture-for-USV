@@ -465,6 +465,60 @@ a { color:inherit; }
    outdoor light and without relying on colour alone. */
 .usv-marker .staledash { position:absolute; left:50%; top:50%; width:30px; height:30px; transform:translate(-50%,-50%); border-radius:50%; border:2px dashed currentColor; opacity:.75; }
 
+/* ---------- UAV companion (reported via Scout) — observations only ----------
+   A diamond, never a circle, so it can never read as a USV; neutral white so it never borrows
+   a comm-state colour it has not earned. State lives in words (the chip / tag text) as well as
+   in colour, and "stale" is a dashed SHAPE, as it is for the USV marker. */
+.cmp-chip { margin-top:3px; font-family:var(--font-mono); font-size:9px; letter-spacing:.06em; font-weight:700; padding:2px 6px; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel); color:var(--muted); cursor:pointer; white-space:nowrap; transition:border-color var(--t-hover); }
+.cmp-chip:hover { border-color:var(--accent); }
+.cmp-chip.st-active, .cmp-state.st-active { color:var(--connected); border-color:rgba(62,207,142,.4); background:rgba(62,207,142,.08); }
+.cmp-chip.st-idle, .cmp-state.st-idle { color:var(--accent-bright); border-color:rgba(76,141,255,.36); background:var(--accent-dim); }
+.cmp-chip.st-stale, .cmp-state.st-stale { color:var(--caution); border-color:rgba(242,169,59,.5); border-style:dashed; background:rgba(242,169,59,.06); }
+.cmp-chip.st-lost, .cmp-state.st-lost { color:var(--disconnected); border-color:rgba(229,72,77,.5); background:rgba(229,72,77,.08); }
+.cmp-chip.st-unknown, .cmp-state.st-unknown { color:var(--dim); border-style:dotted; }
+/* Capped so an open panel scrolls inside itself instead of squeezing the vehicle roster. */
+.cmp-panel { max-height:32%; }
+.cmp-panel .pxm-h { align-items:center; }
+.cmp-close { background:transparent; border:1px solid var(--line-strong); color:var(--muted); border-radius:4px; width:18px; height:18px; line-height:1; cursor:pointer; font-size:12px; padding:0; }
+.cmp-close:hover { color:var(--text); border-color:var(--accent); }
+.cmp-item { display:flex; flex-direction:column; gap:7px; }
+.cmp-name { display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 8px; font-size:13px; font-weight:600; }
+.cmp-name .cmp-state { margin-left:auto; }
+.cmp-via { font-size:10.5px; font-weight:400; color:var(--muted); }
+.cmp-sub { font-size:10px; color:var(--muted); text-align:right; }
+.cmp-sub-i { font-size:10px; color:var(--muted); }
+.cmp-lk { display:block; margin-top:2px; font-size:8.5px; letter-spacing:.06em; font-weight:700; color:var(--caution); text-align:right; }
+.cmp-hz { display:flex; flex-direction:column; gap:3px; padding:6px 0 2px 8px; border-left:2px solid #F2A93B; }
+.cmp-hz.hz-proposed { border-left-style:dashed; }
+.cmp-hz.hz-accepted { border-left-color:#D946EF; }
+.cmp-hz.hz-dismissed { border-left-color:#8C9BAB; border-left-style:dotted; }
+.cmp-hz.is-stale { opacity:.7; }
+.cmp-hz-disp { font-size:11.5px; color:var(--text); }
+.cmp-tip-state { font-family:var(--font-mono); font-size:9px; letter-spacing:.06em; font-weight:700; margin-bottom:4px; color:#F2A93B; }
+.cmp-tip-state.hz-accepted { color:#D946EF; }
+.cmp-tip-state.hz-dismissed { color:#8C9BAB; }
+.cmp-tip-note { margin-top:4px; font-size:10.5px; color:var(--muted); max-width:240px; white-space:normal; }
+.cmp-lk-tag { color:var(--caution); border-color:rgba(242,169,59,.45); background:rgba(242,169,59,.1); }
+/* Clock/delivery-delay anomaly — distinct from staleness: it means the age NUMBERS above it may
+   be unreliable beyond the guaranteed lower bound, not that the value itself is wrong or old. */
+.cmp-clockwarn { margin-top:3px; font-size:10px; font-weight:600; color:var(--warn); }
+/* companion tooltips reuse the waypoint-popup rows, so they need the same dark shell */
+.leaflet-tooltip.cmp-tip { background:var(--panel); color:var(--text); border:1px solid var(--line-strong); border-radius:var(--r); box-shadow:var(--shadow-1); padding:8px 10px; white-space:nowrap; }
+.leaflet-tooltip.cmp-tip::before { display:none; }
+.uav-marker { position:relative; width:30px; height:30px; display:flex; align-items:center; justify-content:center; }
+.uav-marker .uav-body { width:12px; height:12px; transform:rotate(45deg); background:#E6EDF3; border:2px solid #070C11; box-shadow:0 0 0 1.5px #E6EDF3, 0 1px 3px rgba(0,0,0,.6); }
+.uav-marker.is-stale .uav-body { background:rgba(9,13,18,.6); border:2px dashed #E6EDF3; box-shadow:none; }
+.uav-marker .uav-hdg { position:absolute; inset:0; display:flex; justify-content:center; pointer-events:none; }
+.uav-marker .uav-hdg span { font-size:9px; line-height:1; color:#E6EDF3; text-shadow:0 0 2px #070C11, 0 0 2px #070C11; }
+.uav-marker .uav-tag { position:absolute; top:27px; left:50%; transform:translateX(-50%); font-family:var(--font-mono); font-size:9px; font-weight:700; color:#E6EDF3; background:rgba(9,13,18,.9); padding:0 3px; border-radius:3px; border:1px solid var(--line-strong); white-space:nowrap; }
+.uav-marker.is-stale .uav-tag { color:var(--caution); border-color:var(--caution); }
+.uav-marker.st-lost .uav-tag { color:var(--disconnected); border-color:var(--disconnected); }
+.li-ic.uav { width:10px; height:10px; margin:3px 2px 0; transform:rotate(45deg); background:#E6EDF3; border:1.5px solid #070C11; }
+.li-ic.hzprop { background:rgba(242,169,59,.12); border:1.5px dashed #F2A93B; border-radius:2px; }
+.li-ic.hzacc { background:rgba(217,70,239,.22); border:2px solid #D946EF; border-radius:2px; }
+.li-ic.hzdis { background:transparent; border:1.5px dotted #8C9BAB; border-radius:2px; }
+.li-ic.hzstale { background:rgba(242,169,59,.05); border:1.5px dashed rgba(242,169,59,.45); border-radius:2px; opacity:.7; }
+
 /* ---------- inspector ---------- */
 .inspector { grid-row:2; grid-column:4; background:var(--panel); border-left:1px solid var(--line); min-height:0; min-width:0; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain; }
 .isec { padding:var(--sp-4); border-bottom:1px solid var(--line); }
