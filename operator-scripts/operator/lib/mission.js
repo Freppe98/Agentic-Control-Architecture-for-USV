@@ -106,3 +106,19 @@ export function fmtDuration(s) {
   const h = Math.floor(m / 60);
   return `${h}h ${m % 60}m`;
 }
+
+/**
+ * ETA text for an operator-facing readout — ALWAYS remaining time, never an arrival
+ * clock. Distinguishes the two ways an estimate can be legitimately unavailable rather
+ * than collapsing both to one generic dash: `remDistM` known but `etaS` null means
+ * etaSeconds rejected the speed (missing, or too near zero to trust — see etaSeconds),
+ * so the honest reason is "no speed"; `remDistM` itself null means progress/position
+ * isn't known yet, so there is nothing to blame speed for. Never invents a nominal
+ * speed and never fabricates a plausible-looking duration.
+ * @param etaS seconds remaining, or null (etaSeconds's output)
+ * @param remDistM remaining distance in metres, or null (remainingRouteDistanceM's output)
+ */
+export function etaBarText(etaS, remDistM) {
+  if (etaS != null) return `ETA ${fmtDuration(etaS)}`;
+  return remDistM != null ? "ETA — no speed" : "ETA —";
+}

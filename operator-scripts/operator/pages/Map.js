@@ -15,12 +15,12 @@ import { StatusBadges } from "../components/StatusBadges.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { CompanionPanel } from "../components/CompanionPanel.js";
 import { companionMapPlan, planSignature, fmtEvidenceAge } from "../lib/companion.js";
-import { COL, cls, commState, fmtAge, pad3, noTelem, opsStale } from "../lib/ui.js";
+import { COL, cls, commState, fmtAge, pad3, opsStale } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
 import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
 import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
-import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, fmtDuration } from "../lib/mission.js";
+import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, etaBarText } from "../lib/mission.js";
 import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
 import { MISSION_WRITE_COMMANDS, missionWriteNeedsRefetch } from "../lib/mission-refresh.js";
@@ -304,7 +304,6 @@ export function Map(root) {
        <div class="veh-list" id="veh-list"><div class="empty-state" style="padding:10px 12px">Connecting…</div></div>
        <div class="pxm cmp-panel" id="cmp-panel" style="display:none" aria-live="polite"></div>
        <div class="pxm" id="pxm"></div>
-       <div class="mprog" id="mprog"></div>
      </div>
      <div class="map-wrap">
        <div class="map-stage" id="map-stage">
@@ -349,7 +348,7 @@ export function Map(root) {
        </div>
        <div class="mission-progress-bar" id="mpbar" style="display:none">
          <div class="mpb-fill" id="mpb-fill" style="width:0%"></div>
-         <div class="mpb-label" id="mpb-label"></div>
+         <div class="mpb-label" id="mpb-label" title="ETA is estimated time REMAINING, not an arrival clock time"></div>
        </div>
      </div>
      <aside class="inspector" id="inspector"></aside>`;
@@ -438,33 +437,6 @@ export function Map(root) {
       e.stopPropagation();
       openCompanion(canonicalVehicleId(b.dataset.cmpParent));
     }));
-
-    // Mission progress for the SELECTED vehicle — real waypoint counts + remaining
-    // distance/ETA from the Pixhawk mission readback (lib/mission.js), the same numbers
-    // the bottom-of-map progress bar shows. Falls back to the (optional) per-vehicle
-    // coverage field when no mission is loaded yet, then to an honest empty state —
-    // never a fabricated percentage.
-    const ms = selectedMissionStats();
-    const cov = fleet.map((v) => v.coverage).find((c) => c != null);
-    let body;
-    if (ms && ms.pct != null) {
-      body = `<div class="top"><span class="lbl">Waypoints</span><span class="pct mono">${ms.pct}%</span></div>
-           <div class="bar"><i style="width:${ms.pct}%;background:var(--connected)"></i></div>
-           <div class="mgrid">
-             <div><span class="lbl">Remaining</span><span class="v">${ms.remaining} / ${ms.total}</span></div>
-             <div><span class="lbl">ETA</span><span class="v">${ms.etaS != null ? fmtDuration(ms.etaS) : noTelem("no speed")}</span></div>
-           </div>`;
-    } else if (cov != null) {
-      body = `<div class="top"><span class="lbl">Coverage</span><span class="pct mono">${cov}%</span></div>
-           <div class="bar"><i style="width:${cov}%;background:var(--connected)"></i></div>
-           <div class="mgrid">
-             <div><span class="lbl">Remaining</span><span class="v">${noTelem()}</span></div>
-             <div><span class="lbl">ETA</span><span class="v">${noTelem()}</span></div>
-           </div>`;
-    } else {
-      body = `<div class="no-telem-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>No mission loaded for the selected vehicle</div>`;
-    }
-    document.getElementById("mprog").innerHTML = `<div class="row"><span class="lbl">Mission progress</span></div>` + body;
   }
 
   // ---- UAV companion (reported via Scout) — read-only observations ----------
@@ -1201,17 +1173,36 @@ export function Map(root) {
 
   // Bottom-of-map mission-progress strip (H1, operational review) — the map surface
   // itself now shows "how much of the survey is left", not just a text chip in the
-  // side panel. Hidden entirely when there is nothing real to show (no mission loaded,
-  // or no vehicle selected) rather than rendering a fabricated 0%.
+  // side panel. It is the ONLY place Map.js shows mission progress (the old dock card
+  // duplicated these same numbers and is gone), still driven entirely by
+  // selectedMissionStats() so there is exactly one waypoint/ETA calculation on this
+  // page. Hidden entirely when there is nothing real to show (no mission loaded, or no
+  // vehicle selected) rather than rendering a fabricated 0%.
+  //
+  // ETA is always REMAINING time (etaSeconds → fmtDuration), never an arrival clock —
+  // and never invented: "no speed" only when the remaining distance is real but speed
+  // isn't (the same distinction Mission.js's Overview tab makes), a bare "—" when even
+  // the distance is unknown. Switching vehicles re-runs this from the newly-selected
+  // vehicle's own fleet row + mission cache, so no stale ETA can survive a switch.
   function renderMissionBar() {
     const bar = document.getElementById("mpbar");
     if (!bar) return;
     const ms = selectedMissionStats();
-    if (!ms || ms.pct == null) { bar.style.display = "none"; return; }
+    if (!ms || ms.pct == null) {
+      // Hidden AND cleared — belt-and-braces so a vehicle switch can never leave the
+      // previous vehicle's text sitting in the DOM (invisible today, but nothing here
+      // relies on "hidden" alone to keep one vehicle's numbers off another's display).
+      bar.style.display = "none";
+      document.getElementById("mpb-fill").style.width = "0%";
+      document.getElementById("mpb-label").textContent = "";
+      return;
+    }
     bar.style.display = "flex";
     document.getElementById("mpb-fill").style.width = ms.pct + "%";
     document.getElementById("mpb-label").textContent =
-      `WP ${ms.completed}/${ms.total} · ${ms.pct}%` + (ms.remDistM != null ? ` · ${fmtDistance(ms.remDistM)} remaining` : "");
+      `WP ${ms.completed}/${ms.total} · ${ms.pct}%`
+      + (ms.remDistM != null ? ` · ${fmtDistance(ms.remDistM)} remaining` : "")
+      + ` · ${etaBarText(ms.etaS, ms.remDistM)}`;
   }
 
   function tickPxmAge() {

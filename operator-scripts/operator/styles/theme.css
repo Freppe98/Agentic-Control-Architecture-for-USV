@@ -11,7 +11,7 @@ html,body { height:100%; margin:0; overflow:hidden; }
    Configuration page two of four threshold rows and two of three registry vehicles), so
    the invariant is declared once here for every scrolling column in the app rather than
    rediscovered per component. */
-.veh-list > *, .mprog > *, .pxm > *, .legend-body > *, .stub > *,
+.veh-list > *, .pxm > *, .legend-body > *, .stub > *,
 .cfg > *, .mission-body > *, .fleet-picklist > *, .fleet-sumlist > *,
 .evbar > *, .plan-tools > * { flex-shrink:0; }
 body {
@@ -218,8 +218,11 @@ a { color:inherit; }
 /* ---------- left dock (roster + panels) ---------- */
 .dock { grid-row:2; grid-column:2; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0; min-width:0; overflow:hidden; }
 .dock-h { flex:none; display:flex; align-items:center; justify-content:space-between; padding:12px 14px 9px; }
-/* the roster is the ONLY part of the dock that scrolls; the fixed cards below it keep
-   their space, so mission progress is never pushed out of the viewport */
+/* flex:1 1 auto — the roster is the ONLY part of the dock that grows/scrolls. The
+   fixed cards below it (companion panel, Pixhawk mission) keep their own content
+   height (flex:0 1 auto); whatever space they don't use, the roster claims — so there
+   is no separately-reserved "mission progress" slot to leave empty when a card below
+   is short (see the bottom-of-map strip, .mission-progress-bar, for that number now). */
 .veh-list { flex:1 1 auto; min-height:0; overflow-y:auto; padding:0 10px 10px; display:flex; flex-direction:column; gap:5px; }
 .vrow { display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:11px; padding:11px; border-radius:var(--r); cursor:pointer; border:1px solid transparent; background:var(--panel-2); transition:background var(--t-hover), border-color var(--t-hover), transform var(--t-fast); }
 .vrow:hover { background:var(--raise); } .vrow:active { transform:translateY(1px); }
@@ -231,10 +234,6 @@ a { color:inherit; }
 .vrow .sub { font-family:var(--font-mono); font-size:10.5px; color:var(--muted); border:none; background:transparent; border-radius:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .vrow .mid { display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
 .vrow .bt { font-family:var(--font-mono); font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
-.mprog { flex:0 1 auto; min-height:0; overflow-y:auto; border-top:1px solid var(--line); padding:13px 14px 15px; background:var(--panel-2); display:flex; flex-direction:column; gap:11px; }
-.mprog .row { display:flex; align-items:center; justify-content:space-between; }
-.mprog .top { display:flex; align-items:baseline; justify-content:space-between; }
-.mprog .pct { font-family:var(--font-mono); font-size:24px; line-height:1; }
 .mgrid { display:grid; grid-template-columns:1fr 1fr; gap:11px 14px; }
 .mgrid div { display:flex; flex-direction:column; gap:3px; }
 .mgrid .v { font-family:var(--font-mono); font-size:var(--fs-base); }
@@ -419,10 +418,13 @@ a { color:inherit; }
 
 /* bottom-of-map mission-progress strip — 0-100% waypoint completion for the selected
    vehicle, on the map surface itself (not just a side-panel chip). Hidden entirely
-   (see renderMissionBar) when no mission is loaded, never a fabricated 0%. */
-.mission-progress-bar { grid-row:2; position:relative; height:28px; background:var(--panel-2); border-top:1px solid var(--line-strong); display:flex; align-items:center; z-index:var(--z-page-bar); overflow:hidden; }
+   (see renderMissionBar) when no mission is loaded, never a fabricated 0%. This is now
+   the ONLY progress/ETA readout on the Map page (the dock's old duplicate card is
+   gone) — min-height, not a fixed height, so a narrow viewport that wraps the label to
+   two lines grows the strip instead of clipping it. */
+.mission-progress-bar { grid-row:2; position:relative; min-height:34px; padding:6px 16px; background:var(--panel-2); border-top:1px solid var(--line-strong); display:flex; align-items:center; justify-content:center; z-index:var(--z-page-bar); overflow:hidden; }
 .mpb-fill { position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg, rgba(62,207,142,.28), rgba(62,207,142,.4)); transition:width var(--t-slow); }
-.mpb-label { position:relative; margin:0 auto; font-family:var(--font-mono); font-size:11px; letter-spacing:.04em; color:var(--text); font-variant-numeric:tabular-nums; }
+.mpb-label { position:relative; margin:0 auto; max-width:100%; font-family:var(--font-mono); font-size:12.5px; letter-spacing:.03em; line-height:1.4; color:var(--text); font-variant-numeric:tabular-nums; text-align:center; overflow-wrap:anywhere; }
 
 /* transient command-result toast (replaces window.alert). Sits BELOW whatever the top
    corners already hold, so a command result never lands on top of the status banner or
