@@ -161,6 +161,26 @@ export function homeStatus(v, { phase = "idle", failMessage = null, now = Date.n
   };
 }
 
+/**
+ * Compact Home-verification label for a control that has no room for a sentence (the
+ * Map's Set Home button carries this as its secondary line). Pure state → {text, cls}
+ * mapping off `hs.state` (from homeStatus() above) ONLY — never from a command's own
+ * result, so a successful click or HTTP response alone can never read as "Verified"
+ * here; only Scout's own next-polled status (which flips hs.state) can.
+ *
+ * Four distinct texts, not three: "Unknown" (Scout has never reported a Home at all)
+ * is kept apart from "Not verified" (Scout reports one, just not at this site) even
+ * though the button-enablement policy treats both as "not verified" — the operator-
+ * facing wording must not blur "nothing to verify yet" into "verification failed".
+ */
+export function homeButtonState(hs) {
+  if (!hs) return { text: "Unknown", cls: "dim" };
+  if (hs.state === "verified") return { text: "Verified", cls: "ok" };
+  if (hs.state === "pending") return { text: "Setting…", cls: "pending" };
+  if (hs.state === "unknown") return { text: "Unknown", cls: "dim" };
+  return { text: "Not verified", cls: "warn" }; // hs.state === "unverified"
+}
+
 // Commands the Home-verification interlock disables until Home is VERIFIED. Each
 // reason is the ONE place its hover copy is authored — the single contextual
 // explanation shown on the button itself (see the UI cleanup: the permanent

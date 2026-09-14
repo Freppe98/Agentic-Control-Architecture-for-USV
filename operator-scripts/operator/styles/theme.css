@@ -232,8 +232,13 @@ a { color:inherit; }
 .vrow .nm { font-family:var(--font-mono); font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .vrow .act { font-size:12px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .vrow .sub { font-family:var(--font-mono); font-size:10.5px; color:var(--muted); border:none; background:transparent; border-radius:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.vrow .mid { display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
-.vrow .bt { font-family:var(--font-mono); font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
+/* Battery lives INSIDE .sub now (activity/last-contact · battery), not a separate right-hand
+   column — its own colour (low/critical) overrides the line's inherited colour because a direct
+   rule on the span always wins over one inherited from an ancestor. */
+.vrow .sub .vb { font-weight:600; font-variant-numeric:tabular-nums; }
+/* The row's one reserved right-edge slot — the companion tab (opt-in, .cmp-tab below). Never
+   holds anything else, so a page that doesn't ask for companions simply has no third column. */
+.vrow-cmp { flex:none; }
 .mgrid { display:grid; grid-template-columns:1fr 1fr; gap:11px 14px; }
 .mgrid div { display:flex; flex-direction:column; gap:3px; }
 .mgrid .v { font-family:var(--font-mono); font-size:var(--fs-base); }
@@ -243,6 +248,12 @@ a { color:inherit; }
    shrink and scroll internally on a short laptop rather than pushing the roster — or
    themselves — out of the dock. */
 .pxm { flex:0 1 auto; min-height:0; overflow-y:auto; border-top:1px solid var(--line); padding:12px 14px 14px; background:var(--panel-2); display:flex; flex-direction:column; gap:9px; }
+/* The Pixhawk Mission card specifically (id, not the shared .pxm class the companion panel
+   also carries — see CompanionPanel/.cmp-panel, which keeps the roomier base above): tighter
+   padding/gap after moving the download-age and Home-verification rows into the action
+   buttons, so the freed height goes to the vehicle roster above rather than sitting empty. */
+#pxm { padding:9px 12px 10px; gap:6px; }
+#pxm .pxm-grid { gap:4px; }
 .pxm .pxm-h { display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .pxm-chip { font-family:var(--font-mono); font-size:9.5px; letter-spacing:.04em; text-transform:uppercase; font-weight:600; padding:3px 8px; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel); color:var(--muted); white-space:nowrap; }
 .pxm-chip.ok { color:var(--connected); border-color:rgba(62,207,142,.3); background:rgba(62,207,142,.08); }
@@ -272,6 +283,27 @@ a { color:inherit; }
 .pxm-toggle { grid-column:span 2; display:inline-flex; align-items:center; justify-content:center; gap:6px; }
 .pxm-toggle svg { width:14px; height:14px; flex:none; }
 .pxm-toggle[aria-pressed="true"]:not(:disabled) { border-color:var(--connected); }
+/* Refresh / Set Home carry a second, smaller line (mission-download age; Home verification
+   state) INSIDE the same button — not a separate row, not a second control, so the row stays
+   short and a click anywhere on the button (either line) fires the one handler exactly once.
+   This row is allowed to run a little taller than the plain single-line Hide/Center row below
+   it to make room for that second line without wrapping the main label. */
+.pxm-btns2 button { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px; padding:6px 4px 7px; text-align:center; }
+.pxm-btn-main { font-size:12px; font-weight:600; line-height:1.15; }
+/* No letter-spacing and the smallest legible size — this line has the least room of any
+   text on the card (a narrow laptop dock leaves each of the two buttons ~75-90px), so
+   "Last download Ns ago" stays to two lines instead of three at 1366px-class widths. */
+.pxm-btn-sub { font-family:var(--font-mono); font-size:9px; letter-spacing:0; line-height:1.25; color:var(--muted); white-space:normal; overflow-wrap:break-word; max-width:100%; }
+/* Same restrained palette the rest of the card's chips use — text colour only, no pill
+   background, so it reads as a caption rather than a second status badge. */
+.pxm-btn-sub.ok { color:var(--connected); }
+.pxm-btn-sub.warn { color:var(--caution); }
+.pxm-btn-sub.dim { color:var(--dim); }
+.pxm-btn-sub.pending { color:var(--accent-bright); }
+/* The state word must stay legible even while the button is disabled (e.g. Set Home locked
+   by the interlock) — the default .42 disabled fade the other pxm buttons use is too faint
+   for that to hold, so this row gets a lighter fade of its own. */
+#pxm .pxm-btns2 button:disabled { opacity:.64; }
 
 /* mission overlay — small, discreet numbered waypoints that stay subordinate to the
    round comm-colored vehicle dot. Rounded-square so they never read as a vehicle. */
@@ -468,16 +500,36 @@ a { color:inherit; }
 .usv-marker .staledash { position:absolute; left:50%; top:50%; width:30px; height:30px; transform:translate(-50%,-50%); border-radius:50%; border:2px dashed currentColor; opacity:.75; }
 
 /* ---------- UAV companion (reported via Scout) — observations only ----------
-   A diamond, never a circle, so it can never read as a USV; neutral white so it never borrows
-   a comm-state colour it has not earned. State lives in words (the chip / tag text) as well as
-   in colour, and "stale" is a dashed SHAPE, as it is for the USV marker. */
-.cmp-chip { margin-top:3px; font-family:var(--font-mono); font-size:9px; letter-spacing:.06em; font-weight:700; padding:2px 6px; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel); color:var(--muted); cursor:pointer; white-space:nowrap; transition:border-color var(--t-hover); }
-.cmp-chip:hover { border-color:var(--accent); }
-.cmp-chip.st-active, .cmp-state.st-active { color:var(--connected); border-color:rgba(62,207,142,.4); background:rgba(62,207,142,.08); }
-.cmp-chip.st-idle, .cmp-state.st-idle { color:var(--accent-bright); border-color:rgba(76,141,255,.36); background:var(--accent-dim); }
-.cmp-chip.st-stale, .cmp-state.st-stale { color:var(--caution); border-color:rgba(242,169,59,.5); border-style:dashed; background:rgba(242,169,59,.06); }
-.cmp-chip.st-lost, .cmp-state.st-lost { color:var(--disconnected); border-color:rgba(229,72,77,.5); background:rgba(229,72,77,.08); }
-.cmp-chip.st-unknown, .cmp-state.st-unknown { color:var(--dim); border-style:dotted; }
+   The dock-row TAB (.cmp-tab) and the card-header dot (.cmp-tab-dot) share ONE four-way palette —
+   green/yellow/red/grey — for Scout-REPORTED LINK CONDITION only (see lib/companion.js's
+   companionTab(): activity is a separate fact, shown separately, never folded into this colour).
+   Grey is the deliberately "loud" default: no assignment, no current report, or a LOST claim
+   this session has no prior CONNECTED/DEGRADED evidence for — red is earned, never assumed. */
+.cmp-tab { flex:none; width:26px; height:26px; display:flex; align-items:center; justify-content:center; border-radius:var(--r-sm); border:1px solid var(--line-strong); background:var(--panel); color:var(--dim); cursor:pointer; transition:border-color var(--t-hover), background var(--t-hover), color var(--t-hover), transform var(--t-fast); }
+.cmp-tab svg { width:15px; height:15px; pointer-events:none; }
+.cmp-tab:hover { border-color:var(--accent); }
+.cmp-tab:active { transform:translateY(1px); }
+.cmp-tab.is-open { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+.cmp-tab.lvl-green { color:var(--connected); border-color:rgba(62,207,142,.45); background:rgba(62,207,142,.10); }
+.cmp-tab.lvl-yellow { color:var(--caution); border-color:rgba(242,169,59,.5); background:rgba(242,169,59,.10); }
+.cmp-tab.lvl-red { color:var(--disconnected); border-color:rgba(229,72,77,.5); background:rgba(229,72,77,.10); }
+.cmp-tab.lvl-grey { color:var(--dim); border-style:dashed; }
+/* The same colour, small, inline in the companion card's own header — so a viewer never has to
+   cross-reference the dock row to know which link condition the open card belongs to. */
+.cmp-tab-dot { display:inline-flex; width:16px; height:16px; align-items:center; justify-content:center; border-radius:4px; flex:none; align-self:center; }
+.cmp-tab-dot svg { width:11px; height:11px; }
+.cmp-tab-dot.lvl-green { color:var(--connected); background:rgba(62,207,142,.12); }
+.cmp-tab-dot.lvl-yellow { color:var(--caution); background:rgba(242,169,59,.12); }
+.cmp-tab-dot.lvl-red { color:var(--disconnected); background:rgba(229,72,77,.12); }
+.cmp-tab-dot.lvl-grey { color:var(--dim); background:transparent; }
+/* companionStatus()'s finer activity/currency chip (ACTIVE/IDLE/STALE/LOST/UNKNOWN) — a
+   DIFFERENT fact from the tab's link colour above, kept visually distinct (pill, not a small
+   swatch) so the two are never mistaken for the same signal. */
+.cmp-state.st-active { color:var(--connected); border-color:rgba(62,207,142,.4); background:rgba(62,207,142,.08); }
+.cmp-state.st-idle { color:var(--accent-bright); border-color:rgba(76,141,255,.36); background:var(--accent-dim); }
+.cmp-state.st-stale { color:var(--caution); border-color:rgba(242,169,59,.5); border-style:dashed; background:rgba(242,169,59,.06); }
+.cmp-state.st-lost { color:var(--disconnected); border-color:rgba(229,72,77,.5); background:rgba(229,72,77,.08); }
+.cmp-state.st-unknown { color:var(--dim); border-style:dotted; }
 /* Capped so an open panel scrolls inside itself instead of squeezing the vehicle roster. */
 .cmp-panel { max-height:32%; }
 .cmp-panel .pxm-h { align-items:center; }

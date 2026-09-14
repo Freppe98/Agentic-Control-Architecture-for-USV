@@ -202,20 +202,118 @@ export function companionStatus(c, v) {
            peerEv, statusAgeS, activity, current: reportCurrent };
 }
 
-/** The ONE dock indicator for a row, or null when no assignment is known. */
-export function companionIndicator(v) {
+// ---- the dock TAB — Scout-reported LINK CONDITION only, never activity -----------------------
+// The dock row's compact right-hand tab is a different question from companionStatus() above: it
+// answers ONLY "what does Scout currently report about the radio link to the assigned companion",
+// on a fixed four-way scale (green/yellow/red/grey) that has to stay legible as a small icon with
+// no room for words. Activity ("inspecting" vs "idle") is deliberately NOT part of this — connected
+// does not mean surveying, so folding activity into the tab's colour would let a mid-mission pause
+// misread as a link problem or vice versa. See companionStatus/companionSection for activity.
+//
+// RED is the one level this module will not hand out cheaply: Scout's own `link.state` enum
+// already distinguishes NEVER_CONNECTED from LOST, but nothing in the contract stops a buggy or
+// freshly-restarted publisher from reporting LOST for a companion it has, in truth, never actually
+// connected to (see SCOUT_INTEGRATION_HANDOFF.md's proposed `link.ever_connected` field — Scout
+// does not report one today, so nothing here may invent one). Until Scout reports its own
+// connection history explicitly, a LOST report only turns the tab red when THIS OPERATOR SESSION
+// has itself previously observed that exact assignment (`${parentId}::${companionId}`) reporting
+// CONNECTED or DEGRADED — see `updateLinkHistory` below. That evidence is scoped to the current
+// assignment on purpose: unassigning, or Scout swapping in a different `companion_id`, drops the
+// key entirely, so a replacement companion can never inherit a predecessor's history.
+export const TAB_LEVELS = ["green", "yellow", "red", "grey"];
+
+/**
+ * Reducer for the operator-local "has this assignment ever reported CONNECTED/DEGRADED" evidence.
+ * Pure: takes the previous history (a Map, or nothing) and the current fleet, returns a NEW Map —
+ * callers (Map.js) hold the returned value and pass it back in on the next fleet poll, the same
+ * pattern as lib/telemetry-cache.js. Keyed by `${parentId}::${companionId}`, and ONLY for the
+ * currently ASSIGNED companion on each row: a key that stops being reported as ASSIGNED (removed,
+ * or explicitly unassigned) is dropped on the very next update, never carried across a later
+ * reassignment — see the module note above.
+ */
+export function createLinkHistory() {
+  return new Map();
+}
+
+export function updateLinkHistory(history, fleet) {
+  const next = new Map(history instanceof Map ? history : []);
+  const seen = new Set();
+  for (const v of Array.isArray(fleet) ? fleet : []) {
+    for (const c of assignedCompanions(v)) {
+      const key = `${v.id}::${c.companion_id}`;
+      seen.add(key);
+      const link = isObj(c.link) ? c.link : {};
+      if (link.state === "CONNECTED" || link.state === "DEGRADED") next.set(key, true);
+      else if (!next.has(key)) next.set(key, false);
+    }
+  }
+  for (const key of [...next.keys()]) if (!seen.has(key)) next.delete(key);
+  return next;
+}
+
+/** The ONE dock tab for a row — NEVER null (an unassigned/unavailable row still renders a grey
+ *  tab, so every row keeps the same layout; see VehicleDock/CompanionPanel.CompanionTab).
+ *  `history` is the Map from updateLinkHistory (or undefined/null — treated as "no local
+ *  evidence yet", never as false evidence of loss). `aria`/`title` use the exact wording this
+ *  station's tabs are documented to show (SCOUT_INTEGRATION_HANDOFF.md-adjacent — see
+ *  docs/verification/uav-companion.md), so screen readers and hover both agree with the colour. */
+export function companionTab(v, history) {
+  if (!v) return { level: "grey", parentId: null, companionId: null, aria: "No companion assigned", title: "No companion assigned" };
   const list = assignedCompanions(v);
-  if (!list.length) return null;
+  if (!list.length) {
+    return { level: "grey", parentId: v.id, companionId: null,
+             aria: "No companion assigned", title: "No companion assigned" };
+  }
+  // Deterministic choice for a multi-companion row: always the FIRST assigned item in Scout's own
+  // `items` order. Never re-picked based on which one looks "most interesting" as reports arrive —
+  // that would make the tab (and the card it opens) flip identity on its own between polls.
   const c = list[0];
-  const s = companionStatus(c, v);
   const type = c.vehicle_type || "UAV";
   const name = c.display_name || c.companion_id;
-  return {
-    parentId: v.id, companionId: c.companion_id, state: s.state,
-    text: `${type} · ${STATE_SHORT[s.state]}`, more: list.length - 1,
-    aria: `${name} via ${(v && v.name) || "Scout"}: ${s.label}. Open companion details.`,
-    title: s.reason,
-  };
+  const parent = v.name || "Scout";
+  const base = { parentId: v.id, companionId: c.companion_id, name, type };
+  const statusAgeS = num(c.status_age_s);
+  const scoutCurrent = parentCurrent(v);
+  const reportCurrent = scoutCurrent && statusAgeS != null && statusAgeS <= EVIDENCE_STALE_S;
+  const link = isObj(c.link) ? c.link : {};
+  const linkState = typeof link.state === "string" ? link.state : "UNKNOWN";
+  const linkText = LINK_TEXT[linkState] || LINK_TEXT.UNKNOWN;
+
+  if (!reportCurrent) {
+    // Scout itself went quiet, or simply hasn't refreshed this companion's block recently: this
+    // is NOT evidence the UAV link failed (that would be inferring a UAV fact from a Scout fact —
+    // exactly what this module exists to avoid), so the tab goes grey/unknown, never red/yellow,
+    // and the tooltip says whose report is stale, plus what it LAST said.
+    const why = !scoutCurrent ? `${parent} is not in contact` : `${parent} has not reported ${name} recently`;
+    return { ...base, level: "grey", aria: "Companion status unavailable",
+      title: `Companion status unavailable — ${why}. Last companion-link report: ${linkText}.` };
+  }
+  if (linkState === "CONNECTED") {
+    return { ...base, level: "green", aria: `UAV companion — reported connected via ${parent}`,
+      title: `${parent} reports ${name} connected.` };
+  }
+  if (linkState === "DEGRADED") {
+    return { ...base, level: "yellow", aria: "UAV companion — link degraded",
+      title: `${parent} reports a degraded link to ${name}.` };
+  }
+  if (linkState === "LOST") {
+    const key = `${v.id}::${c.companion_id}`;
+    const everConnected = !!(history && typeof history.get === "function" && history.get(key));
+    if (everConnected) {
+      return { ...base, level: "red", aria: "UAV companion — connection lost",
+        title: `${parent} reports its link to ${name} is lost. It was previously connected.` };
+    }
+    // A first-ever LOST report with no CONNECTED/DEGRADED sighting behind it: honest grey, not a
+    // fabricated "lost" for something that (as far as this station has ever seen) never connected.
+    return { ...base, level: "grey", aria: "Companion status unavailable",
+      title: `${parent} reports ${name} as lost, but no prior connection has been observed for this assignment this session.` };
+  }
+  if (linkState === "NEVER_CONNECTED") {
+    return { ...base, level: "grey", aria: "Companion status unavailable",
+      title: `${name} is assigned, but ${parent} has not heard from it yet.` };
+  }
+  return { ...base, level: "grey", aria: "Companion status unavailable",
+    title: `${parent} does not report the link to ${name}.` };
 }
 
 /** The UAV position as the map should draw it, or null when none was reported. `stale` alone

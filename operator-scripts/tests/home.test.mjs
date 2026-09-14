@@ -11,6 +11,7 @@ import {
   SAFETY_HOLD_TYPE, PRIMARY_MODES, ADVANCED_MODES, isSafetyHold,
   setHomeOutcome, SET_HOME_QUEUE_GRACE_MS, SET_HOME_LOST_GRACE_MS,
   SET_HOME_DEADLINE_SLACK_MS, SET_HOME_FALLBACK_TTL_MS,
+  homeButtonState,
 } from "../operator/lib/home.js";
 
 // ---- helpers ----
@@ -361,4 +362,40 @@ test("an authority rejection is surfaced verbatim, not as a comms/timeout failur
   assert.equal(out.code, "rejected");
   assert.equal(out.message, "blocked: SET_HOME requires LOCAL_AGENT control authority");
   assert.doesNotMatch(out.message, /timed out|never reported|lost track/i);
+});
+
+// ---- F. homeButtonState — the compact label the Map's Set Home button shows -------------
+// Pins the Map's Pixhawk Mission card: the button's secondary line must read exactly one of
+// Verified / Not verified / Unknown / Setting…, coloured from the same restrained palette as
+// the rest of the card, and driven ONLY by Scout's own homeStatus() state — never by a
+// command's own click/HTTP result.
+test("homeButtonState: no status at all reads Unknown, dim", () => {
+  assert.deepEqual(homeButtonState(null), { text: "Unknown", cls: "dim" });
+});
+test("homeButtonState maps every homeStatus state to its own text and colour", () => {
+  assert.deepEqual(homeButtonState(homeStatus(veh(null))), { text: "Unknown", cls: "dim" }); // no Home received
+  assert.deepEqual(homeButtonState(homeStatus(veh(HOME_FAR))), { text: "Not verified", cls: "warn" });
+  assert.deepEqual(
+    homeButtonState(homeStatus(veh(HOME_HERE), { phase: "pending" })),
+    { text: "Setting…", cls: "pending" },
+  );
+  assert.deepEqual(
+    homeButtonState(homeStatus(veh({ ...HOME_HERE, verified: true }))),
+    { text: "Verified", cls: "ok" },
+  );
+});
+test("homeButtonState: Unknown and Not verified are textually distinct, not just recoloured", () => {
+  const unknown = homeButtonState(homeStatus(veh(null)));
+  const unverified = homeButtonState(homeStatus(veh(HOME_FAR)));
+  assert.notEqual(unknown.text, unverified.text);
+});
+test("homeButtonState never reads Verified from a command outcome alone — only Scout's own status flips it", () => {
+  // A SET_HOME that Scout accepted (EXECUTED + verified) still leaves v.home.verified false
+  // until Scout's NEXT reported status catches up — homeStatus()'s `verified` is untouched by
+  // phase, and homeButtonState only ever reads that field.
+  const stillUnverified = homeStatus(veh(HOME_FAR), { phase: "idle" }); // click feedback settled
+  assert.equal(homeButtonState(stillUnverified).text, "Not verified");
+  // A failed click also must not turn the state word into anything but the real status.
+  const failed = homeStatus(veh(HOME_FAR), { phase: "failed", failMessage: "Set Home was not accepted." });
+  assert.equal(homeButtonState(failed).text, "Not verified");
 });

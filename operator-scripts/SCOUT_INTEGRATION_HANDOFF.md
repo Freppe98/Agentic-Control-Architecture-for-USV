@@ -386,3 +386,10 @@ This contract does not define, and this integration does not require:
 - Nothing here specifies how Scout internally decides whether to accept a hazard or launch
   replanning — those decisions, and everything about UAV flight itself, remain entirely
   Scout/UAV-side design work this document does not attempt to anticipate.
+- The operator's dock shows a compact green/yellow/red/grey tab for the link, built from
+  `link.state` alone. Red ("previously connected, now lost") needs evidence the assignment
+  was once `CONNECTED`/`DEGRADED` — nothing here lets you assert that directly today, so the
+  operator falls back to its own local session history (reset on page reload) rather than
+  ever inventing red from a bare `LOST`. An optional `link.ever_connected` boolean (true once
+  YOU have ever observed this specific assignment connected) would let the operator show red
+  reliably across a page reload too — not required; see `COMPANION_CONTRACT.md` §11.

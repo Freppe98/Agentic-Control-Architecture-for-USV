@@ -9,16 +9,22 @@
 import { noTelem } from "../lib/ui.js";
 import { esc, escAttr } from "../lib/format.js";
 import {
-  companionIndicator, companionsOf, companionStatus, positionView, hazardsOf, hazardView,
+  companionTab, assignedCompanions, companionStatus, positionView, hazardsOf, hazardView,
   evidenceView, fmtEvidenceAge, STATE_SHORT, EVIDENCE_STALE_S,
 } from "../lib/companion.js";
 
-/** The compact dock chip beside a vehicle, or "" when no assignment is known. */
-export function CompanionChip(v) {
-  const ind = companionIndicator(v);
-  if (!ind) return "";
-  return `<button type="button" class="cmp-chip st-${ind.state}" data-cmp-parent="${escAttr(String(v.id))}"
-    aria-label="${escAttr(ind.aria)}" title="${escAttr(ind.title)}">${esc(ind.text)}${ind.more > 0 ? ` +${ind.more}` : ""}</button>`;
+// A small quadcopter glyph — never a circle (that reads as a USV) — used both on the dock tab
+// and, at the same colour, in the card header, so the two are visibly the same fact.
+const UAV_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="10" y="10" width="4" height="4" rx="1"/><path d="M10 10 6 6M14 10l4-4M10 14l-4 4M14 14l4 4"/><circle cx="5" cy="5" r="2.1"/><circle cx="19" cy="5" r="2.1"/><circle cx="5" cy="19" r="2.1"/><circle cx="19" cy="19" r="2.1"/></svg>';
+
+/** The compact dock TAB at the row's right edge — ALWAYS rendered (never ""), so every row keeps
+ *  the same layout whether or not a companion is assigned (grey = no assignment / no evidence).
+ *  Opens/closes `v`'s companion card; `isOpen` only changes the pressed styling, never the tab's
+ *  colour, which is companionTab()'s alone. See lib/companion.js companionTab() for the state
+ *  rules and updateLinkHistory() for the local "ever connected" evidence this reads. */
+export function CompanionTab(v, history, isOpen) {
+  const t = companionTab(v, history);
+  return `<button type="button" class="cmp-tab lvl-${t.level}${isOpen ? " is-open" : ""}" data-cmp-parent="${escAttr(String(v.id))}" aria-pressed="${isOpen ? "true" : "false"}" aria-label="${escAttr(t.aria)}" title="${escAttr(t.title)}">${UAV_SVG}</button>`;
 }
 
 const row = (k, v) => `<div class="pxm-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
@@ -104,11 +110,13 @@ function hazardRow(c, v) {
     </div>`;
 }
 
-function companionSection(c, v) {
+function companionSection(c, v, tab) {
   const s = companionStatus(c, v);
   const name = c.display_name || c.companion_id;
   return `<div class="cmp-item">
-      <div class="cmp-name"><span class="mono">${esc(name)}</span><span class="cmp-via">via ${esc(v.name || "Scout")}</span>
+      <div class="cmp-name">
+        <span class="cmp-tab-dot lvl-${tab.level}" title="${escAttr(tab.title)}">${UAV_SVG}</span>
+        <span class="mono">${esc(name)}</span><span class="cmp-via">via ${esc(v.name || "Scout")}</span>
         <span class="pxm-chip cmp-state st-${s.state}" title="${escAttr(s.reason)}">${esc((c.vehicle_type || "UAV") + " · " + STATE_SHORT[s.state])}</span></div>
       ${s.current ? "" : `<div class="pxm-note warn">${esc(s.reason)}</div>`}
       <div class="pxm-grid">
@@ -122,15 +130,21 @@ function companionSection(c, v) {
     </div>`;
 }
 
-/** The dock panel for ONE parent vehicle's companions (usually exactly one). */
-export function CompanionPanel(v) {
-  const list = v ? companionsOf(v) : [];
+/** The dock panel for ONE parent vehicle's companion — always the SAME companion (list[0], the
+ *  same deterministic choice companionTab() makes) the tab opened, never every item Scout has
+ *  ever mentioned. An item Scout reports but has UNASSIGNED is deliberately excluded here — the
+ *  same rule the tab itself follows (assignedCompanions), so pressing a grey "no assignment" tab
+ *  can never open a card that still shows a UAV identity. */
+export function CompanionPanel(v, history) {
+  const list = v ? assignedCompanions(v) : [];
   const head = `<div class="pxm-h"><span class="lbl">Companion</span>
       <button type="button" class="cmp-close" data-cmp-close aria-label="Close companion details" title="Close">×</button></div>`;
   if (!list.length) {
-    return head + `<div class="no-telem-box">No companion reported by ${esc((v && v.name) || "this vehicle")}</div>`;
+    return head + `<div class="no-telem-box">No companion assigned to ${esc((v && v.name) || "this vehicle")}</div>`;
   }
-  return head + list.map((c) => companionSection(c, v)).join("") +
+  const c = list[0];
+  const tab = v ? companionTab(v, history) : null;
+  return head + companionSection(c, v, tab || { level: "grey", title: "" }) +
     `<div class="pxm-note">Observations reported through ${esc(v.name || "Scout")}. They never change the
       operator's mission or plan; an inspected area is not confirmed safe, and a hazard leaving this
       panel means Scout stopped reporting it — it does NOT mean Scout removed any exclusion from its

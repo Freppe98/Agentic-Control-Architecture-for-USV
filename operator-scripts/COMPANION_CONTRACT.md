@@ -609,3 +609,28 @@ left them:
 
 Fleet-row output of the operator backend (`companions` on `GET /api/fleet/status`) is
 documented in `DATA_DICTIONARY.md` (Companions).
+
+## 11. Optional / proposed — not required for Scout to implement
+
+The operator dock renders a compact per-vehicle "companion tab" (green/yellow/red/grey) from
+`link.state` alone — see `lib/companion.js`'s `companionTab()`. Turning a `LOST` report red
+(rather than the conservative grey) requires evidence that the assignment was PREVIOUSLY
+`CONNECTED`/`DEGRADED` at some point. Nothing in this contract lets Scout assert that
+directly today, so the operator falls back to its OWN locally-observed history for the
+current browser session only (reset on page reload, on unassignment, and on any companion
+replacement) — never a value Scout reported.
+
+A future, optional field would let Scout supply this directly and more reliably (surviving
+an operator page reload, and reflecting Scout's OWN authoritative history rather than
+whatever the operator happened to observe):
+
+```json
+"link": {"state": "LOST", "last_peer_contact_at": 1786175300.0, "ever_connected": true}
+```
+
+`ever_connected` (optional boolean): true once Scout has EVER itself observed `CONNECTED` or
+`DEGRADED` for this specific companion assignment; reset to false/omitted on a fresh
+assignment (a new `companion_id`, or after an explicit unassign/reassign). Not implementing
+this is fine — the operator's local-session fallback is deliberately conservative (a bare
+`LOST` with no local evidence reads as grey/unknown, never a fabricated red) and needs no
+Scout-side change to work correctly.

@@ -14,11 +14,11 @@ import { BatteryBar } from "../components/BatteryBar.js";
 import { StatusBadges } from "../components/StatusBadges.js";
 import { vehicleRows } from "../components/VehicleDock.js";
 import { CompanionPanel } from "../components/CompanionPanel.js";
-import { companionMapPlan, planSignature, fmtEvidenceAge } from "../lib/companion.js";
+import { companionMapPlan, planSignature, fmtEvidenceAge, updateLinkHistory, createLinkHistory } from "../lib/companion.js";
 import { COL, cls, commState, fmtAge, pad3, opsStale } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
-import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome } from "../lib/home.js";
+import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome, homeButtonState } from "../lib/home.js";
 import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, etaBarText } from "../lib/mission.js";
 import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
@@ -211,6 +211,18 @@ export function Map(root) {
   // A plain object, never the Map collection: inside this module `Map` is the page function itself.
   const cmpLatest = {};            // key -> latest plan entry (live tooltips)
   let cmpOpenFor = null;
+  // Operator-LOCAL, session-only evidence that a companion assignment has ever reported
+  // CONNECTED/DEGRADED — the ONLY thing that lets the dock tab read a LOST report as red rather
+  // than grey (see lib/companion.js companionTab()/updateLinkHistory()). Rebuilt from the fleet
+  // every poll; a key not currently ASSIGNED is dropped by updateLinkHistory itself, so an
+  // unassignment or a companion swap never carries a predecessor's history forward, and a replayed
+  // late snapshot can only ever ADD evidence for what it actually reports — it cannot restore a
+  // companion that is no longer in the fleet payload at all.
+  // createLinkHistory()/updateLinkHistory() (lib/companion.js) build and update the Map
+  // collection — never constructed directly here: this module's own top-level name IS the page
+  // function (see the note by cmpLatest above), so writing that constructor call inline in this
+  // function's body would recurse into the page itself instead of building a collection.
+  let cmpHistory = createLinkHistory();
   // Command types with a POST in flight right now — a synchronous guard against a rapid
   // double-press queuing a duplicate before the queue poll catches up (matters most for
   // LOITER, which has no confirmation modal to slow a double-click). Cleared per type in
@@ -429,13 +441,15 @@ export function Map(root) {
 
   function renderDock() {
     const list = document.getElementById("veh-list");
-    list.innerHTML = vehicleRows(fleet, selId, { companions: true });
+    list.innerHTML = vehicleRows(fleet, selId, { companions: true, companionHistory: cmpHistory, companionOpenId: cmpOpenFor });
     list.querySelectorAll(".vrow").forEach((el) => (el.onclick = () => select(canonicalVehicleId(el.dataset.id))));
-    // The companion chip opens its parent's companion panel (and selects that parent) — the row
-    // click underneath must not also fire.
+    // The companion tab opens its parent's companion card (and selects that parent) — the row
+    // click underneath must not also fire. It is a plain <button> nested in the row's <div>, not
+    // inside another <button> — the row itself and the tab stay two separate accessible controls.
     list.querySelectorAll("[data-cmp-parent]").forEach((b) => (b.onclick = (e) => {
       e.stopPropagation();
-      openCompanion(canonicalVehicleId(b.dataset.cmpParent));
+      const parentId = canonicalVehicleId(b.dataset.cmpParent);
+      if (parentId === cmpOpenFor) closeCompanion(); else openCompanion(parentId);
     }));
   }
 
@@ -447,18 +461,25 @@ export function Map(root) {
     if (parentId == null) return;
     if (parentId !== selId) select(parentId);
     cmpOpenFor = parentId;
+    renderDock();          // the pressed (is-open) tab state lives on the dock row
     renderCompanionPanel();
   }
-  function closeCompanion() { cmpOpenFor = null; renderCompanionPanel(); }
+  function closeCompanion() {
+    cmpOpenFor = null;
+    renderDock();
+    renderCompanionPanel();
+  }
 
   function renderCompanionPanel() {
     const box = document.getElementById("cmp-panel");
     if (!box) return;
-    // Isolation: the panel only ever renders the SELECTED vehicle's own row.
+    // Isolation: the panel only ever renders the SELECTED vehicle's own row — switching vehicles
+    // (select() clears cmpOpenFor) closes it rather than ever showing one vehicle's card under
+    // another's name.
     const v = cmpOpenFor != null && cmpOpenFor === selId ? fleet.find((x) => x.id === cmpOpenFor) : null;
     if (!v) { cmpOpenFor = null; box.style.display = "none"; box.innerHTML = ""; return; }
     box.style.display = "";
-    box.innerHTML = CompanionPanel(v);
+    box.innerHTML = CompanionPanel(v, cmpHistory);
     const close = box.querySelector("[data-cmp-close]");
     if (close) close.onclick = closeCompanion;
   }
@@ -987,6 +1008,11 @@ export function Map(root) {
     return `${Math.floor(s / 3600)}h ago`;
   }
   function pxmAgeText(s) { return s && s.fetchedAt ? fmtSince(s.fetchedAt) : "—"; }
+  // The Refresh button's secondary line — mission-DOWNLOAD age (this readback's own
+  // fetchedAt), never telemetry/fleet-poll age. Honest when nothing has ever been
+  // downloaded rather than a fabricated "0s ago". Shared by the initial render and the
+  // 1 s tick below so the two can never drift apart.
+  function pxmDownloadLabel(s) { return s && s.fetchedAt ? `Last download ${pxmAgeText(s)}` : "Not downloaded"; }
 
   // Toggle glyph — a shape per state so it reads without relying on colour: an open eye when
   // shown, a struck-through eye when hidden, an empty/None slash otherwise.
@@ -1001,21 +1027,30 @@ export function Map(root) {
   // distinguish "there is no no-go zone in this plan" from "the plan could not be read". It never
   // implies more than the record states, and it is the only reference-plan text on this page —
   // the detailed E2 evidence lives on the Agent page.
+  // Label shortened LOADED PLAN → PLAN (the header's own chip already carries the live-
+  // mission LOADED/status word — see renderPxm below); the full identity ("the operator-
+  // approved plan") moves to a title/tooltip on the label itself so it survives the
+  // shorter text, on the row's own `k` span AND on the value, so either hover target works.
+  const PLAN_LABEL_DESC = "PLAN — the operator-approved plan (the immutable original mission record). "
+    + "Distinct from the LOADED mission above: the two are never reconciled and may carry "
+    + "different waypoint counts.";
   function refPlanRow(id) {
     const s = id != null ? orig[id] : null;
     const g = originalModel(id);
+    const kAttr = `title="${escAttr(PLAN_LABEL_DESC)}"`;
     if (!g.present) {
       const txt = s && s.note === "error" ? "Could not be read"
         : s && s.note === "none" ? "No approved mission" : "—";
-      return `<div class="pxm-row"><span class="k">Approved plan</span><span class="v" title="${escAttr(
-        "The immutable original mission record (revision 0). Without it the map cannot show the "
-        + "original route or the no-go zones the mission was planned around.")}">${esc(txt)}</span></div>`;
+      return `<div class="pxm-row"><span class="k" ${kAttr}>Plan</span><span class="v" ${kAttr}>${esc(txt)}</span></div>`;
     }
+    // Compact "48 wp · 1 no-go zone" — the same "no-go zone" wording the Plan page itself
+    // uses for this concept (never "exclusion": that word is reserved on this page for
+    // Scout's OWN accepted-hazard exclusions, a different fact — see HZ_HEAD above).
     const zones = g.noGoZoneCount === null ? "no no-go field on the record"
       : `${g.noGoZoneCount} no-go zone${g.noGoZoneCount === 1 ? "" : "s"}`;
     const parts = [`${g.routeCount} wp`, zones];
-    return `<div class="pxm-row"><span class="k">Approved plan</span><span class="v" title="${escAttr(
-      "Reference geometry from the immutable original mission record"
+    return `<div class="pxm-row"><span class="k" ${kAttr}>Plan</span><span class="v" title="${escAttr(
+      PLAN_LABEL_DESC + " Reference geometry from record"
       + (g.missionId ? ` ${g.missionId}` : "")
       + ". No-go zones come from its planning inputs — they are never inferred from the route.")}"
       >${esc(parts.join(" · "))}</span></div>`;
@@ -1090,35 +1125,37 @@ export function Map(root) {
     // "Verified" here is ALWAYS hs.state === "verified" — i.e. v.home.verified as Scout
     // itself currently reports it (home_block(), sourced from payload.agent.home_status).
     // A successful SET_HOME command result never sets this chip directly; see the
-    // "confirmed" phase below for the transient, non-authoritative click feedback.
-    const homeChip = !hs ? ["—", "dim"]
-      : hs.state === "verified" ? ["Verified", "ok"]
-      : hs.state === "pending" ? ["Setting…", "pending"]
-      : ["Not verified", hs.state === "unknown" ? "dim" : "warn"];
-    let homeSub = null;
+    // "confirmed" phase below for the transient, non-authoritative click feedback. The
+    // four-way text/colour mapping itself is shared with the Vehicle page's pure test
+    // suite (lib/home.js homeButtonState) — never re-derived per page.
+    const homeState = homeButtonState(hs);
+    // Everything below is CLICK-FEEDBACK ONLY (never a verification claim): the command's
+    // own accepted/failed result, shown as a compact note under the buttons. The Home
+    // distance-from-Scout figure that used to live here is gone from this card entirely —
+    // it stays on the Vehicle Home marker's map popup (vehHomeTooltip), which is a
+    // different display of the same underlying data, not removed.
+    let homeNote = null;
     if (hs) {
       if (setHome.phase === "confirmed") {
         // The command itself succeeded (Scout accepted + verified the read-back) —
-        // NOT the same as the Home chip above reading Verified, which waits for
-        // Scout's own continuous status to catch up on the next fleet poll.
-        homeSub = "Set Home accepted by Scout — confirming Home status…";
+        // NOT the same as the button reading Verified, which waits for Scout's own
+        // continuous status to catch up on the next fleet poll.
+        homeNote = "Set Home accepted by Scout — confirming Home status…";
       } else if (hs.failMessage) {
-        homeSub = hs.failMessage;
-      } else if (hs.state === "pending") {
-        homeSub = "Verification pending";
-      } else if (hs.state === "verified") {
-        homeSub = hs.verifiedDistanceM != null ? `${fmtDistance(hs.verifiedDistanceM)} from Scout` : null;
-      } else if (hs.distanceM != null) {
-        homeSub = `${fmtDistance(hs.distanceM)} from Scout`;
-      } else if (hs.state === "unknown") {
-        homeSub = "Home not received";
+        homeNote = hs.failMessage;
       }
     }
-    const homeSubCls = hs && hs.failMessage ? "warn" : (setHome.phase === "confirmed" ? "pending" : "");
+    const homeNoteCls = hs && hs.failMessage ? "warn" : (setHome.phase === "confirmed" ? "pending" : "");
     const setHomeLabel = setHome.phase === "pending" ? "Setting…" : "Set Home";
     const setHomeTitle = (g.enabled
       ? "Set the Pixhawk HOME / RTL recovery point to the Scout's current position"
       : (g.reason || (v ? "Set Home unavailable" : "No vehicle selected"))).replace(/"/g, "&quot;");
+    // Mission-download age, INSIDE the Refresh button as a smaller secondary line — never
+    // telemetry/fleet-poll age, which is a different clock entirely. Honest when nothing
+    // has ever been downloaded (never a fabricated "0s ago"). id="pxm-age" is kept on the
+    // span itself so tickPxmAge() below can update just its textContent on the 1 s timer
+    // without touching (and so never re-binding) the button's own onclick.
+    const downloadLabel = pxmDownloadLabel(s);
 
     box.innerHTML = `
       <div class="pxm-h">
@@ -1126,20 +1163,24 @@ export function Map(root) {
         <span class="pxm-chip ${chipCls}">${chipText}</span>
       </div>
       <div class="pxm-grid">
-        <div class="pxm-row"><span class="k">Loaded</span><span class="v">${execCount == null ? "—" : `${execCount} waypoint${execCount === 1 ? "" : "s"}`}${homeSplit ? ` <span class="pxm-sub">+ Home (seq ${mc.home.seq == null ? 0 : mc.home.seq})</span>` : ""}</span></div>
+        <div class="pxm-row"><span class="k">Route</span><span class="v">${execCount == null ? "—" : `${execCount} waypoint${execCount === 1 ? "" : "s"}`}${homeSplit ? ` <span class="pxm-sub">+ Home (${mc.home.seq == null ? 0 : mc.home.seq})</span>` : ""}</span></div>
         <div class="pxm-row"><span class="k">Current</span><span class="v">${curText}</span></div>
         ${integ ? `<div class="pxm-row"><span class="k">Integrity</span><span class="pxm-integ ${integ[1]}">${integ[0]}</span></div>` : ""}
-        <div class="pxm-row"><span class="k">Last download</span><span class="v" id="pxm-age">${pxmAgeText(s)}</span></div>
         ${hash ? `<div class="pxm-row"><span class="k">Mission id</span><span class="v" title="${hash}">${hash.slice(0, 8)}</span></div>` : ""}
-        <div class="pxm-row"><span class="k">Home</span><span class="pxm-chip ${homeChip[1]}">${homeChip[0]}</span></div>
-        ${homeSub ? `<div class="pxm-note ${homeSubCls}">${homeSub}</div>` : ""}
         ${refPlanRow(id)}
       </div>
       ${cachedNote}
+      ${homeNote ? `<div class="pxm-note ${homeNoteCls}">${homeNote}</div>` : ""}
       <div class="pxm-actions">
         <div class="pxm-btns2">
-          <button data-pxm="fetch" ${s && s.loading ? "disabled" : ""} title="Fetch the mission stored on the Pixhawk">${fetched ? "Refresh" : "Fetch"}</button>
-          <button data-pxm="set-home" ${g.enabled ? "" : "disabled"} title="${setHomeTitle}">${setHomeLabel}</button>
+          <button data-pxm="fetch" ${s && s.loading ? "disabled" : ""} title="Fetch the mission stored on the Pixhawk">
+            <span class="pxm-btn-main">${fetched ? "Refresh" : "Fetch"}</span>
+            <span class="pxm-btn-sub" id="pxm-age">${downloadLabel}</span>
+          </button>
+          <button data-pxm="set-home" ${g.enabled ? "" : "disabled"} title="${setHomeTitle}">
+            <span class="pxm-btn-main">${setHomeLabel}</span>
+            <span class="pxm-btn-sub ${homeState.cls}">${homeState.text}</span>
+          </button>
         </div>
         <div class="pxm-btns">
           <button data-pxm="toggle" class="pxm-toggle ${tb.state}" ${tb.disabled ? "disabled" : ""} aria-pressed="${tb.ariaPressed}" title="${tb.title.replace(/"/g, "&quot;")}">${toggleIcon(tb.state)}<span>${tb.label}</span></button>
@@ -1206,8 +1247,10 @@ export function Map(root) {
   }
 
   function tickPxmAge() {
+    // Updates ONLY the span's textContent — the button it lives in keeps the onclick
+    // renderPxm bound, so a tick can never replace or drop the Refresh handler.
     const el = document.getElementById("pxm-age");
-    if (el && selId != null) el.textContent = pxmAgeText(pxm[selId]);
+    if (el && selId != null) el.textContent = pxmDownloadLabel(pxm[selId]);
   }
 
   function normEvent(e) {
@@ -2518,6 +2561,11 @@ export function Map(root) {
     // rendering "—". Freshness is untouched (comm_state/last_seen_age_s carry through), so a
     // retained value is still marked stale when the link degrades.
     fleet = telemCache.mergeFleet(Array.isArray(data) ? data : []);
+    // Local link-history evidence (see companionTab()'s red/grey distinction) is rebuilt from
+    // the MERGED fleet every poll — never wiped by switching vehicles, only by a companion
+    // actually dropping out of its parent's reported items (updateLinkHistory prunes those keys
+    // itself), so a stale/replayed snapshot can only add evidence for what it currently reports.
+    cmpHistory = updateLinkHistory(cmpHistory, fleet);
     detectReconnect();
     if (selId == null && fleet.length) {
       // First fleet payload: adopt the shared selection if it still names a real vehicle,

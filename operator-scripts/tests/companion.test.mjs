@@ -7,11 +7,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  companionsOf, assignedCompanions, companionStatus, companionIndicator, positionView,
+  companionsOf, assignedCompanions, companionStatus, companionTab, updateLinkHistory, positionView,
   hazardView, hazardsOf, replanView, companionMapPlan, planSignature, fmtEvidenceAge,
   evidenceView, EVIDENCE_STALE_S, POSITION_FRESH_S, REPORTING_DELAY_NOTABLE_S,
 } from "../operator/lib/companion.js";
-import { CompanionPanel, CompanionChip } from "../operator/components/CompanionPanel.js";
+import { CompanionPanel, CompanionTab } from "../operator/components/CompanionPanel.js";
 import { vehicleRow, vehicleRows } from "../operator/components/VehicleDock.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -60,20 +60,24 @@ function hz(over = {}) {
 }
 
 // ---- backward compatibility & assignment ----------------------------------------------------
-test("a legacy row, a cleared block and an unassigned companion show no indicator", () => {
+test("a legacy row, a cleared block and an unassigned companion all show the grey 'no companion' tab — never a fabricated identity", () => {
   assert.deepEqual(companionsOf({ id: 2, name: "Scout", comm_state: "CONNECTED" }), []);
-  assert.equal(companionIndicator({ id: 2, comm_state: "CONNECTED" }), null);
-  assert.equal(companionIndicator(scout([])), null);
-  assert.equal(companionIndicator(scout([uav({ assignment_state: "UNASSIGNED" })])), null);
-  assert.equal(companionIndicator(scout([uav({ assignment_state: "UNKNOWN" })])), null);
-  assert.equal(CompanionChip(scout([])), "");
+  const noCmp = (v) => { const t = companionTab(v); assert.equal(t.level, "grey"); assert.equal(t.companionId, null); assert.equal(t.aria, "No companion assigned"); };
+  noCmp({ id: 2, comm_state: "CONNECTED" });
+  noCmp(scout([]));
+  noCmp(scout([uav({ assignment_state: "UNASSIGNED" })]));
+  noCmp(scout([uav({ assignment_state: "UNKNOWN" })]));
+  // The tab component never renders "" (unlike the old opt-out chip) — every row keeps the same
+  // layout, grey or not — and it is exactly one <button>, never nested in another.
+  const html = CompanionTab(scout([]), new Map(), false);
+  assert.equal((html.match(/<button/g) || []).length, 1);
 });
 
 // ---- isolation ---------------------------------------------------------------------------------
 test("an item naming another parent is never shown on this row", () => {
   const leaked = scout([uav({ parent_id: 3 })]);
   assert.deepEqual(companionsOf(leaked), []);
-  assert.equal(companionIndicator(leaked), null);
+  assert.equal(companionTab(leaked).level, "grey");
   assert.equal(companionsOf(SAR).length, 0);
 });
 
@@ -86,12 +90,12 @@ test("map plan keys are namespaced by parent — the same companion id never mer
   assert.deepEqual(companionMapPlan([SAR]), []);
 });
 
-// ---- indicator states --------------------------------------------------------------------------
-test("indicator distinguishes active / idle / lost / unknown with text, not colour alone", () => {
-  const st = (c, v = {}) => companionIndicator(scout([c], v));
+// ---- companionStatus (activity/currency — the CARD's states, independent of the tab's link colour) --
+test("companionStatus distinguishes active / idle / lost / unknown with text, not colour alone", () => {
+  const st = (c, v = {}) => companionStatus(c, scout([c], v));
   assert.equal(st(uav()).state, "active");
-  assert.equal(st(uav()).text, "UAV · ACTIVE");
-  assert.match(st(uav()).aria, /UAV-1 via Scout: UAV active/);
+  assert.equal(st(uav()).label, "UAV active");
+  assert.match(st(uav()).reason, /UAV-1: Inspecting \(reported by Scout\)/);
   assert.equal(st(uav({ activity: { state: "IDLE" } })).state, "idle");
   assert.equal(st(uav({ activity: { state: "LANDED" } })).state, "idle");
   assert.equal(st(uav({ link: { state: "LOST", last_peer_contact: fresh(30) } })).state, "lost");
@@ -101,7 +105,7 @@ test("indicator distinguishes active / idle / lost / unknown with text, not colo
 });
 
 test("stale covers every way the evidence is PROVEN to stop being current", () => {
-  const st = (c, v = {}) => companionIndicator(scout([c], v)).state;
+  const st = (c, v = {}) => companionStatus(c, scout([c], v)).state;
   assert.equal(st(uav(), { comm_state: "PARTITIONED" }), "stale", "Scout itself not current");
   assert.equal(st(uav(), { comm_state: "DISCONNECTED" }), "stale");
   assert.equal(st(uav({ status_age_s: EVIDENCE_STALE_S + 5 })), "stale", "Scout omitted the block");
@@ -119,10 +123,118 @@ test("a small lower-bound age with a notable reporting delay is UNCERTAIN, never
   // neither may the unvalidated delay estimate be used to assert staleness either — this reads
   // as UNCERTAIN and falls through to Scout's own activity claim (status_age_s is unaffected by
   // any of this: it never compares Scout's clock to anything).
-  const st = (c, v = {}) => companionIndicator(scout([c], v));
+  const st = (c, v = {}) => companionStatus(c, scout([c], v));
   const uncertainContact = uav({ link: { state: "CONNECTED", last_peer_contact: fresh(1, 20) } });
   assert.equal(st(uncertainContact).state, "active",
     "reporting_delay_s is display-only and must never force a staleness verdict");
+});
+
+// ---- companionTab / updateLinkHistory: the dock TAB's green/yellow/red/grey link colour --------
+// Distinct from companionStatus above on purpose: a tab never reflects activity, only what Scout
+// currently reports about the RADIO LINK, plus this session's own "has it ever connected" evidence.
+test("never connected reads grey, with an honest tooltip, no red or yellow", () => {
+  const v = scout([uav({ link: { state: "NEVER_CONNECTED", last_peer_contact: null } })]);
+  const t = companionTab(v);
+  assert.equal(t.level, "grey");
+  assert.match(t.title, /has not heard from it yet/);
+});
+
+test("a CONNECTED report reads green", () => {
+  const t = companionTab(scout([uav()]));
+  assert.equal(t.level, "green");
+  assert.equal(t.aria, "UAV companion — reported connected via Scout");
+});
+
+test("a DEGRADED report reads yellow, distinct from both connected and lost", () => {
+  const t = companionTab(scout([uav({ link: { state: "DEGRADED", last_peer_contact: fresh(1) } })]));
+  assert.equal(t.level, "yellow");
+  assert.equal(t.aria, "UAV companion — link degraded");
+});
+
+test("LOST after this session observed CONNECTED/DEGRADED reads red — 'previously connected'", () => {
+  const key = "2::uav-1";
+  let hist = updateLinkHistory(new Map(), [scout([uav()])]);                 // CONNECTED seen once
+  assert.equal(hist.get(key), true);
+  const lostAfter = scout([uav({ link: { state: "LOST", last_peer_contact: fresh(50) } })]);
+  hist = updateLinkHistory(hist, [lostAfter]);                               // LOST does not erase history
+  const t = companionTab(lostAfter, hist);
+  assert.equal(t.level, "red");
+  assert.equal(t.aria, "UAV companion — connection lost");
+  assert.match(t.title, /previously connected/);
+  // DEGRADED counts as connection evidence too (a degraded link is still an established one).
+  let hist2 = updateLinkHistory(new Map(), [scout([uav({ link: { state: "DEGRADED", last_peer_contact: fresh(1) } })])]);
+  assert.equal(hist2.get(key), true);
+});
+
+test("a first-ever LOST report with NO prior connection evidence stays grey, never red", () => {
+  const lost = scout([uav({ link: { state: "LOST", last_peer_contact: fresh(5) } })]);
+  const hist = updateLinkHistory(new Map(), [lost]);          // this session has NEVER seen it connected
+  assert.equal(hist.get("2::uav-1"), false);
+  const t = companionTab(lost, hist);
+  assert.equal(t.level, "grey");
+  assert.match(t.title, /no prior connection has been observed/);
+  // Also true with no history object supplied at all (undefined — never treated as false evidence
+  // of loss, but also never treated as proof of a prior connection).
+  assert.equal(companionTab(lost).level, "grey");
+});
+
+test("Scout itself going stale reads grey/unavailable — never inferred as a UAV link failure", () => {
+  // A CONNECTED companion whose PARENT (Scout) is no longer current: the tab must not keep
+  // showing green (that would assert liveness Scout can no longer vouch for), and must not turn
+  // red either (no UAV-side evidence of loss exists at all here) — only grey/unknown.
+  const stale = scout([uav()], { comm_state: "DISCONNECTED" });
+  const hist = updateLinkHistory(new Map(), [scout([uav()])]);   // was connected while Scout was live
+  const t = companionTab(stale, hist);
+  assert.equal(t.level, "grey");
+  assert.equal(t.aria, "Companion status unavailable");
+  assert.match(t.title, /not in contact/);
+  assert.match(t.title, /Connected/, "the last reported condition is retained in the tooltip");
+  // Same for a merely-stale status block (Scout itself current, but hasn't refreshed this
+  // companion recently).
+  const staleReport = scout([uav({ status_age_s: EVIDENCE_STALE_S + 5 })]);
+  assert.equal(companionTab(staleReport, hist).level, "grey");
+});
+
+test("reconnection restores the appropriate reported state", () => {
+  let hist = new Map();
+  const never = scout([uav({ link: { state: "NEVER_CONNECTED", last_peer_contact: null } })]);
+  hist = updateLinkHistory(hist, [never]);
+  assert.equal(companionTab(never, hist).level, "grey");
+  const connected = scout([uav()]);
+  hist = updateLinkHistory(hist, [connected]);
+  assert.equal(companionTab(connected, hist).level, "green");
+  const lost = scout([uav({ link: { state: "LOST", last_peer_contact: fresh(10) } })]);
+  hist = updateLinkHistory(hist, [lost]);
+  assert.equal(companionTab(lost, hist).level, "red", "history from the earlier CONNECTED report survives");
+  const reconnected = scout([uav()]);
+  hist = updateLinkHistory(hist, [reconnected]);
+  assert.equal(companionTab(reconnected, hist).level, "green");
+});
+
+test("unassignment returns to grey, and a replacement companion never inherits the old one's history", () => {
+  let hist = updateLinkHistory(new Map(), [scout([uav()])]);   // uav-1 CONNECTED
+  assert.equal(hist.get("2::uav-1"), true);
+  const unassigned = scout([uav({ assignment_state: "UNASSIGNED" })]);
+  hist = updateLinkHistory(hist, [unassigned]);
+  assert.equal(companionTab(unassigned, hist).level, "grey");
+  assert.equal(hist.has("2::uav-1"), false, "an unassigned key is pruned, not just ignored");
+  // A DIFFERENT companion_id takes over the same parent, immediately reported LOST: it must read
+  // grey (no evidence for THIS assignment), never red from uav-1's old history.
+  const replacement = scout([uav({ companion_id: "uav-2", link: { state: "LOST", last_peer_contact: fresh(5) } })]);
+  hist = updateLinkHistory(hist, [replacement]);
+  assert.equal(companionTab(replacement, hist).level, "grey");
+  assert.equal(hist.has("2::uav-1"), false);
+});
+
+test("a snapshot replay cannot restore a companion that is no longer in the fleet payload", () => {
+  let hist = updateLinkHistory(new Map(), [scout([uav()])]);
+  assert.equal(hist.get("2::uav-1"), true);
+  hist = updateLinkHistory(hist, [scout([])]);                 // Scout now reports items: [] (§8)
+  assert.equal(hist.has("2::uav-1"), false);
+  // A later poll that (incorrectly) replayed the old CONNECTED item would simply re-establish
+  // fresh evidence from what it actually contains — it cannot "restore" anything on its own; the
+  // point is the ABSENT report cannot be undone by anything other than a new report.
+  assert.equal(companionTab(scout([]), hist).level, "grey");
 });
 
 test("when Scout is silent its last CONNECTED claim is never presented as current", () => {
@@ -136,10 +248,14 @@ test("when Scout is silent its last CONNECTED claim is never presented as curren
   assert.match(html, /LAST KNOWN/);
 });
 
-test("more than one assigned companion still renders ONE chip", () => {
-  const ind = companionIndicator(scout([uav(), uav({ companion_id: "uav-2" })]));
-  assert.equal(ind.more, 1);
-  assert.equal((CompanionChip(scout([uav(), uav({ companion_id: "uav-2" })])).match(/<button/g) || []).length, 1);
+test("more than one assigned companion still resolves to ONE deterministic tab and card — never a random pick", () => {
+  const v = scout([uav(), uav({ companion_id: "uav-2" })]);
+  assert.equal(assignedCompanions(v).length, 2);
+  const t = companionTab(v);
+  assert.equal(t.companionId, "uav-1", "always Scout's FIRST reported item — never re-picked as reports arrive");
+  assert.equal((CompanionTab(v, new Map(), false).match(/<button/g) || []).length, 1);
+  assert.match(CompanionPanel(v), /uav-1|UAV-1/, "the card shows the SAME companion the tab identifies");
+  assert.doesNotMatch(CompanionPanel(v), /uav-2/);
   assert.equal(assignedCompanions(scout([uav(), uav({ companion_id: "uav-2", assignment_state: "UNASSIGNED" })])).length, 1);
 });
 
@@ -380,20 +496,28 @@ test("reported strings are escaped", () => {
   assert.match(html, /&lt;img/);
 });
 
-// ---- dock chip ---------------------------------------------------------------------------------
-test("the dock chip is opt-in and appears only beside the parent that reports it", () => {
+// ---- dock tab ------------------------------------------------------------------------------
+test("the dock tab is opt-in, always rendered when asked for (grey included), and beside only the parent that reports it", () => {
   const s = scout([uav()]);
-  assert.doesNotMatch(vehicleRow(s, 2), /cmp-chip/, "other pages' docks are unchanged");
-  assert.match(vehicleRow(s, 2, { companions: true }), /class="cmp-chip st-active" data-cmp-parent="2"/);
-  assert.match(vehicleRow(s, 2, { companions: true }), /UAV · ACTIVE/);
-  const both = vehicleRows([s, SAR], 3, { companions: true });
-  assert.equal((both.match(/cmp-chip/g) || []).length, 1);
-  assert.doesNotMatch(vehicleRow(SAR, 3, { companions: true }), /cmp-chip/);
+  assert.doesNotMatch(vehicleRow(s, 2), /cmp-tab/, "other pages' docks are unchanged — no tab, no reserved space");
+  const row = vehicleRow(s, 2, { companions: true, companionHistory: new Map() });
+  assert.match(row, /class="cmp-tab lvl-green" data-cmp-parent="2"/);
+  assert.match(row, /aria-label="UAV companion — reported connected via Scout"/);
+  const both = vehicleRows([s, SAR], 3, { companions: true, companionHistory: new Map() });
+  assert.equal((both.match(/cmp-tab/g) || []).length, 2, "SAR gets a grey tab too — the right edge stays a consistent width on every row");
+  assert.match(vehicleRow(SAR, 3, { companions: true, companionHistory: new Map() }), /cmp-tab lvl-grey/);
+});
+
+test("battery sits beside activity on the left; the right edge holds only the companion tab", () => {
+  const v = { id: 2, name: "Scout", comm_state: "CONNECTED", status: "IDLE", battery: 90 };
+  const row = vehicleRow(v, null, { companions: true, companionHistory: new Map() });
+  assert.match(row, /class="sub[^"]*" title="IDLE · 90%">IDLE · <span class="vb[^"]*">90%<\/span><\/span>/);
+  assert.doesNotMatch(row, /<span class="mid"/, "the old right-hand battery column is gone");
 });
 
 // ---- Map page wiring (static) -----------------------------------------------------------------
-test("Map page wires the companion panel, layers and cleanup", () => {
-  assert.match(MAP_SRC, /vehicleRows\(fleet, selId, \{ companions: true \}\)/);
+test("Map page wires the companion tab/card, layers and cleanup", () => {
+  assert.match(MAP_SRC, /vehicleRows\(fleet, selId, \{ companions: true, companionHistory: cmpHistory, companionOpenId: cmpOpenFor \}\)/);
   assert.match(MAP_SRC, /id="cmp-panel"/);
   assert.match(MAP_SRC, /cmpOpenFor === selId/, "panel renders only the selected vehicle");
   assert.match(MAP_SRC, /cmpOpenFor = null;\s*\}\s*\/\/ Snap the map/, "a vehicle switch closes the panel");
@@ -401,6 +525,8 @@ test("Map page wires the companion panel, layers and cleanup", () => {
   assert.match(MAP_SRC, /updateCompanionLayers\(\); renderCompanionPanel\(\);/, "every fleet poll reconciles");
   assert.match(MAP_SRC, /if \(!keep\.has\(k\)\)|if \(keep\.has\(k\)\) return;/, "vanished companions are removed");
   assert.match(MAP_SRC, /li-ic hzacc/, "legend explains accepted exclusions");
+  assert.match(MAP_SRC, /cmpHistory = updateLinkHistory\(cmpHistory, fleet\)/, "link history is rebuilt every fleet poll");
+  assert.match(MAP_SRC, /parentId === cmpOpenFor\) closeCompanion\(\); else openCompanion\(parentId\)/, "pressing the same tab again closes the card");
 });
 
 test("the Map page never constructs the global Map — its own page function shadows it", () => {

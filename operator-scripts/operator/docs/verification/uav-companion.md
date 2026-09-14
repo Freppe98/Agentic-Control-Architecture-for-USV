@@ -24,8 +24,10 @@ the current state.
 ## Frontend
 - [x] `lib/companion.js` — states ACTIVE / IDLE / STALE / LOST / UNKNOWN, position/hazard
       staleness, disposition + replan wording, map plan keyed `${parentId}::${companionId}`.
-- [x] `components/CompanionPanel.js` — chip + read-only panel (only button: close).
-- [x] `VehicleDock` — chip opt-in (`{ companions: true }`); other pages' docks unchanged.
+- [x] `components/CompanionPanel.js` — dock tab + read-only panel (only button: close).
+      Originally a text chip; replaced by a compact right-edge TAB in the v3 pass below —
+      read that pass for the current presentation, not this line.
+- [x] `VehicleDock` — tab opt-in (`{ companions: true }`); other pages' docks unchanged.
 - [x] `Map.js` — panel (selected vehicle only, closed on switch), UAV marker, hazard pane
       (z 398: above the original plan, below the live route), legend, cleanup.
 
@@ -299,3 +301,135 @@ fixture runs during manual testing (the fixture always starts a fresh process at
 - No field exists yet for Scout to supply a validated clock-offset or delivery-delay bound;
   this pass deliberately does not invent one — freshness stays UNCERTAIN rather than guessed.
 - `companion_fixture.py`'s cosmetic display-name issue (from the first v2 pass) remains.
+
+---
+
+# v3 — dock TAB / inline card presentation (frontend only, no contract change)
+
+Scope: replace the dock chip (battery-right, text chip) with the presentation an annotated
+screenshot specified: battery moves into the left-hand vehicle info group beside activity
+("Scout · IDLE · 90%"), and the right edge of every roster row is reserved for a compact
+companion TAB — a small UAV icon, always rendered (grey included, never hidden) — that opens
+an inline companion card in the left sidebar directly above the (already compact) PIXHAWK
+MISSION card. No backend change; `companion_telemetry.py` and the wire contract are
+untouched. `link.ever_connected` is proposed but not required — see `COMPANION_CONTRACT.md`
+§11 / `SCOUT_INTEGRATION_HANDOFF.md` §14.
+
+**The tab is the primary entry point for UAV details** — link state, activity, assignment
+and measurement freshness stay four separate facts (never inferred from one another):
+- The tab's colour is Scout-reported LINK CONDITION only (`lib/companion.js`
+  `companionTab()`): green = `CONNECTED`, yellow = `DEGRADED`, red = `LOST` **with** prior
+  connection evidence for THIS assignment, grey = everything else (no assignment,
+  `NEVER_CONNECTED`, a `LOST` report with no such evidence, or Scout's own report/contact
+  gone stale). Activity (inspecting/idle/paused) is a SEPARATE fact, shown separately in the
+  card (`companionStatus()`'s existing ACTIVE/IDLE/STALE/LOST/UNKNOWN pill) — connected never
+  implies surveying.
+- **Red requires prior connection evidence for that companion assignment.** Scout's contract
+  has no field for "has this ever connected" today, so the operator keeps its OWN
+  session-local evidence (`updateLinkHistory()`): true once THIS assignment
+  (`${parentId}::${companionId}`) has been observed `CONNECTED`/`DEGRADED` in this browser
+  session. A bare first-ever `LOST` with no such evidence reads grey, never red. The evidence
+  is dropped the instant the key stops being reported as `ASSIGNED` — an explicit
+  unassignment or Scout swapping in a different `companion_id` can never inherit it.
+- **Losing Scout contact does not prove losing the UAV link.** If Scout itself goes stale
+  (comm not current, or its companion block simply hasn't refreshed recently), the tab reads
+  grey/"Companion status unavailable", never red or yellow — the tooltip names whose report
+  is stale and retains the LAST reported link condition; the card's own Link row does the
+  same (pre-existing behaviour, unchanged).
+- **The card belongs to the parent vehicle** and opens/closes above PIXHAWK MISSION
+  (`#cmp-panel` already sits directly above `#pxm` in the dock's DOM order). Pressing the
+  same tab again closes it; switching vehicles always closes it first (`select()` clears
+  `cmpOpenFor`) and it is re-derived from `cmpOpenFor === selId`, so it can never show one
+  vehicle's data under another's name.
+- **Deterministic multi-companion choice, documented, not random**: if Scout ever reports
+  more than one ASSIGNED companion on a row, the tab and the card both resolve to
+  `assignedCompanions(v)[0]` — Scout's first-reported item — and stay on it; a later poll
+  reordering `items` does not change which one is shown. The data contract still carries
+  every companion Scout reports (`companionMapPlan` draws all of them on the map); only the
+  dock's single tab/card picks one.
+- **The UAV remains a companion, not a fleet vehicle**: still read-only (only button: Close),
+  still no `api.`/`fetch`/command path anywhere in `lib/companion.js` or
+  `components/CompanionPanel.js` (regression-tested).
+- A grey tab opens an honest, non-fabricated empty state: "No companion assigned to
+  `<vehicle>`" when nothing is assigned at all (`CompanionPanel` now reads
+  `assignedCompanions`, the SAME filter the tab uses, so a merely-unassigned item can never
+  render as if it were live); "assigned, no contact yet" reads through the normal card when
+  Scout has assigned a real identity but never heard from it.
+
+## Frontend (this pass)
+- [x] `lib/companion.js` — `companionTab()` (the tab's own state machine, independent of
+      `companionStatus()`), `updateLinkHistory()` / `createLinkHistory()` (the session-local
+      "ever connected" reducer — a plain `Map`, never touched via a bare `new Map()` inside
+      `Map.js` itself; see the existing shadowing note).
+- [x] `components/CompanionPanel.js` — `CompanionTab()` replaces `CompanionChip`/
+      `companionIndicator` (removed, no second implementation left active); the card's header
+      now carries a small colour-matched dot (`.cmp-tab-dot`) so the open card and its tab
+      visibly agree; `CompanionPanel()` now takes the same `history` and resolves to
+      `assignedCompanions(v)[0]`, never every item Scout has ever mentioned.
+- [x] `components/VehicleDock.js` — battery moved into `.body`'s `.sub` line beside
+      activity/last-contact; the row's third grid column is now the tab alone
+      (`opts.companions`/`companionHistory`/`companionOpenId`), opt-in and unchanged for every
+      other `vehicleRows()` consumer (Vehicle/Autonomy/Mission pages: no tab, no reserved
+      space, battery still relocates there too since it is the same shared row renderer).
+- [x] `Map.js` — `cmpHistory` (built via `createLinkHistory()`/`updateLinkHistory()`, rebuilt
+      every fleet poll from the merged fleet — never wiped by a vehicle switch, only by a
+      companion actually dropping out of its parent's reported items), the tab's toggle-close
+      wiring (`parentId === cmpOpenFor` closes, otherwise opens).
+- [x] `styles/theme.css` — `.cmp-tab`/`.cmp-tab-dot` (new four-way palette, reusing the
+      station's existing connected/caution/disconnected/dim tokens) replace `.cmp-chip`;
+      `.vrow .vb` (inline battery colour) replaces `.vrow .mid`/`.bt`.
+
+## Sidebar layout (unchanged mechanics, now exercised by the tab)
+`#cmp-panel` already sat directly above `#pxm` in the dock's DOM (`display:none` when
+closed, so the roster reclaims the space; `.cmp-panel { max-height:32% }` bounds it with
+internal scrolling when open) — this pass did not need to move it, only make the tab the way
+to reach it. Refresh/last-download text, Set Home/verification text, Hide mission, Center,
+and the bottom map progress strip are all unchanged (see `map-pxm-card.test.mjs`).
+
+## Browser verification (Playwright, headless, fresh backend, opt-in fixture-derived poster;
+`runtime_data/companion_sessions.json` cleared first — see the Gotchas in the memory note on
+why that matters for a fixture-only session)
+
+| Scenario | Observed |
+|---|---|
+| CONNECTED | roster: "Scout (FIXTURE) · SEARCHING · 82%"; green tab; card opens above PIXHAWK MISSION: "Link Connected", "Activity inspecting · task insp-0001 · route rev 3", "Battery 71 %" |
+| DEGRADED (same session, same companion) | tab turns yellow; card "Link Degraded"; the card's OWN activity/currency pill separately reads "UAV · STALE" (companionStatus's DEGRADED-is-stale rule, unchanged, unrelated to the tab's colour) |
+| LOST, after this session saw CONNECTED | tab turns **red**; card "Link Lost", "UAV · LOST"; tooltip "…is lost. It was previously connected." |
+| a FRESH page load, Scout already reporting LOST (no session evidence) | tab reads grey ("Companion status unavailable"/no evidence yet) — never a fabricated red from a page that never itself observed a connection |
+| SAR-001 (no companion ever reported) | grey dashed tab; opening it: "No companion assigned to SAR-001 (FIXTURE)" — no fabricated UAV identity |
+| pressing the open tab again | card closes; `#cmp-panel` returns to `display:none`, roster reclaims the space |
+| switching vehicles while a card is open | card closes immediately (confirmed via computed style, not just visually) |
+| 1366×768 | battery still inline, tab still fits without growing row height, card + PIXHAWK MISSION + Refresh/Set Home/Hide/Center all remain visible and clickable, Vehicle Commands / Agent Mission panel and the bottom progress strip unclipped, no horizontal overflow |
+
+![green tab, card open above Pixhawk Mission](img/uav-companion-v3-01-tab-green-card.png)
+![yellow tab — degraded](img/uav-companion-v3-02-tab-yellow-degraded.png)
+![red tab — previously connected, now lost](img/uav-companion-v3-03-tab-red-previously-connected.png)
+![1366×768 — layout holds, nothing clipped](img/uav-companion-v3-04-1366x768-layout.png)
+![grey tab — honest empty state, no fabricated identity](img/uav-companion-v3-05-grey-no-assignment.png)
+
+Page errors: none. Gotcha hit and worked around: a fresh browser profile auto-opens the
+guided tour (`operator.tour.v1` in `localStorage`) whose backdrop intercepts the tab's click
+— seeded `localStorage` before navigation in the verification driver only; the app itself is
+unchanged.
+
+## Automated (this pass)
+- `tests/companion.test.mjs` — 39 tests (was 29): rewrote the dock-indicator tests around
+  `companionTab()`/`CompanionTab()` (never/green/yellow/red/grey, LOST-with-no-history stays
+  grey, Scout-stale stays grey, reconnection, unassignment + companion-replacement history
+  isolation, a snapshot that no longer reports a companion cannot "restore" its history,
+  deterministic multi-companion choice), added roster tests for the relocated battery and the
+  opt-in/always-rendered tab, and updated the Map-wiring regression tests for the new call
+  signature and toggle-close logic.
+- Full suites: `npm test` 1082 passed; `python -m unittest tests.test_companion_telemetry`
+  66 OK (backend untouched by this pass, run only to confirm no regression).
+
+## Limitations / not verified (this pass)
+- `link.ever_connected` remains unimplemented on Scout (proposed only, §11/§14 above) — the
+  red state is therefore session-local: a page reload while a companion is genuinely LOST
+  (but was connected earlier, before the reload) shows grey until a fresh CONNECTED/DEGRADED
+  report is seen again in the new session. This is the deliberately conservative direction to
+  err in (never a fabricated red) and is documented, not a bug.
+- The small quadcopter glyph is abstract at the tab's compact size; it reads as a distinct
+  non-circular shape from the round USV markers, which was the actual requirement, but is not
+  a polished icon.
+- Everything above is fixture/poster-driven; no real Scout has sent this block.
