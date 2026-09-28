@@ -304,12 +304,26 @@ presented as current information about the companion. If the file is missing, un
 fails validation (wrong version, malformed vehicle entry, negative/non-integer field), the
 operator logs the problem and starts with **no** persisted ordering state for the affected
 vehicle(s) — it never guesses or falls back to trusting an unverified snapshot, matching the
-fail-closed pattern `_load_mission_store()` already uses for the mission store. One practical
-consequence Scout should know about: persistence happens only when a generation actually
-changes, not on every `seq` bump, so a `seq`-level replay arriving in the short window right
-after an operator restart but before Scout's next real packet is not fully protected — a
-retired-*generation* replay is always protected regardless of timing, because rejecting it
-does not depend on the operator having observed that generation change itself.
+fail-closed pattern `_load_mission_store()` already uses for the mission store.
+
+**Persistence is written on every accepted ordering-relevant change — a generation advance AND
+an ordinary same-generation `seq` advance alike**, not only on a generation change. An earlier
+revision of this contract persisted only on a generation change and documented a residual gap
+here (a delayed, already-superseded `seq` replay arriving in the short window right after an
+operator restart but before Scout's next real packet was not fully protected). That gap is
+closed: `companion_telemetry.ingest()` signals "worth persisting" for `"new"`,
+`"advance_generation"` **and** `"advance_seq"` alike, so the persisted triplet is never more than
+one accepted packet behind the in-memory one, and a restart can never let an older `seq` (or an
+older generation) replace what was already accepted before it. The one thing this cannot
+paper over is a WRITE that fails (disk full, permissions, …): `_save_companion_sessions()` never
+raises and the in-memory ordering state keeps rejecting replays correctly for the rest of that
+process's life either way, but a failed write is not durable across a *crash* of that process
+until a later write succeeds. This is never silent: a failure is logged on the transition into
+and out of it (not once per packet), retried automatically on the operator's existing 1 Hz
+background loop, and surfaced on `GET /api/diagnostics` as
+`companion_sessions_persistence: {ok, consecutive_failures, last_error, last_attempt}`. Scout
+does not need to do anything differently for any of this — it is entirely an operator-side
+durability property.
 
 A companion-v1 payload (no `session` at all) is simply rejected under this contract — see
 the top of this document for why that gap was not worth patching around.

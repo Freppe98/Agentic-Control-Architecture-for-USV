@@ -118,19 +118,33 @@ RULES THIS MODULE OBEYS
     gets full cross-generation replay protection; it only loses FRESHNESS information (see
     EVIDENCE TIME) and main.py's own envelope-level replay guard (a DIFFERENT, pre-existing,
     unrelated limitation — see COMPANION_CONTRACT.md's Limitations for what remains open there).
-  * OPERATOR RESTARTS. The highest `generation` (and the `id`/`seq` that go with it) accepted
-    per vehicle is persisted to `runtime_data/companion_sessions.json` (atomic write, same
-    convention as the mission store) whenever a NEW generation is adopted — see `main.py`'s
-    `_save_companion_sessions()`. At startup the operator restores ONLY this ordering triplet
-    per vehicle (`seed_session()`) — never any companion identity, measurement or hazard data,
-    which always starts genuinely empty after a restart, so restored ordering protection never
-    presents restored evidence as current. A missing or corrupt persisted file fails CLOSED to
-    "no persisted ordering state" (logged loudly): the station still runs, and an UNFAMILIAR
-    session (one this process has no memory of, old or new) is then judged purely by whether its
-    `generation` is higher than whatever this process has seen SINCE it started — a narrower,
-    but still safe (never-fabricating), degradation. See COMPANION_CONTRACT.md's Limitations for
-    the residual gap this leaves (a delayed retired-generation packet arriving in the SHORT
-    window between an operator restart and the operator's next real update from Scout).
+  * OPERATOR RESTARTS. The highest `{id, seq, generation}` accepted per vehicle is persisted to
+    `runtime_data/companion_sessions.json` (atomic write, same convention as the mission store)
+    on EVERY accepted ordering-relevant change — a new/advancing `generation` AND an ordinary
+    same-generation `seq` advance (`ingest()` returns True for `"new"`, `"advance_generation"`
+    and `"advance_seq"` alike; see `main.py`'s `_save_companion_sessions()`, called whenever
+    `ingest()` returns True). This closes what was, before this revision, a documented gap: only
+    persisting on a generation change left a same-generation `seq` advance unprotected across a
+    restart that happened before Scout's next packet — a delayed, already-superseded `seq` could
+    briefly look "new" to a freshly-seeded process. Persisting on every accepted `seq` advance
+    too removes that window: at startup the operator restores ONLY this ordering triplet per
+    vehicle (`seed_session()`) — never any companion identity, measurement or hazard data, which
+    always starts genuinely empty after a restart, so restored ordering protection never presents
+    restored evidence as current — and that triplet is never more than one accepted packet stale.
+    A missing or corrupt persisted file fails CLOSED to "no persisted ordering state" (logged
+    loudly): the station still runs, and an UNFAMILIAR session (one this process has no memory
+    of, old or new) is then judged purely by whether its `generation` is higher than whatever
+    this process has seen SINCE it started — a narrower, but still safe (never-fabricating),
+    degradation.
+    EXPLICIT PERSISTENCE-FAILURE BEHAVIOUR: a write that fails (disk full, permissions, etc.)
+    never raises and never blocks ingestion — the in-memory ordering state is still updated and
+    still used to reject a replay for the rest of this process's life, exactly as if the write
+    had succeeded. What it does NOT get, until a write finally succeeds, is protection across a
+    CRASH of this process: see `main.py`'s `_save_companion_sessions()` / `_companion_sessions_persist_*`
+    globals for how a failed write is tracked (loudly, with a state transition logged rather than
+    a log line per packet), retried automatically on `main.py`'s existing 1 Hz background loop
+    until it succeeds, and surfaced on `GET /api/diagnostics` — a persistence failure is never
+    silent, and this station never claims a durability guarantee it has not actually achieved.
   * SCOUT'S WORDS, BOUNDED. Link/disposition/replan tokens outside the documented set become
     UNKNOWN — never a guess, and never "ACCEPTED"/"VERIFIED" by accident.
   * MALFORMED IS REJECTED, NOT REPAIRED. Nonfinite/out-of-range coordinates, self-intersecting
@@ -515,8 +529,10 @@ def _session_conflict(cur, sid, generation):
 def _apply_session(st, sid, seq, generation, received_at, received_mono):
     """(outcome, apply_membership). Assumes `_session_conflict()` was already checked and was
     False. `outcome` is one of "new" / "advance_generation" / "advance_seq" / "unchanged" /
-    "stale_seq" / "retired_generation" — the caller uses "new"/"advance_generation" to decide
-    whether the change is worth persisting (see main.py's `_save_companion_sessions`).
+    "stale_seq" / "retired_generation" — the caller (`ingest()`) treats "new", "advance_generation"
+    AND "advance_seq" alike as worth persisting (see main.py's `_save_companion_sessions`): any
+    of the three moves the accepted ordering triplet forward, and a restart must never seed from
+    something older than the last one actually accepted.
 
     POLICY — publisher generations, not session-id trust:
     `session.generation` is an integer Scout persists across its own process restarts and
@@ -776,10 +792,13 @@ def ingest(store, vid, payload, *, packet_ts, received_at, received_mono, resolv
     GENERATIONS in the module docstring for the ADDITIONAL, companion-specific ordering this
     function enforces on top of that outer guard.
 
-    Returns True when a NEW publisher generation was just adopted for this vehicle (first-ever
-    session, or a genuine generation advance) — the caller's signal that this is worth
-    persisting (see main.py's `_save_companion_sessions`); False in every other case (nothing
-    ordering-relevant changed, or the block was rejected outright)."""
+    Returns True whenever the accepted `{id, seq, generation}` ordering triplet just changed for
+    this vehicle — a first-ever session, a genuine generation advance, OR an ordinary
+    same-generation `seq` advance — the caller's signal that this is worth persisting (see
+    main.py's `_save_companion_sessions`, and the module docstring's OPERATOR RESTARTS section
+    for why `seq` advances are persisted too, not just generation changes). False when nothing
+    ordering-relevant changed (an idempotent resend at an unchanged `seq`) or the block was
+    rejected outright (bad schema/session, stale seq, retired or inconsistent generation)."""
     if vid is None or not isinstance(payload, dict):
         return False
     block = payload.get("companions")
@@ -851,7 +870,10 @@ def ingest(store, vid, payload, *, packet_ts, received_at, received_mono, resolv
     st["companions"] = out
     if not items:
         st["cleared_at"] = _mark(received_at, received_mono)
-    return outcome in ("new", "advance_generation")
+    # Persist-worthy: any change to the accepted ordering triplet, not only a generation advance
+    # — see the module docstring's OPERATOR RESTARTS section for why a same-generation `seq`
+    # advance needs the same durability as a generation change.
+    return outcome in ("new", "advance_generation", "advance_seq")
 
 
 # --- publication ------------------------------------------------------------------------

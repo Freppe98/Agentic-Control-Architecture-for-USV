@@ -7,10 +7,11 @@ radio, UAV control, perception or replanning execution. Scout code (`Scout-USV-s
 `_scout_ref/`) was not touched. Contract: `COMPANION_CONTRACT.md` (reference) /
 `SCOUT_INTEGRATION_HANDOFF.md` (concise, for the Scout-side developer).
 
-Three passes, in order below: phase 1 (`companion-v1`, superseded), the **v2 follow-up**
-(freshness model + session/seq ordering), then **v2, second pass** (publisher generations +
-honest STALE/UNCERTAIN/UNKNOWN freshness classification) — read that last section first for
-the current state.
+Passes, in order below: phase 1 (`companion-v1`, superseded), the **v2 follow-up** (freshness
+model + session/seq ordering), **v2, second pass** (publisher generations + honest
+STALE/UNCERTAIN/UNKNOWN freshness classification), **v3** (dock TAB / inline card presentation,
+frontend only), then **v2, third pass** (durable same-generation `seq` persistence) — read that
+last section first for the current state.
 
 ## Backend
 - [x] `companion_telemetry.py` — pure module: validation, omission vs clear, snapshots,
@@ -433,3 +434,100 @@ unchanged.
   non-circular shape from the round USV markers, which was the actual requirement, but is not
   a polished icon.
 - Everything above is fixture/poster-driven; no real Scout has sent this block.
+
+---
+
+# v2, third pass — durable same-generation `seq` persistence + isolated Scout-compat harness
+
+Scope: closed the residual gap the second pass documented (Limitations, above and
+`COMPANION_CONTRACT.md` §4): companion-session ordering state was persisted to
+`runtime_data/companion_sessions.json` only on a `generation` change, not on an ordinary
+same-generation `seq` advance, leaving a delayed/superseded `seq` replay unprotected in the
+window right after an operator restart. Also: reconciled `DATA_DICTIONARY.md`'s Companions
+section against the actual second-pass implementation (it still described the FIRST v2 pass's
+superseded session-id-trust policy and the old `BOUNDED` freshness-quality name, and was missing
+`session.generation` entirely from the published shape), and prepared an isolated replay harness
+so a real Scout capture can be verified through the real ingestion endpoint once one exists —
+Scout has still not implemented `companion-v2` as of this pass; no real capture was available to
+run through it.
+
+1. **Durable `seq` persistence.** `companion_telemetry.ingest()` now signals "worth persisting"
+   for an ordinary same-generation `seq` advance (`"advance_seq"`), not only `"new"` /
+   `"advance_generation"`. `main.py`'s call site already persisted on any truthy signal, so this
+   is the entire behavioural change; `_apply_session()`'s own ordering policy is untouched. An
+   idempotent resend at an unchanged `seq` (`"unchanged"`) still does not write to disk — a
+   heartbeat repeating the same content is not a new fact worth persisting, and this was
+   confirmed as a NON-regression (see Automated, below).
+2. **Explicit persistence-failure behaviour.** A write that fails (disk full, permissions, the
+   directory replaced by a file, …) still never raises and still never blocks ingestion — the
+   in-memory ordering state keeps protecting against replay for the rest of that process's own
+   life either way. What's new: the failure is tracked explicitly
+   (`main._companion_sessions_persist_ok` / `_failures` / `_last_error` / `_last_attempt`),
+   logged loudly only on the TRANSITION into and out of failure (not once per packet), retried
+   automatically on the pre-existing 1 Hz `_comms_monitor_loop()`, and surfaced on
+   `GET /api/diagnostics` as `companion_sessions_persistence`. Before this pass a failed write
+   was logged once and then silent for as long as it kept failing.
+3. **Isolated Scout-compatibility replay harness.** `scripts/scout_payload_replay.py` replays
+   captured envelope files through the REAL `/agent/status` route (a `TestClient` against
+   `main.app`), forcing `OPERATOR_RUNTIME_DIR` to a fresh temp directory *before* `main` is
+   imported so it can never resolve `runtime_data/` regardless of how it is invoked. It prints
+   the actual accepted/rejected companion state from `GET /api/fleet/status`, not just the HTTP
+   status — see its module docstring for why HTTP 200 alone proves nothing here.
+   `tests/test_scout_companion_compat.py` wraps the same machinery as a `unittest` suite:
+   `HarnessMechanicsTests` proves the harness itself works (using an operator-authored synthetic
+   capture, which is explicitly NOT a Scout-compatibility proof); `ScoutCompatibilityTests`
+   discovers real captures under `tests/fixtures/scout_companion_payloads/` and SKIPS with an
+   actionable message when none exist yet, rather than passing trivially or failing.
+   `SCOUT_INTEGRATION_HANDOFF.md` §13 ("Handing back a compatibility capture") tells Scout's
+   developer exactly what to send back and how it gets verified.
+4. **`DATA_DICTIONARY.md` reconciliation.** Fixed three discrepancies against the actual
+   second-pass implementation: `companions.session` was documented as `{id, seq, age_s}`,
+   missing `generation` entirely; `freshness_quality`'s valid value was still given as the
+   superseded `BOUNDED` name rather than `LOWER_BOUND`; and the "Snapshot ordering" paragraph
+   still described the FIRST v2 pass's superseded "trust any different session id" restart
+   policy and its one acknowledged gap, rather than the second pass's generation-numeric-
+   comparison policy that actually ships. Also fixed a stale `companion-v1` reference in a
+   `Map.js` code comment (cosmetic; no behavioural effect).
+
+## Backend (this pass)
+- [x] `companion_telemetry.py` — `ingest()`'s persist-worthy outcome set broadened to
+      `{"new", "advance_generation", "advance_seq"}`; module docstring's OPERATOR RESTARTS
+      section and `_apply_session()`'s docstring updated to match.
+- [x] `main.py` — `_companion_sessions_persist_ok/_failures/_last_error/_last_attempt` globals;
+      `_save_companion_sessions()` updates them on every attempt (transition-only logging);
+      `_comms_monitor_loop()` retries a failed write once a second; `GET /api/diagnostics` gained
+      `companion_sessions_persistence`.
+- [x] `scripts/scout_payload_replay.py` — new; isolated CLI replay tool (see above).
+
+## Automated (this pass)
+- `tests/test_companion_session_persistence.py` — new, 9 tests, exercised through the REAL
+  `POST /agent/status` route (this behaviour cannot be pinned inside
+  `companion_telemetry.py`'s own pure tests, which own no file I/O): a same-generation `seq`
+  advance is persisted immediately; an idempotent unchanged-`seq` resend does NOT rewrite the
+  file; a simulated restart (drop all in-memory state, `_load_companion_sessions()`) correctly
+  rejects an already-superseded delayed `seq` replay and still accepts a genuinely newer one; a
+  generation advance's pre-existing persistence-and-restart protection is unchanged
+  (non-regression); a failed write is tracked, does not raise, and does not open a replay hole
+  for the rest of the (unwritten-to-disk) process's life; a recovered write clears the failure
+  state and logs recovery; `GET /api/diagnostics` reports the failure honestly; a legitimate
+  repeated heartbeat at an unchanged `seq` after a simulated restart is accepted as idempotent
+  and restores companion data from that point forward (not retroactively).
+- `tests/test_scout_companion_compat.py` — new, 7 tests (6 harness-mechanics, always run; 1
+  Scout-compatibility test that SKIPS with an actionable message — no real Scout capture exists
+  yet). The mechanics tests replay a synthetic capture through the real endpoint and confirm a
+  malformed companion block is reported as a rejection in `GET /api/fleet/status`, never a 500.
+- Full suites (this pass): `node --test` on the companion/map suites — 68 passed (frontend
+  touched only by the one-line `Map.js` comment fix). `python -m unittest discover -s tests` —
+  1411 OK (includes the production-mission-store-isolation subprocess re-run of the whole
+  suite; `COMPANION_SESSIONS_PATH` inherits that isolation guarantee structurally, being derived
+  from the same `MISSION_STORE_DIR`).
+
+## Limitations / not verified (this pass)
+- Still no real Scout capture to run through `test_scout_companion_compat.py` /
+  `scout_payload_replay.py` — the harness is prepared and self-tested, not yet exercised against
+  real Scout output. See `SCOUT_INTEGRATION_HANDOFF.md` §13 for exactly what closes this.
+- A write failure is only retried once a second by `_comms_monitor_loop()`; a companion packet
+  arriving in that same second still updates in-memory state correctly (never blocked), it just
+  doesn't get its own extra persistence attempt beyond the loop's.
+- `main.py`'s pre-existing per-vehicle envelope-timestamp guard (no upper bound on a
+  future-timestamped envelope) remains unfixed and unrelated to this pass, as in every prior one.

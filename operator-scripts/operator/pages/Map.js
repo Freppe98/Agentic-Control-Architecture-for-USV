@@ -202,7 +202,7 @@ export function Map(root) {
   //   { record, model, fetchedAt, loading, note }
   const orig = {};
   let originalLayer = null;  // the reference geometry layer group (selected vehicle)
-  // Scout's UAV companion (companion-v1) — OBSERVATIONS ONLY, no command path. One Leaflet layer
+  // Scout's UAV companion (companion-v2) — OBSERVATIONS ONLY, no command path. One Leaflet layer
   // group per `${parentId}::${companionId}` (lib/companion.js companionMapPlan), rebuilt only when
   // what it draws changes; tooltips read the latest poll live. Every parent's companions are drawn
   // (like every vehicle marker), each strictly from its own row. `cmpOpenFor` is the parent whose

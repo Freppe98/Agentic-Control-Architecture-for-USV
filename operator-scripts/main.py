@@ -917,6 +917,14 @@ async def _comms_monitor_loop():
         try:
             evaluate_comms_transitions()
             expire_commands()
+            if not _companion_sessions_persist_ok:
+                # Retry a failed companion-sessions write. Nothing ordering-relevant needs to have
+                # changed for this to be worth retrying: the in-memory snapshot already reflects
+                # everything accepted since the last successful write, so a bare retry (no new
+                # packet required) is what actually closes the durability gap a stuck disk left
+                # open — see companion_telemetry.py's OPERATOR RESTARTS / EXPLICIT
+                # PERSISTENCE-FAILURE BEHAVIOUR notes and _save_companion_sessions above.
+                _save_companion_sessions()
         except Exception as exc:  # keep the loop alive
             print("[COMMS-MONITOR] error:", exc)
         await asyncio.sleep(1)
@@ -2930,14 +2938,32 @@ def _load_mission_store():
 # conventions as _save_mission_store / _load_mission_store.
 COMPANION_SESSIONS_PATH = MISSION_STORE_DIR / "companion_sessions.json"
 
+# EXPLICIT persistence-failure tracking (see companion_telemetry.py's OPERATOR RESTARTS section).
+# `_save_companion_sessions()` never raises — a write failure must not take companion ingestion
+# down — but it must also never be SILENT: this station does not get to claim a durability
+# guarantee it has not actually achieved. These globals are the honest record of that, read by
+# `_comms_monitor_loop()` (to retry) and `GET /api/diagnostics` (to surface it to an operator or
+# a test, rather than only to terminal scrollback).
+_companion_sessions_persist_ok = True
+_companion_sessions_persist_failures = 0     # consecutive failed writes since the last success
+_companion_sessions_persist_last_error = None
+_companion_sessions_persist_last_attempt = None   # ISO timestamp of the most recent attempt
+
 
 def _save_companion_sessions():
-    """Persist companion-session ordering metadata atomically. Called only when ingest() signals
-    a NEW publisher generation was adopted (see receive_agent_status) — not on every packet, since
-    seq alone advancing within an unchanged generation needs no cross-restart protection (the
-    narrower residual gap this leaves is documented in COMPANION_CONTRACT.md's Limitations).
-    Never raises: a station that cannot write this file keeps running on its in-memory ordering
-    state, loudly, the same as _save_mission_store."""
+    """Persist companion-session ordering metadata atomically. Called whenever ingest() signals
+    the accepted `{id, seq, generation}` ordering triplet changed for some vehicle — a NEW/
+    advancing generation OR an ordinary same-generation `seq` advance (see receive_agent_status
+    and companion_telemetry.ingest's docstring): a `seq` advance gets the SAME durability as a
+    generation change, closing what was previously a documented gap where only generation changes
+    were persisted. Never raises: a station that cannot write this file keeps running and keeps
+    rejecting replays correctly for the rest of THIS process's life on its in-memory ordering
+    state — it only loses that protection across a CRASH, until a write finally succeeds again.
+    Failure is tracked explicitly (loudly, on each state TRANSITION rather than once per packet)
+    and retried automatically by `_comms_monitor_loop()` until it succeeds."""
+    global _companion_sessions_persist_ok, _companion_sessions_persist_failures
+    global _companion_sessions_persist_last_error, _companion_sessions_persist_last_attempt
+    _companion_sessions_persist_last_attempt = datetime.now(timezone.utc).isoformat()
     try:
         MISSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = COMPANION_SESSIONS_PATH.with_suffix(".json.tmp")
@@ -2950,10 +2976,25 @@ def _save_companion_sessions():
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, COMPANION_SESSIONS_PATH)
+        if not _companion_sessions_persist_ok:
+            print(f"[COMPANION SESSIONS] write to {COMPANION_SESSIONS_PATH} recovered after "
+                  f"{_companion_sessions_persist_failures} consecutive failure(s)")
+        _companion_sessions_persist_ok = True
+        _companion_sessions_persist_failures = 0
+        _companion_sessions_persist_last_error = None
         return True
     except Exception as exc:
-        print(f"[COMPANION SESSIONS] could not write {COMPANION_SESSIONS_PATH}: {exc} - "
-              "continuing with in-memory ordering state; this restart will lose it")
+        was_ok = _companion_sessions_persist_ok
+        _companion_sessions_persist_ok = False
+        _companion_sessions_persist_failures += 1
+        _companion_sessions_persist_last_error = str(exc)
+        if was_ok:
+            # Log the TRANSITION into failure loudly; a retry that fails again is tracked (see
+            # /api/diagnostics) rather than spamming one line per packet while it stays down.
+            print(f"[COMPANION SESSIONS] could not write {COMPANION_SESSIONS_PATH}: {exc} - "
+                  "continuing with in-memory ordering state; a crash before this recovers would "
+                  "lose durability for the ordering triplet accepted since the last successful "
+                  "write. Retrying automatically; see GET /api/diagnostics.")
         return False
 
 
@@ -4050,9 +4091,12 @@ async def receive_agent_status(request: Request):
             # received_mono anchors this arrival on the monotonic clock so companion_telemetry's
             # own elapsed-time math (min_age_s etc.) survives a wall-clock jump between now and
             # the next poll — see companion_telemetry.py's EVIDENCE TIME section. A True return
-            # means a NEW publisher generation was just adopted — persist it immediately so a
-            # retired generation stays rejected even across an operator restart (see
-            # companion_telemetry.py's OPERATOR RESTARTS section and _save_companion_sessions).
+            # means the accepted {id, seq, generation} ordering triplet just moved forward — a new
+            # publisher generation OR an ordinary same-generation seq advance — persist it
+            # immediately so neither a retired generation nor an already-superseded seq can be
+            # replayed across an operator restart (see companion_telemetry.py's OPERATOR RESTARTS
+            # section and _save_companion_sessions; a failed write is retried automatically and
+            # surfaced on GET /api/diagnostics, never silently dropped).
             if companion_telemetry.ingest(companion_state_by_id, vid, payload, packet_ts=msg_ts,
                                           received_at=now.timestamp(), received_mono=time.monotonic(),
                                           resolve_parent=canonical_id):
@@ -5757,6 +5801,18 @@ def diagnostics():
         "mission_store_path": str(MISSION_STORE_PATH),
         "mission_store_exists": MISSION_STORE_PATH.exists(),
         "mission_record_count": len(original_missions),
+        # Explicit, honest persistence-failure surface for companion-session ordering (see
+        # companion_telemetry.py's OPERATOR RESTARTS section and _save_companion_sessions above):
+        # "ok": False means an accepted ordering change (generation OR seq) since the last
+        # successful write is not yet durable across a crash of this process — it is still being
+        # retried automatically once a second and is never silently swallowed.
+        "companion_sessions_persistence": {
+            "path": str(COMPANION_SESSIONS_PATH),
+            "ok": _companion_sessions_persist_ok,
+            "consecutive_failures": _companion_sessions_persist_failures,
+            "last_error": _companion_sessions_persist_last_error,
+            "last_attempt": _companion_sessions_persist_last_attempt,
+        },
         "active_missions": [
             {
                 "vehicle_id": vehicle_slug(v),

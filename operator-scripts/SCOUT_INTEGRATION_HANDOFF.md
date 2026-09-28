@@ -358,7 +358,53 @@ It is not something Scout runs; it is a reference for what a correct publisher l
 and how the operator station is expected to react to it, useful for comparing your own
 implementation's behaviour against.
 
-## 13. Explicitly out of scope here
+## 13. Handing back a compatibility capture
+
+Once you have a real publisher running (even the minimal one in §12, pointed at your own
+companion-reporting code instead of a hand-written loop), the operator side needs an actual
+capture of what it sends — not a description of it — to verify compatibility. Everything the
+operator team has tested so far (`scripts/companion_fixture.py`,
+`tests/test_companion_telemetry.py`) is **operator-authored**: it proves the operator parses what
+*we* think you should send, never what your actual code produces. Only a real capture closes
+that gap.
+
+**What to capture.** The exact JSON body of one or more real `POST /agent/status` requests your
+publisher sent — logged from your own outbound code, or captured off the wire (a proxy, a raw
+socket log, whatever is easiest on your side). Do not hand-edit it afterward: an omitted field,
+an odd `session.id` shape, a `generation` that didn't advance the way you expected — all of that
+is exactly what this capture is supposed to reveal, and "cleaning it up" first defeats the point.
+
+**What to send back.** One `*.json` file per scenario, placed in
+`operator-scripts/tests/fixtures/scout_companion_payloads/` in the operator repository:
+
+- a single JSON object for a one-packet capture, or
+- a JSON array of objects, in the order you sent them, for a **sequence** — e.g. "assigned, no
+  contact yet" -> "connected, hazard reported" -> "hazard accepted, replanning" -> "replan
+  verified", or your companion-reporting subsystem actually restarting (the `session.generation`
+  case this contract cares about most).
+
+A capture of your process actually restarting (or, failing that, a description of exactly how
+you tested that `generation` persists and increases across a real restart of your own code) is
+the single most valuable one to include — it is the one behaviour this contract has no other way
+to verify from your side.
+
+**How the operator verifies it — you do not need to run this yourself, but you can.**
+
+```
+python scripts/scout_payload_replay.py
+python -m unittest tests.test_scout_companion_compat -v
+```
+
+Both replay your capture(s) through the REAL `/agent/status` route (not a mock, not a
+description of the contract) in a runtime directory that is forced isolated from
+`runtime_data/` before the operator backend is even imported — nothing you send can affect a
+live vehicle's state or the operator's own persisted companion-session generation record. Both
+report the ACTUAL accepted/rejected state from `GET /api/fleet/status`, not just the HTTP status
+code — an HTTP 200 from `/agent/status` does not mean your companion block was accepted; a
+malformed block is silently refused several layers deeper and only shows up in that fleet-status
+read as a counted rejection (see `companions.rejections` in `DATA_DICTIONARY.md`).
+
+## 14. Explicitly out of scope here
 
 This contract does not define, and this integration does not require:
 - UAV↔Scout serial/radio transport or protocol.
@@ -368,7 +414,7 @@ This contract does not define, and this integration does not require:
 - Obstacle-avoidance replanning logic itself (only *reporting the outcome* of Scout's own
   replanning is covered — see §9's `replan` field).
 
-## 14. Unresolved / left for later
+## 15. Unresolved / left for later
 
 - No field yet exists for Scout to supply its own validated clock-offset or delivery-delay
   bound to sharpen the operator's freshness estimate beyond the guaranteed lower bound it
