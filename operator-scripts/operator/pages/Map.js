@@ -18,8 +18,10 @@ import { companionMapPlan, planSignature, fmtEvidenceAge, updateLinkHistory, cre
 import { COL, cls, commState, fmtAge, pad3, opsStale } from "../lib/ui.js";
 import { createAuthorityController, handoffGate } from "../lib/authority.js";
 import { AVAIL, availSlot } from "../lib/availability.js";
-import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, setHomeOutcome, homeButtonState } from "../lib/home.js";
+import { homeStatus, commandGate, commandGateCtx, deploymentReadiness, fmtDistance, fmtAgo, isSafetyHold, SAFETY_HOLD_TITLE, SAFETY_HOLD_TYPE, setHomeOutcome, homeButtonState } from "../lib/home.js";
 import { commandVerification, hasPendingOfType, commandStages } from "../lib/command.js";
+import { quickMoveGate, quickMoveView, quickMoveLabel, quickMoveCurrent, fmtTarget,
+         vehicleDistanceTo, validTarget } from "../lib/quick-move.js";
 import { classifyMissionWaypoints, missionCounts, remainingRouteDistanceM, etaSeconds, etaBarText } from "../lib/mission.js";
 import { canonicalVehicleId, getSelectedVehicleId, setSelectedVehicleId } from "../lib/selection.js";
 import { createSelectedRefresh } from "../services/selected-refresh.js";
@@ -177,6 +179,14 @@ export function Map(root) {
   const lastCommState = {};
   const markers = {};
   let homeMarker = null;         // dedicated Vehicle Home (HOME_POSITION) marker, selected vehicle
+  // ---- Quick move (right-click "Move <vehicle> here") ----------------------------------
+  // Three pieces of page-local state, and deliberately nothing else: there is no local copy
+  // of where the vehicle is going, no local arrival timer and no local notion of "done".
+  // The MOVEMENT lives entirely on the fleet row (v.quick_move, written by Scout) so a page
+  // reload, a vehicle switch or a browser reconnect cannot lose it or invent it.
+  let qmMenu = null;             // the open context menu element, or null
+  let qmMarker = null;           // the temporary target marker for the SELECTED vehicle
+  let qmSending = false;         // synchronous double-click guard around the POST
   // Set-Home CLICK FEEDBACK ONLY — never the source of Home's verified/not-verified
   // state (that is always v.home, Scout's own continuously-reported home_status; see
   // lib/home.js homeStatus()). `phase` is idle/pending/confirmed/failed: "confirmed"
@@ -396,6 +406,13 @@ export function Map(root) {
   // Wide zoom hides mission waypoint numbers (leaving dots); close zoom restores them.
   // A single container class toggle — the mission Leaflet layers are never recreated.
   map.on("zoomend", applyMissionZoom);
+  // Right-click anywhere on the map opens the one-action Quick move menu for the vehicle
+  // that is selected AT THAT MOMENT. Leaflet gives us both the geographic point and the
+  // original DOM event, which is what lets the menu name a destination and place itself.
+  map.on("contextmenu", openQuickMenu);
+  // Panning/zooming invalidates the screen position the menu was placed at, so it closes
+  // rather than floating over a different part of the water than the one it names.
+  map.on("movestart zoomstart", closeQuickMenu);
 
   function makeIcon(v) {
     const st = commState(v), color = COL[st], stale = st !== "connected", sel = v.id === selId;
@@ -716,6 +733,197 @@ export function Map(root) {
       ${row("Distance from Scout", fmtDistance(hs.distanceM))}
     </div>`;
   }
+  // ── QUICK MOVE ────────────────────────────────────────────────────────────────────────
+  //
+  // ONE operator-authority action: right-click the map, send the selected surface vehicle
+  // straight to that point, and let Scout hold there in a verified LOITER once it arrives.
+  //
+  // WHAT THIS CODE DELIBERATELY DOES NOT DO, because each of these would be the station
+  // asserting something it cannot verify:
+  //   * it never validates the target against a survey polygon, approved geometry, a
+  //     shoreline offset or a mission no-go zone — a quick move exists precisely for the
+  //     moments when no mission applies, and it works with no planning data at all;
+  //   * it never uploads, replaces, clears or restores a mission, and never touches the
+  //     mission overlays or the stored mission record;
+  //   * it never arms the vehicle, takes authority, changes a fence or resumes a mission;
+  //   * it never runs a timer that decides the vehicle arrived, changes a flight mode, or
+  //     ends the movement. Only Scout's reported status does any of that.
+  // The prerequisites checked here are a courtesy to the operator. The BACKEND re-runs the
+  // same policy at dispatch over a live authority read (main.py quick_move_dispatch_gate),
+  // so a menu item this page enabled can still be refused — which is the correct order of
+  // authority, not a bug.
+
+  /** The eligibility answer for a candidate target, using the SAME shared policy the
+   *  backend mirrors. `busy` covers both the in-flight POST and a quick move that is
+   *  already running, so a second right-click cannot queue a competing move by accident. */
+  function quickMoveGateFor(v, target) {
+    const stale = commState(v) !== "connected";
+    const av = authCtl.view();
+    return quickMoveGate(v, {
+      connected: !stale,
+      // handoffGate is the SAME predicate the mode buttons and the Home interlock are
+      // gated by (lib/authority.js), resolved against link staleness here exactly as
+      // homeGateCtx does — so Quick move can never be offered in a state where the
+      // station considers itself read-only for vehicle writes.
+      hasControl: handoffGate(av, { stale }).hasControl,
+      authority: stale ? null : av.value,
+      target,
+      busy: qmSending || hasPendingOfType(cmds, "QUICK_MOVE"),
+    });
+  }
+
+  function closeQuickMenu() {
+    if (!qmMenu) return;
+    document.removeEventListener("keydown", qmMenu._onKey, true);
+    document.removeEventListener("pointerdown", qmMenu._onOutside, true);
+    qmMenu.remove();
+    qmMenu = null;
+  }
+
+  /**
+   * The compact one-action menu. Bound to BOTH the clicked coordinates and the identity of
+   * the vehicle selected at the moment it opened: if the selection changes underneath it
+   * the menu closes rather than silently re-targeting, because a menu that said "Move
+   * Scout here" and then moved a different vehicle is the worst outcome this whole surface
+   * can produce.
+   */
+  function openQuickMenu(ev) {
+    closeQuickMenu();
+    const v = fleet.find((x) => x.id === selId);
+    if (!v) return;
+    const target = { lat: ev.latlng.lat, lng: ev.latlng.lng };
+    const gate = quickMoveGateFor(v, target);
+    const dist = vehicleDistanceTo(v, target);
+    const menu = document.createElement("div");
+    menu.className = "qm-menu";
+    menu.setAttribute("role", "menu");
+    menu.innerHTML = `
+      <button class="qm-item" role="menuitem" ${gate.enabled ? "" : "disabled"}>
+        <span class="qm-act">${esc(quickMoveLabel(v))}</span>
+        <span class="qm-dest">${esc(fmtTarget(target))}</span>
+      </button>
+      ${dist == null
+        ? '<div class="qm-note">Distance unavailable — this vehicle has no current position.</div>'
+        : `<div class="qm-note">${esc(fmtDistance(dist))} from ${esc(v.name || "USV-" + v.id)}</div>`}
+      ${gate.enabled ? "" : `<div class="qm-block">${esc(gate.reason)}</div>`}`;
+    document.body.appendChild(menu);
+    // Placed after insertion so the measured size can keep it inside the viewport on a
+    // laptop screen, where a right-click near the bottom edge is entirely normal.
+    const pad = 8, r = menu.getBoundingClientRect();
+    const oe = ev.originalEvent;
+    menu.style.left = `${Math.min(oe.clientX, window.innerWidth - r.width - pad)}px`;
+    menu.style.top = `${Math.min(oe.clientY, window.innerHeight - r.height - pad)}px`;
+
+    menu._forVehicle = selId;
+    menu._onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); closeQuickMenu(); } };
+    menu._onOutside = (e) => { if (!menu.contains(e.target)) closeQuickMenu(); };
+    document.addEventListener("keydown", menu._onKey, true);
+    document.addEventListener("pointerdown", menu._onOutside, true);
+    // No second confirmation dialog: the menu already names the vehicle and the destination,
+    // and an extra modal restating both would only teach the operator to click through it.
+    if (gate.enabled) {
+      menu.querySelector(".qm-item").onclick = () => { closeQuickMenu(); sendQuickMove(v.id, target); };
+    }
+    menu.querySelector(".qm-item").focus();
+    qmMenu = menu;
+  }
+
+  /** Issue the move. The response answers DELIVERY only — never arrival — so nothing here
+   *  draws a target or claims progress; the next fleet poll carries Scout's own status. */
+  async function sendQuickMove(vid, target) {
+    if (qmSending || !validTarget(target)) return;
+    qmSending = true;
+    renderInspector();
+    try {
+      const res = await api.quickMove(vid, target);
+      if (!res.ok) {
+        const d = res.data || {};
+        showToast(d.message || "The Quick move was not accepted.", "warn");
+      }
+    } catch (e) {
+      // A failed fetch is genuinely ambiguous: the request may have reached the backend.
+      // Say that, rather than reporting a failure the station cannot actually establish.
+      showToast("The Quick move request did not complete. It may or may not have been sent — "
+                + "check the vehicle before trying again.", "warn");
+    } finally {
+      qmSending = false;
+      loadCommands(vid);
+      renderInspector();
+    }
+  }
+
+  /** The temporary destination marker for the SELECTED vehicle only. Driven entirely by the
+   *  backend's tracked move, so it appears when Scout confirms one, follows a supersession,
+   *  and disappears on its own when the move ends — never on a browser timer. */
+  function updateQuickMoveMarker() {
+    if (!map) return;
+    const v = fleet.find((x) => x.id === selId);
+    const cur = v ? quickMoveCurrent(v) : null;
+    const t = cur && cur.requested_target;
+    if (!t) {
+      if (qmMarker) { map.removeLayer(qmMarker); qmMarker = null; }
+      return;
+    }
+    const st = cur.status || null;
+    const done = !!(st && st.terminal);
+    const icon = L.divIcon({
+      className: "",
+      html: `<div class="qm-target${done ? " done" : ""}" title="Quick move target — ${escAttr(fmtTarget(t))}">
+               <span class="ring"></span><span class="pip"></span></div>`,
+      iconSize: [26, 26], iconAnchor: [13, 13],
+    });
+    const ll = [t.lat, t.lng];
+    if (!qmMarker) qmMarker = L.marker(ll, { icon, zIndexOffset: 400 }).addTo(map);
+    else qmMarker.setLatLng(ll).setIcon(icon);
+  }
+
+  /** The compact Quick move status card. Renders only when there is a move to report, and
+   *  says nothing about mission progress — the two are separate facts and separate cards. */
+  function renderQuickMove(v) {
+    const view = quickMoveView(v, {
+      connected: commState(v) === "connected",
+      command: cmds.find((c) => c && c.id === (quickMoveCurrent(v) || {}).command_id) || null,
+    });
+    if (!view) return "";
+    const rows = [];
+    rows.push(`<div class="qmc-row"><span class="k">Destination</span><span class="mono">${esc(view.targetText)}</span></div>`);
+    if (view.remainingText) {
+      rows.push(`<div class="qmc-row"><span class="k">Remaining</span><span class="mono">${esc(view.remainingText)}</span> <span class="src">Scout</span></div>`);
+    }
+    if (view.mode) rows.push(`<div class="qmc-row"><span class="k">Mode</span><span class="mono">${esc(view.mode)}</span></div>`);
+    rows.push(`<div class="qmc-row"><span class="k">Requested</span><span>${esc(view.requestedAgo)}</span></div>`);
+    if (view.statusAgo) {
+      rows.push(`<div class="qmc-row"><span class="k">Scout reported</span><span>${esc(view.statusAgo)}</span></div>`);
+    }
+    const notes = [];
+    if (view.cancelRequested) {
+      // A REQUEST, never a cancellation: until Scout reports a terminal state the vehicle
+      // may still be moving, and telling the operator otherwise would be a fabrication.
+      notes.push(`<div class="qmc-note">Stop requested (${esc(view.cancelRequested.reason)}) — waiting for Scout to confirm the vehicle has stood down.</div>`);
+    }
+    if (view.targetMismatch) {
+      notes.push(`<div class="qmc-note warn">Scout is reporting a target ${esc(fmtDistance(view.targetOffsetM))} from the point you clicked (${esc(fmtTarget(view.scoutTarget))}).</div>`);
+    }
+    if (view.completionNote) notes.push(`<div class="qmc-note warn">${esc(view.completionNote)}</div>`);
+    if (view.reason) notes.push(`<div class="qmc-note">${esc(view.reason)}</div>`);
+    if (view.lastKnown) {
+      notes.push('<div class="qmc-note">Scout is not currently reporting this move — the state above is last known, not confirmed current.</div>');
+    }
+    return `
+      <div class="qmc">
+        <div class="qmc-head">
+          <span class="pill ${view.stateCls}">${esc(view.stateText)}</span>
+          <span class="qmc-del ${view.delivery.cls}">${esc(view.delivery.text)}</span>
+        </div>
+        <div class="qmc-grid">${rows.join("")}</div>
+        ${notes.join("")}
+        ${view.stopAvailable
+          ? `<div class="qa qmc-stop"><button data-qm-stop title="${escAttr(SAFETY_HOLD_TITLE)}">STOP / LOITER</button></div>
+             <div class="qmc-foot">Stop sends the ordinary LOITER safety hold. The move ends when Scout reports it, not when this button is pressed.</div>`
+          : ""}
+      </div>`;
+  }
+
   function updateHomeMarker() {
     if (!map) return;
     const v = fleet.find((x) => x.id === selId);
@@ -2123,6 +2331,11 @@ export function Map(root) {
     // Mission card (renderPxm); this gateCtx is only for the command gating below.
     const gateCtx = homeGateCtx(v);
 
+    // Rendered once, here, rather than twice inside the template (a presence test and then
+    // the content). Empty string = there is no quick move to report, and the whole section
+    // is omitted rather than rendered as an empty card.
+    const quickMoveCard = renderQuickMove(v);
+
     // SECTION ORDER IS A PRODUCT DECISION, pinned by tests/map-inspector.test.mjs:
     //   vehicle header → Status → Vehicle Commands → Agent Mission → Vehicle readiness →
     //   secondary information.
@@ -2162,6 +2375,10 @@ export function Map(root) {
             Stop transfer and verify authority themselves as part of the same operation.</div>
         </details>
       </div>
+      ${quickMoveCard ? `<div class="isec">
+        <div class="sec-title"><span class="lbl">Quick move</span><span class="tag" style="margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--dim)">operator · not mission progress</span></div>
+        ${quickMoveCard}
+      </div>` : ""}
       <div class="isec">
         <div class="sec-title"><span class="lbl">Agent Mission</span></div>
         ${renderAgentMission(v)}
@@ -2210,6 +2427,14 @@ export function Map(root) {
     });
     box.querySelectorAll("button[data-cmd]").forEach((btn) => {
       btn.onclick = () => sendCommand(btn.dataset.cmd);
+    });
+    // Stop a Quick move by sending the ORDINARY safety hold — the same LOITER command the
+    // mode row has always had, through the same pipeline, with no second cancel mechanism.
+    // The backend records the operator's cancel request against the tracked move and stops
+    // any still-undelivered one from firing afterwards; Scout decides when the vehicle has
+    // actually stood down, and nothing here claims it has.
+    box.querySelectorAll("button[data-qm-stop]").forEach((btn) => {
+      btn.onclick = () => sendCommand(SAFETY_HOLD_TYPE);
     });
     box.querySelectorAll("button[data-mx]").forEach((btn) => {
       btn.onclick = () => onMissionAction(btn.dataset.mx, v);
@@ -2533,6 +2758,13 @@ export function Map(root) {
       // tracked command id) across a switch.
       if (setHomeTimer) { clearTimeout(setHomeTimer); setHomeTimer = null; }
       setHome = { phase: "idle", code: null, message: null, at: 0, cmdId: null };
+      // A Quick move belongs to ONE vehicle too. The menu is bound to the vehicle it opened
+      // for and the target marker to the selected one, so both are torn down here rather
+      // than left to re-point at whichever vehicle is now selected. The MOVEMENT itself is
+      // untouched — it lives on the other vehicle's fleet row and keeps running (and keeps
+      // being reported) exactly as before; only this page's view of it moves.
+      closeQuickMenu();
+      if (qmMarker) { map.removeLayer(qmMarker); qmMarker = null; }
       // A companion panel belongs to ONE parent: never carry it onto another vehicle.
       cmpOpenFor = null;
     }
@@ -2541,7 +2773,7 @@ export function Map(root) {
     const v = fleet.find((x) => x.id === id);
     if (map && v && v.lat != null && v.lng != null) map.panTo([v.lat, v.lng]);
     renderDock(); renderPxm(); syncMissionOverlay(); renderInspector(); updateMarkers(); updateHomeMarker();
-    renderCompanionPanel();
+    updateQuickMoveMarker(); renderCompanionPanel();
     // The approved-plan reference follows the selected vehicle (per-USV, like every other
     // overlay) and is redrawn from THIS vehicle's own record.
     drawOriginalOverlay(id); renderReplanBanner();
@@ -2580,7 +2812,7 @@ export function Map(root) {
       noteRevisionEvidence(selId);
     }
     updateMarkers(); renderDock(); renderPxm(); renderInspector(); updateHomeMarker();
-    updateCompanionLayers(); renderCompanionPanel();
+    updateQuickMoveMarker(); updateCompanionLayers(); renderCompanionPanel();
     updateRibbon({ counts: counts() });
   }
 

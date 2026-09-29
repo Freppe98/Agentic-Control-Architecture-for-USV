@@ -460,6 +460,23 @@ def _since(mark, now_mono_s):
     return _elapsed(mark, now_mono_s)
 
 
+# --- the EVIDENCE TIME model as a stable, station-wide primitive --------------------------
+# The four functions above are this station's ONE answer to "how old is this Scout-reported
+# fact, and what may we honestly claim about that" (see this module's EVIDENCE TIME section
+# and COMPANION_CONTRACT.md section 3). They were private while companions were the only
+# consumer; `quick_move.py` is the second, and a second COPY of min_age_s /
+# reporting_delay_s arithmetic is precisely the drift the model exists to prevent.
+#
+# So they are re-exported here under public names, unchanged. This is a rename, not a new
+# API: the semantics, the "no FRESH verdict" rule and the monotonic-clock guarantee are the
+# ones documented above, and any consumer inherits them whole.
+mark_now = _mark                # one receipt-clock reading: {wall, mono}
+receipt_bundle = _receipt       # the per-delivery bundle every evidence item in a packet shares
+evidence_of = _evidence         # (evidence, reason) for one Scout-supplied observed_at
+evidence_freshness = _freshness  # the published {min_age_s, reporting_delay_s, ...} view
+time_since = _since             # monotonic elapsed time since a bookkeeping mark
+
+
 # --- per-vehicle state ------------------------------------------------------------------
 
 def new_state():

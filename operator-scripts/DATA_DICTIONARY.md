@@ -151,6 +151,39 @@ Wire format Scout must send: **`COMPANION_CONTRACT.md`** (full reference) / **`S
 
 UI states (`operator/lib/companion.js`): chip **ACTIVE / IDLE / STALE / LOST / UNKNOWN** in text + colour. STALE whenever Scout is not CONNECTED, has not listed the companion for > 15 s, reports DEGRADED, its last peer contact is > 15 s old (by the EFFECTIVE, delay-inclusive age — see `evidenceView`), or the evidence's freshness is UNKNOWN. A UAV position older than 10 s (effective age) is drawn stale. A hazard reads as an accepted exclusion **only** for `disposition.state = ACCEPTED`; a missing replan outcome reads "not reported". A notable reporting delay (> 5 s) is surfaced in the age text itself ("at least Ns ago (delivery delay ~Ds)"), never silently folded away.
 
+## Quick move (operator "Move <vehicle> here") — `quick-move-v1`
+Wire format Scout must send, and everything Scout must implement: **`QUICK_MOVE_HANDOFF.md`**. Status: PROPOSED — operator side implemented, Scout side **not** (ArduRover GUIDED has no Local Agent mapping and no Flask endpoint today, and firmware support is unverified). A quick move is ONE operator-authority guided movement to a clicked lat/lng, after which Scout enters and **verifies** LOITER. It is not a mission operation: no geometry validation, no readiness requirement, no upload, no mission replacement, and it never arms, takes authority, changes a fence or resumes a mission. Every fleet row (never-contacted included) carries `quick_move`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `quick_move.reported` | bool | has this vehicle ever sent a well-formed block |
+| `quick_move.block_age_s` | s (monotonic) | since the last well-formed block |
+| `quick_move.capability` | {supported, reason, nav_ready, max_distance_m, vehicle_class, source} | **absence means unsupported** (`source:"absent"`). Being present in the fleet is never evidence a vehicle can perform a guided move; only `supported:true` enables the action. `nav_ready` is tri-state — `null` (Scout said nothing) never blocks, only an explicit `false` does. |
+| `quick_move.current` | object \| null | the ONE move this station tracks for this vehicle; `null` when there is none, or once a terminal one has aged past `TERMINAL_RETENTION_S` (120 s) |
+| `current.command_id` | uuid | the operator command every status is correlated against (see **Correlation** below) |
+| `current.requested_target` | {lat, lng} | what the OPERATOR clicked — the authority on where the move was meant to go |
+| `current.requested_age_s` | s (monotonic) | since the operator issued it |
+| `current.delivery_confirmed` | bool | `true` once Scout names this `command_id` back to us. `false` means only "not yet reported" — **never** that delivery failed; the command record's own lifecycle carries the queue side, and between them the UI shows uncertainty rather than inventing either verdict |
+| `current.cancel_requested` | {reason, age_s} \| null | the operator asked for a stop (today: an ordinary `SET_MODE_LOITER`). A REQUEST, never a cancellation — only Scout reporting a terminal state ends the movement |
+| `current.status` | object \| null | Scout's last APPLIED movement report; `null` until Scout reports one. A command result is **not** a movement status |
+| `status.state` | `STARTING\|MOVING\|ARRIVED\|COMPLETED\|CANCELLED\|FAILED` | the last three are terminal; `ARRIVED` means at the target with LOITER **not** yet verified |
+| `status.target` | {lat, lng} | where Scout says it is going |
+| `status.target_offset_m` / `target_mismatch` | m / bool | distance between Scout's target and the operator's, and whether it exceeds 5 m. Surfaced prominently: a vehicle driving somewhere else is the one failure that would otherwise look like a healthy move |
+| `status.distance_remaining_m` | m \| null | **Scout's** number, shown only when Scout sends one. The station never substitutes its own straight-line distance — that answers a different question |
+| `status.arrival_confirmed` / `loiter_verified` | bool \| null | tri-state; `null` = Scout did not say, which is never read as proof of either |
+| `status.completion` | `CONFIRMED\|CLAIMED_UNVERIFIED` \| null | the OPERATOR's verdict. `CONFIRMED` only for `COMPLETED` **with both** evidence flags; a bare `COMPLETED` is `CLAIMED_UNVERIFIED` — Scout's claim stays visible but is never rendered as a finished hold |
+| `status.mode` / `reason` / `terminal` | token / text / bool | Scout's observed mode; readable reason (required for `FAILED`/`CANCELLED`) |
+| `status.updated` | *freshness* | the same freshness object companions use (see above) — `quick_move.py` imports `companion_telemetry`'s primitives rather than keeping a second copy |
+| `status.status_age_s` | s (monotonic) | since this status reached the operator. Past ~10 s, or on a link that is not CONNECTED, the movement renders **"(last known)"**, never as current |
+| `quick_move.rejections` | {count, by_reason, last_reason} | refusals per reason (see **Correlation**) |
+
+**Correlation and supersession** — every status carries the `command_id` it refers to, and the station tracks exactly one current move per vehicle. A status for a **retired** id (a superseded or replaced move) is refused as `superseded_status`; one for an id this station never issued is refused as `unknown_command_id`. Neither can put an old target back on the map. Within one id, `updated_at` must strictly increase (`stale_status` otherwise) and a terminal state is never walked back to a running one (`terminal_state_regression`) — a buffered `MOVING` arriving after a `CANCELLED` cannot resurrect the movement. Issuing a new quick move also terminates the previous one's queue record, so an undelivered older move is never handed to Scout afterwards. `main.py`'s own per-vehicle envelope-timestamp guard still applies on top, as it does for companions.
+
+**Short-lived by construction** — `QUICK_MOVE` has its own TTL (`QUICK_MOVE_TTL_S = 45` vs. the queue's 300) and the backend **refuses to create one at all** unless the link is CONNECTED; `confirm:true`, which buys every other command type into the queue-until-contact path, cannot override that. "Go there now" must never survive a disconnection and execute on reconnection. The TTL covers delivery and acceptance, not the movement: Scout reports `EXECUTED` once it has commanded the guided move, and everything after that travels on the status block. Refusals come back as `409 {code, message}` with a machine `code` from one ordered list mirrored verbatim in `operator/lib/quick-move.js` (parity is test-pinned): `not_reported`, `not_supported`, `link_not_current`, `authority_unreadable`, `not_operator`, `disarmed`, `armed_unknown`, `nav_not_ready`, `bad_target`, `too_far`, `busy`. The gate is re-run server-side at dispatch over a **live** authority read — a UI check is a courtesy to the operator, never an authorization.
+
+UI (`operator/lib/quick-move.js`, `operator/pages/Map.js`): a right-click opens a one-action menu naming the vehicle, the destination and the distance, disabled with the real reason when any prerequisite fails. While a move runs, the inspector carries a compact Quick move card (deliberately its own section, between Vehicle Commands and Agent Mission, and never part of mission progress) plus a temporary dashed target marker. Delivery, movement and completion are rendered as three separate claims and no browser timer decides any of them.
+
+
 ## Events & notifications
 | Field | Type | Source | Pages | Freq | Opt | Notes |
 |---|---|---|---|---|---|---|

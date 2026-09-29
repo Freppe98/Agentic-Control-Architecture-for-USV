@@ -120,6 +120,8 @@
   --z-nav-tip:60;        /* nav-rail hover tooltips */
   --z-map-overlay:1100;  /* legend, status banner, wind, map view controls */
   --z-map-toast:1200;    /* map-local toast — above every other map overlay */
+  --z-map-menu:1300;     /* map context menu: above the map toast, below a dialog,
+                            because a dialog it opened must still cover it */
   --z-modal:2000;        /* confirmation dialogs */
   --z-tour:3000;         /* guided tour, deliberately above a dialog */
 }

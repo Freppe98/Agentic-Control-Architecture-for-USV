@@ -27,6 +27,7 @@ import scout_replan
 import vehicle_registry
 import vehicle_telemetry
 import companion_telemetry
+import quick_move
 
 
 @asynccontextmanager
@@ -202,6 +203,17 @@ packet_loss_by_id = {}     # {vehicle_id: vehicle_telemetry.PacketLossEstimator}
 # vehicle_telemetry.CARRIED_GROUPS: its omission/clear semantics and per-measurement
 # observation times are its own.
 companion_state_by_id = {}  # {vehicle_id: companion_telemetry state}
+
+# Quick move (operator-authority direct "go here") state, per vehicle: Scout's advertised
+# capability plus the ONE movement this station currently considers authoritative for that
+# vehicle (quick_move.py / QUICK_MOVE_HANDOFF.md). Kept apart from the command queue on
+# purpose: the queue answers "did the command reach Scout", this answers "what is the
+# vehicle doing about it" — and neither is ever read as the other.
+quick_move_state_by_id = {}  # {vehicle_id: quick_move state}
+# Last quick-move state already written to the event log, per vehicle. Scout repeats its
+# current status on every packet (it is a state, not an event), so without this a 1 Hz
+# MOVING heartbeat would write one event per second.
+_last_quick_move_state = {}
 
 
 def packet_loss_estimator(cid):
@@ -387,6 +399,10 @@ def never_contacted_row(cid):
         "link": vehicle_telemetry.link_block({}, None),
         "stale_groups": [],
         "companions": companion_telemetry.empty_block(),
+        # Absence means unsupported: a configured-but-silent vehicle advertises no Quick
+        # move capability, so the Map never offers the action for it. Being in the fleet is
+        # never, on its own, evidence a vehicle can perform a guided move.
+        "quick_move": quick_move.empty_block(),
         "agent_status": {},
         "mission_upload": None,
         "fleet_info": {},
@@ -767,6 +783,14 @@ def normalize_agent_message(message: dict, cid=None, received_at=None) -> dict:
         # NTP step or manual clock change here cannot corrupt a freshness reading.
         "companions": companion_telemetry.fleet_block(companion_state_by_id, usv_id,
                                                        time.time(), time.monotonic()),
+        # Quick move: Scout's advertised capability plus the ONE movement this station is
+        # currently tracking for this vehicle, each measurement aged from its own Scout-side
+        # observation time rather than this packet's arrival (quick_move.py, which shares
+        # companion_telemetry's evidence-time model). Deliberately separate from
+        # `mission_data` / `mission_status`: a quick move is not mission progress and must
+        # never be rendered as any part of one.
+        "quick_move": quick_move.fleet_block(quick_move_state_by_id, usv_id,
+                                             time.time(), time.monotonic()),
         # Agent reasoning (payload.agent.*) forwarded verbatim for the Agent page:
         # current_behaviour, decision_reason, current_policy, autonomy_level,
         # current_communication_state, current_mission_state, buffer_usage,
@@ -1228,6 +1252,12 @@ COMMAND_TYPES = {
     # verified by a Scout read-back (observed count/hash vs the operator's expected), never
     # by transport success alone — see _annotate_mission_upload_result.
     "MISSION_UPLOAD", "MISSION_CLEAR",
+    # QUICK_MOVE is the Map's right-click "Move <vehicle> here": ONE operator-authority
+    # guided movement to a clicked lat/lng, after which Scout enters and VERIFIES LOITER.
+    # It is deliberately not a mission operation — it uploads nothing, replaces nothing and
+    # requires no approved geometry — and it is deliberately not queueable while offline
+    # (see QUICK_MOVE_TTL_S). quick_move.py / QUICK_MOVE_HANDOFF.md own the contract.
+    "QUICK_MOVE",
 }
 # Arming touches the motors, so both ARM and DISARM ALWAYS require an explicit
 # confirm:true (independent of comm-state) — the backend rejects them otherwise.
@@ -1236,6 +1266,11 @@ COMMAND_TYPES = {
 # MISSION_UPLOAD/MISSION_CLEAR overwrite the flight controller's stored mission, so they
 # join the confirm-required set (readback-verified, same treatment as SET_HOME).
 CONFIRM_REQUIRED_TYPES = {"ARM", "DISARM", "SET_HOME", "MISSION_UPLOAD", "MISSION_CLEAR"}
+# The active anti-drift safety hold, named once. It is deliberately NOT confirm-required and
+# NOT Home-gated anywhere in this station (operator/lib/home.js says the same thing for the
+# UI): LOITER must stay a one-press option at all times, and it doubles as the Stop action
+# for a quick move (see create_command).
+SAFETY_HOLD_COMMAND = "SET_MODE_LOITER"
 RISK_WARNING = {
     "ARM": "High-risk: the vehicle can move under power once armed. Confirmed by operator.",
     "DISARM": "Disarms the vehicle (motors off). Confirmed by operator.",
@@ -1323,6 +1358,16 @@ def normalize_source(raw):
         return "LOCAL_AGENT"
     return "OPERATOR"
 COMMAND_TTL_S = 300              # queued commands survive ~5 min of disconnection, then EXPIRE
+# QUICK_MOVE gets its OWN, much shorter TTL, and this is a safety property rather than a
+# tuning choice: "go to that spot now" stops being the operator's intent within seconds of
+# them losing the link, so a quick move must never survive a disconnection and execute on
+# reconnection. The short TTL is the second half of that guarantee; the first is
+# create_command refusing to create one at all unless the link is currently CONNECTED.
+# The window still has to cover DELIVERY AND ACCEPTANCE, not the movement itself: Scout
+# reports EXECUTED once it has commanded the guided move, and everything after that
+# (moving, arriving, verified LOITER) travels on the status block, not the queue record.
+QUICK_MOVE_TTL_S = 45
+COMMAND_TTL_OVERRIDES = {"QUICK_MOVE": QUICK_MOVE_TTL_S}
 TERMINAL_STATUSES = {"EXECUTED", "REJECTED", "FAILED", "EXPIRED"}
 RESULT_STATUSES = {"ACCEPTED", "EXECUTED", "REJECTED", "FAILED"}  # what an Agent may report
 
@@ -1380,6 +1425,163 @@ def _canonical_set_home_params(raw_params):
     if lat is not None and lng is not None:
         canonical["requested_position"] = {"lat": lat, "lng": lng}
     return canonical
+
+
+# --- QUICK_MOVE (operator-authority "Move <vehicle> here"; see quick_move.py) ----------
+#
+# THE DIVISION OF OWNERSHIP, which everything below depends on:
+#   * The OPERATOR supplies a destination and nothing else. No mode, no arrival radius, no
+#     speed, no path: those are Scout's, and a station that sent them would be asserting
+#     things about a vehicle it cannot verify.
+#   * SCOUT owns execution: entering GUIDED, driving there, deciding it has arrived, and
+#     entering and VERIFYING the LOITER hold afterwards.
+#   * Therefore the operator's queue record only ever means "the move was delivered and
+#     accepted". Arrival and the verified hold arrive separately, on the status block.
+#
+# Nothing in this path validates the target against a survey polygon, approved geometry, a
+# shoreline offset or a mission no-go zone, and nothing here requires mission readiness or
+# an approved planning package. A quick move is an operator-authority action that exists
+# precisely for the moments when no mission applies.
+
+
+class QuickMoveError(Exception):
+    """A quick move the operator cannot have: a bad destination or a failed prerequisite."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def canonical_quick_move_params(raw_params, *, vehicle_position=None, now=None):
+    """The params a QUICK_MOVE record carries, and the ONLY thing Scout is handed.
+
+    `target` is authoritative and is the operator's clicked destination. `requested_from`
+    is the vehicle position the operator's own screen was showing at click time, kept
+    nested and clearly separate as NON-AUTHORITATIVE audit metadata (the same treatment
+    _canonical_set_home_params gives a browser-supplied lat/lng, for the same reason: it
+    is a snapshot, not a fact about the vehicle now). Scout must never navigate relative
+    to it."""
+    raw = raw_params if isinstance(raw_params, dict) else {}
+    target = quick_move.latlng(raw.get("target") if isinstance(raw.get("target"), dict) else raw)
+    if target is None:
+        raise QuickMoveError("bad_target", quick_move.REASON_TEXT["bad_target"])
+    params = {
+        "schema": quick_move.SCHEMA,
+        "target": target,
+        "issued_at": (now or datetime.now(timezone.utc)).timestamp(),
+    }
+    if vehicle_position:
+        d = quick_move.meters_between(vehicle_position, target)
+        params["requested_from"] = {
+            **vehicle_position,
+            "distance_m": None if d is None else round(d, 1),
+        }
+    return params
+
+
+def _effective_telemetry(vid):
+    """This vehicle's telemetry group as the fleet row would resolve it - the packet's own
+    group when it carried one, else the vehicle's last-known snapshot (the SAME
+    partial-update guard normalize_agent_message uses). Read directly rather than through
+    a fleet row so the dispatch gate cannot disagree with what the operator was shown."""
+    rec = current_vehicle_state.get(vid)
+    raw = rec.get("raw_latest") if isinstance(rec, dict) else None
+    payload = {}
+    if isinstance(raw, dict):
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+    tel, _stale = vehicle_telemetry.effective_group(last_known_groups, vid, payload, "telemetry")
+    return tel if isinstance(tel, dict) else {}
+
+
+def _vehicle_armed(vid):
+    """True / False / None. None means "not reported", never "disarmed" - quick_move's gate
+    refuses both, with different reasons, because they are different things to tell an
+    operator."""
+    armed = _effective_telemetry(vid).get("armed")
+    return armed if isinstance(armed, bool) else None
+
+
+def _vehicle_position(vid):
+    """{lat, lng} the vehicle last actually reported, or None. Never a fabricated fix."""
+    tel = _effective_telemetry(vid)
+    lk = last_known_telemetry.get(vid, {})
+    return quick_move.latlng({"lat": tel.get("lat") or lk.get("lat"),
+                              "lng": tel.get("lng") or lk.get("lng")})
+
+
+def _read_authority_value(vid):
+    """The effective authority a LIVE read returns, or None when it could not be read.
+
+    None covers every "we do not know" case - Scout unreachable, no authority API
+    configured for this vehicle, an unrecognised value - and the gate fails closed on all
+    of them. It never falls back to a remembered or assumed value: an authority this
+    station cannot confirm right now is not an authority it may command a movement on."""
+    try:
+        data = read_control_authority(vid)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("reachable"):
+        return None
+    value = data.get("authority")
+    return value if value in REPORTABLE_AUTHORITY else None
+
+
+def quick_move_dispatch_gate(vid, target, comm_state):
+    """The SERVER-side prerequisite re-check for one quick move -> (ok, code, message).
+
+    The Map runs the same policy before it enables the menu item, but a UI check is a
+    courtesy to the operator, not an authorization: this one is what actually decides,
+    and it re-reads authority live rather than trusting anything the browser believed."""
+    return quick_move.eligibility(
+        quick_move_state_by_id, vid,
+        target=target,
+        connected=comm_state == "CONNECTED",
+        authority=_read_authority_value(vid),
+        armed=_vehicle_armed(vid),
+        vehicle_position=_vehicle_position(vid),
+    )
+
+
+def supersede_quick_moves(vid, now, reason, *, keep_id=None):
+    """Terminate every non-terminal QUICK_MOVE for one vehicle except `keep_id`.
+
+    Reuses the existing EXPIRED terminal status (no new lifecycle) exactly as
+    cancel_pending_commands does, so a superseded move that had not been delivered yet can
+    never be handed to Scout afterwards. Returns the ids it terminated."""
+    ended = []
+    for cmd in commands:
+        if (cmd["vehicle_id"] != vid or cmd["type"] != "QUICK_MOVE"
+                or cmd["status"] in TERMINAL_STATUSES or cmd["id"] == keep_id):
+            continue
+        cmd["status"] = "EXPIRED"
+        cmd["completed_at"] = now.isoformat()
+        cmd["reason"] = reason
+        _refresh_command_derived(cmd)
+        _command_event(cmd, severity="info",
+                       message="Quick move superseded (" + reason + ")",
+                       source="operator-backend")
+        ended.append(cmd["id"])
+    return ended
+
+
+def _quick_move_event(vid, status, *, severity="info"):
+    """One operator event per APPLIED quick-move state change, so the Events page carries
+    the movement's history even after the temporary on-map status has cleared."""
+    target = status.get("target") or {}
+    where = ("{:.6f}, {:.6f}".format(target["lat"], target["lng"]) if target
+             else "unknown target")
+    message = "Quick move " + str(status.get("state")) + " (" + where + ")"
+    if status.get("reason"):
+        message = message + " - " + str(status["reason"])
+    _append_event(severity=severity, message=message, etype="command",
+                  source=vehicle_slug(vid), vehicle_id=vid, vehicle=name_of(vid),
+                  detail={"quick_move_command_id": status.get("command_id"),
+                          "quick_move_state": status.get("state"),
+                          "target": target or None,
+                          "arrival_confirmed": status.get("arrival_confirmed"),
+                          "loiter_verified": status.get("loiter_verified"),
+                          "reason": status.get("reason")})
 
 
 # --- mission-contract-v1 (Scout-owned mission upload contract) -------------------
@@ -1634,7 +1836,11 @@ def make_command(*, vid, ctype, params, created_by, comm_state, now, source=None
         # Scout in agent_command_view and preserved in every record/history view.
         "source": normalize_source(source or created_by),
         "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(seconds=COMMAND_TTL_S)).isoformat(),
+        # Per-type TTL (COMMAND_TTL_OVERRIDES) with the queue's default for everything else.
+        # Stamped onto the record, so the Scout-facing view, the expiry sweep and the
+        # frontend's own "this can never pend forever" backstop all read ONE deadline.
+        "expires_at": (now + timedelta(
+            seconds=COMMAND_TTL_OVERRIDES.get(ctype, COMMAND_TTL_S))).isoformat(),
         "created_by": created_by or "operator",
         "requested_comm_state": comm_state,   # operator-side link state at creation
         "claimed_at": None,                   # set when the Agent first fetches it (SENT)
@@ -2316,6 +2522,27 @@ async def create_command(request: Request):
     comm_state = comms_state_by_id.get(vid, "UNKNOWN")
     confirm = bool(body.get("confirm"))
 
+    # QUICK_MOVE is gated BEFORE the confirm / queue-until-contact logic below, and that
+    # ordering is the point: every other command type may be confirmed into the queue while
+    # the vehicle is DISCONNECTED and delivered on the next contact. A quick move must never
+    # be, so it can never reach the confirm branch that would allow it. It is also refused
+    # outright (409, one machine `code` the UI renders) rather than queued-with-a-warning
+    # when any prerequisite fails, because there is no useful half-state for "drive over
+    # there" -- see quick_move.eligibility, which this re-runs server-side over a LIVE
+    # authority read regardless of what the browser believed when it enabled the menu item.
+    if ctype == "QUICK_MOVE":
+        try:
+            qm_target = quick_move.latlng((body.get("params") or {}).get("target")
+                                          if isinstance(body.get("params"), dict) else None)
+        except Exception:
+            qm_target = None
+        ok, code, message = quick_move_dispatch_gate(vid, qm_target, comm_state)
+        if not ok:
+            return JSONResponse(status_code=409, content={
+                "ok": False, "error": "quick_move_refused", "code": code,
+                "message": message, "type": ctype, "vehicle_id": vid,
+                "comm_state": comm_state})
+
     # High-risk arming: ARM/DISARM always require confirm:true, whatever the link state.
     if ctype in CONFIRM_REQUIRED_TYPES and not confirm:
         return JSONResponse(status_code=409, content={
@@ -2333,6 +2560,14 @@ async def create_command(request: Request):
     params = body.get("params")
     if ctype == "SET_HOME":
         params = _canonical_set_home_params(params)
+    elif ctype == "QUICK_MOVE":
+        try:
+            params = canonical_quick_move_params(
+                params, vehicle_position=_vehicle_position(vid), now=now)
+        except QuickMoveError as exc:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "quick_move_refused", "code": exc.code,
+                "message": exc.message, "type": ctype, "vehicle_id": vid})
     elif ctype == "MISSION_UPLOAD":
         try:
             params = canonical_mission_upload_params(params)
@@ -2369,6 +2604,31 @@ async def create_command(request: Request):
     _command_event(cmd, severity=severity,
                    message=f"Command {ctype} created ({comm_state})",
                    source="operator-backend")
+
+    if ctype == "QUICK_MOVE":
+        # This command is now the ONE quick move this station considers authoritative for
+        # the vehicle. Registering it retires the previous one, so a delayed status (or a
+        # delayed result) for the older move can never put the old target back on the map;
+        # terminating the older QUEUED/SENT record stops it being delivered at all. The
+        # two halves are both needed: the first protects the display, the second the vehicle.
+        superseded = quick_move.register_command(
+            quick_move_state_by_id, vid, command_id=cmd["id"], target=params["target"],
+            now_wall_s=time.time(), now_mono_s=time.monotonic())
+        supersede_quick_moves(vid, now, "replaced by a newer Quick move", keep_id=cmd["id"])
+        if superseded:
+            print(f"[QUICK-MOVE] vehicle={vid} new={cmd['id']} superseded={superseded}")
+    elif ctype == SAFETY_HOLD_COMMAND:
+        # LOITER is the Stop action for a quick move: it is the SAME ordinary safety-hold
+        # command the Map has always had, not a second cancel mechanism. The operator's
+        # request is recorded against the current move (so the card can say "stop requested")
+        # and any still-undelivered quick move is terminated so it cannot fire AFTER the
+        # hold. Scout still owns the outcome: the movement is only CANCELLED once Scout says
+        # so, and nothing here asserts the vehicle has stopped.
+        if quick_move.request_cancel(quick_move_state_by_id, vid,
+                                     reason="Operator commanded LOITER.",
+                                     now_wall_s=time.time(), now_mono_s=time.monotonic()):
+            supersede_quick_moves(vid, now, "cancelled by an operator LOITER command")
+
     return {"ok": True, "command": cmd}
 
 
@@ -2383,6 +2643,22 @@ def command_capabilities():
     caps["MISSION_CLEAR"] = {
         "supported": MISSION_CLEAR_SUPPORTED,
         "reason": None if MISSION_CLEAR_SUPPORTED else MISSION_CLEAR_UNSUPPORTED_REASON,
+    }
+    # QUICK_MOVE is the one entry here whose `supported:true` means something WEAKER than
+    # the others, and the extra fields say so explicitly rather than leaving a caller to
+    # assume. This endpoint answers "can this STATION deliver the command type at all" --
+    # it is fleet-wide and knows nothing about any particular vehicle. Whether a quick move
+    # may actually be sent to USV-N is a PER-VEHICLE question answered only by that
+    # vehicle's own advertised capability on its fleet row (`quick_move.capability`), and
+    # absence there means unsupported. A UI that enabled the action from this endpoint
+    # alone would be offering a guided move to every vehicle in the fleet.
+    caps["QUICK_MOVE"] = {
+        "supported": True,
+        "reason": None,
+        "per_vehicle_capability": "fleet.quick_move.capability",
+        "contract": quick_move.SCHEMA,
+        "ttl_s": QUICK_MOVE_TTL_S,
+        "offline_queueable": False,
     }
     return {
         "ok": True,
@@ -3562,6 +3838,14 @@ def cancel_pending_commands(vid: int, now, reason: str):
         cmd["completed_at"] = now.isoformat()
         cmd["reason"] = reason
         _refresh_command_derived(cmd)
+        if cmd["type"] == "QUICK_MOVE":
+            # Releasing authority to the agent cancels the queue, so the quick-move card
+            # must stop presenting the move as something the operator is still driving.
+            # Recorded as a cancel REQUEST, not a cancellation: if the command had already
+            # been delivered, only Scout can say whether the vehicle actually stood down.
+            quick_move.request_cancel(quick_move_state_by_id, vid, reason=reason,
+                                      now_wall_s=time.time(), now_mono_s=time.monotonic(),
+                                      command_id=cmd["id"])
         _command_event(cmd, severity="warning",
                        message=f"Command {cmd['type']} cancelled ({reason})",
                        source="operator-backend")
@@ -4101,6 +4385,19 @@ async def receive_agent_status(request: Request):
                                           received_at=now.timestamp(), received_mono=time.monotonic(),
                                           resolve_parent=canonical_id):
                 _save_companion_sessions()
+            # Optional quick-move block, in the accepted branch for the same reason: a
+            # replayed older packet must not rewrite movement state. A True return means a
+            # status was APPLIED to the move this station is tracking (correlation and
+            # ordering already checked inside), which is worth one event -- so the movement
+            # has a permanent record after the temporary on-map status has cleared. This
+            # NEVER decides arrival or completion; it only logs what Scout reported.
+            if quick_move.ingest(quick_move_state_by_id, vid, payload, packet_ts=msg_ts,
+                                 received_at=now.timestamp(), received_mono=time.monotonic()):
+                _qm = (quick_move_state_by_id[vid]["current"] or {}).get("status")
+                if _qm and _qm.get("state") != _last_quick_move_state.get(vid):
+                    _last_quick_move_state[vid] = _qm["state"]
+                    _quick_move_event(vid, _qm,
+                                      severity="warning" if _qm["state"] == "FAILED" else "info")
         record_agent_changes(vid, payload, now)
         rec["packets"] = rec.get("packets", 0) + 1
         # The STREAK ends on recovery, but `last_reject` is deliberately NOT cleared: an

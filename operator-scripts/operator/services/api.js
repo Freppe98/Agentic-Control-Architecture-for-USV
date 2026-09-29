@@ -218,6 +218,25 @@ export function setHome(id, { lat, lng } = {}) {
   return createCommand({ vehicle_id: id, type: "SET_HOME", params, confirm: true });
 }
 
+// --- Quick move (Map right-click "Move <vehicle> here") --------------------------------
+// An ordinary queued command (POST /api/commands, type QUICK_MOVE) — deliberately NOT a
+// bespoke endpoint, so it inherits the one command lifecycle, the one at-least-once
+// delivery with a stable command id across retries, and the one result path. Three things
+// are specific to it and all live in the backend, not here:
+//   * it is NEVER confirm-into-the-offline-queue. The backend refuses it outright (409
+//     with a machine `code`) unless the link is CONNECTED, and gives it a much shorter TTL;
+//   * the backend re-runs the full prerequisite gate at dispatch over a LIVE authority
+//     read, so this call can be refused even though the UI enabled the menu item;
+//   * issuing one SUPERSEDES the vehicle's previous quick move — no client bookkeeping.
+// `confirm` is deliberately absent: the action is a single deliberate click on a named
+// vehicle at a clicked point, and a second dialog restating it adds nothing.
+//
+// The return value answers DELIVERY ONLY. Arrival is never knowable here: it arrives later
+// on the vehicle's own fleet row (`quick_move.current.status`), reported by Scout.
+export function quickMove(id, { lat, lng } = {}) {
+  return createCommand({ vehicle_id: id, type: "QUICK_MOVE", params: { target: { lat, lng } } });
+}
+
 // --- Mission upload / clear (write the Pixhawk mission via the command queue) ----------
 // MISSION_UPLOAD / MISSION_CLEAR are normal queued commands (POST /api/commands, confirm-
 // required) — NOT a bespoke transport. `params` for an upload is the mission-contract-v1
