@@ -361,3 +361,92 @@ test("the status card is not mission progress and does not claim to be", () => {
       `the quick-move card must not read mission progress (${forbidden})`);
   }
 });
+
+// ── Scout integration round 2 (quick-move-v1 against Scout checkpoint a102f21a) ────────
+// Three defects the real Scout contract exposed, each pinned here. See
+// QUICK_MOVE_HANDOFF.md §13 for the joint findings these came from.
+
+import { commandOnlyState } from "../operator/lib/quick-move.js";
+
+test("a Scout rejection is never rendered as 'awaiting Scout'", () => {
+  // Scout refuses at its own prepare() precondition WITHOUT registering a movement, so the
+  // status block stays empty and the command result is the only thing that happened. The
+  // state line used to read "Sent — awaiting Scout" beside the rejection reason.
+  const v = vehicle({ current: current({ status: null, delivery_confirmed: false }) });
+  const view = quickMoveView(v, {
+    connected: true,
+    command: { status: "REJECTED", reason: "Mission supervisor is executing a bound mission." },
+  });
+  assert.equal(view.stateText, "Rejected by Scout");
+  assert.equal(view.stateCls, "d");
+  assert.doesNotMatch(view.stateText, /awaiting/i);
+  assert.match(view.delivery.text, /Mission supervisor/);
+});
+
+test("every terminal command outcome has its own state line", () => {
+  assert.deepEqual(commandOnlyState({ status: "REJECTED" }), ["Rejected by Scout", "d"]);
+  assert.deepEqual(commandOnlyState({ status: "FAILED" }), ["Failed", "d"]);
+  assert.deepEqual(commandOnlyState({ status: "EXPIRED" }), ["Not delivered", "u"]);
+  assert.deepEqual(commandOnlyState({ status: "EXECUTED" }), ["Accepted — awaiting movement", "p"]);
+  assert.deepEqual(commandOnlyState(null), ["Sent — awaiting Scout", "p"]);
+});
+
+test("an EXPIRED command stays neutral about WHY it was not delivered", () => {
+  // Link loss, supersession, Stop and the claim window all expire the record. The reason is
+  // on the record and the delivery line renders it; the state line must not guess.
+  const [text] = commandOnlyState({ status: "EXPIRED" });
+  assert.doesNotMatch(text, /link|replac|stop|stale/i);
+});
+
+test("arrival with a failed hold is surfaced as its own fact, not just 'Failed'", () => {
+  // Scout's `arrival_loiter_failure`: the vehicle IS at the operator's point and is NOT
+  // confirmed holding. "Failed" alone reads as "nothing happened", which is the opposite of
+  // the truth and hides that the boat may be drifting there.
+  const st = status({ state: "FAILED", terminal: true, arrival_confirmed: true,
+                      loiter_verified: false, mode: "GUIDED",
+                      reason: "Arrived at the target but LOITER was not verified." });
+  const view = quickMoveView(vehicle({ current: current({ status: st }) }), { connected: true });
+  assert.equal(view.arrivedNotHolding, true);
+  assert.equal(view.completion, null, "never a completion of any kind");
+});
+
+test("a cancelled move that never arrived is not flagged as arrived-not-holding", () => {
+  const st = status({ state: "CANCELLED", terminal: true, arrival_confirmed: null });
+  const view = quickMoveView(vehicle({ current: current({ status: st }) }), { connected: true });
+  assert.equal(view.arrivedNotHolding, false);
+});
+
+test("a self-contradictory completion is refused as a confirmed hold", () => {
+  // Scout fixed this (it was reporting mode=GUIDED after a verified LOITER). The operator
+  // checks it rather than trusting the fix: a silent regression here produces a confident
+  // "arrived and holding" over a vehicle that may not be holding at all.
+  const st = status({ state: "COMPLETED", terminal: true, completion: "CLAIMED_UNVERIFIED",
+                      arrival_confirmed: true, loiter_verified: true, mode: "GUIDED",
+                      mode_incoherent: true });
+  const view = quickMoveView(vehicle({ current: current({ status: st }) }), { connected: true });
+  assert.equal(view.modeIncoherent, true);
+  const note = completionNote(st);
+  assert.match(note, /contradicts itself/i);
+  assert.match(note, /GUIDED/);
+  assert.match(note, /unconfirmed/i);
+  assert.doesNotMatch(note, /did not confirm/,
+    "it DID claim both — naming the contradiction is the useful thing to say");
+});
+
+test("a coherent completion is still confirmed and carries no caveat", () => {
+  const st = status({ state: "COMPLETED", terminal: true, completion: "CONFIRMED",
+                      arrival_confirmed: true, loiter_verified: true, mode: "LOITER",
+                      mode_incoherent: false });
+  assert.equal(completionNote(st), null);
+  const view = quickMoveView(vehicle({ current: current({ status: st }) }), { connected: true });
+  assert.equal(view.stateText, "Arrived and holding");
+  assert.equal(view.modeIncoherent, false);
+});
+
+test("the Map renders the arrived-not-holding warning", () => {
+  const card = mapSrc.slice(mapSrc.indexOf("function renderQuickMove"),
+                            mapSrc.indexOf("function updateHomeMarker"));
+  assert.match(card, /arrivedNotHolding/);
+  assert.match(card, /reached the target/i);
+  assert.match(card, /not<\/b> confirmed|not confirmed/i);
+});

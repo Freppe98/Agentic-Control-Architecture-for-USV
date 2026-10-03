@@ -1,0 +1,660 @@
+{
+  "_WARNING": "RECONSTRUCTION, NOT A SCOUT CAPTURE. Transcribed from the prose of Scout's QUICK_MOVE_HANDOFF.md (checkpoint a102f21a). It proves the operator handles the contract AS DOCUMENTED; it cannot prove the operator handles what Scout's publisher actually emits. Replace with the real scout_quick_move_captures/ export when it is available. See README.md in this directory.",
+  "_source": "Scout QUICK_MOVE_HANDOFF.md section 5, scenario table (8 scenarios)",
+  "_captured_command_id": "scout-fixture-cmd-0001",
+  "scenarios": {
+    "01_capability_only_heartbeat": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": null
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000001.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": null
+          }
+        }
+      }
+    ],
+    "02_disabled_carries_reason": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": false,
+              "reason": "Quick move is disabled on this vehicle (QUICK_MOVE_ENABLED = False)."
+            },
+            "active": null
+          }
+        }
+      }
+    ],
+    "03_full_success": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "STARTING",
+              "updated_at": 1790000000.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "mode": "GUIDED"
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000002.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000002.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 118.4,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000005.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000005.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 40.2,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000008.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "LOITER",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "COMPLETED",
+              "updated_at": 1790000008.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 1.1,
+              "arrival_confirmed": true,
+              "loiter_verified": true,
+              "mode": "LOITER"
+            }
+          }
+        }
+      }
+    ],
+    "04_arrival_loiter_failure": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000000.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 55.0,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000006.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "FAILED",
+              "updated_at": 1790000006.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 1.4,
+              "arrival_confirmed": true,
+              "loiter_verified": false,
+              "mode": "GUIDED",
+              "reason": "Arrived at the target but LOITER was not verified."
+            }
+          }
+        }
+      }
+    ],
+    "05_cancelled_by_loiter_command": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000000.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 92.0,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000004.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "LOITER",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "CANCELLED",
+              "updated_at": 1790000004.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "mode": "LOITER",
+              "reason": "Cancelled by an operator LOITER command."
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000006.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000002.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 70.0,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      }
+    ],
+    "06_authority_transfer_mid_move": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000000.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 80.0,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000003.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "LOITER",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "CANCELLED",
+              "updated_at": 1790000003.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "mode": "LOITER",
+              "reason": "Control authority transferred to LOCAL_AGENT mid-move; safety LOITER engaged."
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000005.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "GUIDED",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "MOVING",
+              "updated_at": 1790000001.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "distance_remaining_m": 75.0,
+              "mode": "GUIDED"
+            }
+          }
+        }
+      }
+    ],
+    "07_rejected_not_armed": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": false,
+            "mode": "HOLD",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            }
+          }
+        }
+      },
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000002.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": false,
+            "mode": "HOLD",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            }
+          }
+        }
+      }
+    ],
+    "08_failed_dispatch_target_not_accepted": [
+      {
+        "message_type": "status",
+        "schema_version": "1.0",
+        "source": "usv-2-fixture",
+        "target": "operator",
+        "timestamp": 1790000000.0,
+        "payload": {
+          "usv_id": "usv-2-fixture",
+          "name": "Scout (SIMULATED QUICK MOVE FIXTURE)",
+          "comm_state": "CONNECTED",
+          "telemetry": {
+            "lat": 56.6995,
+            "lng": 13.00215,
+            "armed": true,
+            "mode": "LOITER",
+            "battery": 74,
+            "groundspeed": 0.8,
+            "heading": 45
+          },
+          "quick_move": {
+            "schema": "quick-move-v1",
+            "capability": {
+              "supported": true
+            },
+            "active": {
+              "command_id": "scout-fixture-cmd-0001",
+              "state": "FAILED",
+              "updated_at": 1790000000.0,
+              "target": {
+                "lat": 56.7005,
+                "lng": 13.0038
+              },
+              "mode": "LOITER",
+              "reason": "GUIDED entered but the reposition target was not accepted (MAV_RESULT_DENIED); safety LOITER engaged."
+            }
+          }
+        }
+      }
+    ]
+  }
+}

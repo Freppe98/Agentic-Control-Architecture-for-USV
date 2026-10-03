@@ -904,6 +904,12 @@ export function Map(root) {
     if (view.targetMismatch) {
       notes.push(`<div class="qmc-note warn">Scout is reporting a target ${esc(fmtDistance(view.targetOffsetM))} from the point you clicked (${esc(fmtTarget(view.scoutTarget))}).</div>`);
     }
+    // The vehicle got there but the hold was never confirmed. Said plainly and first,
+    // because "Failed" on its own reads as "nothing happened" — and what actually happened
+    // is that the vehicle is sitting at the operator's point, possibly drifting.
+    if (view.arrivedNotHolding) {
+      notes.push('<div class="qmc-note warn">The vehicle reached the target, but the LOITER hold was <b>not</b> confirmed — it may not be holding position. Check the vehicle and command LOITER if needed.</div>');
+    }
     if (view.completionNote) notes.push(`<div class="qmc-note warn">${esc(view.completionNote)}</div>`);
     if (view.reason) notes.push(`<div class="qmc-note">${esc(view.reason)}</div>`);
     if (view.lastKnown) {

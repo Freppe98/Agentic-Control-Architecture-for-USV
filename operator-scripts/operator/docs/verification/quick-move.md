@@ -127,20 +127,79 @@ gate working, not a fixture failure. The browser run above stubbed
 
 ---
 
+## Round 2 — Scout integration (Scout checkpoint `a102f21a`)
+
+Scout implemented its side and handed over a written handoff (its captures were **not**
+handed over — see `QUICK_MOVE_HANDOFF.md` §12). This round verified the operator against that
+contract, fixed what it exposed, and fixed the command-delivery defect.
+
+| Suite | Result |
+|---|---|
+| `tests.test_quick_move` | **46 passed** |
+| `tests.test_quick_move_delivery` (new) | **21 passed** |
+| `tests.test_scout_quick_move_compat` (new) | **20 passed** |
+| `tests/quick-move.test.mjs` | **50 passed** |
+| Whole backend suite | **1505 passed**, 1 skipped |
+| Whole frontend suite | **1132 passed** |
+| Browser, round 2 | **28/28** at 1920x1080 and 1366x768 |
+
+### Capture replay
+
+All eight of Scout's scenarios were replayed through the real `POST /agent/status` in an
+isolated runtime, with correlated command ids, and the **resulting fleet state** checked per
+scenario — not just HTTP 200. Results are tabulated in `QUICK_MOVE_HANDOFF.md` §12.
+
+Two things the replay itself exposed, both now fixed in the harness:
+
+1. **Scenario isolation is mandatory.** Scout's scenarios are independent and each starts at
+   its own `t0`, so replayed into shared state every scenario after the first was silently
+   refused by the per-vehicle monotonic envelope guard (`stale_timestamp`) while the run still
+   looked like a pass. `scout_payload_replay.py` now isolates per scenario and prints a loud
+   `!! REFUSED AS STALE` line for any envelope that changed nothing.
+2. **Correlated command ids.** Scout's captured ids were never issued here, so a bare replay
+   has every status correctly refused as `unknown_command_id`. `--correlate-commands` mints a
+   real operator command per captured id and rewrites it **in memory**; the capture files on
+   disk are never modified.
+
+### Browser — round 2
+
+| Screenshot | What it shows |
+|---|---|
+| `quick-move-r2-01-rejected-mission-bound-{desktop,laptop}.png` | A Scout `prepare()` rejection — **Rejected by Scout**, with Scout's mission-supervisor sentence verbatim. Previously read "Sent - awaiting Scout" beside its own rejection. |
+| `quick-move-r2-02-arrived-not-holding-{...}.png` | `FAILED` with `arrival_confirmed: true` - the amber warning that the vehicle **reached** the target but the hold was **not** confirmed. Previously collapsed into a bare "Failed". |
+| `quick-move-r2-03-incoherent-completion-{...}.png` | `COMPLETED` + `loiter_verified: true` + `mode: GUIDED` - refused as a confirmed hold, with the contradiction named. |
+| `quick-move-r2-04-coherent-completion-{...}.png` | The same report with `mode: LOITER` (what Scout now sends) - **Arrived and holding**, no caveat. |
+| `quick-move-r2-05-link-gap-invalidated-{...}.png` | A quick move created on a healthy link, then a real link gap: never delivered, record reads *"Link left CONNECTED (PARTITIONED) before delivery - Quick move invalidated"*, card stops presenting it as live. |
+
+### Command delivery - the defect, reproduced and fixed
+
+Creation-while-CONNECTED plus a 45 s TTL **was not sufficient**, and this was reproduced
+rather than theorised: a quick move survived a full `CONNECTED -> PARTITIONED -> DISCONNECTED
+-> CONNECTED` cycle and was handed to Scout afterwards. Three independent bounds now apply at
+the moment of delivery (link-continuity epoch, invalidation on link loss, a 15 s claim window)
+- see `QUICK_MOVE_HANDOFF.md` §7. `SET_MODE_LOITER` is deliberately exempt: the safety hold
+must still reach the vehicle across an outage.
+
+---
+
 ## Known limitations of this verification
 
-1. **No hardware, and no Scout implementation.** Everything above verifies the **operator
-   station's** behaviour given a conforming Scout. `QUICK_MOVE` is not implemented on Scout,
-   ArduRover GUIDED has **no Local Agent mapping and no Flask endpoint**, and firmware
-   support for GUIDED on this airframe **has not been verified** — that could not be
-   established from operator code. See `QUICK_MOVE_HANDOFF.md` §0 and §11.
+1. **No hardware, and no capture of Scout's real output.** Everything above verifies the
+   **operator station's** behaviour given a conforming Scout. Scout has now implemented its
+   side (checkpoint `a102f21a`), but its exported captures were **not handed over**, so the
+   replay runs against a **reconstruction transcribed from Scout's handoff prose** — weaker
+   evidence than a capture, and the difference is spelled out in `QUICK_MOVE_HANDOFF.md` §12.
+   Neither side has moved a vehicle: no SITL and no live mavlink2rest exists in either
+   development environment. See §0 and §14 of that document.
 2. **The action stays unavailable for every real vehicle** until one advertises
    `capability.supported: true`. Nothing in this work makes a live movement command reachable
    by accident.
-3. **Mission interaction is undecided by design** (handoff §11): whether a quick move
-   suspends a running mission, is refused during one, or layers over it is Scout's call with
-   its mission supervisor. The operator asserts nothing either way and never resumes a
-   mission afterwards.
+3. **Mission interaction is a RESTRICTION, not a suspension feature** (handoff §11). Scout
+   **rejects** a quick move while its controller is actively driving a bound mission; with no
+   mission bound, entering GUIDED is itself the suspension. **There is no automatic mission
+   suspension and no automatic resume on either side**, and the operator cannot pre-empt the
+   rejection — it has no way to know what Scout's controller currently has bound, so the
+   refusal arrives as a command rejection with Scout's own sentence.
 4. **The 45 s TTL is an operator-side estimate** of “long enough to deliver and confirm a
    mode change, short enough that the intent is still current”. It is one constant and moves
    if Scout's GUIDED-entry path proves slower.

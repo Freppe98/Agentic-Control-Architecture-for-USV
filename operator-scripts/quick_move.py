@@ -416,16 +416,39 @@ def _parse_status(raw, packet_ts, receipt):
     }, None
 
 
+HOLD_MODE = "LOITER"
+
+
+def _mode_incoherent(status):
+    """True when the report CONTRADICTS ITSELF: Scout says it verified the LOITER hold while
+    also reporting the vehicle observed in some other mode.
+
+    This is a real defect Scout hit and fixed (its `_handle_arrival()` checked the LOITER
+    call's `verified` but discarded that same response's `observed_mode`, so `mode` kept
+    reporting the last value sampled during the arrival poll — GUIDED). The operator checks
+    it rather than trusting the fix, because a silent regression here produces the most
+    dangerous possible screen: a confident "arrived and holding" over a vehicle that is
+    still in GUIDED and may not be holding at all.
+
+    Only an EXPLICIT contradiction counts. An absent `mode` is not one — Scout is allowed
+    not to report it, and inventing a contradiction out of a missing field would be the
+    same sin in the other direction."""
+    return status["loiter_verified"] is True and status["mode"] not in (None, HOLD_MODE)
+
+
 def _completion(status):
     """The operator's OWN verdict on a claimed completion — never Scout's word alone.
 
-    COMPLETED is published as CONFIRMED only when Scout also reports that it confirmed
-    arrival AND verified LOITER. A bare COMPLETED is CLAIMED_UNVERIFIED: Scout's claim stays
-    visible (it is evidence), but the station never renders it as a finished, confirmed
-    hold. This is the same rule mission upload follows for a read-back."""
+    COMPLETED is published as CONFIRMED only when Scout reports that it confirmed arrival,
+    verified LOITER, AND the rest of the same report does not contradict that. A bare
+    COMPLETED — or one whose own `mode` says the vehicle is not in the hold Scout claims to
+    have verified — is CLAIMED_UNVERIFIED: Scout's claim stays visible (it is evidence), but
+    the station never renders it as a finished, confirmed hold. This is the same rule
+    mission upload follows for a read-back."""
     if status["state"] != "COMPLETED":
         return None
-    if status["arrival_confirmed"] is True and status["loiter_verified"] is True:
+    if (status["arrival_confirmed"] is True and status["loiter_verified"] is True
+            and not _mode_incoherent(status)):
         return COMPLETION_CONFIRMED
     return COMPLETION_CLAIMED
 
@@ -549,6 +572,10 @@ def _status_view(cur, status, now_wall_s, now_mono_s):
         "arrival_confirmed": status["arrival_confirmed"],
         "loiter_verified": status["loiter_verified"],
         "mode": status["mode"],
+        # The report contradicts itself: a verified LOITER hold reported alongside some
+        # other observed mode. Published as its own flag rather than folded silently into
+        # `completion`, so the operator is told WHY the hold is not being confirmed.
+        "mode_incoherent": _mode_incoherent(status),
         "reason": status["reason"],
         "terminal": status["state"] in TERMINAL_STATES,
         # CONFIRMED only with BOTH pieces of evidence; CLAIMED_UNVERIFIED for a bare

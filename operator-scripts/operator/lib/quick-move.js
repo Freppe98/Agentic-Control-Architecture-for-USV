@@ -207,8 +207,14 @@ export function quickMoveView(v, { connected = false, command = null } = {}) {
   const cur = quickMoveCurrent(v);
   if (!cur) return null;
   const st = cur.status || null;
+  // When Scout never reported a movement at all, the COMMAND's own terminal outcome is the
+  // only thing that happened, and it is what the state line must say. Scout rejects a quick
+  // move at its `prepare()` precondition (not armed, a mission actively bound, …) without
+  // ever registering a movement record, so this is the normal shape of a refusal — not an
+  // edge case. Reading "Sent — awaiting Scout" beside a rejection reason is the one thing
+  // this line must never do.
   const [stateText, stateCls] = st ? (QM_STATE_TEXT[st.state] || [st.state, "u"])
-    : ["Sent — awaiting Scout", "p"];
+    : commandOnlyState(command);
 
   // How old Scout's last word on this move is, and whether we may still present it as
   // current. A status we cannot refresh (link down) is LAST KNOWN — it is never re-read
@@ -244,6 +250,14 @@ export function quickMoveView(v, { connected = false, command = null } = {}) {
     // --- COMPLETION (the operator's verdict, not Scout's word alone) ---
     completion: st ? st.completion : null,
     completionNote: completionNote(st),
+    // The vehicle reached the target but the hold was NOT confirmed — a terminal state
+    // that is neither a success nor a "nothing happened". Surfaced on its own because the
+    // operational consequence is specific and urgent: the vehicle is sitting at the point
+    // the operator chose, possibly drifting, and "Failed" alone does not say that.
+    arrivedNotHolding: !!(st && st.terminal && st.state !== "COMPLETED"
+                          && st.arrival_confirmed === true),
+    // Scout's report contradicts itself (verified hold + a non-LOITER observed mode).
+    modeIncoherent: !!(st && st.mode_incoherent),
 
     // --- supersession / cancellation ---
     cancelRequested: cur.cancel_requested || null,
@@ -289,12 +303,38 @@ export function deliveryLine(cur, command) {
   return { text: "Sending…", cls: "p", uncertain: false };
 }
 
+/**
+ * The state line for a move Scout never reported on — the COMMAND's own outcome is all
+ * there is. Pure; `command` is the QUICK_MOVE queue record, or null while the POST is in
+ * flight.
+ */
+export function commandOnlyState(command) {
+  const status = command && command.status;
+  if (status === "REJECTED") return ["Rejected by Scout", "d"];
+  if (status === "FAILED") return ["Failed", "d"];
+  // EXPIRED covers every operator-side termination: the link went away before delivery, a
+  // newer move replaced it, Stop was pressed, or nothing collected it in time. The command
+  // record's own `reason` says which, and the delivery line renders that — so this stays
+  // deliberately neutral rather than guessing at a cause it does not know.
+  if (status === "EXPIRED") return ["Not delivered", "u"];
+  if (status === "EXECUTED" || status === "ACCEPTED") return ["Accepted — awaiting movement", "p"];
+  return ["Sent — awaiting Scout", "p"];
+}
+
 /** The caveat under a claimed completion, or null. A COMPLETED that Scout did not back
- *  with BOTH confirmed arrival and verified LOITER is shown as Scout's claim, not as a
- *  finished hold — the same rule a mission upload read-back follows. */
+ *  with BOTH confirmed arrival and verified LOITER — or whose own report contradicts
+ *  itself — is shown as Scout's claim, not as a finished hold; the same rule a mission
+ *  upload read-back follows. */
 export function completionNote(st) {
   if (!st || st.state !== "COMPLETED") return null;
   if (st.completion === "CONFIRMED") return null;
+  if (st.mode_incoherent) {
+    // The sharper of the two cases: Scout did claim both pieces of evidence, but the same
+    // report says the vehicle is in another mode. Naming the contradiction is the useful
+    // thing — "did not confirm verified LOITER" would be flatly wrong here, since it did.
+    return `Scout reported a verified LOITER hold but also reports the vehicle in `
+         + `${st.mode}. The report contradicts itself — treat the hold as unconfirmed.`;
+  }
   const missing = [];
   if (st.arrival_confirmed !== true) missing.push("arrival");
   if (st.loiter_verified !== true) missing.push("verified LOITER");

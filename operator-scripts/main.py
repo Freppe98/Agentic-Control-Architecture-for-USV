@@ -164,6 +164,13 @@ latest_msg_ts_by_id = {}   # {vehicle_id: float epoch seconds}
 last_seen_by_id = {}       # {vehicle_id: datetime}
 comms_state_by_id = {}     # {vehicle_id: last-logged state}
 comms_history_by_id = {}   # {vehicle_id: [ {state, from, ts, since_last_seen_s} ]}
+# Per-vehicle LINK-CONTINUITY EPOCH: a counter bumped on every comm-state transition for that
+# vehicle. It exists for exactly one question -- "has this vehicle's link been continuously
+# CONNECTED since this command was created?" -- which a comm-state SAMPLE cannot answer. A
+# QUICK_MOVE stamps the epoch at creation and is refused at delivery if it has moved, so a
+# brief disconnect/reconnect inside the TTL can never hand Scout a stale "go there now".
+# Starts at 0 for a vehicle that has never transitioned; see comms_epoch().
+comms_epoch_by_id = {}     # {vehicle_id: int}
 
 # Last-known telemetry per vehicle (store-and-forward consequence). When the Local
 # Agent degrades and drops the telemetry group, the operator must show the LAST KNOWN
@@ -910,12 +917,29 @@ def derive_comm_state(age_s):
     return "CONNECTED"
 
 
+def comms_epoch(vid):
+    """This vehicle's current link-continuity epoch (see comms_epoch_by_id)."""
+    return comms_epoch_by_id.get(vid, 0)
+
+
 def record_comms_state(vid: int, state: str, ts: datetime, age_s):
-    """Append a transition only when the state actually changes."""
+    """Append a transition only when the state actually changes.
+
+    Also the ONE place the link-continuity epoch moves, and the ONE place a pending
+    QUICK_MOVE is invalidated by the link itself: creation checks the link at t=0 and can
+    say nothing about t=20, so without this a command created on a healthy link would be
+    delivered and executed after an intervening outage."""
     prev = comms_state_by_id.get(vid)
     if state == prev:
         return None
     comms_state_by_id[vid] = state
+    comms_epoch_by_id[vid] = comms_epoch(vid) + 1
+    if prev == "CONNECTED":
+        # The link just LEFT a current state. Every pending quick move for this vehicle is
+        # now stale intent: the operator pointed at a spot on a live picture, and that
+        # picture is no longer live. Terminated here rather than left for the TTL, which
+        # would still allow delivery for up to QUICK_MOVE_TTL_S after the link returned.
+        invalidate_quick_moves_on_link_loss(vid, ts, state)
     entry = {
         "state": state,
         "from": prev,
@@ -1368,6 +1392,13 @@ COMMAND_TTL_S = 300              # queued commands survive ~5 min of disconnecti
 # (moving, arriving, verified LOITER) travels on the status block, not the queue record.
 QUICK_MOVE_TTL_S = 45
 COMMAND_TTL_OVERRIDES = {"QUICK_MOVE": QUICK_MOVE_TTL_S}
+# A quick move must be CLAIMED by Scout within this window of being created, or it is stale
+# intent and is never delivered. This is a SEPARATE bound from the TTL and bounds a different
+# thing: the TTL asks "how long may Scout have to finish reporting a result", this asks "how
+# long after the click is 'go there now' still what the operator meant". A move still sitting
+# unclaimed 15 s after the press means Scout was not listening, and the operator has had no
+# feedback that anything happened -- delivering it at second 40 would be a surprise.
+QUICK_MOVE_CLAIM_WINDOW_S = 15
 TERMINAL_STATUSES = {"EXECUTED", "REJECTED", "FAILED", "EXPIRED"}
 RESULT_STATUSES = {"ACCEPTED", "EXECUTED", "REJECTED", "FAILED"}  # what an Agent may report
 
@@ -1453,7 +1484,8 @@ class QuickMoveError(Exception):
         self.message = message
 
 
-def canonical_quick_move_params(raw_params, *, vehicle_position=None, now=None):
+def canonical_quick_move_params(raw_params, *, vehicle_position=None, now=None,
+                                link_epoch=None):
     """The params a QUICK_MOVE record carries, and the ONLY thing Scout is handed.
 
     `target` is authoritative and is the operator's clicked destination. `requested_from`
@@ -1471,6 +1503,11 @@ def canonical_quick_move_params(raw_params, *, vehicle_position=None, now=None):
         "target": target,
         "issued_at": (now or datetime.now(timezone.utc)).timestamp(),
     }
+    if link_epoch is not None:
+        # OPERATOR-SIDE BOOKKEEPING, not part of the Scout contract. It records which
+        # uninterrupted stretch of link this command belongs to, so delivery can prove the
+        # link never dropped in between (quick_move_delivery_block). Scout ignores it.
+        params["link_epoch"] = link_epoch
     if vehicle_position:
         d = quick_move.meters_between(vehicle_position, target)
         params["requested_from"] = {
@@ -1563,6 +1600,97 @@ def supersede_quick_moves(vid, now, reason, *, keep_id=None):
                        source="operator-backend")
         ended.append(cmd["id"])
     return ended
+
+
+def invalidate_quick_moves_on_link_loss(vid, now, new_state):
+    """Terminate every non-terminal QUICK_MOVE for one vehicle because its link stopped
+    being current. Called from record_comms_state on any CONNECTED -> anything transition.
+
+    Reuses the existing EXPIRED terminal status (no new lifecycle), exactly as
+    cancel_pending_commands and supersede_quick_moves do. The operator's own tracked move
+    also gets a cancel REQUEST recorded, so the card stops presenting it as something still
+    being driven -- but it is never shown as CANCELLED, because if the command had already
+    reached Scout only Scout can say whether the vehicle actually stood down."""
+    reason = f"Link left CONNECTED ({new_state}) before delivery - Quick move invalidated"
+    ended = []
+    for cmd in commands:
+        if (cmd["vehicle_id"] != vid or cmd["type"] != "QUICK_MOVE"
+                or cmd["status"] in TERMINAL_STATUSES):
+            continue
+        cmd["status"] = "EXPIRED"
+        cmd["completed_at"] = now.isoformat()
+        cmd["reason"] = reason
+        _refresh_command_derived(cmd)
+        _command_event(cmd, severity="warning",
+                       message=f"Quick move invalidated ({new_state} before delivery)",
+                       source="operator-backend")
+        ended.append(cmd["id"])
+    if ended:
+        quick_move.request_cancel(quick_move_state_by_id, vid, reason=reason,
+                                  now_wall_s=time.time(), now_mono_s=time.monotonic())
+        print(f"[QUICK-MOVE] vehicle={vid} invalidated={ended} reason={new_state}")
+    return ended
+
+
+def quick_move_delivery_block(cmd, now):
+    """Why this QUICK_MOVE must NOT be handed to Scout right now, or None if it may be.
+
+    The creation-time gate (quick_move_dispatch_gate) proves the link was current when the
+    operator pressed. It proves nothing about the moment of DELIVERY, which is the moment
+    that actually matters -- and the two can be tens of seconds apart. This is the second
+    half of that guarantee, applied at every delivery and every REdelivery:
+
+      * link continuity -- the epoch stamped at creation must still be the vehicle's
+        current one. ANY transition since (CONNECTED -> PARTITIONED -> CONNECTED included)
+        means the picture the operator pointed at went away and came back, and the command
+        is refused. This catches the sub-second race that the 1 Hz comms monitor cannot:
+        a poll arriving between the outage and the monitor noticing it.
+      * current link state -- belt and braces, so the invariant is readable at the point it
+        is enforced rather than only inferable from the epoch.
+      * claim window -- an unclaimed move older than QUICK_MOVE_CLAIM_WINDOW_S is stale
+        intent even on a link that never wobbled. Only applies before the first claim: once
+        Scout has it, the TTL governs, and a REdelivery of an already-claimed command is
+        the at-least-once mechanism doing its job, not a late first delivery.
+
+    Returns a reason string (the caller expires the command with it) or None."""
+    vid = cmd["vehicle_id"]
+    stamped = (cmd.get("params") or {}).get("link_epoch")
+    if stamped is not None and stamped != comms_epoch(vid):
+        return "Link was interrupted after the Quick move was issued - not delivered"
+    state = comms_state_by_id.get(vid, "UNKNOWN")
+    if state != "CONNECTED":
+        return f"Link is {state} at delivery time - Quick move not delivered"
+    if cmd.get("claimed_at") is None:
+        try:
+            created = datetime.fromisoformat(cmd["created_at"])
+        except (TypeError, ValueError):
+            return None
+        if (now - created).total_seconds() > QUICK_MOVE_CLAIM_WINDOW_S:
+            return (f"Not collected by Scout within {QUICK_MOVE_CLAIM_WINDOW_S}s - "
+                    "Quick move intent is stale, not delivered")
+    return None
+
+
+def quick_move_deliverable(cmd, now):
+    """True when this command may be delivered. A QUICK_MOVE that may not is EXPIRED here
+    and now (with the real reason on the record), so the next poll does not re-evaluate it
+    and the operator sees why it never went."""
+    if cmd["type"] != "QUICK_MOVE":
+        return True
+    reason = quick_move_delivery_block(cmd, now)
+    if reason is None:
+        return True
+    cmd["status"] = "EXPIRED"
+    cmd["completed_at"] = now.isoformat()
+    cmd["reason"] = reason
+    _refresh_command_derived(cmd)
+    _command_event(cmd, severity="warning",
+                   message=f"Quick move not delivered - {reason}",
+                   source="operator-backend")
+    quick_move.request_cancel(quick_move_state_by_id, cmd["vehicle_id"], reason=reason,
+                              now_wall_s=time.time(), now_mono_s=time.monotonic(),
+                              command_id=cmd["id"])
+    return False
 
 
 def _quick_move_event(vid, status, *, severity="info"):
@@ -2563,7 +2691,8 @@ async def create_command(request: Request):
     elif ctype == "QUICK_MOVE":
         try:
             params = canonical_quick_move_params(
-                params, vehicle_position=_vehicle_position(vid), now=now)
+                params, vehicle_position=_vehicle_position(vid), now=now,
+                link_epoch=comms_epoch(vid))
         except QuickMoveError as exc:
             return JSONResponse(status_code=400, content={
                 "ok": False, "error": "quick_move_refused", "code": exc.code,
@@ -2658,7 +2787,12 @@ def command_capabilities():
         "per_vehicle_capability": "fleet.quick_move.capability",
         "contract": quick_move.SCHEMA,
         "ttl_s": QUICK_MOVE_TTL_S,
+        "claim_window_s": QUICK_MOVE_CLAIM_WINDOW_S,
         "offline_queueable": False,
+        # Delivery additionally requires the link to have been CONTINUOUSLY current since
+        # the command was created -- a brief disconnect/reconnect inside the TTL invalidates
+        # it rather than delaying it. See quick_move_delivery_block.
+        "requires_continuous_link": True,
     }
     return {
         "ok": True,
@@ -3554,6 +3688,10 @@ def pending_commands(vehicle_id: str):
     for cmd in commands:
         if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
             continue
+        # Same deliverability rule as /agent/commands -- this endpoint claims from the SAME
+        # queue, so it must not be a way to hand out a quick move the other path refuses.
+        if not quick_move_deliverable(cmd, now):
+            continue
         if cmd["status"] == "QUEUED":
             cmd["status"] = "SENT"
             cmd["claimed_at"] = now.isoformat()
@@ -3636,6 +3774,11 @@ async def agent_commands(usv_id: str = ""):
     delivered = []
     for cmd in commands:
         if cmd["vehicle_id"] != vid or cmd["status"] in TERMINAL_STATUSES:
+            continue
+        # A quick move is the ONE command type whose deliverability is re-decided at every
+        # delivery, because it is the one whose meaning expires: see
+        # quick_move_delivery_block. Everything else is queue-until-contact by design.
+        if not quick_move_deliverable(cmd, now):
             continue
         if cmd["status"] == "QUEUED":
             # First delivery only: claim it. A redelivery re-sends the same record
