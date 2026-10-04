@@ -911,6 +911,10 @@ export function Map(root) {
       notes.push('<div class="qmc-note warn">The vehicle reached the target, but the LOITER hold was <b>not</b> confirmed — it may not be holding position. Check the vehicle and command LOITER if needed.</div>');
     }
     if (view.completionNote) notes.push(`<div class="qmc-note warn">${esc(view.completionNote)}</div>`);
+    // The command was refused while Scout's newest report still shows the move running.
+    // Both facts stay on screen: the refusal is this station's, the movement is Scout's,
+    // and nothing here claims the vehicle stopped — only Scout can report that.
+    if (view.refusedNote) notes.push(`<div class="qmc-note warn">${esc(view.refusedNote)}</div>`);
     if (view.reason) notes.push(`<div class="qmc-note">${esc(view.reason)}</div>`);
     if (view.lastKnown) {
       notes.push('<div class="qmc-note">Scout is not currently reporting this move — the state above is last known, not confirmed current.</div>');

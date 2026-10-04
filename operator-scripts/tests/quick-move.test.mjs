@@ -450,3 +450,77 @@ test("the Map renders the arrived-not-holding warning", () => {
   assert.match(card, /reached the target/i);
   assert.match(card, /not<\/b> confirmed|not confirmed/i);
 });
+
+// ── 6. The command's outcome and Scout's movement report can disagree ─────────────────
+// Scout's own implementation (checkpoint 7e67dfe0) is what makes these reachable rather
+// than theoretical: `prepare()` registers the movement record — which is also when the
+// first STARTING can be published — and only THEN does `confirm_dispatch()` run, which can
+// still refuse the move. The operator's own link invalidation arrives at the same shape
+// from the other side. Both facts are real; neither may be dropped.
+import { stopAvailable, refusedWhileRunningNote } from "../operator/lib/quick-move.js";
+
+test("a command refused AFTER Scout began reporting shows both facts", () => {
+  const view = quickMoveView(
+    vehicle({ current: current({ status: status({ state: "STARTING" }) }) }),
+    { connected: true,
+      command: { id: "cmd-1", status: "REJECTED",
+                 reason: "Operator link is not CONNECTED - Quick move refused." } });
+  // The movement Scout reported is still shown — the station did not witness it stop.
+  assert.equal(view.state, "STARTING");
+  // ...and the refusal is no longer invisible, which is what it used to be.
+  assert.match(view.refusedNote, /rejected by Scout/);
+  assert.match(view.refusedNote, /not CONNECTED/);
+  assert.match(view.refusedNote, /starting/i);
+  // It must NOT claim the vehicle stopped: only Scout can report that.
+  assert.match(view.refusedNote, /Only Scout can report/);
+  assert.doesNotMatch(view.refusedNote, /stopped|cancelled|stood down\./);
+});
+
+test("an operator link invalidation over a running move says so without claiming a stop", () => {
+  const note = refusedWhileRunningNote(status({ state: "MOVING" }), {
+    status: "EXPIRED",
+    reason: "Link left CONNECTED (PARTITIONED) before delivery - Quick move invalidated",
+  });
+  assert.match(note, /terminated by this station/);
+  assert.match(note, /Link left CONNECTED/);
+  assert.match(note, /command LOITER/);
+});
+
+test("a healthy move and a finished move carry no refusal note", () => {
+  assert.equal(refusedWhileRunningNote(status({ state: "MOVING" }),
+                                       { status: "EXECUTED", reason: null }), null);
+  // A terminal movement report is the outcome; the command's own status adds nothing.
+  assert.equal(refusedWhileRunningNote(status({ state: "CANCELLED", terminal: true }),
+                                       { status: "FAILED", reason: "x" }), null);
+  assert.equal(refusedWhileRunningNote(null, { status: "REJECTED", reason: "x" }), null,
+    "no movement reported at all is commandOnlyState's job, not this one");
+});
+
+test("Stop is offered before Scout's first status, and only while something may be moving", () => {
+  // Scout spends up to several seconds inside the blocking GUIDED transition before any
+  // `active` block can reach the station. Withholding Stop through that window withholds it
+  // exactly when the vehicle is most likely to have started moving.
+  assert.equal(stopAvailable(null, { status: "SENT" }), true);
+  assert.equal(stopAvailable(null, { status: "ACCEPTED" }), true);
+  assert.equal(stopAvailable(null, null), true, "the POST is still in flight");
+  // Nothing was ever reported moving and the command is terminally refused: nothing to stop.
+  assert.equal(stopAvailable(null, { status: "REJECTED" }), false);
+  assert.equal(stopAvailable(null, { status: "EXPIRED" }), false);
+  // A reported movement decides it on its own, whatever the command record says.
+  assert.equal(stopAvailable(status({ state: "MOVING" }), { status: "REJECTED" }), true);
+  assert.equal(stopAvailable(status({ state: "ARRIVED" }), null), true);
+  assert.equal(stopAvailable(status({ state: "COMPLETED", terminal: true }), null), false);
+});
+
+test("the Map renders the refusal-over-a-running-move note", () => {
+  const card = mapSrc.slice(mapSrc.indexOf("function renderQuickMove"),
+                            mapSrc.indexOf("function updateHomeMarker"));
+  assert.match(card, /view\.refusedNote/);
+});
+
+test("Stop still sends nothing but the ordinary safety hold", () => {
+  // The fix above widened WHEN Stop is offered. It must not have introduced a second
+  // cancel mechanism: the button is still the one LOITER command the mode row has.
+  assert.doesNotMatch(libSrc, /quick_move\/cancel|qm_cancel|cancelQuickMove/);
+  assert.match(mapSrc, /data-qm-stop.*sendCommand\(SAFETY_HOLD_TYPE\)/s);
+});

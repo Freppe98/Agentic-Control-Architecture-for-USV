@@ -261,8 +261,12 @@ export function quickMoveView(v, { connected = false, command = null } = {}) {
 
     // --- supersession / cancellation ---
     cancelRequested: cur.cancel_requested || null,
-    stopAvailable: !!st && QM_RUNNING.includes(st.state),
+    stopAvailable: stopAvailable(st, command),
     terminal: !!st && st.terminal === true,
+
+    // The command record ended in a refusal while Scout's newest movement report still
+    // shows the move running. Surfaced as its own note: neither half may be dropped.
+    refusedNote: refusedWhileRunningNote(st, command),
 
     // A Scout driving to a different place than the operator clicked. Published as a
     // first-class flag because it is the one failure mode that would otherwise look
@@ -319,6 +323,59 @@ export function commandOnlyState(command) {
   if (status === "EXPIRED") return ["Not delivered", "u"];
   if (status === "EXECUTED" || status === "ACCEPTED") return ["Accepted — awaiting movement", "p"];
   return ["Sent — awaiting Scout", "p"];
+}
+
+/**
+ * May the card offer its Stop (LOITER) button?
+ *
+ * Scout's status block is NOT the first thing that happens: the Local Agent claims the
+ * command, runs `prepare()`, then spends up to several seconds inside the blocking GUIDED
+ * transition before any `active` block can reach this station. The vehicle may already be
+ * under way during that window, so a card that withholds Stop until the first status has
+ * arrived withholds it exactly when it is most likely to be wanted. The ordinary LOITER
+ * button in the mode row is always there, but the card must not look as though the move
+ * cannot be stopped yet.
+ *
+ * Offered while the move is still running, and — when Scout has not reported a movement at
+ * all — while the COMMAND is still live. A command that was terminally refused with no
+ * movement ever reported has nothing to stop, and offering a hold there would imply the
+ * station believes something is moving when it has no reason to.
+ */
+export function stopAvailable(st, command) {
+  if (st) return QM_RUNNING.includes(st.state);
+  const status = command && command.status;
+  return !(status === "REJECTED" || status === "FAILED" || status === "EXPIRED");
+}
+
+/**
+ * The note for a move whose COMMAND record ended in a refusal while Scout's newest
+ * movement report still shows it running — or null when that is not the case.
+ *
+ * This is the mirror of the `commandOnlyState()` case below, and Scout's own implementation
+ * is what makes it reachable rather than theoretical. Scout registers its movement record
+ * in `prepare()` — which is also when the first `STARTING` can be published — and only
+ * THEN runs `confirm_dispatch()`, which can still refuse the move (superseded, authority
+ * changed, link not CONNECTED, expired). The operator's own invalidation reaches the same
+ * shape from the other side: a record EXPIRED by a link transition that Scout had already
+ * claimed and acted on.
+ *
+ * Both halves are facts and neither may be dropped. Rendering only the running status would
+ * show a healthy move over a command this station knows was refused; rendering only the
+ * refusal would claim the vehicle stood down, which NOTHING here can establish — only Scout
+ * reports that, and it has not. So the card says both, and says plainly which it cannot
+ * confirm.
+ */
+export function refusedWhileRunningNote(st, command) {
+  if (!st || st.terminal === true) return null;
+  const status = command && command.status;
+  const label = { REJECTED: "rejected by Scout", FAILED: "failed",
+                  EXPIRED: "terminated by this station" }[status];
+  if (!label) return null;
+  const why = command.reason ? ` (${command.reason})` : "";
+  const phrase = (QM_STATE_TEXT[st.state] || [st.state])[0].toLowerCase();
+  return `The command for this move was ${label}${why}, but Scout's last report still `
+       + `shows it "${phrase}". Only Scout can report that the vehicle stood down, and it `
+       + "has not — check the vehicle and command LOITER if it is still moving.";
 }
 
 /** The caveat under a claimed completion, or null. A COMPLETED that Scout did not back

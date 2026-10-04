@@ -295,5 +295,69 @@ class PendingViewTests(DeliveryBase):
         self.assertEqual(main.commands_by_id[cmd["id"]]["status"], "EXPIRED")
 
 
+# ── The envelope Scout actually parses ─────────────────────────────────────────────────
+class CommandEnvelopeTests(DeliveryBase):
+    """Scout's Local Agent normalizes every command timestamp through its own
+    `timestamp_utils.normalize_timestamp()` before comparing it against `time.time()`, and
+    it does that THREE times for a quick move: at `prepare()`, at `confirm_dispatch()`, and
+    once more inside the vehicle Flask service immediately before the physical
+    `DO_REPOSITION` write (Scout's QUICK_MOVE_HANDOFF.md 2b). All three read the SAME
+    top-level `expires_at` this endpoint sends, so its shape and its margin are a contract,
+    not an implementation detail.
+
+    Scout accepts epoch seconds, an ISO-8601 string with an explicit offset, one ending in
+    'Z', or a naive one (read as UTC). This station sends the second of those. A raw ISO
+    string crashing a `> time.time()` comparison is not hypothetical on this integration —
+    it is the live SET_HOME defect Scout's `timestamp_utils` was written for."""
+
+    def test_the_command_envelope_carries_a_parseable_iso_expires_at(self):
+        cmd = self.issue()
+        env = self.client.get("/agent/commands?usv_id=usv-2").json()["commands"]
+        env = [c for c in env if c["command_id"] == cmd["id"]]
+        self.assertEqual(len(env), 1, "the quick move must be delivered exactly once here")
+        view = env[0]
+        # The field names are the Local Agent's own, not the internal record's.
+        self.assertEqual(sorted(view),
+                         ["command_id", "command_type", "expires_at", "params", "source"])
+        self.assertEqual(view["command_type"], "QUICK_MOVE")
+        self.assertEqual(view["source"], "OPERATOR")
+        raw = view["expires_at"]
+        self.assertIsInstance(raw, str, "a float would also parse, but this is what we send")
+        deadline = datetime.fromisoformat(raw)      # what Scout's normalizer does
+        self.assertIsNotNone(deadline.tzinfo,
+                             "an explicit offset — never a naive string Scout has to guess at")
+
+    def test_the_ttl_leaves_room_for_scouts_blocking_guided_transition(self):
+        """Scout's THIRD expiry check happens AFTER the GUIDED transition and immediately
+        before the target write, so the TTL has to outlast that transition — otherwise a
+        legitimate move would be refused at the actuation boundary, leaving the vehicle in
+        GUIDED with no target (Scout's safety-LOITER fallback then runs).
+
+        Scout's `mode_verification.set_mode_and_verify` is bounded by its own ack (1.5 s),
+        verify (5.0 s) and stable-window (1.5 s) timeouts: ~8 s worst case. A generous
+        multiple of that is the bar, so this fails if the TTL is ever shortened toward it."""
+        guided_transition_bound_s = 8.0
+        self.assertGreaterEqual(main.QUICK_MOVE_TTL_S, 4 * guided_transition_bound_s)
+        # And the claim window must be comfortably longer than Scout's own 1 Hz poll.
+        self.assertGreaterEqual(main.QUICK_MOVE_CLAIM_WINDOW_S, 10)
+        self.assertLess(main.QUICK_MOVE_CLAIM_WINDOW_S, main.QUICK_MOVE_TTL_S)
+
+    def test_requested_from_is_the_only_extra_and_is_clearly_audit_metadata(self):
+        """`target` is authoritative; `requested_from` is the position the operator's screen
+        showed at click time and Scout must never navigate relative to it. It stays nested
+        so it cannot be mistaken for the destination, and `link_epoch` is operator-side
+        bookkeeping Scout ignores."""
+        cmd = self.issue()
+        params = main.commands_by_id[cmd["id"]]["params"]
+        self.assertEqual(params["target"], TARGET)
+        self.assertEqual(params["schema"], "quick-move-v1")
+        self.assertIsInstance(params["issued_at"], float)
+        self.assertNotIn("lat", params, "the destination is never flattened onto params")
+        self.assertNotIn("mode", params, "the operator sends no mode, speed, radius or path")
+        self.assertNotIn("speed", params)
+        self.assertNotIn("arrival_radius_m", params)
+        self.assertIn("link_epoch", params)
+
+
 if __name__ == "__main__":
     unittest.main()

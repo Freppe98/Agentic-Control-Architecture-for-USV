@@ -182,6 +182,93 @@ must still reach the vehicle across an outage.
 
 ---
 
+## Round 3 — integration-complete against Scout `7e67dfe0`
+
+Scout's final implementation adds the stale-command / dispatch-window hardening (its §2b): a
+second preflight (`confirm_dispatch`) on the Local Agent immediately before the one blocking
+dispatch call, and a third expiry recheck inside the vehicle Flask service immediately before the
+physical `DO_REPOSITION` write. This round checked the operator against that contract, fixed the
+two gaps it exposed, and re-verified end to end.
+
+| Suite | Result |
+|---|---|
+| `tests.test_quick_move` | **46 passed** |
+| `tests.test_quick_move_delivery` | **24 passed** (3 new: the command envelope Scout parses) |
+| `tests.test_scout_quick_move_compat` | **20 passed** |
+| `tests/quick-move.test.mjs` | **56 passed** (6 new) |
+| Whole backend suite | **1508 passed**, 1 skipped, 0 failed |
+| Whole frontend suite | **1138 passed**, 0 failed |
+| Browser, round 3 | **24/24 at 1920x1080 and 24/24 at 1366x768** |
+
+### The command envelope, checked against Scout's own parser
+
+`GET /agent/commands` hands Scout exactly `{command_id, command_type, source, params,
+expires_at}`, with `expires_at` an ISO-8601 string carrying an explicit UTC offset. Scout
+normalizes it through `timestamp_utils.normalize_timestamp()` and compares it against
+`time.time()` **three times** for one quick move. That file IS present in `_scout_ref/`, so the
+operator's real envelope was fed through Scout's actual normalizer rather than a description of
+it: it parses, and at issue time leaves ~45 s of margin.
+
+The margin matters because Scout's third check sits *after* the blocking GUIDED transition.
+`mode_verification.set_mode_and_verify` is bounded by its own 1.5 s ack, 5.0 s verify and 1.5 s
+stable-window timeouts — ~8 s worst case against a 45 s TTL, so a legitimate move cannot be
+refused at the actuation boundary. `test_the_ttl_leaves_room_for_scouts_blocking_guided_transition`
+fails if the TTL is ever shortened toward that bound.
+
+### Two gaps found and fixed
+
+1. **A command refused AFTER Scout began reporting was invisible.** Scout registers its movement
+   record in `prepare()` — which is also when the first `STARTING` can be published — and only
+   then runs `confirm_dispatch()`, which can still refuse. The card showed the running status and
+   *"Scout has this move."* with **the refusal reason nowhere on screen**. The operator's own link
+   invalidation reaches the same shape from the other side. Both facts are now shown together,
+   with the stand-down explicitly deferred to Scout; the movement is never rendered as cancelled.
+2. **Stop was withheld until Scout's first status.** The window between the click and the first
+   `active` block spans the claim, `prepare()` and the whole blocking GUIDED transition — exactly
+   when the vehicle is most likely to have started moving. Stop is now offered while the command
+   is live, and withheld only when the command was terminally refused with no movement ever
+   reported, or the move is terminal. It is still the one ordinary `SET_MODE_LOITER`.
+
+### Browser — round 3
+
+Both viewports ran against a **fresh** backend; a quick move stays tracked for
+`TERMINAL_RETENTION_S` and an unacked command stays non-terminal, so two viewports sharing one
+backend start "busy" and read the first run's move. The move is issued through the UI and the
+status is reported against the target the operator actually clicked.
+
+| Screenshot | What it shows |
+|---|---|
+| `quick-move-r3-01-menu-{desktop,laptop}.png` | The menu names the **selected** vehicle, the clicked destination to 6 decimals, and the distance from that vehicle; enabled for a capable, armed, OPERATOR, CONNECTED vehicle. |
+| `quick-move-r3-02-stop-before-status-{...}.png` | **Fix 2** — immediately after the click: a tracked move, **no** invented movement status, the state line *"Sent — awaiting Scout"*, and **STOP / LOITER already available**. |
+| `quick-move-r3-03-refused-over-running-{...}.png` | **Fix 1** — `STARTING` + *"Scout has this move."* + the amber note naming the refusal with Scout's sentence verbatim and deferring the stand-down to Scout. Stop stays available. |
+| `quick-move-r3-04-moving-{...}.png` | A healthy move: `MOVING TO TARGET`, Scout's own remaining distance, delivery on its own line, and no refusal or mismatch note. |
+| `quick-move-r3-05-completed-{...}.png` | Arrival + verified LOITER → *"Arrived and holding"*, no caveat, Stop withdrawn. |
+
+Also asserted at both sizes: quick move never renders inside the mission progress bar, and no
+page errors.
+
+### Captures — still not supplied
+
+`scout_quick_move_captures/` was re-checked for this round and is **absent**; Scout's source at
+`7e67dfe0` is not in this repository either (`_scout_ref/` is a July snapshot predating quick
+move). `scripts/scout_payload_replay.py` was re-run and still works, but against the **same
+reconstruction** as round 2 — no substitute was manufactured, because a second reconstruction
+would only make the evidence look stronger than it is. Dropping the real captures into
+`tests/fixtures/scout_quick_move_payloads/` requires no other change.
+
+### Known Scout limitation — preserved, not resolved
+
+A cancellation, authority change, supersession or link drop occurring **strictly inside** Scout's
+single blocking GUIDED dispatch call is **not proven to prevent the target write**. Only expiry
+has a check at the actuation boundary, because it alone needs no state from the Local Agent's
+process; nothing can reach inside an in-flight HTTP call in the current synchronous design. This
+is an inherent limit of that design, it is **open**, and nothing in this round closed it — see
+`QUICK_MOVE_HANDOFF.md` §7 ("the residual that remains") and §14 step 8c. What the operator does
+instead is refuse to misrepresent it: a Stop reads as *"Stop requested"* until Scout reports a
+terminal state, and fix 1 above keeps a refused-but-still-running move visible as both facts.
+
+---
+
 ## Known limitations of this verification
 
 1. **No hardware, and no capture of Scout's real output.** Everything above verifies the

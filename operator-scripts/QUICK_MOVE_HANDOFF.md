@@ -1,14 +1,16 @@
 # QUICK_MOVE_HANDOFF.md — `quick-move-v1` (joint integration contract)
 
-**Status: implemented on BOTH sides. Not verified against real hardware, SITL or a live
-mavlink2rest on either side. `QUICK_MOVE_ENABLED = False` on Scout; the operator's menu item
-stays disabled for every vehicle that has not advertised support.**
+**Status: implemented on BOTH sides, and the operator is integration-complete against Scout
+`7e67dfe0`. Not verified against real hardware, SITL or a live mavlink2rest on either side.
+`QUICK_MOVE_ENABLED = False` on Scout; the operator's menu item stays disabled for every vehicle
+that has not advertised support — so nothing here is reachable until Scout is enabled.**
 
 This is the **joint** contract. It supersedes the operator-only version and incorporates
-Scout's own `QUICK_MOVE_HANDOFF.md` at checkpoint `a102f21a`, which implements the Scout side
-(GUIDED entry, `MAV_CMD_DO_REPOSITION` over `COMMAND_INT`, arrival/LOITER monitoring, capability
-and status reporting). Where the two repositories' requirements differ, **both are preserved
-here and the difference is named** — see §13.
+Scout's own `QUICK_MOVE_HANDOFF.md` at checkpoint **`7e67dfe0`**, which implements the Scout
+side (GUIDED entry, `MAV_CMD_DO_REPOSITION` over `COMMAND_INT`, arrival/LOITER monitoring,
+capability and status reporting, and — new at this checkpoint — the stale-command /
+dispatch-window hardening in §7). Where the two repositories' requirements differ, **both are
+preserved here and the difference is named** — see §13.
 
 Nothing in this document means either side has moved a vehicle. Scout's own verification is a
 source read plus fixture runs against synthetic telemetry; the operator's is unit tests, capture
@@ -21,17 +23,23 @@ the authoritative rationale for everything below), `main.py` (`QUICK_MOVE` comma
 `quick_move_dispatch_gate`, `quick_move_delivery_block`, `supersede_quick_moves`,
 `invalidate_quick_moves_on_link_loss`), `operator/lib/quick-move.js` (view and gating policy),
 `operator/pages/Map.js` (context menu, target marker, status card).
-Tests: `tests/test_quick_move.py` (46), `tests/test_quick_move_delivery.py` (21),
-`tests/test_scout_quick_move_compat.py` (20), `tests/quick-move.test.mjs` (50).
+Tests: `tests/test_quick_move.py` (46), `tests/test_quick_move_delivery.py` (24),
+`tests/test_scout_quick_move_compat.py` (20), `tests/quick-move.test.mjs` (56).
 Fixture: `scripts/quick_move_fixture.py` (opt-in, loopback only).
 Capture replay: `scripts/scout_payload_replay.py`, payloads in
 `tests/fixtures/scout_quick_move_payloads/`.
 
-**Scout implementation** (checkpoint `a102f21a`): `flask/services/guided_navigation.py`,
+**Scout implementation** (checkpoint `7e67dfe0`): `flask/services/guided_navigation.py`,
 `flask/routes/agent_routes.py` (`POST /agent/guided_target`), `command_executor.py`,
 `command_normalization.py`, `command_handler.py`, `quick_move_controller.py`,
-`quick_move_state.py` / `quick_move_runtime.py`, `local_agent.py`.
+`quick_move_state.py` / `quick_move_runtime.py`, `local_agent.py`,
+`timestamp_utils.py` (the ISO-8601 `expires_at` normalizer all three expiry checks read).
 Fixture: `quick_move_fixture.py` (8 scenarios, synthetic telemetry, opt-in).
+
+**Scout's source is NOT in this repository** — `_scout_ref/` is a July snapshot that predates
+quick move entirely. Everything asserted here about Scout's internals comes from its written
+handoff at `7e67dfe0`, except `timestamp_utils.py` and `mode_verification.py`, which ARE in that
+snapshot and were read directly.
 
 ---
 
@@ -368,7 +376,7 @@ Scout can say whether the vehicle stood down.
 ### Required Scout behaviour — the part the operator CANNOT close alone
 
 Everything above is operator-side and needs no Scout change. But there is a residual the
-operator provably cannot cover, and it needs two precise things from Scout:
+operator provably cannot cover, and it needed two precise things from Scout:
 
 1. **Honour `expires_at` at execution time, not just at receipt.** If a `QUICK_MOVE` is
    dequeued, or reaches the point of execution, after its `expires_at`, **do not execute it** —
@@ -378,13 +386,48 @@ operator provably cannot cover, and it needs two precise things from Scout:
    invalidate a move it has not yet handed over; once Scout has claimed it, **only Scout can
    decide not to act on it.** If the Scout→operator link was interrupted between claiming a
    `QUICK_MOVE` and acting on it, treat the command as stale: do not start the move, and report
-   `CANCELLED` or `REJECTED` with that reason. Scout already knows its own link state
-   (`communication.py`), so this is a local check, not new protocol.
+   `CANCELLED` or `REJECTED` with that reason.
 
-Without (2) there remains a window — claimed, link drops, link returns, Scout executes — that
-no operator-side guard can reach, because by then the command is in Scout's hands. The operator
-will show it as "Delivery not confirmed" rather than claiming either outcome, which is honest
-but is not the same as the move being prevented.
+**Both are now implemented on Scout (checkpoint `7e67dfe0`), in three layers** — and the layer
+boundaries matter, because they are exactly what decides which interruptions are caught:
+
+| Layer | Where | Rechecks |
+|---|---|---|
+| `quick_move_controller.prepare()` | Local Agent, before the record is registered | expiry + a fresh `control_authority` read |
+| `quick_move_controller.confirm_dispatch()` (new) | Local Agent, immediately before the ONE blocking dispatch call | the record is still active/non-terminal/non-cancelled (catches supersession and an operator Stop), expiry again, authority again, and — new — Scout's own `comm_state`, against the same "must be CONNECTED" bar this station applies |
+| `guided_navigation.enter_guided_and_reposition(..., expires_at=…)` (new) | vehicle Flask, **after** the GUIDED transition and immediately before the physical `DO_REPOSITION` write | expiry only |
+
+The operator's side of this is the `expires_at` it already sends: Scout normalizes that ISO-8601
+string to epoch seconds (`timestamp_utils.normalize_timestamp`) and all three checks read it.
+Pinned here by `tests/test_quick_move_delivery.py::CommandEnvelopeTests`, including that the TTL
+leaves room for the blocking GUIDED transition — Scout's `set_mode_and_verify` is bounded at
+~8 s (1.5 s ack + 5 s verify + 1.5 s stable window) against a 45 s TTL.
+
+#### The residual that remains — do NOT read this as closed
+
+Only the third layer sits at the actual actuation boundary, and **it can check expiry alone**,
+because expiry is the one precondition that needs no state from the Local Agent's process.
+Once `confirm_dispatch()` returns and the HTTP call is made, the Local Agent is blocked inside
+that single synchronous call for as long as the GUIDED transition takes. **A cancellation, an
+authority change, a supersession or a link interruption occurring strictly inside that window —
+a few seconds — is not observable or actionable, and is not proven to prevent the target
+write.** Nothing can reach inside an in-flight HTTP call in the current synchronous
+one-call-per-command design; this is an inherent limit, not an oversight, and Scout's own
+handoff states it in the same terms. Phase 2 (the monitor thread) resumes continuous link /
+authority / mode supervision only once that call returns.
+
+**What the operator does about it.** It cannot prevent the write, so it does not pretend to.
+Two things it does instead:
+
+* the card never renders a cancel as a stop — it reads *"Stop requested — waiting for Scout to
+  confirm the vehicle has stood down"* until Scout reports a terminal state (§8); and
+* when this station's own command record ends in a refusal (`REJECTED` / `FAILED` / `EXPIRED`)
+  while Scout's newest movement report still shows the move RUNNING — precisely the shape this
+  window produces — **both facts are shown together**, with the refusal named and the
+  stand-down explicitly deferred to Scout (`refusedWhileRunningNote`, pinned by
+  `tests/quick-move.test.mjs`). Showing only the running status would present a healthy move
+  over a command known to be refused; showing only the refusal would claim a stand-down nothing
+  here witnessed.
 
 **Nothing else about §7 requires a Scout change.**
 
@@ -547,8 +590,10 @@ is evidence that any vehicle moved, or that a command was ever delivered to one.
 ### Evidence quality — read this before quoting the results
 
 Scout's handoff says its exported captures live in `scout_quick_move_captures/` in the Scout
-repository, **gitignored**, and asks for them to be handed over. **They have not been.** What is
-in `tests/fixtures/scout_quick_move_payloads/` today is
+repository, **gitignored**, and asks for them to be handed over. **They still have not been, at
+checkpoint `7e67dfe0` either** — `tests/fixtures/scout_quick_move_payloads/` was re-checked for
+this round and the archive is absent. No substitute was manufactured for it; a second
+reconstruction would only make the evidence look better than it is. What is in that directory is
 `RECONSTRUCTED-from-scout-handoff.json` — Scout's eight scenarios **transcribed from the prose
 of its handoff**, not captured from its code.
 
@@ -664,6 +709,30 @@ a screen showing fixture data cannot be mistaken for a live vehicle. No registry
 test-only identity hack is required.
 *Pinned by `test_the_fixture_vehicle_is_isolated_from_the_real_scout`.*
 
+### 8. A command refused AFTER Scout began reporting was invisible — **fixed this round**
+The mirror of finding 2, and `7e67dfe0` is what made it reachable. Scout registers its movement
+record in `prepare()` — which is also when the first `STARTING` can be published — and only then
+runs `confirm_dispatch()`, which can still refuse the move. The operator's own link invalidation
+produces the same shape from the other side (a record EXPIRED for a move Scout had already
+claimed). In both cases the card read the running status with the delivery line *"Scout has this
+move."* and **the refusal reason appeared nowhere** — a healthy-looking move over a command this
+station knew was refused.
+
+`refusedWhileRunningNote()` now shows both facts: the refusal with its reason, the movement Scout
+last reported, and the stand-down explicitly deferred to Scout. It does **not** render the move
+as cancelled — nothing here witnessed that.
+*Pinned by `tests/quick-move.test.mjs` "a command refused AFTER Scout began reporting shows both
+facts" and the r3 browser run.*
+
+### 9. Stop was withheld until Scout's first status — **fixed this round**
+`stopAvailable` required a reported movement, so the card offered no Stop between the click and
+Scout's first `active` block — a window that spans the claim, `prepare()`, and the whole blocking
+GUIDED transition (up to ~8 s), which is exactly when the vehicle is most likely to have started
+moving. Stop is now offered while the command is live, and withheld only when the command was
+terminally refused with no movement ever reported (nothing to stop) or the move is terminal. It
+is still the same ordinary `SET_MODE_LOITER` — no second cancel mechanism was introduced.
+*Pinned by "Stop is offered before Scout's first status, and only while something may be moving".*
+
 ### 6. Quick move has no session/generation — **open, low priority**
 Companions carry `session {id, seq, generation}` so the operator can tell a publisher restart
 from a quiet link. Quick move has no equivalent, and Scout's state is explicitly **in-memory only
@@ -699,7 +768,8 @@ Scout's list, in Scout's order (cheapest/lowest-risk first), with the operator-s
 | 6 | **ArduRover 4.5.0 vs master** — confirm this boat's firmware behaves as the master-branch source read and the 4.6.3 forum report describe. | Scout |
 | 7 | **Hand over the real captures** — `scout_quick_move_captures/` → `tests/fixtures/scout_quick_move_payloads/`, so §12 runs on evidence instead of a reconstruction. | Scout |
 | 8 | **Delivery across a real link gap** — with a real Scout polling, create a quick move, drop the link, restore it, and confirm nothing is delivered and the operator shows the invalidation. Reproduced and fixed in-process (§7); never exercised over a real radio. | Both |
-| 8b | **Scout-side staleness checks** (§7, "the part the operator cannot close alone") — honour `expires_at` at execution time, and refuse a quick move claimed before a link outage. **Not implemented on Scout today**; without it a claimed-then-interrupted move can still execute. | Scout |
+| 8b | ~~**Scout-side staleness checks**~~ — **implemented at `7e67dfe0`** (§7): expiry and authority rechecked at `confirm_dispatch()`, Scout's own `comm_state` checked there for the first time, and expiry rechecked once more at the physical-actuation boundary. Source-read and unit-tested on Scout; never exercised over a real radio. | done |
+| 8c | **The blocking-dispatch window** (§7, "the residual that remains") — a cancellation, authority change, supersession or link drop occurring **inside** Scout's single blocking GUIDED call is still **not proven to prevent the target write**. Exercising it needs a real link and deliberate timing; there is no in-process way to reproduce it. **Open — do not record this as closed.** | Both |
 | 9 | **Full end-to-end** — one real (or SITL) quick move from click to `COMPLETED`, with `payload.quick_move` observed live on the operator station. | Both |
 
 Steps 2–6 and 8–9 can all be run against SITL first, if one becomes available.
