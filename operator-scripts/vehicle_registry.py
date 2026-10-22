@@ -58,7 +58,7 @@ from pathlib import Path
 # records rather than creating a second row (no static USV-3 placeholder alongside a dynamic
 # SAR-001 row — one canonical record per vehicle, always).
 DEFAULT_REGISTRY = {
-    "usv-1": {"id": 1, "display_name": "USV-1", "aliases": []},
+    "usv-1": {"id": 1, "display_name": "Operator", "aliases": ["Operator"]},
     "usv-2": {"id": 2, "display_name": "Scout", "aliases": ["Scout"]},
     "usv-3": {"id": 3, "display_name": "SAR-001", "aliases": ["SAR-001", "SAR001", "SAR"]},
 }
@@ -68,6 +68,7 @@ REGISTRY_ENV_VAR = "OPERATOR_VEHICLE_REGISTRY"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _USV_NUM_RE = re.compile(r"^usv-(\d+)$")
+_NEGATIVE_NUM_RE = re.compile(r"^\s*-\d+\s*$")
 
 
 class RegistryError(ValueError):
@@ -87,6 +88,10 @@ def normalize_token(raw) -> str:
         return ""
     if isinstance(raw, float) and raw.is_integer():
         raw = int(raw)
+    if _NEGATIVE_NUM_RE.match(str(raw)):
+        # -1 is the routes' "names no vehicle" sentinel. Stripping its sign below would turn
+        # it into "1" and resolve it onto vehicle 1, so a negative number is never an id.
+        return ""
     token = _SLUG_RE.sub("-", str(raw).strip().lower()).strip("-")
     return token
 

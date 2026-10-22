@@ -31,9 +31,16 @@ import mission_contract  # noqa: E402
 import requests as real_requests  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+OPERATOR_VID = 1       # Operator — configured with a LOCAL_AGENT_API_BASE (8090) route
 SCOUT_VID = 2          # Scout — configured with a LOCAL_AGENT_API_BASE (8090) route
 SAR_VID = 3            # SAR-001 — also configured
-NO_LA_VID = 1          # USV-1 — configured identity, but NO LOCAL_AGENT_API_BASE route
+NO_LA_VID = 4          # known (in contact) but with NO LOCAL_AGENT_API_BASE route
+
+
+def make_known_without_route(test, vid=NO_LA_VID):
+    """Bring `vid` into contact the way a real vehicle appears — by its own record."""
+    main.vehicle_record(vid)
+    test.addCleanup(main.current_vehicle_state.pop, vid, None)
 
 
 class FakeResp:
@@ -358,7 +365,15 @@ class ReplanProxyRouteTests(unittest.TestCase):
         r = self.client.get("/api/vehicles/usv-999/replan/status")
         self.assertEqual(r.status_code, 404)
 
+    def test_operator_status_proxies_to_operator_base_only(self):
+        self.fake.set("GET", "/agent/replan/status", FakeResp({"fsm_state": "MONITORING"}))
+        self.client.get(f"/api/vehicles/{OPERATOR_VID}/replan/status")
+        urls = [u for _, u in self.fake.calls]
+        self.assertTrue(urls)
+        self.assertTrue(all(u.startswith(main.LOCAL_AGENT_API_BASE[OPERATOR_VID]) for u in urls), urls)
+
     def test_no_local_agent_route_is_supported_false(self):
+        make_known_without_route(self)
         r = self.client.get(f"/api/vehicles/{NO_LA_VID}/replan/status")
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()["supported"])

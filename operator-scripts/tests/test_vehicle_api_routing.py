@@ -32,14 +32,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+OPERATOR = 1                    # canonical id, display name "Operator"
 SCOUT = 2                       # canonical id, display name "Scout"
 SAR = 3                         # canonical id, display name "SAR-001"
+OPERATOR_BASE = "http://10.0.1.10:5050"   # Operator's vehicle API serves on 5050
 SCOUT_BASE = "http://10.0.2.10:8080"
 SAR_BASE = "http://10.0.3.10:8080"
+OPERATOR_AGENT_BASE = "http://10.0.1.10:8090"
+# Known (in contact — it has pushed a status packet) but with NO configured route. Every
+# registry vehicle is routed, so the "known but unrouted" cases use this one instead.
+UNROUTED = 4
 
 # Every accepted spelling of SAR's identity. The display name/callsign is a REGISTRY alias,
 # so it resolves — but it resolves to the canonical id, which is what does the routing.
 SAR_SPELLINGS = [3, "3", "usv-3", "USV-3", "usv_3", "SAR-001", "sar-001", "SAR001", "SAR"]
+OPERATOR_SPELLINGS = [1, "1", "usv-1", "USV-1", "Operator", "operator"]
 
 
 class FakeResp:
@@ -115,12 +122,23 @@ class RoutingTestBase(unittest.TestCase):
 
     def tearDown(self):
         main.requests = self._orig_requests
+        main.current_vehicle_state.pop(UNROUTED, None)
+
+    def make_unrouted_vehicle_known(self):
+        """Bring UNROUTED into contact the way a real vehicle appears: by its own record."""
+        main.vehicle_record(UNROUTED)
+        self.assertIsNone(main.vehicle_api_base(UNROUTED))
 
 
 # ---------------------------------------------------------------------------------
 # 1. Pure resolution: the map itself
 # ---------------------------------------------------------------------------------
 class RouteResolutionTests(RoutingTestBase):
+    def test_operator_resolves_only_to_operator_base(self):
+        for spelling in OPERATOR_SPELLINGS:
+            self.assertEqual(main.vehicle_api_base(spelling), OPERATOR_BASE, spelling)
+            self.assertEqual(main.local_agent_base(spelling), OPERATOR_AGENT_BASE, spelling)
+
     def test_scout_resolves_only_to_scout_base(self):
         for spelling in (2, "2", "usv-2", "USV-2", "Scout"):
             self.assertEqual(main.vehicle_api_base(spelling), SCOUT_BASE, spelling)
@@ -133,8 +151,9 @@ class RouteResolutionTests(RoutingTestBase):
         bases = {main.vehicle_api_base(s) for s in SAR_SPELLINGS}
         self.assertEqual(bases, {SAR_BASE})
 
-    def test_the_two_vehicles_never_share_a_base(self):
-        self.assertNotEqual(main.vehicle_api_base(SCOUT), main.vehicle_api_base(SAR))
+    def test_no_two_vehicles_share_a_base(self):
+        bases = [main.vehicle_api_base(v) for v in (OPERATOR, SCOUT, SAR)]
+        self.assertEqual(len(set(bases)), 3, bases)
 
     def test_unknown_vehicle_resolves_to_no_base(self):
         for unknown in ("usv-99", 99, "nope", "", None, "9f2c-uuid-like", "usv-", 0):
@@ -152,14 +171,25 @@ class RouteResolutionTests(RoutingTestBase):
         and /agent/experiment/network — so a row pointed there looks healthy on the mission
         pages while control silently fails. That half-working mode is why this is pinned."""
         for cid, base in main.VEHICLE_API_BASE.items():
-            self.assertTrue(base.endswith(":8080"), f"{cid} -> {base}")
+            expected = ":5050" if cid == OPERATOR else ":8080"   # Operator's API is on 5050
+            self.assertTrue(base.endswith(expected), f"{cid} -> {base}")
             self.assertNotIn(":8090", base)
 
-    def test_registry_membership_does_not_imply_a_route(self):
-        """usv-1 is a configured, monitored vehicle with no verified address. That is a
-        supported state, and proves appearing in vehicles.json never grants command reach."""
-        self.assertIn(1, main.REGISTRY.configured_ids())
-        self.assertIsNone(main.vehicle_api_base(1))
+    def test_unknown_vehicle_sentinel_never_resolves_to_operator(self):
+        """parse_vehicle_id returns -1 for "names no vehicle". Its sign must not be stripped
+        into "1", or every unknown id would be routed to Operator (vehicle 1)."""
+        for sentinel in (-1, "-1"):
+            self.assertIsNone(main.canonical_id(sentinel), sentinel)
+            self.assertIsNone(main.vehicle_api_base(sentinel), sentinel)
+            self.assertIsNone(main.local_agent_base(sentinel), sentinel)
+
+    def test_known_vehicle_without_a_route_resolves_to_no_base(self):
+        """A vehicle the station knows (it is in contact) but has no route for is a supported
+        state: being known never grants command reach."""
+        self.make_unrouted_vehicle_known()
+        self.assertEqual(main.parse_vehicle_id(UNROUTED), UNROUTED)
+        self.assertIsNone(main.vehicle_api_base(UNROUTED))
+        self.assertIsNone(main.local_agent_base(UNROUTED))
 
 
 # ---------------------------------------------------------------------------------
@@ -204,8 +234,18 @@ class ControlAuthorityRoutingTests(RoutingTestBase):
         self.assertEqual(self.http.urls("POST"), [f"{SAR_BASE}/agent/control_authority"])
         self.assertNotIn(SCOUT_BASE, self.http.hosts_touched())
 
+    def test_operator_authority_read_reaches_operator_only(self):
+        self.http.responses = {OPERATOR_BASE: FakeResp({"authority": "OPERATOR"})}
+        body = self.client.get(f"/api/control_authority/{OPERATOR}").json()
+        self.assertEqual(body["vehicle_id"], OPERATOR)
+        self.assertTrue(body["available"])
+        self.assertEqual(body["authority"], "OPERATOR")
+        self.assertEqual(self.http.urls("GET"), [f"{OPERATOR_BASE}/agent/control_authority"])
+        self.assertFalse({SCOUT_BASE, SAR_BASE} & self.http.hosts_touched())
+
     def test_authority_write_for_unrouted_vehicle_is_refused_not_redirected(self):
-        r = self.client.post("/api/control_authority/1", json={"authority": "OPERATOR"})
+        self.make_unrouted_vehicle_known()
+        r = self.client.post(f"/api/control_authority/{UNROUTED}", json={"authority": "OPERATOR"})
         self.assertEqual(r.status_code, 409)
         self.assertFalse(r.json()["available"])
         self.assertEqual(self.http.calls, [])      # nothing left the station
@@ -216,7 +256,8 @@ class ControlAuthorityRoutingTests(RoutingTestBase):
         self.assertEqual(self.http.calls, [])
 
     def test_unrouted_but_known_vehicle_reads_available_false(self):
-        r = self.client.get("/api/control_authority/1")
+        self.make_unrouted_vehicle_known()
+        r = self.client.get(f"/api/control_authority/{UNROUTED}")
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertFalse(body["available"])
@@ -307,7 +348,8 @@ class PixhawkMissionRoutingTests(RoutingTestBase):
         self.assertEqual(self.http.calls, [])
 
     def test_unrouted_vehicle_mission_is_available_false_not_scouts_mission(self):
-        body = self.client.get("/api/vehicles/1/pixhawk-mission").json()
+        self.make_unrouted_vehicle_known()
+        body = self.client.get(f"/api/vehicles/{UNROUTED}/pixhawk-mission").json()
         self.assertFalse(body["available"])
         self.assertEqual(body["waypoints"], [])
         self.assertEqual(body["count"], 0)

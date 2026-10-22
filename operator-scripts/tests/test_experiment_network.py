@@ -28,7 +28,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+OPERATOR_VID = 1  # Operator's canonical id; its route lives in VEHICLE_API_BASE too
 SCOUT_VID = 2  # Scout's canonical id; its route lives in VEHICLE_API_BASE (SAR-001 is 3)
+UNROUTED_VID = 4  # known (in contact) but with NO VEHICLE_API_BASE route
 
 
 class FakeResp:
@@ -376,16 +378,29 @@ class TestAuthorityIndependence(ExperimentTestBase):
         self.assertNotEqual(r.status_code, 409)
 
 
+class TestOperatorVehicle(ExperimentTestBase):
+    def test_get_for_operator_reaches_operator_base_only(self):
+        self.client.get(f"/api/experiment/network?vehicle_id={OPERATOR_VID}")
+        urls = [u for _, u, _ in self.scout.calls]
+        self.assertEqual(urls, [f"{main.VEHICLE_API_BASE[OPERATOR_VID]}/agent/experiment/network"])
+
+
 class TestUnconfiguredVehicle(ExperimentTestBase):
+    def setUp(self):
+        super().setUp()
+        main.vehicle_record(UNROUTED_VID)          # in contact, but no route configured
+        self.addCleanup(main.current_vehicle_state.pop, UNROUTED_VID, None)
+
     def test_apply_to_vehicle_without_scout_base_is_stable_409(self):
-        r = self.client.post("/api/experiment/network", json={**VALID_BODY, "vehicle_id": 1})
+        r = self.client.post("/api/experiment/network",
+                             json={**VALID_BODY, "vehicle_id": UNROUTED_VID})
         self.assertEqual(r.status_code, 409)
         data = r.json()
         self.assertFalse(data["available"])
-        self.assertEqual(data["vehicle_id"], 1)
+        self.assertEqual(data["vehicle_id"], UNROUTED_VID)
 
     def test_get_for_vehicle_without_scout_base_is_stable_200_unavailable(self):
-        r = self.client.get("/api/experiment/network?vehicle_id=1")
+        r = self.client.get(f"/api/experiment/network?vehicle_id={UNROUTED_VID}")
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()["available"])
         self.assertEqual(r.json()["status"], "unavailable")

@@ -23,6 +23,7 @@ import { canonicalVehicleId } from "../lib/selection.js";
 // with a real, reachable local dashboard belong here — we do not fabricate one for
 // hulls that don't serve a web UI.
 const DASHBOARDS = {
+  1: "http://10.0.1.10:5050/", // Operator — Aquality web dashboard, over WireGuard
   2: "http://10.0.2.10:8080/", // Scout — vehicle-local web dashboard
 };
 

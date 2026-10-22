@@ -283,6 +283,8 @@ last_authority_by_id = {}        # {vehicle_id: last event-recorded effective au
 VEHICLE_API_BASE = {
     2: "http://10.0.2.10:8080",  # Scout   — motherpi Flask API, over WireGuard
     3: "http://10.0.3.10:8080",  # SAR-001 — verified over WireGuard (wg0 10.0.3.10/16)
+    # Kept after Scout: the first row is the default experiment target (_last_experiment_vehicle_id).
+    1: "http://10.0.1.10:5050",  # Operator — vehicle API on 5050, over WireGuard
 }
 
 
@@ -307,6 +309,7 @@ def vehicle_api_base(vid):
 LOCAL_AGENT_API_BASE = {
     2: "http://10.0.2.10:8090",  # Scout   — Local Agent replanning server, over WireGuard
     3: "http://10.0.3.10:8090",  # SAR-001 — Local Agent replanning server, over WireGuard
+    1: "http://10.0.1.10:8090",  # Operator — Local Agent replanning server, over WireGuard
 }
 
 

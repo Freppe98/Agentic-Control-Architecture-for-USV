@@ -36,7 +36,10 @@ import scout_mission_execution as mx  # noqa: E402
 import requests as real_requests  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+OPERATOR_VID = 1
 SCOUT_VID = 2
+UNROUTED_VID = 4       # known (in contact) but with NO VEHICLE_API_BASE route
+OPERATOR_FLASK_BASE = main.VEHICLE_API_BASE[OPERATOR_VID]
 SCOUT_LA_BASE = main.LOCAL_AGENT_API_BASE[SCOUT_VID]
 SCOUT_FLASK_BASE = main.VEHICLE_API_BASE[SCOUT_VID]
 
@@ -340,8 +343,14 @@ class EvidenceProxyTest(unittest.TestCase):
         self.assertEqual(body["supported"], False)
         self.assertIsNone(body["evidence"])
 
+    def test_operator_evidence_is_read_from_operators_own_api(self):
+        self._proxy(FakeResp({"evidence": EVIDENCE}), vehicle=f"usv-{OPERATOR_VID}")
+        self.assertEqual(self.fake.urls, [f"{OPERATOR_FLASK_BASE}/agent/state"])
+
     def test_a_vehicle_with_no_flask_route_is_available_false(self):
-        r = self._proxy(FakeResp({}), vehicle="usv-1")
+        main.vehicle_record(UNROUTED_VID)          # in contact, but no route configured
+        self.addCleanup(main.current_vehicle_state.pop, UNROUTED_VID, None)
+        r = self._proxy(FakeResp({}), vehicle=f"usv-{UNROUTED_VID}")
         body = r.json()
         self.assertEqual(body["available"], False)
         self.assertIsNone(body["evidence"])

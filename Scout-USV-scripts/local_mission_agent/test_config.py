@@ -19,11 +19,14 @@ import config
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _RUN_SCRIPT = os.path.join(_HERE, "run_local_agent.sh")
 
+MAX_COMPUTER = "http://10.0.0.21:8210"     # Max computer
 DESKTOP = "http://10.0.0.23:8210"          # Fredrik desktop
 LAPTOP = "http://10.0.0.24:8210"           # Fredrik laptop
 AQUALITY_LAPTOP = "http://10.0.0.25:8210"  # aquality laptop
 
-EXPECTED_DEFAULTS = [DESKTOP, LAPTOP, AQUALITY_LAPTOP]
+
+EXPECTED_DEFAULTS = [MAX_COMPUTER, DESKTOP, LAPTOP, AQUALITY_LAPTOP]
+_STATION_HOSTS = ("10.0.0.23", "10.0.0.24", "10.0.0.25", "10.0.0.21")
 
 
 def _port_for_host(urls, host):
@@ -38,17 +41,17 @@ class TestOperatorEndpoints(unittest.TestCase):
     def test_all_stations_resolve_to_8210(self):
         # After the backend move, every configured operator station answers on
         # 8210 -- desktop, laptop, and the aquality laptop alike.
-        for host in ("10.0.0.23", "10.0.0.24", "10.0.0.25"):
+        for host in _STATION_HOSTS:
             self.assertEqual(_port_for_host(config.DEFAULT_OPERATOR_URLS, host), 8210)
 
     def test_no_station_points_at_stale_8200(self):
         # The historical 8200 port is dead for every station -- no entry may map
         # any known operator host to it.
         for u in config.DEFAULT_OPERATOR_URLS:
-            for host in ("10.0.0.23", "10.0.0.24", "10.0.0.25"):
+            for host in _STATION_HOSTS:
                 self.assertNotIn(f"{host}:8200", u)
 
-    def test_default_list_is_exactly_the_three_stations(self):
+    def test_default_list_is_exactly_the_configured_stations(self):
         self.assertEqual(list(config.DEFAULT_OPERATOR_URLS), EXPECTED_DEFAULTS)
 
     def test_run_script_loads_default_config(self):

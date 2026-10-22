@@ -32,12 +32,20 @@ import scout_mission_execution as mx  # noqa: E402
 import requests as real_requests  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+OPERATOR_VID = 1       # Operator — configured with a LOCAL_AGENT_API_BASE (8090) route
 SCOUT_VID = 2          # Scout — configured with a LOCAL_AGENT_API_BASE (8090) route
 SAR_VID = 3            # SAR-001 — also configured
-NO_LA_VID = 1          # USV-1 — configured identity, but NO LOCAL_AGENT_API_BASE route
+NO_LA_VID = 4          # known (in contact) but with NO LOCAL_AGENT_API_BASE route
 
+OPERATOR_BASE = main.LOCAL_AGENT_API_BASE[OPERATOR_VID]
 SCOUT_BASE = main.LOCAL_AGENT_API_BASE[SCOUT_VID]
 SAR_BASE = main.LOCAL_AGENT_API_BASE[SAR_VID]
+
+
+def make_known_without_route(test, vid=NO_LA_VID):
+    """Bring `vid` into contact the way a real vehicle appears — by its own record."""
+    main.vehicle_record(vid)
+    test.addCleanup(main.current_vehicle_state.pop, vid, None)
 
 
 class FakeResp:
@@ -205,7 +213,7 @@ class MissionExecutionTestCase(unittest.TestCase):
                     "authority": authority, "available": True, "reachable": True}, 200
         main.apply_control_authority = _apply
 
-        for vid in (SCOUT_VID, SAR_VID):
+        for vid in (OPERATOR_VID, SCOUT_VID, SAR_VID):
             main.active_original_by_vehicle[vid] = "msn-0001"
         main.original_missions["msn-0001"] = {
             "mission_id": "msn-0001", "upload_status": "VERIFIED", "route_hash": "sha256:aaa"}
@@ -215,7 +223,7 @@ class MissionExecutionTestCase(unittest.TestCase):
         main._compute_replan_readiness = self._real_readiness
         main.read_control_authority = self._real_read_authority
         main.apply_control_authority = self._real_apply_authority
-        for vid in (SCOUT_VID, SAR_VID):
+        for vid in (OPERATOR_VID, SCOUT_VID, SAR_VID):
             main.active_original_by_vehicle.pop(vid, None)
         main.original_missions.pop("msn-0001", None)
 
@@ -311,6 +319,7 @@ class TestRoutes(MissionExecutionTestCase):
     def test_stop_on_a_vehicle_with_no_local_agent_is_unsupported_not_guessed(self):
         """Same handling as every other lifecycle write: a handled `supported:false`, and no
         other vehicle's Local Agent base substituted in."""
+        make_known_without_route(self)
         r = self.client.post(f"/api/vehicles/{NO_LA_VID}/mission-execution/stop")
         self.assertEqual(r.status_code, 200)
         self.assertIs(r.json()["supported"], False)
@@ -375,6 +384,7 @@ class TestRoutes(MissionExecutionTestCase):
         self.assertEqual(self.fake.calls, [])
 
     def test_vehicle_without_a_local_agent_route_is_unsupported_not_guessed(self):
+        make_known_without_route(self)
         r = self.client.post(f"/api/vehicles/{NO_LA_VID}/mission-execution/start")
         self.assertEqual(r.status_code, 200)
         self.assertIs(r.json()["supported"], False)
@@ -394,8 +404,10 @@ class TestIsolation(MissionExecutionTestCase):
         self.set_op("pause", FakeResp(op_body("pause"), 200))
         self.client.post(f"/api/vehicles/{SCOUT_VID}/mission-execution/pause")
         self.client.post(f"/api/vehicles/{SAR_VID}/mission-execution/pause")
+        self.client.post(f"/api/vehicles/{OPERATOR_VID}/mission-execution/pause")
         self.assertIn(f"{SCOUT_BASE}/agent/mission_execution/pause", self.fake.urls("POST"))
         self.assertIn(f"{SAR_BASE}/agent/mission_execution/pause", self.fake.urls("POST"))
+        self.assertIn(f"{OPERATOR_BASE}/agent/mission_execution/pause", self.fake.urls("POST"))
 
     def test_operation_results_do_not_leak_across_vehicles(self):
         self.set_op("start", FakeResp(op_body("start"), 200))

@@ -12,8 +12,7 @@
     "  aliases      every other spelling THIS vehicle may use for itself in a status packet",
     "               (callsigns, hull names, bare numbers). Explicit only — the station never",
     "               guesses an alias, because a guess could merge two different vehicles.",
-    "               The key, its slug and its bare number are always aliases of themselves.",
-    "",
+    "               The key, its slug and its bare number are always aliases of themselves.",    "",
     "An alias claimed by two vehicles is a hard startup error, not a silent last-one-wins.",
     "",
     "SCOPE — this file is MONITORING & IDENTITY ONLY. It says who exists and how to",
@@ -36,8 +35,8 @@
   ],
   "usv-1": {
     "id": 1,
-    "display_name": "USV-1",
-    "aliases": []
+    "display_name": "Operator",
+    "aliases": ["Operator"]
   },
   "usv-2": {
     "id": 2,

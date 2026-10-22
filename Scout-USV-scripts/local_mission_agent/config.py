@@ -11,10 +11,11 @@ LOCAL_FLASK_URL = "http://127.0.0.1:8080"
 # switching -- use OPERATOR_URLS env var or local_config.py instead.
 
 DEFAULT_OPERATOR_URLS = [ #(backend moved 8200 -> 8210)
+    "http://10.0.0.21:8210",    # Max computer
     "http://10.0.0.23:8210",  # Fredrik desktop
     "http://10.0.0.24:8210",  # Fredrik laptop
     "http://10.0.0.25:8210",    # aquality laptop
-
+    
 ]
 
 
